@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# nvim-test — repo-owned Neovim behavior for termnav modules.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+_nvim_lua() {
+  nvim --headless --noplugin -u NONE -i NONE \
+    -c "lua $1" \
+    -c "qa!" 2>&1 |
+    tr -d '\r'
+}
+
+if ! command -v nvim >/dev/null 2>&1; then
+  echo "  SKIP: termnav nvim module assertions (nvim unavailable)"
+  _test_summary
+fi
+
+opener_module="$TERMNAV_ROOT/lib/termnav/nvim/nvim-tmux-open.lua"
+vars_module="$TERMNAV_ROOT/lib/termnav/nvim/wezterm-vars.lua"
+
+echo "=== nvim-tmux-open ==="
+
+_assert_not_contains "setup: publish events avoid per-cursor-move disk writes" \
+  "CursorMoved" "$(cat "$opener_module")"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = '/tmp/tmux.sock,1,0'
+  vim.env.TMUX_PANE = '%42'
+  local vars = dofile('$vars_module')
+  local old_system = vim.fn.system
+  local old_open = io.open
+  local calls = 0
+  local opened = {}
+  vim.fn.system = function(cmd)
+    calls = calls + 1
+    if calls == 1 then
+      return '\n'
+    end
+    print(table.concat(cmd, ' '))
+    return '/dev/pts/42\n'
+  end
+  io.open = function(path, mode)
+    opened[#opened + 1] = path .. ' ' .. mode
+    return {
+      write = function(_, text)
+        opened[#opened + 1] = text:match('SetUserVar=IS_NVIM=') and 'user-var' or 'bad-write'
+      end,
+      flush = function() end,
+      close = function() end,
+    }
+  end
+  print(tostring(vars.set('IS_NVIM', 'true')))
+  print(tostring(calls))
+  print(tostring(#opened))
+  print(tostring(vars.set('IS_NVIM', 'true')))
+  print(tostring(calls))
+  print(opened[1])
+  print(opened[2])
+  vim.fn.system = old_system
+  io.open = old_open
+")
+expected="$(printf 'false\n1\n0\ntmux display-message -t %%42 -p #{pane_tty}\ntrue\n2\n/dev/pts/42 w\nuser-var')"
+_assert_eq "wezterm-vars: empty tmux tty is not cached and next publish can recover" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  local old_jobpid = vim.fn.jobpid
+  local old_executable = vim.fn.executable
+  local old_systemlist = vim.fn.systemlist
+  vim.b.terminal_job_id = 77
+  vim.fn.jobpid = function()
+    return 99999999
+  end
+  vim.fn.executable = function(name)
+    if name == 'lsof' then
+      return 0
+    end
+    return old_executable(name)
+  end
+  vim.fn.systemlist = function()
+    print('systemlist-called')
+    return {}
+  end
+  print(tostring(opener.terminal_cwd(0) == nil))
+  vim.fn.jobpid = old_jobpid
+  vim.fn.executable = old_executable
+  vim.fn.systemlist = old_systemlist
+")
+_assert_eq "terminal_cwd: missing lsof fails closed" "true" "$result"
+
+NVIM_TMUX_OPEN_TMP=$(_tmpdir)
+mkdir -p "$NVIM_TMUX_OPEN_TMP/terminal-cwd"
+touch "$NVIM_TMUX_OPEN_TMP/terminal-cwd/clicked.txt"
+NVIM_TMUX_OPEN_TERMINAL_CWD=$(realpath "$NVIM_TMUX_OPEN_TMP/terminal-cwd")
+NVIM_TMUX_OPEN_EXPECTED=$(realpath "$NVIM_TMUX_OPEN_TMP/terminal-cwd/clicked.txt")
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  vim.cmd('edit $NVIM_TMUX_OPEN_TMP/editor.txt')
+  vim.cmd('terminal')
+  local job = vim.b.terminal_job_id
+  vim.fn.chansend(job, 'cd $NVIM_TMUX_OPEN_TMP/terminal-cwd\n')
+  local ready = vim.wait(5000, function()
+    return opener.terminal_cwd(0) == '$NVIM_TMUX_OPEN_TERMINAL_CWD'
+  end)
+  if not ready then
+    print('terminal cwd not ready: ' .. tostring(opener.terminal_cwd(0)))
+    return
+  end
+  local win = vim.api.nvim_get_current_win()
+  opener.open_now('clicked.txt', 1, 0, '$HOME', 'nvim')
+  print(vim.api.nvim_buf_get_name(0))
+  print(tostring(vim.api.nvim_get_current_win() == win))
+  print(#vim.api.nvim_list_tabpages())
+")
+expected="$(printf '%s\ntrue\n1' "$NVIM_TMUX_OPEN_EXPECTED")"
+_assert_eq "open_now: nvim terminal clicks reuse the current window" "$expected" "$result"
+
+mkdir -p "$NVIM_TMUX_OPEN_TMP/editor-cwd" "$NVIM_TMUX_OPEN_TMP/other-terminal-cwd"
+touch "$NVIM_TMUX_OPEN_TMP/editor-cwd/shared.txt" "$NVIM_TMUX_OPEN_TMP/other-terminal-cwd/shared.txt"
+NVIM_TMUX_OPEN_OTHER_TERMINAL_CWD=$(realpath "$NVIM_TMUX_OPEN_TMP/other-terminal-cwd")
+NVIM_TMUX_OPEN_EXPECTED=$(realpath "$NVIM_TMUX_OPEN_TMP/editor-cwd/shared.txt")
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  vim.cmd('cd $NVIM_TMUX_OPEN_TMP/editor-cwd')
+  local clicked_cwd = vim.fn.getcwd()
+  vim.cmd('edit $NVIM_TMUX_OPEN_TMP/editor-cwd/editor.txt')
+  vim.cmd('terminal')
+  -- terminal_cwd() is covered above. Stub it here so this path-resolution
+  -- test does not depend on shell startup and cd timing on slower hosts.
+  opener.terminal_cwd = function()
+    return '$NVIM_TMUX_OPEN_OTHER_TERMINAL_CWD'
+  end
+  opener.open_now('shared.txt', 1, 0, clicked_cwd, 'terminal')
+  print(vim.api.nvim_buf_get_name(0))
+")
+_assert_eq "open_now: explicit clicked cwd wins when relative file exists there" \
+  "$NVIM_TMUX_OPEN_EXPECTED" "$result"
+
+touch "$NVIM_TMUX_OPEN_TMP/external-click.txt"
+NVIM_TMUX_OPEN_EXPECTED=$(realpath "$NVIM_TMUX_OPEN_TMP/external-click.txt")
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  vim.cmd('terminal')
+  local win = vim.api.nvim_get_current_win()
+  opener.open_now('$NVIM_TMUX_OPEN_TMP/external-click.txt', 1, 0, '', 'terminal')
+  print(vim.api.nvim_buf_get_name(0))
+  print(tostring(vim.api.nvim_get_current_win() == win))
+  print(#vim.api.nvim_list_tabpages())
+")
+expected="$(printf '%s\ntrue\n1' "$NVIM_TMUX_OPEN_EXPECTED")"
+_assert_eq "open_now: external terminal clicks reuse current window when needed" "$expected" "$result"
+
+NVIM_TMUX_OPEN_HOME="$NVIM_TMUX_OPEN_TMP/home"
+mkdir -p "$NVIM_TMUX_OPEN_HOME/.local/share/example/core"
+touch "$NVIM_TMUX_OPEN_HOME/.local/share/example/core/shell-loader.sh"
+NVIM_TMUX_OPEN_EXPECTED=$(realpath "$NVIM_TMUX_OPEN_HOME/.local/share/example/core/shell-loader.sh")
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  local old_home = vim.env.HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_HOME'
+  opener.open_now('\$HOME/.local/share/example/core/shell-loader.sh', 8, 1, '$NVIM_TMUX_OPEN_HOME/.config/shell', 'nvim')
+  print(vim.api.nvim_buf_get_name(0))
+  vim.env.HOME = old_home
+")
+_assert_eq "open_now: expands literal HOME file references" "$NVIM_TMUX_OPEN_EXPECTED" "$result"
+
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  local old_home = vim.env.HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_HOME'
+  opener.open_now('\${HOME}/.local/share/example/core/shell-loader.sh', 8, 1, '$NVIM_TMUX_OPEN_HOME/.config/shell', 'nvim')
+  print(vim.api.nvim_buf_get_name(0))
+  vim.env.HOME = old_home
+")
+_assert_eq "open_now: expands braced HOME file references" "$NVIM_TMUX_OPEN_EXPECTED" "$result"
+
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  local old_home = vim.env.HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_HOME'
+  opener.open_now('\$HOME/.local/share/example/core/shell-loader.sh', 8, 1, '$NVIM_TMUX_OPEN_HOME/.config/shell', 'cli')
+  print(vim.api.nvim_buf_get_name(0))
+  vim.env.HOME = old_home
+")
+_assert_eq "open_now: cli mode preserves literal HOME file references" \
+  "$NVIM_TMUX_OPEN_HOME/.config/shell/\$HOME/.local/share/example/core/shell-loader.sh" "$result"
+
+NVIM_TMUX_OPEN_STATE=$(_tmpdir)
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local old_home = vim.env.HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_STATE'
+  local opener = dofile('$opener_module')
+  opener.setup()
+  local current = vim.fn.readfile(vim.fn.expand('~/.local/state/nvim-tmux-open/current'))[1]
+  print(tostring(current == vim.v.servername))
+  print(vim.fn.isdirectory(vim.fn.expand('~/.local/state/nvim-tmux-open/panes')))
+  vim.env.HOME = old_home
+")
+expected="$(printf 'true\n1')"
+_assert_eq "setup: publishes a discoverable current nvim outside tmux" "$expected" "$result"
+
+result=$(_nvim_lua "
+  local opener = dofile('$opener_module')
+  print(tostring(opener.server() ~= ''))
+")
+_assert_eq "server: exposes the socket address used for publication" "true" "$result"
+
+_test_summary

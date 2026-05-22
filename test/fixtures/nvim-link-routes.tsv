@@ -1,0 +1,9 @@
+# Shared link-routing contract for WezTerm, tmux, and nvim opener tests.
+# Columns: name, uri, target, cwd, source, context.
+# cwd is the clicked/pane cwd input; WezTerm remote helper calls intentionally
+# omit it because remote absolute targets already carry their host context.
+# A context of "-" means the route should not pass a fourth helper argument.
+local-nvim	nvim-open://src/main.lua:12	src/main.lua:12	/repo	terminal	-
+lazygit-space	lazygit-edit://src/file%20with%20space.lua:7	src/file with space.lua:7	/repo	terminal	-
+localhost-file	file://localhost/tmp/local.lua:4	/tmp/local.lua:4	/repo	terminal	-
+remote-file	file://remote.example/home/alex/.bashrc:1	/home/alex/.bashrc:1	/repo	remote	remote.example

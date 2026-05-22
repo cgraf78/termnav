@@ -1,0 +1,93 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || '' }}
+    strategy:
+      fail-fast: false
+      # Push/PR should stay cheap; scheduled/manual runs keep broader drift
+      # coverage for platforms that are lower priority or rarely changed.
+      matrix: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'pull_request') && '{"include":[{"name":"macOS","runner":"macos-latest"},{"name":"CentOS Stream","runner":"ubuntu-latest","container":"quay.io/centos/centos:latest"},{"name":"Arch","runner":"ubuntu-latest","container":"archlinux:latest"},{"name":"Debian","runner":"ubuntu-latest","container":"debian:stable"}]}' || '{"include":[{"name":"macOS","runner":"macos-latest"},{"name":"CentOS Stream","runner":"ubuntu-latest","container":"quay.io/centos/centos:latest"},{"name":"Arch","runner":"ubuntu-latest","container":"archlinux:latest"},{"name":"Debian","runner":"ubuntu-latest","container":"debian:stable"},{"name":"Ubuntu","runner":"ubuntu-latest"},{"name":"WSL","runner":"ubuntu-latest"},{"name":"Fedora","runner":"ubuntu-latest","container":"fedora:latest"},{"name":"Alpine","runner":"ubuntu-latest","container":"alpine:latest"}]}') }}
+
+    name: ${{ matrix.name }}
+    steps:
+      - name: Install system prereqs
+        shell: sh
+        env:
+          MATRIX_NAME: ${{ matrix.name }}
+        run: |
+          set -eu
+
+          sudo_if_available() {
+            if command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              "$@"
+            fi
+          }
+
+          ensure_lua() {
+            if command -v lua >/dev/null 2>&1; then
+              return
+            fi
+            if command -v lua5.4 >/dev/null 2>&1; then
+              sudo_if_available ln -sf "$(command -v lua5.4)" /usr/local/bin/lua
+            fi
+          }
+
+          case "$MATRIX_NAME" in
+            macOS)
+              brew install bash lua neovim tmux python
+              ;;
+            Debian | Ubuntu | WSL)
+              sudo_if_available apt-get update
+              sudo_if_available apt-get install -y bash git curl ca-certificates lua5.4 neovim tmux lsof openssh-client netcat-openbsd python3
+              ensure_lua
+              ;;
+            Arch)
+              pacman-key --init
+              pacman-key --populate
+              pacman -Syu --noconfirm bash git curl ca-certificates lua neovim tmux lsof openssh openbsd-netcat python
+              ;;
+            CentOS* | Fedora)
+              dnf install -y --allowerasing bash git curl ca-certificates lua tmux lsof openssh-clients nmap-ncat python3
+              ;;
+            Alpine)
+              apk add --no-cache bash git curl ca-certificates lua5.4 neovim tmux lsof openssh-client netcat-openbsd python3 coreutils
+              ensure_lua
+              ;;
+          esac
+
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Simulate WSL environment
+        if: matrix.name == 'WSL'
+        run: |
+          echo 'Linux version 5.15.0 (Microsoft@Microsoft.com)' > /tmp/wsl-proc-version
+          sudo mount --bind /tmp/wsl-proc-version /proc/version
+
+      - name: Set HOME to workspace
+        run: echo "HOME=$(pwd)" >> "$GITHUB_ENV"
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$(pwd)"
+
+      - name: Run tests
+        shell: bash
+        run: test/termnav-test

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run all repo-owned termnav test suites.
+
+set -euo pipefail
+
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+for suite in "$test_dir"/suites/*-test; do
+  "$suite"
+done
+
+printf 'termnav-test: ok\n'

@@ -1,0 +1,1032 @@
+#!/usr/bin/env bash
+# wezterm-test — checks for WezTerm config integration details.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+helper="$TERMNAV_ROOT/bin/nvim-tmux-open"
+eza_linker="$TERMNAV_ROOT/bin/eza-nvim-links"
+eza_linker_content=$(cat "$TERMNAV_ROOT/bin/eza-nvim-links" 2>/dev/null || true)
+public_link_rules="$TERMNAV_ROOT/lib/termnav/wezterm/public-link-rules.lua"
+
+_run_lua() {
+  if command -v lua >/dev/null 2>&1; then
+    lua "$@"
+    return
+  fi
+  if command -v nvim >/dev/null 2>&1; then
+    # Neovim's -l mode writes Lua print() output to stderr, unlike standalone
+    # lua. Capture both streams in callers for stable assertions.
+    nvim --headless -u NONE -n -l "$@" 2>&1
+    return
+  fi
+  return 127
+}
+
+echo "=== shdeps-installed symlink entry points ==="
+
+symlink_bin=$(_tmpdir)/bin
+mock_bin=$(_tmpdir)/mock-bin
+mkdir -p "$symlink_bin" "$mock_bin"
+ln -s "$helper" "$symlink_bin/nvim-tmux-open"
+ln -s "$eza_linker" "$symlink_bin/eza-nvim-links"
+cat >"$mock_bin/eza" <<'EOF'
+#!/usr/bin/env bash
+printf 'eza'
+for arg in "$@"; do
+  printf ' <%s>' "$arg"
+done
+printf '\n'
+EOF
+chmod +x "$mock_bin/eza"
+
+set +e
+symlink_usage=$("$symlink_bin/nvim-tmux-open" 2>&1)
+symlink_rc=$?
+_assert_exit "nvim-tmux-open symlink: resolves dependency libraries" 2 "$symlink_rc"
+_assert_contains "nvim-tmux-open symlink: usage comes from dependency" \
+  "usage: nvim-tmux-open" "$symlink_usage"
+
+symlink_eza=$(PATH="$mock_bin:$PATH" "$symlink_bin/eza-nvim-links" --all)
+_assert_eq "eza-nvim-links symlink: resolves dependency library" "eza <--hyperlink> <--all>" "$symlink_eza"
+
+echo
+echo "=== WezTerm public hyperlink rules ==="
+
+hyperlink_api_test=$(_tmpdir)/hyperlink-api-test.lua
+cat >"$hyperlink_api_test" <<'EOF'
+local rules_path = arg[1]
+local module = dofile(rules_path)
+local rules = {}
+
+module.add_public_link_rules(rules)
+print(#rules)
+print(rules[1].format)
+
+rules[1].format = "mutated"
+print(module.public_link_rules()[1].format)
+print(tostring(module.add_public_link_rules({}) ~= nil))
+EOF
+hyperlink_api_output=$(_run_lua "$hyperlink_api_test" "$public_link_rules")
+expected="$(printf '7\n%s\n%s\ntrue' "\$1" "\$1")"
+_assert_eq "public hyperlink API: exposes fresh reusable rule copies" \
+  "$expected" "$hyperlink_api_output"
+
+hyperlink_dump_test=$(_tmpdir)/hyperlink-dump.lua
+cat >"$hyperlink_dump_test" <<'EOF'
+local rules_path = arg[1]
+local module = dofile(rules_path)
+for _, rule in ipairs(module.public_link_rules()) do
+  print(rule.regex .. "\t" .. rule.format)
+end
+EOF
+hyperlink_rules_tsv=$(_tmpdir)/hyperlink-rules.tsv
+_run_lua "$hyperlink_dump_test" "$public_link_rules" >"$hyperlink_rules_tsv"
+
+hyperlink_regex_test=$(_tmpdir)/hyperlink-regex-test.py
+cat >"$hyperlink_regex_test" <<'PY'
+import re
+import sys
+
+rules_path = sys.argv[1]
+patterns = []
+with open(rules_path, encoding="utf-8") as rules_file:
+    for line in rules_file:
+        regex, fmt = line.rstrip("\n").split("\t", 1)
+        patterns.append((re.compile(regex), fmt))
+
+if len(patterns) != 7:
+    raise SystemExit(f"expected 7 public hyperlink regexes, found {len(patterns)}")
+
+
+def custom_matches(text):
+    spans = []
+    matches = []
+    for pattern, _ in patterns:
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if any(start < span_end and end > span_start for span_start, span_end in spans):
+                continue
+            spans.append((start, end))
+            matches.append(match.group(0))
+    return matches
+
+
+positives = {
+    "wss://example.com/socket": ["wss://example.com/socket"],
+    "vscode://file/home/example/project": ["vscode://file/home/example/project"],
+    "postgres://user@localhost/db": ["postgres://user@localhost/db"],
+    "localhost:5173?debug=1": ["localhost:5173?debug=1"],
+    "127.0.0.1:8000/status": ["127.0.0.1:8000/status"],
+    "host.docker.internal:8080": ["host.docker.internal:8080"],
+    "github.com/example/project": ["github.com/example/project"],
+    "www.example.com?x=1": ["www.example.com?x=1"],
+    "git@github.com:example/project.git": ["git@github.com:example/project.git"],
+    "git@gitlab.com:org/subgroup/project": ["git@gitlab.com:org/subgroup/project"],
+    "CVE-2024-12345": ["CVE-2024-12345"],
+    "cve-2024-12345": ["cve-2024-12345"],
+    "RFC-9110": ["RFC-9110"],
+    "RFC 9110": ["RFC 9110"],
+}
+negatives = [
+    "https://example.com/path",
+    "file:///tmp/file.txt",
+    "nvim-open://src/main.lua:12",
+    "lazygit-edit://src/main.lua:12",
+    "foo.cpp",
+    "v1.2.3",
+]
+
+for text, expected in positives.items():
+    actual = custom_matches(text)
+    if actual != expected:
+        raise SystemExit(f"{text!r}: expected {expected!r}, got {actual!r}")
+
+for text in negatives:
+    actual = custom_matches(text)
+    if actual:
+        raise SystemExit(f"{text!r}: expected no public match, got {actual!r}")
+
+print("ok")
+PY
+hyperlink_regex_output=$(python3 "$hyperlink_regex_test" "$hyperlink_rules_tsv")
+_assert_eq "public hyperlink regexes: cover reusable browser tokens" \
+  "ok" "$hyperlink_regex_output"
+
+echo
+echo "=== WezTerm link route behavior ==="
+
+route_lua_test=$(_tmpdir)/route-test.lua
+cat >"$route_lua_test" <<'EOF'
+local route_path = arg[1]
+local fixture_path = arg[2]
+local calls = {}
+local sent_text = {}
+local child_calls = {}
+local child_success = false
+local timers = {}
+local toasts = {}
+local errors = {}
+local wezterm = {
+  hostname = function()
+    return "macbook"
+  end,
+  background_child_process = function(argv)
+    table.insert(calls, argv)
+  end,
+  run_child_process = function(argv)
+    table.insert(child_calls, argv)
+    return child_success, "", "mock opener failure"
+  end,
+  log_error = function(message)
+    table.insert(errors, message)
+  end,
+  time = {
+    call_after = function(delay, cb)
+      table.insert(timers, { delay = delay, cb = cb })
+    end,
+  },
+  on = function(_, cb)
+    _G.open_uri_handler = cb
+  end,
+}
+
+local routes = dofile(route_path).new(wezterm)
+
+local function check(name, ok)
+  if not ok then
+    error(name, 0)
+  end
+end
+
+local function pane(vars, cwd_uri, opts)
+  opts = opts or {}
+  local p = {
+    get_user_vars = function()
+      return vars or {}
+    end,
+    get_current_working_dir = function()
+      return cwd_uri
+    end,
+  }
+  if opts.foreground then
+    p.get_foreground_process_name = function()
+      return opts.foreground
+    end
+  end
+  if opts.send_text then
+    p.send_text = function(_, text)
+      table.insert(sent_text, text)
+    end
+  end
+  return p
+end
+
+local function window()
+  return {
+    toast_notification = function(_, title, message)
+      table.insert(toasts, { title = title, message = message })
+    end,
+  }
+end
+
+local function last()
+  return calls[#calls]
+end
+
+local function last_mode()
+  return last()[2]
+end
+
+local function last_target()
+  return last()[3]
+end
+
+local function last_cwd()
+  return last()[4]
+end
+
+local function last_source()
+  return last()[5]
+end
+
+local function last_context()
+  return last()[6]
+end
+
+local function fixture_rows(path)
+  local rows = {}
+  local file = assert(io.open(path, "r"))
+  for line in file:lines() do
+    if line ~= "" and line:sub(1, 1) ~= "#" then
+      local fields = {}
+      local rest = line
+      for _ = 1, 5 do
+        local value, remaining = rest:match("^([^\t]*)\t(.*)$")
+        table.insert(fields, value)
+        rest = remaining
+      end
+      table.insert(fields, rest)
+      if fields[6] == "-" then
+        fields[6] = ""
+      end
+      table.insert(rows, fields)
+    end
+  end
+  file:close()
+  return rows
+end
+
+local function flush_timers()
+  local pending = timers
+  timers = {}
+  for _, timer in ipairs(pending) do
+    timer.cb()
+  end
+end
+
+routes.setup()
+check("setup registers open-uri handler", type(_G.open_uri_handler) == "function")
+
+calls = {}
+child_calls = {}
+local handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/repo" }), "https://example.com/a/b")
+check("regular https URL is left to WezTerm/browser", handled == true)
+check("regular https URL does not invoke nvim helper", #calls == 0)
+check("regular https URL does not invoke remote helper", #child_calls == 0)
+
+for _, row in ipairs(fixture_rows(fixture_path)) do
+  local name, uri, target, cwd, source, context = row[1], row[2], row[3], row[4], row[5], row[6]
+  local expected_cwd = source == "remote" and "" or cwd
+  calls = {}
+  child_calls = {}
+  child_success = false
+  local vars = {}
+  local pane_cwd = { host = "", file_path = cwd }
+  if source == "remote" then
+    pane_cwd = { host = context, file_path = cwd }
+  end
+  local handled = routes.open_uri(nil, pane(vars, pane_cwd), uri)
+  check("shared route handled: " .. name, handled == false)
+  check("shared route mode: " .. name, last_mode() == "link")
+  check("shared route target: " .. name, last_target() == target)
+  check("shared route cwd: " .. name, last_cwd() == expected_cwd)
+  check("shared route source: " .. name, last_source() == source)
+  check("shared route context: " .. name, (last_context() or "") == context)
+end
+
+calls = {}
+handled = routes.open_uri(nil, pane({
+  IS_NVIM = "true",
+  NVIM_LINK_CWD = "/repo",
+  NVIM_OPEN_SOCKET = "/tmp/nvim.sock",
+}, { host = "", file_path = "/wrong" }), "nvim-open://src/main.lua:12:2")
+check("local nvim-open handled", handled == false)
+check("local nvim-open uses link mode", last_mode() == "link")
+check("local nvim-open keeps path info", last_target() == "src/main.lua:12:2")
+check("local nvim-open uses published cwd", last_cwd() == "/repo")
+check("local nvim-open preserves nvim source", last_source() == "nvim")
+check("local nvim-open passes socket", last_context() == "/tmp/nvim.sock")
+
+calls = {}
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+}, { host = "", file_path = "/local" }), "nvim-open://src/main.lua:12")
+check("remote relative nvim-open handled", handled == false)
+check("remote relative nvim-open uses link mode", last_mode() == "link")
+check("remote relative nvim-open resolves against remote cwd", last_target() == "/remote/repo/src/main.lua:12")
+check("remote relative nvim-open uses remote source", last_source() == "remote")
+check("remote relative nvim-open passes host", last_context() == "remote.example")
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = true
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+  NVIM_REMOTE_TMUX = "true",
+}, { host = "", file_path = "/local" }, {
+  foreground = "dev",
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+check("controlmaster remote nvim-open handled", handled == false)
+check("controlmaster remote nvim-open tries ssh helper", child_calls[1][1]:match("nvim%-ssh%-control%-open$") ~= nil)
+check("controlmaster remote nvim-open passes host", child_calls[1][2] == "remote.example")
+check("controlmaster remote nvim-open passes resolved target", child_calls[1][3] == "/remote/repo/src/main.lua:12")
+check("controlmaster remote nvim-open skips pane send", #sent_text == 0)
+check("controlmaster remote nvim-open skips background helper", #calls == 0)
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = false
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+  NVIM_REMOTE_TMUX = "true",
+}, { host = "", file_path = "/local" }, {
+  foreground = "dev",
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+check("direct remote nvim-open handled", handled == false)
+check("direct remote nvim-open tries controlmaster first", child_calls[1][2] == "remote.example")
+check("direct remote nvim-open skips local helper", #calls == 0)
+check("direct remote nvim-open sends prefix first", sent_text[1] == "\002:")
+check("direct remote nvim-open waits for tmux command prompt", timers[1].delay == 0.15)
+flush_timers()
+check("direct remote nvim-open sends remote tmux command", sent_text[2]:find("run%-shell ") == 1)
+check(
+  "direct remote nvim-open includes resolved target",
+  sent_text[2]:find("~/.local/bin/nvim-tmux-open tmux-link '/remote/repo/src/main.lua:12'", 1, true) ~= nil
+)
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = false
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+  NVIM_REMOTE_TMUX = "true",
+}, { host = "", file_path = "/local" }, {
+  foreground = "/opt/homebrew/bin/tmux",
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+check("local tmux remote nvim-open handled", handled == false)
+check("local tmux remote nvim-open tries controlmaster first", child_calls[1][2] == "remote.example")
+check("local tmux remote nvim-open does not send raw prefix", #sent_text == 0)
+check("local tmux remote nvim-open uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = false
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+  NVIM_REMOTE_TMUX = "true",
+}, { host = "", file_path = "/local" }, {
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+check("unknown foreground remote nvim-open handled", handled == false)
+check("unknown foreground remote nvim-open does not send raw prefix", #sent_text == 0)
+check("unknown foreground remote nvim-open uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = true
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+}, { host = "", file_path = "/local" }, {
+  foreground = "ssh",
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+check("non-tmux remote shell nvim-open handled", handled == false)
+check("non-tmux remote shell tries controlmaster", child_calls[1][2] == "remote.example")
+check(
+  "non-tmux remote shell passes resolved target",
+  child_calls[1][3] == "/remote/repo/src/main.lua:12"
+)
+check("non-tmux remote shell does not send raw prefix", #sent_text == 0)
+check("non-tmux remote shell skips helper when controlmaster succeeds", #calls == 0)
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = false
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+}, { host = "", file_path = "/local" }, {
+  foreground = "ssh",
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+check("non-tmux remote shell fallback nvim-open handled", handled == false)
+check("non-tmux remote shell fallback tries controlmaster first", child_calls[1][2] == "remote.example")
+check("non-tmux remote shell fallback does not send raw prefix", #sent_text == 0)
+check("non-tmux remote shell fallback uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = false
+handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }, {
+  foreground = "zsh",
+  send_text = true,
+}), "file://remote.example/home/alex/.bashrc:1")
+check("local pane remote file URI handled", handled == false)
+check("local pane remote file URI does not send raw prefix", #sent_text == 0)
+check("local pane remote file URI uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
+
+calls = {}
+sent_text = {}
+child_calls = {}
+timers = {}
+child_success = false
+local saved_time = wezterm.time
+wezterm.time = nil
+handled = routes.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+  NVIM_REMOTE_TMUX = "true",
+}, { host = "", file_path = "/local" }, {
+  foreground = "dev",
+  send_text = true,
+}), "nvim-open://src/main.lua:12")
+wezterm.time = saved_time
+check("missing timer remote nvim-open handled", handled == false)
+check("missing timer remote nvim-open does not send raw prefix", #sent_text == 0)
+check("missing timer remote nvim-open uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
+
+calls = {}
+child_calls = {}
+toasts = {}
+errors = {}
+child_success = false
+handled = routes.open_uri(window(), pane({}, { host = "", file_path = "/local" }), "file://localhost/tmp/missing.lua:4")
+check("local file link failure is handled by custom route", handled == false)
+check("local file link failure tries nvim helper synchronously", child_calls[1][2] == "link")
+check("local file link failure shows a toast", toasts[1].message == "mock opener failure")
+check("local file link failure is logged", errors[1] == "mock opener failure")
+
+calls = {}
+child_calls = {}
+timers = {}
+child_success = false
+handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }), "lazygit-edit://src/file%20with%20space.lua:7")
+check("lazygit link handled", handled == false)
+check("lazygit link uses link mode", last_mode() == "link")
+check("lazygit link is decoded before helper call", last_target() == "src/file with space.lua:7")
+
+calls = {}
+handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }), "file://localhost/tmp/local.lua:4")
+check("localhost file link handled locally", handled == false)
+check("localhost file link uses link mode", last_mode() == "link")
+check("localhost file link opens decoded path", last_target() == "/tmp/local.lua:4")
+
+calls = {}
+handled = routes.open_uri(nil, pane({}, { host = "remote.example", file_path = "/remote" }), "file:///tmp/ambiguous.lua:4")
+check("hostless file link in remote pane falls through to WezTerm", handled == true)
+check("hostless remote-pane file link does not call helper", #calls == 0)
+
+calls = {}
+handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }), "file://remote.example/home/alex/.bashrc:1")
+check("remote file URI handled", handled == false)
+check("remote file URI uses link mode", last_mode() == "link")
+check("remote file URI keeps absolute path", last_target() == "/home/alex/.bashrc:1")
+check("remote file URI passes host", last_context() == "remote.example")
+
+print("ok")
+EOF
+if ! route_lua_output=$(_run_lua "$route_lua_test" \
+  "$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua" \
+  "$TERMNAV_TEST_DIR/fixtures/nvim-link-routes.tsv"); then
+  _fail "wezterm route behavior test requires lua or nvim"
+  route_lua_output=""
+fi
+_assert_eq "wezterm route module handles local, remote, and lazygit URIs" "ok" "$route_lua_output"
+
+echo
+echo "=== eza semantic links ==="
+
+link_context_tmp=$(_tmpdir)
+link_context_bin="$link_context_tmp/bin"
+mkdir -p "$link_context_bin"
+cat >"$link_context_bin/tmux" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "show-environment" && "${2:-}" == "-g" && "${3:-}" == "NVIM_REMOTE_LINK_HOST" && -n "${TMUX_MOCK_REMOTE_LINK_HOST:-}" ]]; then
+  printf 'NVIM_REMOTE_LINK_HOST=%s\n' "$TMUX_MOCK_REMOTE_LINK_HOST"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$link_context_bin/tmux"
+
+if command -v eza >/dev/null 2>&1; then
+  eza_tmp=$(_tmpdir)
+  mkdir -p "$eza_tmp/listed"
+  touch "$eza_tmp/listed/README.md"
+  eza_target=$(realpath "$eza_tmp/listed/README.md")
+  eza_output=$(eza --hyperlink "$eza_tmp/listed")
+  _assert_contains "eza emits OSC-8 file:// targets when output is piped" \
+    "]8;;file://" "$eza_output"
+  _assert_contains "eza hyperlink target keeps the listed directory" \
+    "$eza_target" "$eza_output"
+else
+  echo "  - skipping eza OSC-8 smoke test (eza not installed)"
+fi
+
+if [[ -x "$eza_linker" ]]; then
+  eza_tmp=$(_tmpdir)
+  mock_bin="$eza_tmp/bin"
+  mkdir -p "$mock_bin"
+  cat >"$mock_bin/eza" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'argv:'
+  printf ' <%s>' "$@"
+  printf '\n'
+} >>"$EZA_MOCK_LOG"
+printf '\033]8;;file:///tmp/remote%%20file.txt\033\\remote file.txt\033]8;;\033\\ file:///visible.txt \033]8;;file://localhost/tmp/local.txt\033\\local.txt\033]8;;\033\\\n'
+EOF
+  chmod +x "$mock_bin/eza"
+
+  remote_output=$(EZA_MOCK_LOG="$eza_tmp/remote-args.log" NVIM_REMOTE_LINK_HOST=remote.example PATH="$mock_bin:$PATH" "$eza_linker")
+  _assert_contains "remote eza wrapper adds the host to OSC-8 file targets" \
+    "]8;;file://remote.example/tmp/remote%20file.txt" "$remote_output"
+  _assert_contains "remote eza wrapper keeps the visible listing text unchanged" \
+    "remote file.txt" "$remote_output"
+  _assert_contains "remote eza wrapper leaves visible file URIs unchanged" \
+    " file:///visible.txt " "$remote_output"
+  _assert_contains "remote eza wrapper preserves explicit OSC-8 hosts" \
+    "]8;;file://localhost/tmp/local.txt" "$remote_output"
+  _assert_contains "remote eza wrapper forces color when eza is behind its pipe" \
+    "--color=always" "$eza_linker_content"
+
+  tmux_remote_output=$(
+    env -u NVIM_REMOTE_LINK_HOST -u SSH_CONNECTION \
+      EZA_MOCK_LOG="$eza_tmp/tmux-remote-args.log" \
+      TMUX=/tmp/tmux-test \
+      TMUX_MOCK_REMOTE_LINK_HOST=tmux-remote \
+      PATH="$link_context_bin:$mock_bin:$PATH" \
+      "$eza_linker"
+  )
+  _assert_contains "remote eza wrapper reads tmux-published host context" \
+    "]8;;file://tmux-remote/tmp/remote%20file.txt" "$tmux_remote_output"
+
+  remote_tty_output=$(
+    EZA_MOCK_LOG="$eza_tmp/remote-tty-args.log" \
+      EZA_NVIM_LINKS_FORCE_TTY=1 \
+      COLUMNS=120 \
+      NVIM_REMOTE_LINK_HOST=remote.example \
+      PATH="$mock_bin:$PATH" \
+      "$eza_linker" -F --group-directories-first
+  )
+  remote_tty_args=$(cat "$eza_tmp/remote-tty-args.log")
+  _assert_contains "remote eza wrapper keeps host rewriting in tty-restored mode" \
+    "]8;;file://remote.example/tmp/remote%20file.txt" "$remote_tty_output"
+  _assert_contains "remote eza wrapper restores grid layout for piped tty output" \
+    "<--grid>" "$remote_tty_args"
+  _assert_contains "remote eza wrapper passes terminal width to piped eza" \
+    "<--width> <120>" "$remote_tty_args"
+  _assert_contains "remote eza wrapper keeps color for piped tty output" \
+    "<--color=always>" "$remote_tty_args"
+
+  EZA_MOCK_LOG="$eza_tmp/remote-long-args.log" \
+    EZA_NVIM_LINKS_FORCE_TTY=1 \
+    COLUMNS=120 \
+    NVIM_REMOTE_LINK_HOST=remote.example \
+    PATH="$mock_bin:$PATH" \
+    "$eza_linker" -alF --group-directories-first >/dev/null
+  remote_long_args=$(cat "$eza_tmp/remote-long-args.log")
+  _assert_not_contains "remote eza wrapper does not override long layout" \
+    "<--grid>" "$remote_long_args"
+
+  local_output=$(env -u NVIM_REMOTE_LINK_HOST -u SSH_CONNECTION -u TMUX EZA_MOCK_LOG="$eza_tmp/local-args.log" PATH="$mock_bin:$PATH" "$eza_linker")
+  _assert_contains "local eza wrapper leaves OSC-8 file links local" \
+    "]8;;file:///tmp/remote%20file.txt" "$local_output"
+else
+  _fail "eza hyperlink wrapper exists and is executable"
+fi
+
+echo
+echo "=== nvim helper edge cases ==="
+
+# Most helper tests in this section model GUI/non-tmux callers. The test suite
+# itself often runs inside tmux, so clear the inherited server context and let
+# individual scoped-tmux cases opt back in explicitly with TMUX=...
+unset TMUX
+
+tmp=$(_tmpdir)
+mock_bin="$tmp/bin"
+mkdir -p "$mock_bin"
+
+cat >"$mock_bin/nvim" <<'EOF'
+#!/usr/bin/env bash
+server=
+expr=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --server)
+      server="$2"
+      shift 2
+      ;;
+    --remote-expr)
+      expr="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+printf 'server=%s\nexpr=%s\n' "$server" "$expr" >>"$NVIM_MOCK_LOG"
+[[ "$server" == "$NVIM_MOCK_SUCCESS_SOCKET" ]]
+EOF
+chmod +x "$mock_bin/nvim"
+
+cat >"$mock_bin/tmux" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  list-panes)
+    cat "$TMUX_MOCK_PANES"
+    ;;
+  send-keys)
+    printf '%s\n' "$*" >>"$TMUX_MOCK_LOG"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+chmod +x "$mock_bin/tmux"
+
+cat >"$mock_bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'argv:'
+  printf ' <%s>' "$@"
+  printf '\n'
+} >>"$SSH_MOCK_LOG"
+
+is_check=false
+prev=
+for arg in "$@"; do
+  if [[ "$prev" == "-O" && "$arg" == "check" ]]; then
+    is_check=true
+    break
+  fi
+  prev="$arg"
+done
+
+if "$is_check"; then
+  [[ "${SSH_MOCK_MASTER:-}" == "yes" ]]
+  exit $?
+fi
+
+if [[ "${SSH_MOCK_RUN_FAIL:-}" == "yes" ]]; then
+  exit 42
+fi
+
+exit 0
+EOF
+chmod +x "$mock_bin/ssh"
+
+cat >"$mock_bin/ps" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${PS_MOCK_PROCS:-}" ]]; then
+  cat "$PS_MOCK_PROCS"
+  exit 0
+fi
+exec /bin/ps "$@"
+EOF
+chmod +x "$mock_bin/ps"
+
+cat >"$mock_bin/nvim-ssh-control-open" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$CONTROL_OPEN_MOCK_LOG"
+exit "${CONTROL_OPEN_MOCK_RC:-0}"
+EOF
+chmod +x "$mock_bin/nvim-ssh-control-open"
+
+cat >"$mock_bin/nvim-remote-pane-host" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "customremote" && "${2:-}" == *"--host custom-host"* ]]; then
+  printf '%s\n' "custom-host"
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$mock_bin/nvim-remote-pane-host"
+
+socket_listener() {
+  local socket="$1"
+  local pid=""
+
+  rm -f "$socket"
+  if command -v nc >/dev/null 2>&1; then
+    nc -lU "$socket" >/dev/null 2>&1 &
+    pid=$!
+    for _ in {1..50}; do
+      [[ -S "$socket" ]] && {
+        echo "$pid"
+        return
+      }
+      sleep 0.02
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$socket"
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    # Some WSL images ship an nc variant without Unix-domain listener support.
+    # Python's stdlib socket module gives the helper tests a portable fake RPC
+    # endpoint without adding another system package dependency.
+    python3 - "$socket" <<'PY' >/dev/null 2>&1 &
+import os
+import signal
+import socket
+import sys
+
+path = sys.argv[1]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(1)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+while True:
+    conn, _ = server.accept()
+    conn.close()
+PY
+    pid=$!
+    for _ in {1..50}; do
+      [[ -S "$socket" ]] && {
+        echo "$pid"
+        return
+      }
+      sleep 0.02
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+
+  echo ""
+  return 1
+}
+
+test_home="$tmp/home"
+mkdir -p "$test_home/.local/state/nvim-tmux-open/panes"
+mkdir -p "$test_home/.local/share/mise/shims"
+ln -s "$mock_bin/nvim" "$test_home/.local/share/mise/shims/nvim"
+ln -s "$mock_bin/tmux" "$test_home/.local/share/mise/shims/tmux"
+socket_one="$tmp/one.sock"
+socket_two="$tmp/two.sock"
+listener_one=$(socket_listener "$socket_one")
+listener_two=$(socket_listener "$socket_two")
+trap 'kill "$listener_one" "$listener_two" 2>/dev/null || true; _cleanup' EXIT
+if [[ -z "$listener_one" || -z "$listener_two" ]]; then
+  _fail "nvim helper edge cases: create fake nvim RPC sockets"
+  _test_summary
+fi
+
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
+touch "$tmp/missing-panes"
+NVIM_MOCK_LOG="$tmp/colon-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/colon-tmux.log" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/path:with:colon.txt:12:3' '/tmp' nvim >/dev/null 2>&1
+colon_call=$(cat "$tmp/colon-nvim.log")
+_assert_contains "helper keeps colons in file paths before :line:col" \
+  "'/tmp/path:with:colon.txt', 12, 3" "$colon_call"
+_assert_contains "helper forwards click source to nvim rpc" \
+  "'nvim'" "$colon_call"
+
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
+NVIM_MOCK_LOG="$tmp/quoted-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/quoted-tmux.log" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link "/tmp/path with 'quote'.txt:9:2" '/tmp' terminal >/dev/null 2>&1
+quoted_call=$(cat "$tmp/quoted-nvim.log")
+_assert_contains "helper vim-quotes spaces and apostrophes for rpc" \
+  "'/tmp/path with ''quote''.txt', 9, 2" "$quoted_call"
+
+mkdir -p "$test_home/.local/share/example/core"
+touch "$test_home/.local/share/example/core/shell-loader.sh"
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
+NVIM_MOCK_LOG="$tmp/home-ref-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/home-ref-tmux.log" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link "\$HOME/.local/share/example/core/shell-loader.sh:8:1" "$test_home/.config/shell" nvim >/dev/null 2>&1
+home_ref_call=$(cat "$tmp/home-ref-nvim.log")
+_assert_contains "helper expands literal HOME file references before rpc" \
+  "'$test_home/.local/share/example/core/shell-loader.sh', 8, 1" "$home_ref_call"
+
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
+NVIM_MOCK_LOG="$tmp/preferred-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_one" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/preferred-tmux.log" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/preferred.txt:2:3' '/tmp' nvim "$socket_one" >/dev/null 2>&1
+preferred_call=$(cat "$tmp/preferred-nvim.log")
+_assert_contains "helper prefers exact nvim socket over global current" \
+  "server=$socket_one" "$preferred_call"
+_assert_not_contains "helper does not try global current before exact nvim socket" \
+  "server=$socket_two" "$preferred_call"
+
+rm -f "$test_home/.local/state/nvim-tmux-open/current"
+printf '%s\n' "$socket_one" >"$test_home/.local/state/nvim-tmux-open/panes/_1"
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/panes/_2"
+cat >"$tmp/panes" <<'EOF'
+%1	nvim
+%2	nvim
+EOF
+NVIM_MOCK_LOG="$tmp/all-panes-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/panes" \
+  TMUX_MOCK_LOG="$tmp/all-panes-tmux.log" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/target.txt:4:5' '/tmp' >/dev/null 2>&1
+all_panes_call=$(cat "$tmp/all-panes-nvim.log")
+tmux_fallback_call=$(cat "$tmp/all-panes-tmux.log" 2>/dev/null || true)
+_assert_contains "helper falls through to the next live nvim pane socket" \
+  "server=$socket_two" "$all_panes_call"
+_assert_not_contains "helper avoids keystroke fallback when another rpc socket works" \
+  "send-keys" "$tmux_fallback_call"
+
+rm -f "$test_home/.local/state/nvim-tmux-open/current"
+rm -f "$test_home/.local/state/nvim-tmux-open/panes/"*
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/panes/_tmp_tmux.sock__2"
+cat >"$tmp/current-window-panes" <<'EOF'
+%1	bash
+%2	nvim
+EOF
+printf '%s\n' "$socket_one" >"$test_home/.local/state/nvim-tmux-open/current"
+NVIM_MOCK_LOG="$tmp/link-current-window-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/current-window-panes" \
+  TMUX_MOCK_LOG="$tmp/link-current-window-tmux.log" \
+  TMUX="/tmp/tmux.sock,1,0" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/window-scope.txt:8:9' '/tmp' terminal >/dev/null 2>&1
+link_current_window_call=$(cat "$tmp/link-current-window-nvim.log")
+_assert_contains "helper link mode uses current-window nvim inside tmux" \
+  "server=$socket_two" "$link_current_window_call"
+_assert_not_contains "helper link mode skips global current inside tmux" \
+  "server=$socket_one" "$link_current_window_call"
+
+cat >"$tmp/no-current-window-nvim-panes" <<'EOF'
+%1	bash
+EOF
+NVIM_MOCK_LOG="$tmp/link-no-window-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_one" \
+  TMUX_MOCK_PANES="$tmp/no-current-window-nvim-panes" \
+  TMUX_MOCK_LOG="$tmp/link-no-window-tmux.log" \
+  TMUX="/tmp/tmux.sock,1,0" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/no-window-nvim.txt:3' '/tmp' terminal >/dev/null 2>&1
+link_no_window_rc=$?
+link_no_window_call=$(cat "$tmp/link-no-window-nvim.log" 2>/dev/null || true)
+_assert_exit "helper link mode fails when tmux current window has no nvim" 1 "$link_no_window_rc"
+_assert_not_contains "helper link mode does not use global current from another tmux window" \
+  "server=$socket_one" "$link_no_window_call"
+
+NVIM_MOCK_LOG="$tmp/launcher-pane-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/current-window-panes" \
+  TMUX_MOCK_LOG="$tmp/launcher-pane-tmux.log" \
+  TMUX="/tmp/tmux.sock,1,0" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" cli 'b/src/launcher.lua:7' '/repo' >/dev/null 2>&1
+launcher_pane_call=$(cat "$tmp/launcher-pane-nvim.log")
+launcher_pane_tmux_call=$(cat "$tmp/launcher-pane-tmux.log" 2>/dev/null || true)
+_assert_contains "helper cli mode uses current-window pane socket" \
+  "server=$socket_two" "$launcher_pane_call"
+_assert_contains "helper cli mode preserves cli-like file arguments" \
+  "'b/src/launcher.lua:7', 1, 0" "$launcher_pane_call"
+_assert_not_contains "helper cli mode avoids keystroke fallback when pane socket works" \
+  "send-keys" "$launcher_pane_tmux_call"
+
+launcher_literal_home="\$HOME/src/launcher.lua:7"
+NVIM_MOCK_LOG="$tmp/launcher-home-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/current-window-panes" \
+  TMUX_MOCK_LOG="$tmp/launcher-home-tmux.log" \
+  TMUX="/tmp/tmux.sock,1,0" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" cli "$launcher_literal_home" '/repo' >/dev/null 2>&1
+launcher_home_call=$(cat "$tmp/launcher-home-nvim.log")
+_assert_contains "helper cli mode preserves literal home references" \
+  "'\$HOME/src/launcher.lua:7', 1, 0" "$launcher_home_call"
+_assert_not_contains "helper cli mode avoids home reference expansion in cli path" \
+  "$test_home/src/launcher.lua" "$launcher_home_call"
+
+remote_cmd_home="$tmp/remote-cmd-home"
+remote_cmd_path="$tmp/remote-cmd-path"
+mkdir -p "$remote_cmd_home/.local/bin" "$remote_cmd_home/.local/state/nvim-tmux-open" "$remote_cmd_path"
+ln -s "$mock_bin/nvim" "$remote_cmd_home/.local/bin/nvim"
+ln -s "$mock_bin/tmux" "$remote_cmd_home/.local/bin/tmux"
+cat >"$remote_cmd_path/uname" <<'EOF'
+#!/usr/bin/env bash
+echo Linux
+EOF
+chmod +x "$remote_cmd_path/uname"
+printf '%s\n' "$socket_two" >"$remote_cmd_home/.local/state/nvim-tmux-open/current"
+env -i \
+  HOME="$remote_cmd_home" \
+  PATH="$remote_cmd_path:/usr/bin:/bin" \
+  NVIM_MOCK_LOG="$tmp/remote-cmd-env-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/remote-cmd-env-tmux.log" \
+  "$helper" link '/tmp/remote-cmd-env.txt:12:13' '/tmp' terminal >/dev/null 2>&1
+remote_cmd_env_call=$(cat "$tmp/remote-cmd-env-nvim.log" 2>/dev/null || true)
+remote_cmd_env_typed=$(cat "$tmp/remote-cmd-env-tmux.log" 2>/dev/null || true)
+_assert_contains "helper finds nvim in ~/.local/bin from stripped remote command environments" \
+  "'/tmp/remote-cmd-env.txt', 12, 13" "$remote_cmd_env_call"
+_assert_not_contains "helper does not use tmux fallback when remote command rpc succeeds" \
+  "send-keys" "$remote_cmd_env_typed"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+  gui_home="$tmp/gui-home"
+  mkdir -p "$gui_home/.local/bin" "$gui_home/.local/state/nvim-tmux-open"
+  ln -s "$mock_bin/nvim" "$gui_home/.local/bin/nvim"
+  ln -s "$mock_bin/tmux" "$gui_home/.local/bin/tmux"
+  printf '%s\n' "$socket_two" >"$gui_home/.local/state/nvim-tmux-open/current"
+  env -i \
+    HOME="$gui_home" \
+    PATH="/usr/bin:/bin" \
+    NVIM_MOCK_LOG="$tmp/gui-env-nvim.log" \
+    NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+    TMUX_MOCK_PANES="$tmp/missing-panes" \
+    TMUX_MOCK_LOG="$tmp/gui-env-tmux.log" \
+    "$helper" link '/tmp/gui-env.txt:10:11' '/tmp' terminal >/dev/null 2>&1
+  gui_env_call=$(cat "$tmp/gui-env-nvim.log")
+  gui_env_typed=$(cat "$tmp/gui-env-tmux.log" 2>/dev/null || true)
+  _assert_contains "helper finds nvim in ~/.local/bin from stripped gui environments" \
+    "'/tmp/gui-env.txt', 10, 11" "$gui_env_call"
+  _assert_not_contains "helper does not use tmux fallback when gui rpc succeeds" \
+    "send-keys" "$gui_env_typed"
+else
+  echo "  - skipping stripped gui environment smoke test (macOS only)"
+fi
+
+echo
+_test_summary

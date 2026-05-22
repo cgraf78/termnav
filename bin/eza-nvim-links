@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Run eza with OSC-8 links, tagging remote tmux links with their host.
+
+set -o pipefail
+
+_termnav_script_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_termnav_script_dir() {
+  local path="$1" dir target
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_termnav_script_parent "$path")" && pwd) || return 1
+    target=$(readlink "$path") || return 1
+    [[ "$target" == /* ]] || target="$dir/$target"
+    path="$target"
+  done
+  cd -P -- "$(_termnav_script_parent "$path")" && pwd
+}
+
+script_dir=$(_termnav_script_dir "${BASH_SOURCE[0]}") || {
+  echo "eza-nvim-links: cannot resolve executable path" >&2
+  exit 2
+}
+lib_dir="${script_dir%/bin}/lib/termnav"
+
+# shellcheck source=../lib/termnav/nvim-link-context.sh
+. "$lib_dir/nvim-link-context.sh" || exit 1
+
+host=$(nvim_link_context_remote_host || true)
+
+if [[ -z "$host" ]]; then
+  exec eza --hyperlink "$@"
+fi
+
+has_layout_arg() {
+  local arg short
+  for arg in "$@"; do
+    case "$arg" in
+      -1 | --oneline | -l | --long | -G | --grid | -T | --tree)
+        return 0
+        ;;
+      --oneline=* | --long=* | --grid=* | --tree=*)
+        return 0
+        ;;
+      --)
+        return 1
+        ;;
+      --*)
+        ;;
+      -*)
+        short="${arg#-}"
+        [[ "$short" == *[1lGT]* ]] && return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+terminal_width() {
+  local cols="${COLUMNS:-}"
+  if [[ ! "$cols" =~ ^[0-9]+$ || "$cols" -le 0 ]]; then
+    cols=$(tput cols 2>/dev/null || true)
+  fi
+  [[ "$cols" =~ ^[0-9]+$ && "$cols" -gt 0 ]] || return 1
+  printf '%s\n' "$cols"
+}
+
+export NVIM_REMOTE_LINK_HOST="$host"
+eza_args=(--hyperlink)
+if [[ -t 1 || "${EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
+  # Remote sessions need the pipe below so we can rewrite OSC-8 file:// links
+  # with the remote host. Since that pipe hides the real terminal from eza,
+  # restore only the TTY-derived presentation defaults that eza would have
+  # picked itself. Explicit layout flags such as -l, -1, or --tree still win.
+  # EZA_NVIM_LINKS_FORCE_TTY only exists so tests can exercise this branch.
+  eza_args+=(--color=always)
+  if width=$(terminal_width); then
+    eza_args+=(--width "$width")
+  fi
+  if ! has_layout_arg "$@"; then
+    eza_args+=(--grid)
+  fi
+fi
+
+eza "${eza_args[@]}" "$@" | perl -CS -pe '
+  my $host = $ENV{NVIM_REMOTE_LINK_HOST};
+  s{\e\]8;;file:///}{\e]8;;file://$host/}g;
+'
