@@ -4,9 +4,9 @@ nvim_link_context_tmux_remote_host() {
   local value
 
   [[ -n "${TMUX:-}" ]] || return 1
-  value=$(tmux show-environment -g NVIM_REMOTE_LINK_HOST 2>/dev/null) || return 1
-  [[ "$value" == NVIM_REMOTE_LINK_HOST=* ]] || return 1
-  value="${value#NVIM_REMOTE_LINK_HOST=}"
+  value=$(tmux show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null) || return 1
+  [[ "$value" == TERMNAV_REMOTE_LINK_HOST=* ]] || return 1
+  value="${value#TERMNAV_REMOTE_LINK_HOST=}"
   [[ -n "$value" ]] || return 1
   printf '%s\n' "$value"
 }
@@ -19,8 +19,8 @@ nvim_link_context_ssh_remote_host() {
 nvim_link_context_remote_host() {
   # Return nothing for local sessions so tools such as eza can keep hostless
   # local file:// links while still sharing remote host discovery with ripgrep.
-  if [[ -n "${NVIM_REMOTE_LINK_HOST:-}" ]]; then
-    printf '%s\n' "$NVIM_REMOTE_LINK_HOST"
+  if [[ -n "${TERMNAV_REMOTE_LINK_HOST:-}" ]]; then
+    printf '%s\n' "$TERMNAV_REMOTE_LINK_HOST"
   elif nvim_link_context_tmux_remote_host; then
     :
   else

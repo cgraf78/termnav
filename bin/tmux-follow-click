@@ -28,8 +28,8 @@ tmux_follow_register_token_detector() {
 tmux_follow_extension_dir() {
   local config_home
 
-  if [[ -n "${TMUX_FOLLOW_EXTENSION_DIR:-}" ]]; then
-    printf '%s\n' "$TMUX_FOLLOW_EXTENSION_DIR"
+  if [[ -n "${TERMNAV_TMUX_FOLLOW_EXTENSION_DIR:-}" ]]; then
+    printf '%s\n' "$TERMNAV_TMUX_FOLLOW_EXTENSION_DIR"
     return 0
   fi
 
@@ -320,10 +320,10 @@ local_file_host() {
   [[ -n "$short" && "$host" == "$(lower_ascii "$short")" ]] && return 0
   [[ -n "$fqdn" && "$host" == "$(lower_ascii "$fqdn")" ]] && return 0
 
-  published="${NVIM_REMOTE_LINK_HOST:-}"
+  published="${TERMNAV_REMOTE_LINK_HOST:-}"
   if [[ -z "$published" && -n "${TMUX:-}" ]] && command -v tmux >/dev/null 2>&1; then
-    published=$(tmux show-environment -g NVIM_REMOTE_LINK_HOST 2>/dev/null || true)
-    published="${published#NVIM_REMOTE_LINK_HOST=}"
+    published=$(tmux show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null || true)
+    published="${published#TERMNAV_REMOTE_LINK_HOST=}"
   fi
   # Remote devserver links are intentionally stamped with the user-facing alias
   # (`dev1`) instead of the machine hostname (`devvm...`). When this helper is

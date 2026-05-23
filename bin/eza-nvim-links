@@ -69,14 +69,14 @@ terminal_width() {
   printf '%s\n' "$cols"
 }
 
-export NVIM_REMOTE_LINK_HOST="$host"
+export TERMNAV_REMOTE_LINK_HOST="$host"
 eza_args=(--hyperlink)
-if [[ -t 1 || "${EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
+if [[ -t 1 || "${TERMNAV_EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
   # Remote sessions need the pipe below so we can rewrite OSC-8 file:// links
   # with the remote host. Since that pipe hides the real terminal from eza,
   # restore only the TTY-derived presentation defaults that eza would have
   # picked itself. Explicit layout flags such as -l, -1, or --tree still win.
-  # EZA_NVIM_LINKS_FORCE_TTY only exists so tests can exercise this branch.
+  # TERMNAV_EZA_NVIM_LINKS_FORCE_TTY only exists so tests can exercise this branch.
   eza_args+=(--color=always)
   if width=$(terminal_width); then
     eza_args+=(--width "$width")
@@ -87,6 +87,6 @@ if [[ -t 1 || "${EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
 fi
 
 eza "${eza_args[@]}" "$@" | perl -CS -pe '
-  my $host = $ENV{NVIM_REMOTE_LINK_HOST};
+  my $host = $ENV{TERMNAV_REMOTE_LINK_HOST};
   s{\e\]8;;file:///}{\e]8;;file://$host/}g;
 '

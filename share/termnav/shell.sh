@@ -69,8 +69,8 @@ _termnav_wezterm_set_user_var() {
 _termnav_wezterm_remote_link_host() {
   local tmux_value
 
-  if [[ -n "${NVIM_REMOTE_LINK_HOST:-}" ]]; then
-    printf '%s\n' "$NVIM_REMOTE_LINK_HOST"
+  if [[ -n "${TERMNAV_REMOTE_LINK_HOST:-}" ]]; then
+    printf '%s\n' "$TERMNAV_REMOTE_LINK_HOST"
     return
   fi
 
@@ -78,9 +78,9 @@ _termnav_wezterm_remote_link_host() {
     # Some persistent remote transports do not expose SSH_CONNECTION. Their
     # landing helpers can seed tmux's global env so already-running shells can
     # still publish the same host identity that local link routing uses.
-    tmux_value=$(tmux show-environment -g NVIM_REMOTE_LINK_HOST 2>/dev/null) || tmux_value=""
-    if [[ "$tmux_value" == NVIM_REMOTE_LINK_HOST=* ]]; then
-      tmux_value="${tmux_value#NVIM_REMOTE_LINK_HOST=}"
+    tmux_value=$(tmux show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null) || tmux_value=""
+    if [[ "$tmux_value" == TERMNAV_REMOTE_LINK_HOST=* ]]; then
+      tmux_value="${tmux_value#TERMNAV_REMOTE_LINK_HOST=}"
       if [[ -n "$tmux_value" ]]; then
         printf '%s\n' "$tmux_value"
         return
@@ -98,8 +98,8 @@ _termnav_wezterm_publish_link_context() {
   remote_host="$(_termnav_wezterm_remote_link_host)"
   # Hyperlink-aware tools run as shell children, so export the same host that
   # WezTerm receives via user vars. Host-specific config can override it.
-  if [[ -n "$remote_host" && -z "${NVIM_REMOTE_LINK_HOST:-}" ]]; then
-    export NVIM_REMOTE_LINK_HOST="$remote_host"
+  if [[ -n "$remote_host" && -z "${TERMNAV_REMOTE_LINK_HOST:-}" ]]; then
+    export TERMNAV_REMOTE_LINK_HOST="$remote_host"
   fi
 
   # Regex fallback links need cwd from the producing pane. WezTerm's process

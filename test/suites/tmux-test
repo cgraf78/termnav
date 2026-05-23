@@ -71,7 +71,7 @@ expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>\n<%s>' "/tmp/a b.txt:4:5" "/re
 _assert_eq "tmux follow helper preserves remote file hyperlink hosts" "$expected" "$(cat "$tmp/remote-file-uri.log")"
 
 TMUX_FOLLOW_LOG="$tmp/remote-alias-file-uri.log" \
-  NVIM_REMOTE_LINK_HOST="dev1" \
+  TERMNAV_REMOTE_LINK_HOST="dev1" \
   PATH="$mock_bin:$PATH" \
   "$tmux_follow_helper" "file://dev1/tmp/a%20b.txt:4:5" "" "" 0 "/repo"
 expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "/tmp/a b.txt:4:5" "/repo" "terminal")"
@@ -304,7 +304,7 @@ tmux_follow_register_token_detector tmux_follow_test_token
 EOF
 : >"$browser_tty"
 TMUX_FOLLOW_LOG="$tmp/extension-url-nvim.log" \
-  TMUX_FOLLOW_EXTENSION_DIR="$extension_dir" \
+  TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="$extension_dir" \
   PATH="$mock_bin:$PATH" \
   "$tmux_follow_helper" "" "EXT123" "" 0 "/repo" "$browser_tty"
 _assert_eq "tmux follow helper extensions do not route URL tokens to nvim" \

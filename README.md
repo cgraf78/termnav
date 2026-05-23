@@ -45,10 +45,16 @@ this repo owns reusable route parsing and open-through behavior.
 
 `tmux-follow-click` loads environment-specific token detectors from
 `${XDG_CONFIG_HOME:-~/.config}/termnav/tmux-follow/extensions.d/*.sh`. Set
-`TMUX_FOLLOW_EXTENSION_DIR` for tests or managed deployments that keep those
-detectors somewhere else. Detector files call
+`TERMNAV_TMUX_FOLLOW_EXTENSION_DIR` for tests or managed deployments that keep
+those detectors somewhere else. Detector files call
 `tmux_follow_register_token_detector <function>`; detectors claim a token by
 setting `target` and `target_kind` and returning 0.
+
+Set `TERMNAV_REMOTE_LINK_HOST` when a shell, tmux server, or managed remote
+transport already knows the remote host identity that file links should carry.
+`bin/eza-nvim-links` also accepts `TERMNAV_EZA_NVIM_LINKS_FORCE_TTY=1` for
+test harnesses that need to exercise TTY-restoration behavior while stdout is
+piped.
 
 Run tests with:
 
