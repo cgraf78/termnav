@@ -69,6 +69,19 @@ terminal_width() {
   printf '%s\n' "$cols"
 }
 
+rewrite_remote_file_links() {
+  local pattern replacement line
+  pattern=$'\033]8;;file:///'
+  replacement=$'\033]8;;file://'"$TERMNAV_REMOTE_LINK_HOST/"
+
+  while IFS= read -r line; do
+    printf '%s\n' "${line//$pattern/$replacement}"
+  done
+  if [[ -n "${line:-}" ]]; then
+    printf '%s' "${line//$pattern/$replacement}"
+  fi
+}
+
 export TERMNAV_REMOTE_LINK_HOST="$host"
 eza_args=(--hyperlink)
 if [[ -t 1 || "${TERMNAV_EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
@@ -86,7 +99,4 @@ if [[ -t 1 || "${TERMNAV_EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
   fi
 fi
 
-eza "${eza_args[@]}" "$@" | perl -CS -pe '
-  my $host = $ENV{TERMNAV_REMOTE_LINK_HOST};
-  s{\e\]8;;file:///}{\e]8;;file://$host/}g;
-'
+eza "${eza_args[@]}" "$@" | rewrite_remote_file_links

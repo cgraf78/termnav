@@ -50,7 +50,7 @@ result=$(_nvim_lua "
     opened[#opened + 1] = path .. ' ' .. mode
     return {
       write = function(_, text)
-        opened[#opened + 1] = text:match('SetUserVar=IS_NVIM=') and 'user-var' or 'bad-write'
+        opened[#opened + 1] = text:match('SetUserVar=IS_NVIM=dHJ1ZQ==') and 'user-var' or text
       end,
       flush = function() end,
       close = function() end,
@@ -69,6 +69,32 @@ result=$(_nvim_lua "
 expected="$(printf 'false\n1\n0\ntmux display-message -t %%42 -p #{pane_tty}\ntrue\n2\n/dev/pts/42 w\nuser-var')"
 _assert_eq "wezterm-vars: empty tmux tty is not cached and next publish can recover" \
   "$expected" "$result"
+
+result=$(_nvim_lua "
+  local old_base64 = vim.base64
+  vim.base64 = nil
+  local vars = dofile('$vars_module')
+  vars.tty_path = function()
+    return '/dev/pts/42'
+  end
+  local old_open = io.open
+  local writes = {}
+  io.open = function()
+    return {
+      write = function(_, text)
+        writes[#writes + 1] = text
+      end,
+      flush = function() end,
+      close = function() end,
+    }
+  end
+  print(tostring(vars.set('IS_NVIM', 'true')))
+  print(writes[1]:match('SetUserVar=IS_NVIM=dHJ1ZQ==') and 'encoded' or writes[1])
+  vim.base64 = old_base64
+  io.open = old_open
+")
+expected="$(printf 'true\nencoded')"
+_assert_eq "wezterm-vars: base64 fallback supports older nvim" "$expected" "$result"
 
 result=$(_nvim_lua "
   local opener = dofile('$opener_module')
