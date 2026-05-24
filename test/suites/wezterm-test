@@ -587,6 +587,12 @@ if [[ -x "$eza_linker" ]]; then
 printf '\033]8;;file:///tmp/remote%%20file.txt\033\\remote file.txt\033]8;;\033\\ file:///visible.txt \033]8;;file://localhost/tmp/local.txt\033\\local.txt\033]8;;\033\\\n'
 EOF
   chmod +x "$mock_bin/eza"
+  cat >"$mock_bin/perl" <<'EOF'
+#!/usr/bin/env bash
+echo "perl should not be required by eza-nvim-links" >&2
+exit 127
+EOF
+  chmod +x "$mock_bin/perl"
 
   remote_output=$(EZA_MOCK_LOG="$eza_tmp/remote-args.log" TERMNAV_REMOTE_LINK_HOST=remote.example PATH="$mock_bin:$PATH" "$eza_linker")
   _assert_contains "remote eza wrapper adds the host to OSC-8 file targets" \
@@ -599,6 +605,8 @@ EOF
     "]8;;file://localhost/tmp/local.txt" "$remote_output"
   _assert_contains "remote eza wrapper forces color when eza is behind its pipe" \
     "--color=always" "$eza_linker_content"
+  _assert_not_contains "remote eza wrapper does not require perl" \
+    "| perl" "$eza_linker_content"
 
   tmux_remote_output=$(
     env -u TERMNAV_REMOTE_LINK_HOST -u SSH_CONNECTION \

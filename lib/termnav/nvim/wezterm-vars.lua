@@ -10,6 +10,36 @@ local vim = vim
 local M = {}
 
 local tty_path
+local base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function base64_encode(value)
+  if vim.base64 and type(vim.base64.encode) == "function" then
+    return vim.base64.encode(value)
+  end
+
+  -- Neovim 0.9 ships on Ubuntu 24.04 and does not provide vim.base64 yet.
+  -- Keep this module self-contained so publishing user vars works on distro
+  -- Neovim builds without shelling out during every focus/update event.
+  return (
+    (value:gsub(".", function(char)
+      local byte = char:byte()
+      local bits = ""
+      for shift = 7, 0, -1 do
+        bits = bits .. (math.floor(byte / 2 ^ shift) % 2 == 1 and "1" or "0")
+      end
+      return bits
+    end) .. "0000"):gsub("%d%d%d?%d?%d?%d?", function(bits)
+      if #bits < 6 then
+        return ""
+      end
+      local index = 0
+      for bit = 1, 6 do
+        index = index + (bits:sub(bit, bit) == "1" and 2 ^ (6 - bit) or 0)
+      end
+      return base64_alphabet:sub(index + 1, index + 1)
+    end) .. ({ "", "==", "=" })[#value % 3 + 1]
+  )
+end
 
 local function tmux_tty_path()
   local pane = vim.env.TMUX_PANE
@@ -56,7 +86,7 @@ function M.set(name, value)
     return false
   end
 
-  local encoded = vim.base64.encode(value or "")
+  local encoded = base64_encode(value or "")
   local osc
   if vim.env.TMUX then
     osc = ("\027Ptmux;\027\027]1337;SetUserVar=%s=%s\007\027\\"):format(name, encoded)
