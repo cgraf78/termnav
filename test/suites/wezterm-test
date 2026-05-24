@@ -13,6 +13,8 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 helper="$TERMNAV_ROOT/bin/nvim-tmux-open"
 eza_linker="$TERMNAV_ROOT/bin/eza-nvim-links"
 eza_linker_content=$(cat "$TERMNAV_ROOT/bin/eza-nvim-links" 2>/dev/null || true)
+nvim_link_host="$TERMNAV_ROOT/bin/nvim-link-host"
+ssh_control_open="$TERMNAV_ROOT/bin/nvim-ssh-control-open"
 public_link_rules="$TERMNAV_ROOT/lib/termnav/wezterm/public-link-rules.lua"
 
 _run_lua() {
@@ -36,6 +38,8 @@ mock_bin=$(_tmpdir)/mock-bin
 mkdir -p "$symlink_bin" "$mock_bin"
 ln -s "$helper" "$symlink_bin/nvim-tmux-open"
 ln -s "$eza_linker" "$symlink_bin/eza-nvim-links"
+ln -s "$nvim_link_host" "$symlink_bin/nvim-link-host"
+ln -s "$ssh_control_open" "$symlink_bin/nvim-ssh-control-open"
 cat >"$mock_bin/eza" <<'EOF'
 #!/usr/bin/env bash
 printf 'eza'
@@ -45,6 +49,32 @@ done
 printf '\n'
 EOF
 chmod +x "$mock_bin/eza"
+cat >"$mock_bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'argv:'
+  printf ' <%s>' "$@"
+  printf '\n'
+} >>"$SSH_MOCK_LOG"
+
+is_check=false
+prev=
+for arg in "$@"; do
+  if [[ "$prev" == "-O" && "$arg" == "check" ]]; then
+    is_check=true
+    break
+  fi
+  prev="$arg"
+done
+
+if "$is_check"; then
+  [[ "${SSH_MOCK_MASTER:-}" == "yes" ]]
+  exit $?
+fi
+
+exit 0
+EOF
+chmod +x "$mock_bin/ssh"
 
 set +e
 symlink_usage=$("$symlink_bin/nvim-tmux-open" 2>&1)
@@ -55,6 +85,42 @@ _assert_contains "nvim-tmux-open symlink: usage comes from dependency" \
 
 symlink_eza=$(PATH="$mock_bin:$PATH" "$symlink_bin/eza-nvim-links" --all)
 _assert_eq "eza-nvim-links symlink: resolves dependency library" "eza <--hyperlink> <--all>" "$symlink_eza"
+
+symlink_host=$(TERMNAV_REMOTE_LINK_HOST=remote.example "$symlink_bin/nvim-link-host")
+_assert_eq "nvim-link-host symlink: resolves dependency libraries" \
+  "remote.example" "$symlink_host"
+
+ssh_control_log="$(_tmpdir)/ssh-control.log"
+TERMNAV_SSH_CONTROL_HOSTS=" remote.example , other.example " \
+  SSH_MOCK_LOG="$ssh_control_log" \
+  SSH_MOCK_MASTER=yes \
+  PATH="$mock_bin:$PATH" \
+  "$symlink_bin/nvim-ssh-control-open" remote.example "/tmp/a b's.txt:2"
+_assert_contains "nvim-ssh-control-open symlink: checks existing control master" \
+  "<-O> <check> <remote.example>" "$(cat "$ssh_control_log")"
+_assert_contains "nvim-ssh-control-open symlink: runs remote nvim opener" \
+  "nvim-tmux-open" "$(cat "$ssh_control_log")"
+
+: >"$ssh_control_log"
+set +e
+TERMNAV_SSH_CONTROL_HOSTS=other.example \
+  SSH_MOCK_LOG="$ssh_control_log" \
+  SSH_MOCK_MASTER=yes \
+  PATH="$mock_bin:$PATH" \
+  "$symlink_bin/nvim-ssh-control-open" remote.example /tmp/file
+ssh_control_rc=$?
+_assert_exit "nvim-ssh-control-open symlink: rejects unallowlisted hosts" 13 "$ssh_control_rc"
+_assert_eq "nvim-ssh-control-open symlink: does not contact rejected hosts" \
+  "" "$(cat "$ssh_control_log")"
+
+: >"$ssh_control_log"
+set +e
+TERMNAV_SSH_CONTROL_HOSTS=remote.example \
+  SSH_MOCK_LOG="$ssh_control_log" \
+  PATH="$mock_bin:$PATH" \
+  "$symlink_bin/nvim-ssh-control-open" remote.example /tmp/file
+ssh_control_rc=$?
+_assert_exit "nvim-ssh-control-open symlink: requires an existing control master" 10 "$ssh_control_rc"
 
 echo
 echo "=== WezTerm public hyperlink rules ==="

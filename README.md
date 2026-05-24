@@ -11,6 +11,9 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
 ## Public API
 
 - `bin/nvim-tmux-open`: open local or remote terminal targets in Neovim.
+- `bin/nvim-link-host`: print the host token for `rg --hostname-bin`.
+- `bin/nvim-ssh-control-open`: open a remote target through an existing
+  SSH ControlMaster connection without starting a new authentication flow.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -45,8 +48,10 @@ this repo owns reusable route parsing and open-through behavior.
   publishing. The tmux and Neovim helpers remain useful without WezTerm when a
   consumer invokes them directly.
 - `eza` for `eza-nvim-links`.
-- `nvim-ssh-control-open` and `nvim-remote-pane-host` are optional extension
-  commands for remote-pane workflows.
+- `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
+  existing ControlMaster connection.
+- `nvim-remote-pane-host` is an optional extension command for custom
+  remote-pane workflows.
 
 `tmux-follow-click` loads environment-specific token detectors from
 `${XDG_CONFIG_HOME:-~/.config}/termnav/tmux-follow/extensions.d/*.sh`. Set
@@ -60,6 +65,12 @@ transport already knows the remote host identity that file links should carry.
 `bin/eza-nvim-links` also accepts `TERMNAV_EZA_NVIM_LINKS_FORCE_TTY=1` for
 test harnesses that need to exercise TTY-restoration behavior while stdout is
 piped.
+
+Set `TERMNAV_SSH_CONTROL_HOSTS` to a comma-separated allowlist of host aliases
+that `bin/nvim-ssh-control-open` may contact through an existing SSH
+ControlMaster connection. The helper fails closed when the variable is unset
+or the target host is not listed, so reusable installs do not inherit private
+host policy from this repo.
 
 Run tests with:
 
