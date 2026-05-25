@@ -37,8 +37,16 @@ nvim_open_remote_host_from_positional_command() {
 
   read -r -a words <<<"$start_command"
   [[ ${#words[@]} -gt 0 ]] || return 1
+  # Only parse this command if it is actually an invocation of the transport.
+  # tmux's pane_start_command is the command that *created* the pane, which for
+  # an interactive pane is the login shell (e.g. `exec /usr/bin/zsh -l`); the
+  # real `ssh host` is typed later and lives only in the process tree. Without
+  # this guard a shell's argv is misread as transport options, returning the
+  # shell word (`exec`) as the "host". Returning here instead lets the caller
+  # fall through to the live process tree, which carries the true `ssh host`.
   first_command="${words[0]##*/}"
-  [[ "$first_command" == "$pane_command" ]] && words=("${words[@]:1}")
+  [[ "$first_command" == "$pane_command" ]] || return 1
+  words=("${words[@]:1}")
 
   while [[ ${#words[@]} -gt 0 ]]; do
     token="${words[0]}"
