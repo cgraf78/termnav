@@ -247,6 +247,7 @@ echo "=== nvim setup ==="
 
 NVIM_TMUX_SETUP_TMP=$(_tmpdir)
 mkdir -p "$NVIM_TMUX_SETUP_TMP/local"
+NVIM_TMUX_SETUP_TMP=$(realpath "$NVIM_TMUX_SETUP_TMP")
 result=$(_nvim_lua "
   vim.env.TMUX = nil
   vim.env.TERMNAV_REMOTE_LINK_HOST = nil
@@ -280,6 +281,7 @@ _assert_eq "nvim setup: publishes local WezTerm context without duplicate tty wr
 
 NVIM_TMUX_SETUP_CLEAR=$(_tmpdir)
 mkdir -p "$NVIM_TMUX_SETUP_CLEAR/current"
+NVIM_TMUX_SETUP_CLEAR=$(realpath "$NVIM_TMUX_SETUP_CLEAR")
 result=$(_nvim_lua "
   vim.env.TMUX = nil
   vim.env.TERMNAV_REMOTE_LINK_HOST = nil
@@ -313,6 +315,7 @@ _assert_eq "nvim setup: clear removes nvim ownership, socket, and cwd metadata" 
 
 NVIM_TMUX_SETUP_REMOTE=$(_tmpdir)
 mkdir -p "$NVIM_TMUX_SETUP_REMOTE/repo"
+NVIM_TMUX_SETUP_REMOTE=$(realpath "$NVIM_TMUX_SETUP_REMOTE")
 result=$(_nvim_lua "
   vim.env.TMUX = '/tmp/tmux.sock,1,0'
   vim.env.TERMNAV_REMOTE_LINK_HOST = 'remote.example'
@@ -385,6 +388,7 @@ _assert_eq "nvim setup: tmux remote host lookup is cached until refresh" "$expec
 
 NVIM_TMUX_SETUP_EVENTS=$(_tmpdir)
 mkdir -p "$NVIM_TMUX_SETUP_EVENTS/one" "$NVIM_TMUX_SETUP_EVENTS/two"
+NVIM_TMUX_SETUP_EVENTS=$(realpath "$NVIM_TMUX_SETUP_EVENTS")
 result=$(_nvim_lua "
   vim.env.TMUX = nil
   vim.env.TERMNAV_REMOTE_LINK_HOST = nil
