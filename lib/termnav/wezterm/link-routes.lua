@@ -1,5 +1,16 @@
 local M = {}
 
+-- These names are termnav's private WezTerm user-var protocol. Consumers should
+-- call route helpers such as is_nvim() instead of reading the raw pane vars.
+local user_vars = {
+  is_nvim = "IS_NVIM",
+  open_socket = "NVIM_OPEN_SOCKET",
+  link_cwd = "NVIM_LINK_CWD",
+  remote_link_host = "NVIM_REMOTE_LINK_HOST",
+  remote_cwd = "NVIM_REMOTE_CWD",
+  remote_tmux = "NVIM_REMOTE_TMUX",
+}
+
 function M.new(wezterm)
   local routes = {}
 
@@ -20,7 +31,7 @@ function M.new(wezterm)
   end
 
   function routes.is_nvim(pane)
-    return pane:get_user_vars().IS_NVIM == "true"
+    return pane:get_user_vars()[user_vars.is_nvim] == "true"
   end
 
   function routes.file_uri_path(uri)
@@ -65,7 +76,7 @@ function M.new(wezterm)
   end
 
   function routes.pane_link_cwd(pane)
-    local user_var_cwd = pane:get_user_vars().NVIM_LINK_CWD
+    local user_var_cwd = pane:get_user_vars()[user_vars.link_cwd]
     if user_var_cwd and user_var_cwd ~= "" then
       return user_var_cwd
     end
@@ -75,9 +86,9 @@ function M.new(wezterm)
   end
 
   function routes.remote_pane_info(pane)
-    local user_vars = pane:get_user_vars()
-    local user_var_host = user_vars.NVIM_REMOTE_LINK_HOST
-    local user_var_cwd = user_vars.NVIM_REMOTE_CWD
+    local pane_user_vars = pane:get_user_vars()
+    local user_var_host = pane_user_vars[user_vars.remote_link_host]
+    local user_var_cwd = pane_user_vars[user_vars.remote_cwd]
     local cwd_uri = pane:get_current_working_dir()
     if user_var_host and user_var_host ~= "" and not routes.local_file_host(user_var_host) then
       -- The shell/nvim-published cwd is authoritative. WezTerm's cwd metadata
@@ -188,7 +199,7 @@ function M.new(wezterm)
     if not pane or type(pane.get_user_vars) ~= "function" then
       return false
     end
-    return pane:get_user_vars().NVIM_REMOTE_TMUX == "true"
+    return pane:get_user_vars()[user_vars.remote_tmux] == "true"
   end
 
   function routes.open_remote_via_controlmaster(remote_host, path_info)
@@ -248,7 +259,7 @@ function M.new(wezterm)
       path_info,
       routes.pane_link_cwd(pane),
       routes.is_nvim(pane) and "nvim" or "terminal",
-      pane:get_user_vars().NVIM_OPEN_SOCKET or "",
+      pane:get_user_vars()[user_vars.open_socket] or "",
     }, "No nvim session found for file link: " .. path_info)
   end
 
