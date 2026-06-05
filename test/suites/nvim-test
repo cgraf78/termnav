@@ -24,6 +24,7 @@ fi
 
 opener_module="$TERMNAV_ROOT/lib/termnav/nvim/nvim-tmux-open.lua"
 vars_module="$TERMNAV_ROOT/lib/termnav/nvim/wezterm-vars.lua"
+setup_module="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua"
 
 echo "=== nvim-tmux-open ==="
 
@@ -240,5 +241,197 @@ result=$(_nvim_lua "
   print(tostring(opener.server() ~= ''))
 ")
 _assert_eq "server: exposes the socket address used for publication" "true" "$result"
+
+echo ""
+echo "=== nvim setup ==="
+
+NVIM_TMUX_SETUP_TMP=$(_tmpdir)
+mkdir -p "$NVIM_TMUX_SETUP_TMP/local"
+NVIM_TMUX_SETUP_TMP=$(realpath "$NVIM_TMUX_SETUP_TMP")
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TERMNAV_REMOTE_LINK_HOST = nil
+  vim.env.SSH_CONNECTION = nil
+  vim.cmd('cd $NVIM_TMUX_SETUP_TMP/local')
+
+  local setup = dofile('$setup_module')
+  local writes = {}
+  local ctx = setup.new({
+    opener = {
+      setup = function() end,
+      server = function()
+        return 'nvim.sock'
+      end,
+    },
+    wezterm_vars = {
+      set = function(name, value)
+        writes[#writes + 1] = name .. '=' .. tostring(value or '')
+        return true
+      end,
+    },
+  })
+
+  ctx.publish()
+  ctx.publish()
+  print(table.concat(writes, '\n'))
+")
+expected="$(printf 'IS_NVIM=true\nNVIM_OPEN_SOCKET=nvim.sock\nNVIM_LINK_CWD=%s/local\nNVIM_REMOTE_LINK_HOST=\nNVIM_REMOTE_CWD=\nNVIM_REMOTE_TMUX=' "$NVIM_TMUX_SETUP_TMP")"
+_assert_eq "nvim setup: publishes local WezTerm context without duplicate tty writes" \
+  "$expected" "$result"
+
+NVIM_TMUX_SETUP_CLEAR=$(_tmpdir)
+mkdir -p "$NVIM_TMUX_SETUP_CLEAR/current"
+NVIM_TMUX_SETUP_CLEAR=$(realpath "$NVIM_TMUX_SETUP_CLEAR")
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TERMNAV_REMOTE_LINK_HOST = nil
+  vim.env.SSH_CONNECTION = nil
+  vim.cmd('cd $NVIM_TMUX_SETUP_CLEAR/current')
+
+  local setup = dofile('$setup_module')
+  local writes = {}
+  local ctx = setup.new({
+    opener = {
+      setup = function() end,
+      server = function()
+        return 'nvim.sock'
+      end,
+    },
+    wezterm_vars = {
+      set = function(name, value)
+        writes[#writes + 1] = name .. '=' .. tostring(value or '')
+        return true
+      end,
+    },
+  })
+
+  ctx.publish()
+  ctx.clear()
+  print(table.concat(writes, '\n'))
+")
+expected="$(printf 'IS_NVIM=true\nNVIM_OPEN_SOCKET=nvim.sock\nNVIM_LINK_CWD=%s/current\nNVIM_REMOTE_LINK_HOST=\nNVIM_REMOTE_CWD=\nNVIM_REMOTE_TMUX=\nIS_NVIM=false\nNVIM_OPEN_SOCKET=\nNVIM_LINK_CWD=' "$NVIM_TMUX_SETUP_CLEAR")"
+_assert_eq "nvim setup: clear removes nvim ownership, socket, and cwd metadata" \
+  "$expected" "$result"
+
+NVIM_TMUX_SETUP_REMOTE=$(_tmpdir)
+mkdir -p "$NVIM_TMUX_SETUP_REMOTE/repo"
+NVIM_TMUX_SETUP_REMOTE=$(realpath "$NVIM_TMUX_SETUP_REMOTE")
+result=$(_nvim_lua "
+  vim.env.TMUX = '/tmp/tmux.sock,1,0'
+  vim.env.TERMNAV_REMOTE_LINK_HOST = 'remote.example'
+  vim.env.SSH_CONNECTION = nil
+  vim.cmd('cd $NVIM_TMUX_SETUP_REMOTE/repo')
+
+  local setup = dofile('$setup_module')
+  local writes = {}
+  local ctx = setup.new({
+    opener = {
+      setup = function() end,
+      server = function()
+        return 'nvim.sock'
+      end,
+    },
+    wezterm_vars = {
+      set = function(name, value)
+        writes[name] = tostring(value or '')
+        return true
+      end,
+    },
+  })
+
+  ctx.publish()
+  print(writes.NVIM_REMOTE_LINK_HOST)
+  print(writes.NVIM_REMOTE_CWD)
+  print(writes.NVIM_REMOTE_TMUX)
+")
+expected="$(printf 'remote.example\n%s/repo\ntrue' "$NVIM_TMUX_SETUP_REMOTE")"
+_assert_eq "nvim setup: public remote host env drives remote pane metadata" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = '/tmp/tmux.sock,1,0'
+  vim.env.TERMNAV_REMOTE_LINK_HOST = nil
+  vim.env.SSH_CONNECTION = nil
+
+  local setup = dofile('$setup_module')
+  local old_system = vim.fn.system
+  local calls = 0
+  vim.fn.system = function(cmd)
+    calls = calls + 1
+    return 'TERMNAV_REMOTE_LINK_HOST=tmux.example\n'
+  end
+
+  local ctx = setup.new({
+    opener = {
+      setup = function() end,
+      server = function()
+        return 'nvim.sock'
+      end,
+    },
+    wezterm_vars = {
+      set = function()
+        return true
+      end,
+    },
+  })
+
+  print(ctx.nvim_remote_link_host())
+  print(calls)
+  print(ctx.nvim_remote_link_host())
+  print(calls)
+  ctx.refresh()
+  print(calls)
+  vim.fn.system = old_system
+")
+expected="$(printf 'tmux.example\n1\ntmux.example\n1\n2')"
+_assert_eq "nvim setup: tmux remote host lookup is cached until refresh" "$expected" "$result"
+
+NVIM_TMUX_SETUP_EVENTS=$(_tmpdir)
+mkdir -p "$NVIM_TMUX_SETUP_EVENTS/one" "$NVIM_TMUX_SETUP_EVENTS/two"
+NVIM_TMUX_SETUP_EVENTS=$(realpath "$NVIM_TMUX_SETUP_EVENTS")
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TERMNAV_REMOTE_LINK_HOST = nil
+  vim.env.SSH_CONNECTION = nil
+  vim.cmd('cd $NVIM_TMUX_SETUP_EVENTS/one')
+
+  local setup = dofile('$setup_module')
+  local opener_setup_count = 0
+  local writes = {}
+  setup.setup({
+    group_name = 'termnav_test_setup',
+    publish_delay_ms = -1,
+    opener = {
+      setup = function()
+        opener_setup_count = opener_setup_count + 1
+      end,
+      server = function()
+        return 'nvim.sock'
+      end,
+    },
+    wezterm_vars = {
+      set = function(name, value)
+        writes[#writes + 1] = name .. '=' .. tostring(value or '')
+        return true
+      end,
+    },
+  })
+
+  vim.api.nvim_exec_autocmds('BufEnter', {})
+  vim.api.nvim_exec_autocmds('WinEnter', {})
+  print(opener_setup_count)
+  print(#writes)
+  vim.cmd('cd $NVIM_TMUX_SETUP_EVENTS/two')
+  vim.api.nvim_exec_autocmds('DirChanged', {})
+  print(writes[#writes])
+  local clear_start = #writes
+  vim.api.nvim_exec_autocmds('FocusLost', {})
+  print(writes[clear_start + 1])
+  print(writes[clear_start + 2])
+  print(writes[clear_start + 3])
+")
+expected="$(printf '1\n6\nNVIM_LINK_CWD=%s/two\nIS_NVIM=false\nNVIM_OPEN_SOCKET=\nNVIM_LINK_CWD=' "$NVIM_TMUX_SETUP_EVENTS")"
+_assert_eq "nvim setup: setup wires publish and clear events with local group policy" \
+  "$expected" "$result"
 
 _test_summary

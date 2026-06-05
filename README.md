@@ -22,7 +22,11 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
   The module returns fresh rule copies from `public_link_rules()` and appends
   them to an existing WezTerm `hyperlink_rules` table with
   `add_public_link_rules(rules)`.
-- `lib/termnav/nvim/*.lua`: Neovim-side terminal navigation helpers.
+- `lib/termnav/nvim/setup.lua`: reusable Neovim-side setup for publishing the
+  current editor socket, cwd, and remote context to WezTerm.
+- `lib/termnav/nvim/nvim-tmux-open.lua` and
+  `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
+  setup module and advanced consumers.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
   pane context publishing.
 
@@ -65,6 +69,11 @@ transport already knows the remote host identity that file links should carry.
 `bin/eza-nvim-links` also accepts `TERMNAV_EZA_NVIM_LINKS_FORCE_TTY=1` for
 test harnesses that need to exercise TTY-restoration behavior while stdout is
 piped.
+
+The `IS_NVIM` and `NVIM_*` WezTerm user variables are termnav's private
+cross-process protocol between shell/Neovim publishers and WezTerm route
+consumers. Configure integrations through the modules above instead of setting
+or reading those names directly.
 
 Set `TERMNAV_SSH_CONTROL_HOSTS` to a comma-separated allowlist of host aliases
 that `bin/nvim-ssh-control-open` may contact through an existing SSH
