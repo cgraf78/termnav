@@ -3,6 +3,10 @@ local vim = vim
 
 local M = {}
 
+-- Write side of termnav's private WezTerm user-var protocol. The wezterm reader
+-- in lib/termnav/wezterm/link-routes.lua declares the same names; the two run in
+-- different Lua hosts (nvim vs wezterm) and cannot share a module reliably
+-- (wezterm has no dependable debug source path), so keep the two tables in sync.
 local user_vars = {
   is_nvim = "IS_NVIM",
   open_socket = "NVIM_OPEN_SOCKET",

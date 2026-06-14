@@ -1,7 +1,10 @@
 local M = {}
 
--- These names are termnav's private WezTerm user-var protocol. Consumers should
+-- Read side of termnav's private WezTerm user-var protocol. Consumers should
 -- call route helpers such as is_nvim() instead of reading the raw pane vars.
+-- The nvim writer in lib/termnav/nvim/setup.lua declares the same names; the two
+-- run in different Lua hosts and cannot share a module reliably, so keep the two
+-- tables in sync.
 local user_vars = {
   is_nvim = "IS_NVIM",
   open_socket = "NVIM_OPEN_SOCKET",

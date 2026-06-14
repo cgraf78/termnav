@@ -519,10 +519,6 @@ target_from_embedded_token() {
   target_from_token "$segment"
 }
 
-target_from_word() {
-  target_from_token "$1"
-}
-
 target_from_line() {
   local line="$1" x="$2" len start=0 end char quote token
 
@@ -781,7 +777,7 @@ if [[ -z "$target" && -n "$line" ]] && line_has_quote "$line"; then
   target_from_line "$line" "$x" || true
 fi
 if [[ -z "$target" && -n "$word" ]]; then
-  target_from_word "$word" || true
+  target_from_token "$word" || true
 fi
 if [[ -z "$target" && -n "$line" && "$line_tried" -eq 0 ]]; then
   target_from_line "$line" "$x" || true
