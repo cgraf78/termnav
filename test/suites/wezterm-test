@@ -16,6 +16,8 @@ eza_linker_content=$(cat "$TERMNAV_ROOT/bin/eza-nvim-links" 2>/dev/null || true)
 nvim_link_host="$TERMNAV_ROOT/bin/nvim-link-host"
 ssh_control_open="$TERMNAV_ROOT/bin/nvim-ssh-control-open"
 public_link_rules="$TERMNAV_ROOT/lib/termnav/wezterm/public-link-rules.lua"
+nvim_setup="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua"
+wezterm_routes="$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua"
 
 _run_lua() {
   if command -v lua >/dev/null 2>&1; then
@@ -124,6 +126,67 @@ _assert_exit "nvim-ssh-control-open symlink: requires an existing control master
 
 echo
 echo "=== WezTerm public hyperlink rules ==="
+
+user_var_protocol_test=$(_tmpdir)/user-var-protocol-test.lua
+cat >"$user_var_protocol_test" <<'EOF'
+local function read(path)
+  local file = assert(io.open(path, "r"))
+  local text = file:read("*a")
+  file:close()
+  return text
+end
+
+local function user_vars(path)
+  local text = read(path)
+  local body = assert(text:match("local%s+user_vars%s*=%s*{(.-)\n}"), path)
+  local vars = {}
+  for line in body:gmatch("[^\n]+") do
+    local entry = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if entry ~= "" and not entry:match("^%-%-") then
+      local key, value = entry:match('^([%w_]+)%s*=%s*"([^"]+)"%s*,?$')
+      assert(key, path .. ": unsupported user_vars entry: " .. entry)
+      vars[key] = value
+    end
+  end
+  return vars
+end
+
+local expected = {
+  is_nvim = "IS_NVIM",
+  open_socket = "NVIM_OPEN_SOCKET",
+  link_cwd = "NVIM_LINK_CWD",
+  remote_link_host = "NVIM_REMOTE_LINK_HOST",
+  remote_cwd = "NVIM_REMOTE_CWD",
+  remote_tmux = "NVIM_REMOTE_TMUX",
+}
+local left = user_vars(arg[1])
+local right = user_vars(arg[2])
+local keys = {}
+for key in pairs(expected) do
+  keys[key] = true
+end
+for key in pairs(left) do
+  keys[key] = true
+end
+for key in pairs(right) do
+  keys[key] = true
+end
+
+for key in pairs(keys) do
+  if left[key] ~= expected[key] or right[key] ~= expected[key] then
+    error(string.format(
+      "%s: expected %s, nvim=%s, wezterm=%s",
+      key,
+      tostring(expected[key]),
+      tostring(left[key]),
+      tostring(right[key])
+    ))
+  end
+end
+print("ok")
+EOF
+user_var_protocol_output=$(_run_lua "$user_var_protocol_test" "$nvim_setup" "$wezterm_routes")
+_assert_eq "wezterm/nvim user-var protocol tables stay in sync" "ok" "$user_var_protocol_output"
 
 hyperlink_api_test=$(_tmpdir)/hyperlink-api-test.lua
 cat >"$hyperlink_api_test" <<'EOF'
