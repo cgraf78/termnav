@@ -1,0 +1,51 @@
+.TH NVIM-TMUX-OPEN 1 "2026-06-30" "termnav" "User Commands"
+.SH NAME
+nvim-tmux-open \- route terminal open requests into Neovim
+.SH SYNOPSIS
+.B nvim-tmux-open
+.B cli
+.RI [ nvim-args ...]
+.br
+.B nvim-tmux-open
+.B link
+.I target
+.RI [ context ...]
+.br
+.B nvim-tmux-open
+.B tmux-link
+.I target
+.RI [ context ...]
+.SH DESCRIPTION
+.B nvim-tmux-open
+opens local or remote terminal targets in an existing Neovim session. The mode
+is explicit so normal
+.B nvim
+command-line arguments stay separate from terminal link text, tmux click text,
+and remote-routing metadata.
+.SH MODES
+.TP
+.B cli
+Preserve ordinary
+.B nvim
+argument semantics for a local launcher.
+.TP
+.B link
+Interpret terminal or WezTerm link text and route it to the local or remote
+Neovim context when possible.
+.TP
+.B tmux-link
+Interpret a tmux-originated link or click target.
+.SH EXIT STATUS
+.TP
+.B 0
+The target was routed successfully.
+.TP
+.B 1
+The requested open operation failed.
+.TP
+.B 2
+Usage error.
+.SH SEE ALSO
+.BR tmux-follow-click (1),
+.BR nvim-link-host (1),
+.BR nvim-ssh-control-open (1)

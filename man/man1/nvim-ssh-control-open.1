@@ -1,0 +1,40 @@
+.TH NVIM-SSH-CONTROL-OPEN 1 "2026-06-30" "termnav" "User Commands"
+.SH NAME
+nvim-ssh-control-open \- open a remote Neovim target through an SSH ControlMaster
+.SH SYNOPSIS
+.B nvim-ssh-control-open
+.I host
+.I target
+.SH DESCRIPTION
+.B nvim-ssh-control-open
+routes a remote file or link target through an already-open SSH ControlMaster
+connection. It never starts a new authentication flow. Hosts must be explicitly
+allowlisted, and the helper fails closed when the host is not allowed or the
+master connection is unavailable.
+.SH ENVIRONMENT
+.TP
+.B TERMNAV_SSH_CONTROL_HOSTS
+Comma-separated allowlist of host aliases that may be contacted through an
+existing SSH ControlMaster connection.
+.SH EXIT STATUS
+.TP
+.B 0
+The remote target was opened.
+.TP
+.B 2
+Usage error.
+.TP
+.B 10
+No existing SSH master connection was available for the host.
+.TP
+.B 11
+The host argument was syntactically unsafe.
+.TP
+.B 12
+The remote open command failed.
+.TP
+.B 13
+The host was not allowlisted.
+.SH SEE ALSO
+.BR nvim-tmux-open (1),
+.BR ssh (1)
