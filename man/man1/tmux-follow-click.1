@@ -46,10 +46,12 @@ Override directory for token detector extensions.
 .SH EXIT STATUS
 .TP
 .B 0
-The click was handled or intentionally ignored.
+The click was handled or intentionally ignored, including clicks that do not
+resolve to a URL or file target.
 .TP
 .B 1
-The click could not be resolved.
+Unexpected helper failure before the click can be handled. Target opener
+failures are normally translated into best-effort terminal or tmux messages.
 .TP
 .B 2
 Usage or environment error.

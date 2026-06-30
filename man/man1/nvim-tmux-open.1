@@ -46,10 +46,18 @@ Interpret a tmux-originated link or click target.
 .SH EXIT STATUS
 .TP
 .B 0
-The target was routed successfully.
+The target was routed successfully. In
+.B tmux-link
+mode, an unroutable target is also translated into a tmux-facing message and
+reported as success so background tmux bindings do not expose shell failures to
+the terminal.
 .TP
 .B 1
-The requested open operation failed.
+The requested open operation failed in strict
+.B cli
+or
+.B link
+mode.
 .TP
 .B 2
 Usage error.
