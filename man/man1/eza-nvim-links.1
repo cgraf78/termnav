@@ -37,10 +37,14 @@ to exercise TTY presentation behavior in tests while stdout is piped.
 completed successfully.
 .TP
 .B 1
-The context library could not be loaded.
+The context library could not be loaded, or
+.B eza
+exited with status 1.
 .TP
 .B 2
-The wrapper could not resolve its installed library path.
+The wrapper could not resolve its installed library path. If
+.B eza
+also exits with status 2, that status is propagated after setup succeeds.
 .TP
 .I other
 The wrapper exits with the status returned by
