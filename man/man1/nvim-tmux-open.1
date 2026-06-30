@@ -9,12 +9,12 @@ nvim-tmux-open \- route terminal open requests into Neovim
 .br
 .B nvim-tmux-open
 .B link
-.I target
+.RI [ target ]
 .RI [ context ...]
 .br
 .B nvim-tmux-open
 .B tmux-link
-.I target
+.RI [ target ]
 .RI [ context ...]
 .SH DESCRIPTION
 .B nvim-tmux-open
@@ -39,10 +39,13 @@ modes.
 .TP
 .B link
 Interpret terminal or WezTerm link text and route it to the local or remote
-Neovim context when possible.
+Neovim context when possible. Empty link input is treated as a no-op so callers
+can pass optional terminal metadata without first filtering blank values.
 .TP
 .B tmux-link
-Interpret a tmux-originated link or click target.
+Interpret a tmux-originated link or click target. Empty input follows
+.B link
+mode and succeeds without opening anything.
 .SH EXIT STATUS
 .TP
 .B 0
