@@ -1,0 +1,60 @@
+.TH TMUX-FOLLOW-CLICK 1 "2026-06-30" "termnav" "User Commands"
+.SH NAME
+tmux-follow-click \- resolve tmux mouse clicks to URL or file actions
+.SH SYNOPSIS
+.B tmux-follow-click
+.RI [ tmux-format-args ...]
+.br
+.B tmux-follow-click
+.B --stdin
+.SH DESCRIPTION
+.B tmux-follow-click
+is intended for tmux mouse bindings. It receives tmux mouse formats and pane
+context, identifies the clicked token or line region, and opens URLs in the
+terminal or file targets through
+.BR nvim-tmux-open (1).
+.PP
+With
+.B --stdin ,
+the helper reads the tmux mouse fields from standard input, one field per line:
+hyperlink, word, line, x, cwd, client tty, pane id, y, pane top, and pane left.
+This mode is preferred for robust tmux bindings because quoted here-doc input
+preserves indentation and literal shell text.
+.PP
+The built-in token policy recognizes common terminal shapes such as HTTP URLs,
+localhost endpoints, git SSH remotes, CVE identifiers, RFC references, file
+paths, and terminal-specific Neovim link schemes.
+.SH EXTENSIONS
+.B tmux-follow-click
+loads optional shell extensions from
+.IR ${XDG_CONFIG_HOME:-~/.config}/termnav/tmux-follow/extensions.d/*.sh .
+Set
+.B TERMNAV_TMUX_FOLLOW_EXTENSION_DIR
+to use another directory.
+.PP
+Extension files can call
+.B tmux_follow_register_token_detector
+with a detector function. Detectors claim a token by setting
+.B target
+and
+.B target_kind
+and returning success.
+.SH ENVIRONMENT
+.TP
+.B TERMNAV_TMUX_FOLLOW_EXTENSION_DIR
+Override directory for token detector extensions.
+.SH EXIT STATUS
+.TP
+.B 0
+The click was handled or intentionally ignored, including clicks that do not
+resolve to a URL or file target.
+.TP
+.B 1
+Unexpected helper failure before the click can be handled. Target opener
+failures are normally translated into best-effort terminal or tmux messages.
+.TP
+.B 2
+Usage or environment error.
+.SH SEE ALSO
+.BR nvim-tmux-open (1),
+.BR nvim-ssh-control-open (1)

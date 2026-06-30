@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Verify that the PATH-visible termnav helpers have manual pages.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_REPO_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+echo "=== termnav: manpages ==="
+
+while IFS= read -r command; do
+  page="$TERMNAV_REPO_ROOT/man/man1/$command.1"
+  _assert_file_exists "manpage exists: $command" "$page"
+  content=$(cat "$page")
+  _assert_contains "manpage NAME section: $command" ".SH NAME" "$content"
+  _assert_contains "manpage names command: $command" "$command \\" "$content"
+done < <(
+  git -C "$TERMNAV_REPO_ROOT" ls-files -- 'bin/*' |
+    xargs -n 1 basename |
+    sort
+)
+
+_test_summary
