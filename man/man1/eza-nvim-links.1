@@ -31,6 +31,18 @@ Set to
 .B 1
 to exercise TTY presentation behavior in tests while stdout is piped.
 .SH EXIT STATUS
+.TP
+.B 0
+.B eza
+completed successfully.
+.TP
+.B 1
+The context library could not be loaded.
+.TP
+.B 2
+The wrapper could not resolve its installed library path.
+.TP
+.I other
 The wrapper exits with the status returned by
 .BR eza .
 .SH SEE ALSO
