@@ -4,7 +4,8 @@ nvim-tmux-open \- route terminal open requests into Neovim
 .SH SYNOPSIS
 .B nvim-tmux-open
 .B cli
-.RI [ nvim-args ...]
+.I file
+.RI [ cwd ]
 .br
 .B nvim-tmux-open
 .B link
@@ -25,9 +26,16 @@ and remote-routing metadata.
 .SH MODES
 .TP
 .B cli
-Preserve ordinary
-.B nvim
-argument semantics for a local launcher.
+Open a literal file target in the current-window Neovim context. The optional
+.I cwd
+is used to resolve relative file names. CLI mode intentionally does not parse
+normal Neovim flags, multiple files, or
+.I file:line
+syntax; terminal-link normalization is kept in
+.B link
+and
+.B tmux-link
+modes.
 .TP
 .B link
 Interpret terminal or WezTerm link text and route it to the local or remote

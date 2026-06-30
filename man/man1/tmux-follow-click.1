@@ -4,12 +4,22 @@ tmux-follow-click \- resolve tmux mouse clicks to URL or file actions
 .SH SYNOPSIS
 .B tmux-follow-click
 .RI [ tmux-format-args ...]
+.br
+.B tmux-follow-click
+.B --stdin
 .SH DESCRIPTION
 .B tmux-follow-click
 is intended for tmux mouse bindings. It receives tmux mouse formats and pane
 context, identifies the clicked token or line region, and opens URLs in the
 terminal or file targets through
 .BR nvim-tmux-open (1).
+.PP
+With
+.B --stdin ,
+the helper reads the tmux mouse fields from standard input, one field per line:
+hyperlink, word, line, x, cwd, client tty, pane id, y, pane top, and pane left.
+This mode is preferred for robust tmux bindings because quoted here-doc input
+preserves indentation and literal shell text.
 .PP
 The built-in token policy recognizes common terminal shapes such as HTTP URLs,
 localhost endpoints, git SSH remotes, CVE identifiers, RFC references, file

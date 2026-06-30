@@ -24,7 +24,10 @@ already knows the correct host.
 A host token was printed.
 .TP
 .B 1
-Context resolution failed.
+The context library could not be loaded or host lookup failed unexpectedly.
+Local sessions without remote context still print
+.B localhost
+and exit successfully.
 .TP
 .B 2
 The helper could not resolve its installed library path.
