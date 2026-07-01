@@ -325,8 +325,8 @@ local_file_host() {
     published=$(tmux show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null || true)
     published="${published#TERMNAV_REMOTE_LINK_HOST=}"
   fi
-  # Remote devserver links are intentionally stamped with the user-facing alias
-  # (`dev1`) instead of the machine hostname (`devvm...`). When this helper is
+  # Remote host links are intentionally stamped with the user-facing alias
+  # (e.g. `dev1`) instead of the raw machine hostname. When this helper is
   # running on that same remote tmux server, the alias is local for opening.
   [[ -n "$published" && "$host" == "$(lower_ascii "$published")" ]] && return 0
 

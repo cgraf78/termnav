@@ -562,12 +562,18 @@ TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:$PATH" \
 _assert_exit "nvim tmux launcher: current-window pane opens" 0 "$?"
 _assert_contains "nvim tmux launcher: targets nvim pane" \
   "send:send-keys -t %2" "$(cat "$launcher_log")"
+# The socketless fallback now opens via :exe 'e '.fnameescape(...)|call cursor()
+# so filename metachars can't glob; the file must survive verbatim inside
+# fnameescape() and no bare `:e +LINE` form is used.
 _assert_contains "nvim tmux launcher: preserves cli-like file arguments" \
-  ":e +1 /repo/a/src/app.lua:12" "$(cat "$launcher_log")"
+  'fnameescape("/repo/a/src/app.lua:12")' "$(cat "$launcher_log")"
 
 launcher_log="$launcher_tmp/tmux-home-literal.log"
 launcher_literal_home="\$HOME/src/app.lua"
-launcher_expected_home=":e +1 /repo/\$HOME/src/app.lua"
+# $HOME is intentionally literal here — it is part of the filename in the
+# expected keystroke, not a variable to expand.
+# shellcheck disable=SC2016
+launcher_expected_home='fnameescape("/repo/$HOME/src/app.lua")'
 TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:$PATH" \
   TMUX_LAUNCHER_LOG="$launcher_log" \
   "$TERMNAV_ROOT/bin/nvim-tmux-open" cli "$launcher_literal_home" "/repo"
