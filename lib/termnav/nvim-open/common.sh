@@ -137,20 +137,33 @@ nvim_open_pane_socket() {
 }
 
 nvim_open_tmux_send() {
-  local pane_id="$1" target_file="$2" target_line="$3" target_cwd="$4"
-  local escaped_file fallback_file
+  local pane_id="$1" target_file="$2" target_line="$3" target_col="$4" target_cwd="$5"
+  local fallback_file vim_file line col
 
   [[ -n "$pane_id" ]] || return 1
   fallback_file="$target_file"
   if [[ "$fallback_file" != /* && -n "$target_cwd" ]]; then
     fallback_file="${target_cwd%/}/$fallback_file"
   fi
-  escaped_file=$(printf '%s' "$fallback_file" | sed 's/[\\ |#%]/\\&/g')
+
+  # This is the no-RPC fallback: we can't pass line/col structurally, so we type
+  # an :edit command into the running nvim. Build it with fnameescape() (applied
+  # by nvim) so filename metacharacters like * ? [ { don't glob or misparse in
+  # :edit — a plain `:e <file>` mishandled those and could open the wrong file.
+  # We only escape the file for the surrounding Vim double-quoted string (\ and
+  # "). cursor() then sets line AND column (the previous `:e +LINE` dropped the
+  # column entirely).
+  vim_file=$(printf '%s' "$fallback_file" | sed 's/[\\"]/\\&/g')
+  line="${target_line:-1}"
+  [[ "$line" =~ ^[0-9]+$ ]] || line=1
+  col="${target_col:-1}"
+  [[ "$col" =~ ^[0-9]+$ ]] || col=1
+
   # Leave terminal-mode reliably. tmux key names for C-\ can degrade into a
   # literal C-n in nested terminal layouts; hex sends the exact control bytes.
   tmux send-keys -t "$pane_id" -H 1c 0e
   tmux send-keys -t "$pane_id" Escape
-  tmux send-keys -t "$pane_id" -l ":e +${target_line} ${escaped_file}"
+  tmux send-keys -t "$pane_id" -l ":exe 'e '.fnameescape(\"${vim_file}\")|call cursor(${line},${col})"
   tmux send-keys -t "$pane_id" Enter
 }
 
@@ -168,5 +181,5 @@ nvim_open_current_window() {
   done <<<"$tmux_panes"
 
   [[ -n "$first_pane" ]] || return 1
-  nvim_open_tmux_send "$first_pane" "$target_file" "$target_line" "$target_cwd"
+  nvim_open_tmux_send "$first_pane" "$target_file" "$target_line" "$target_col" "$target_cwd"
 }

@@ -84,4 +84,34 @@ else
   _pass "host_from_command: bare shell pane reports no host"
 fi
 
+echo "=== nvim_open_tmux_send: no-RPC :edit fallback ==="
+
+# The socketless fallback types an :edit into a running nvim. It must (1) set
+# both line AND column and (2) fnameescape the target so filename metachars
+# (* ? [ {) and spaces don't glob or misparse — regressions were a dropped
+# column and a bare `:e +LINE <file>` that mishandled globs.
+_send_bin=$(_mock_bin)
+_send_log="$(_tmpdir)/tmux-send.log"
+cat >"$_send_bin/tmux" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$_send_log"
+EOF
+chmod +x "$_send_bin/tmux"
+: >"$_send_log"
+PATH="$_send_bin:$PATH" nvim_open_tmux_send "%1" 'weird [name]*.md' 12 34 /tmp/proj
+_send_out=$(cat "$_send_log")
+_assert_contains "tmux-send: fnameescapes the edit target" \
+  'fnameescape("/tmp/proj/weird [name]*.md")' "$_send_out"
+_assert_contains "tmux-send: sets both line and column" \
+  'call cursor(12,34)' "$_send_out"
+_assert_not_contains "tmux-send: no bare globbing ':e +line' form" \
+  ':e +12' "$_send_out"
+
+# Missing/non-numeric line and column fall back to 1, never breaking the command.
+: >"$_send_log"
+PATH="$_send_bin:$PATH" nvim_open_tmux_send "%1" '/abs/file.md' '' '' ''
+_send_out=$(cat "$_send_log")
+_assert_contains "tmux-send: defaults missing line/col to 1" \
+  'call cursor(1,1)' "$_send_out"
+
 _test_summary
