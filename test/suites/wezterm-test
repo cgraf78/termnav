@@ -737,6 +737,24 @@ EOF
   _assert_not_contains "remote eza wrapper does not require perl" \
     "| perl" "$eza_linker_content"
 
+  # Regression guard: the wrapper's last-line handling (emit each read line, then
+  # print a trailing partial line only if the input lacked a final newline) must
+  # not duplicate the final line when eza output IS newline-terminated. The other
+  # assertions use substring matches that would miss a duplicate, so check the
+  # exact line count for a known multi-line, newline-terminated eza output.
+  linecount_bin="$eza_tmp/linecount-bin"
+  mkdir -p "$linecount_bin"
+  cat >"$linecount_bin/eza" <<'EOF'
+#!/usr/bin/env bash
+printf 'line-one\n\033]8;;file:///tmp/x.txt\033\\line-two\033]8;;\033\\\nline-three\n'
+EOF
+  chmod +x "$linecount_bin/eza"
+  linecount_output=$(TERMNAV_REMOTE_LINK_HOST=remote.example PATH="$linecount_bin:$PATH" "$eza_linker")
+  linecount_lines=$(printf '%s\n' "$linecount_output" | wc -l | tr -d ' ')
+  _assert_eq "remote eza wrapper does not duplicate the final line" "3" "$linecount_lines"
+  _assert_contains "remote eza wrapper line-count fixture still rewrites host" \
+    "]8;;file://remote.example/tmp/x.txt" "$linecount_output"
+
   tmux_remote_output=$(
     env -u TERMNAV_REMOTE_LINK_HOST -u SSH_CONNECTION \
       EZA_MOCK_LOG="$eza_tmp/tmux-remote-args.log" \
