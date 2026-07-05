@@ -60,6 +60,35 @@ local function tmux_tty_path()
   return output
 end
 
+local function tmux_client_termname()
+  local pane = vim.env.TMUX_PANE
+  if type(pane) ~= "string" or pane == "" then
+    return nil
+  end
+
+  local output =
+    vim.fn.system({ "tmux", "display-message", "-t", pane, "-p", "#{client_termname}" })
+  if vim.v.shell_error ~= 0 then
+    return nil
+  end
+
+  output = output:gsub("%s+$", "")
+  if output == "" then
+    return nil
+  end
+
+  return output
+end
+
+local function tmux_client_is_nested()
+  local termname = tmux_client_termname()
+  return type(termname) == "string" and (termname:match("^tmux") or termname:match("^screen"))
+end
+
+local function tmux_passthrough(sequence)
+  return "\027Ptmux;" .. sequence:gsub("\027", "\027\027") .. "\027\\"
+end
+
 function M.tty_path()
   if type(tty_path) == "string" and tty_path ~= "" then
     return tty_path
@@ -87,11 +116,12 @@ function M.set(name, value)
   end
 
   local encoded = base64_encode(value or "")
-  local osc
+  local osc = ("\027]1337;SetUserVar=%s=%s\007"):format(name, encoded)
   if vim.env.TMUX then
-    osc = ("\027Ptmux;\027\027]1337;SetUserVar=%s=%s\007\027\\"):format(name, encoded)
-  else
-    osc = ("\027]1337;SetUserVar=%s=%s\007"):format(name, encoded)
+    osc = tmux_passthrough(osc)
+    if tmux_client_is_nested() then
+      osc = tmux_passthrough(osc)
+    end
   end
 
   local tty = io.open(path, "w")

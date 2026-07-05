@@ -14,6 +14,10 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
 - `bin/nvim-link-host`: print the host token for `rg --hostname-bin`.
 - `bin/nvim-ssh-control-open`: open a remote target through an existing
   SSH ControlMaster connection without starting a new authentication flow.
+- `bin/wezterm-switch-tab`: request WezTerm tab switching, including
+  parent-tmux bubbling for nested local or remote tmux sessions.
+- `bin/wezterm-move-tab`: request WezTerm tab movement, including parent-tmux
+  bubbling for nested local or remote tmux sessions.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -27,6 +31,8 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
   `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
   setup module and advanced consumers.
+- `lib/termnav/shell/wezterm-vars.sh`: shell helpers for emitting WezTerm
+  `SetUserVar` OSC requests with raw or tmux-passthrough framing.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
   pane context publishing.
 
@@ -48,9 +54,9 @@ this repo owns reusable route parsing and open-through behavior.
   tmux-aware Neovim targeting.
 - Neovim with a server/socket setup for `nvim-tmux-open` to open file targets
   in an existing editor session.
-- WezTerm for the Lua link-route modules and OSC user-variable context
-  publishing. The tmux and Neovim helpers remain useful without WezTerm when a
-  consumer invokes them directly.
+- WezTerm for the Lua link-route modules, OSC user-variable context
+  publishing, and tab switch/move requests. The tmux and Neovim helpers remain
+  useful without WezTerm when a consumer invokes them directly.
 - `eza` for `eza-nvim-links`.
 - `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
   existing ControlMaster connection.

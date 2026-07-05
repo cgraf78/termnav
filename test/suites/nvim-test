@@ -44,6 +44,9 @@ result=$(_nvim_lua "
     if calls == 1 then
       return '\n'
     end
+    if cmd[#cmd] == '#{client_termname}' then
+      return 'xterm-256color\n'
+    end
     print(table.concat(cmd, ' '))
     return '/dev/pts/42\n'
   end
@@ -51,7 +54,12 @@ result=$(_nvim_lua "
     opened[#opened + 1] = path .. ' ' .. mode
     return {
       write = function(_, text)
-        opened[#opened + 1] = text:match('SetUserVar=IS_NVIM=dHJ1ZQ==') and 'user-var' or text
+        local esc = string.char(27)
+        local bel = string.char(7)
+        local bs = string.char(92)
+        local raw = esc .. ']1337;SetUserVar=IS_NVIM=dHJ1ZQ==' .. bel
+        local expected = esc .. 'Ptmux;' .. raw:gsub(esc, esc .. esc) .. esc .. bs
+        opened[#opened + 1] = text == expected and 'user-var' or text
       end,
       flush = function() end,
       close = function() end,
@@ -67,7 +75,7 @@ result=$(_nvim_lua "
   vim.fn.system = old_system
   io.open = old_open
 ")
-expected="$(printf 'false\n1\n0\ntmux display-message -t %%42 -p #{pane_tty}\ntrue\n2\n/dev/pts/42 w\nuser-var')"
+expected="$(printf 'false\n1\n0\ntmux display-message -t %%42 -p #{pane_tty}\ntrue\n3\n/dev/pts/42 w\nuser-var')"
 _assert_eq "wezterm-vars: empty tmux tty is not cached and next publish can recover" \
   "$expected" "$result"
 
@@ -96,6 +104,48 @@ result=$(_nvim_lua "
 ")
 expected="$(printf 'true\nencoded')"
 _assert_eq "wezterm-vars: base64 fallback supports older nvim" "$expected" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = '/tmp/tmux.sock,1,0'
+  vim.env.TMUX_PANE = '%42'
+  local vars = dofile('$vars_module')
+  vars.tty_path = function()
+    return '/dev/pts/42'
+  end
+  local old_system = vim.fn.system
+  local old_open = io.open
+  vim.fn.system = function(cmd)
+    if cmd[#cmd] == '#{client_termname}' then
+      return 'tmux-256color\n'
+    end
+    return ''
+  end
+  local writes = {}
+  io.open = function()
+    return {
+      write = function(_, text)
+        writes[#writes + 1] = text
+      end,
+      flush = function() end,
+      close = function() end,
+    }
+  end
+  print(tostring(vars.set('DOT_PARENT_SWITCH_TAB', 'next:1')))
+  local esc = string.char(27)
+  local bel = string.char(7)
+  local bs = string.char(92)
+  local raw = esc .. ']1337;SetUserVar=DOT_PARENT_SWITCH_TAB=bmV4dDox' .. bel
+  local single = esc .. 'Ptmux;' .. raw:gsub(esc, esc .. esc) .. esc .. bs
+  local expected = esc .. 'Ptmux;' .. single:gsub(esc, esc .. esc) .. esc .. bs
+  local _, passthrough_count = writes[1]:gsub(esc .. 'Ptmux;', '')
+  print(tostring(passthrough_count))
+  print(writes[1] == expected and 'exact' or writes[1])
+  vim.fn.system = old_system
+  io.open = old_open
+")
+expected="$(printf 'true\n2\nexact')"
+_assert_eq "wezterm-vars: nested tmux clients double-wrap OSC passthrough" \
+  "$expected" "$result"
 
 result=$(_nvim_lua "
   local opener = dofile('$opener_module')
