@@ -8,6 +8,7 @@ installed commands.
 - `nvim-link-context.sh` captures link context shared by commands.
 - `nvim-open/` owns shell routing for local and remote open requests.
 - `nvim/` owns Neovim-side Lua helpers.
+- `shell/` owns reusable shell helpers for terminal control protocols.
 - `wezterm/` owns WezTerm link routing and public link rules.
 
 Keep terminal-specific behavior in the closest integration directory, but keep

@@ -15,6 +15,8 @@ eza_linker="$TERMNAV_ROOT/bin/eza-nvim-links"
 eza_linker_content=$(cat "$TERMNAV_ROOT/bin/eza-nvim-links" 2>/dev/null || true)
 nvim_link_host="$TERMNAV_ROOT/bin/nvim-link-host"
 ssh_control_open="$TERMNAV_ROOT/bin/nvim-ssh-control-open"
+wezterm_switch_tab="$TERMNAV_ROOT/bin/wezterm-switch-tab"
+wezterm_move_tab="$TERMNAV_ROOT/bin/wezterm-move-tab"
 public_link_rules="$TERMNAV_ROOT/lib/termnav/wezterm/public-link-rules.lua"
 nvim_setup="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua"
 wezterm_routes="$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua"
@@ -42,6 +44,8 @@ ln -s "$helper" "$symlink_bin/nvim-tmux-open"
 ln -s "$eza_linker" "$symlink_bin/eza-nvim-links"
 ln -s "$nvim_link_host" "$symlink_bin/nvim-link-host"
 ln -s "$ssh_control_open" "$symlink_bin/nvim-ssh-control-open"
+ln -s "$wezterm_switch_tab" "$symlink_bin/wezterm-switch-tab"
+ln -s "$wezterm_move_tab" "$symlink_bin/wezterm-move-tab"
 cat >"$mock_bin/eza" <<'EOF'
 #!/usr/bin/env bash
 printf 'eza'
@@ -123,6 +127,82 @@ TERMNAV_SSH_CONTROL_HOSTS=remote.example \
   "$symlink_bin/nvim-ssh-control-open" remote.example /tmp/file
 ssh_control_rc=$?
 _assert_exit "nvim-ssh-control-open symlink: requires an existing control master" 10 "$ssh_control_rc"
+
+set +e
+symlink_switch_usage=$("$symlink_bin/wezterm-switch-tab" --help 2>&1)
+symlink_switch_rc=$?
+_assert_exit "wezterm-switch-tab symlink: help exits successfully" 0 "$symlink_switch_rc"
+_assert_contains "wezterm-switch-tab symlink: resolves dependency libraries" \
+  "usage: wezterm-switch-tab" "$symlink_switch_usage"
+
+set +e
+symlink_move_usage=$("$symlink_bin/wezterm-move-tab" --help 2>&1)
+symlink_move_rc=$?
+_assert_exit "wezterm-move-tab symlink: help exits successfully" 0 "$symlink_move_rc"
+_assert_contains "wezterm-move-tab symlink: resolves dependency libraries" \
+  "usage: wezterm-move-tab" "$symlink_move_usage"
+
+echo
+echo "=== WezTerm tab user-var helpers ==="
+
+tab_tty=$(_tmpdir)/tab-tty
+: >"$tab_tty"
+"$wezterm_switch_tab" next "$tab_tty"
+direct_switch=$(cat "$tab_tty")
+_assert_contains "wezterm-switch-tab direct: sets DOT_SWITCH_TAB" \
+  $'\033]1337;SetUserVar=DOT_SWITCH_TAB=' "$direct_switch"
+_assert_contains "wezterm-switch-tab direct: terminates OSC request" \
+  $'\007' "$direct_switch"
+
+switch_tty_again=$(_tmpdir)/tab-tty-again
+: >"$switch_tty_again"
+"$wezterm_switch_tab" next "$switch_tty_again"
+direct_switch_again=$(cat "$switch_tty_again")
+if [[ "$direct_switch" != "$direct_switch_again" ]]; then
+  _pass "wezterm-switch-tab direct: payload changes for repeated directions"
+else
+  _fail "wezterm-switch-tab direct: payload changes for repeated directions"
+fi
+
+: >"$tab_tty"
+"$wezterm_move_tab" left "$tab_tty"
+direct_move=$(cat "$tab_tty")
+_assert_contains "wezterm-move-tab direct: sets DOT_MOVE_TAB" \
+  $'\033]1337;SetUserVar=DOT_MOVE_TAB=' "$direct_move"
+_assert_contains "wezterm-move-tab direct: terminates OSC request" \
+  $'\007' "$direct_move"
+
+: >"$tab_tty"
+"$wezterm_switch_tab" --parent next "$tab_tty"
+parent_switch=$(cat "$tab_tty")
+_assert_contains "wezterm-switch-tab parent: starts tmux passthrough" \
+  $'\033Ptmux;\033\033]1337;SetUserVar=DOT_PARENT_SWITCH_TAB=' "$parent_switch"
+_assert_contains "wezterm-switch-tab parent: terminates tmux passthrough" \
+  $'\007\033\\' "$parent_switch"
+
+: >"$tab_tty"
+"$wezterm_move_tab" --parent left "$tab_tty"
+parent_move=$(cat "$tab_tty")
+_assert_contains "wezterm-move-tab parent: starts tmux passthrough" \
+  $'\033Ptmux;\033\033]1337;SetUserVar=DOT_PARENT_MOVE_TAB=' "$parent_move"
+_assert_contains "wezterm-move-tab parent: terminates tmux passthrough" \
+  $'\007\033\\' "$parent_move"
+
+shell_vars="$TERMNAV_ROOT/lib/termnav/shell/wezterm-vars.sh"
+shell_tmux_mock=$(_tmpdir)/mock-bin
+mkdir -p "$shell_tmux_mock"
+cat >"$shell_tmux_mock/tmux" <<'EOF'
+#!/usr/bin/env bash
+printf 'tmux-256color\n'
+EOF
+chmod +x "$shell_tmux_mock/tmux"
+shell_auto_nested=$(
+  TMUX=/tmp/tmux-test,1,0 PATH="$shell_tmux_mock:$PATH" bash -c \
+    ". '$shell_vars'; termnav_wezterm_user_var_sequence DOT_SWITCH_TAB next auto"
+)
+shell_auto_count=$(printf '%s' "$shell_auto_nested" | python3 -c 'import sys; data=sys.stdin.buffer.read(); print(data.count(b"\x1bPtmux;"))')
+_assert_eq "shell wezterm vars: auto double-wraps nested tmux clients" \
+  "2" "$shell_auto_count"
 
 echo
 echo "=== WezTerm public hyperlink rules ==="

@@ -18,6 +18,35 @@ TERMNAV_SHELL_LOADED=1
 # _termnav_wezterm_precmd
 #   Prompt hook callback that marks the pane as no longer inside nvim/vim.
 
+_termnav_shell_script_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_termnav_shell_script_dir() {
+  local path="$1" dir target
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_termnav_shell_script_parent "$path")" && pwd) || return 1
+    target=$(readlink "$path") || return 1
+    [[ "$target" == /* ]] || target="$dir/$target"
+    path="$target"
+  done
+  cd -P -- "$(_termnav_shell_script_parent "$path")" && pwd
+}
+
+_termnav_shell_source_path="$0"
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  eval '_termnav_shell_source_path="${(%):-%x}"'
+elif [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  _termnav_shell_source_path="${BASH_SOURCE[0]}"
+fi
+_termnav_shell_dir=$(_termnav_shell_script_dir "$_termnav_shell_source_path") || return 1
+_termnav_root="${_termnav_shell_dir%/share/termnav}"
+# shellcheck source=../../lib/termnav/shell/wezterm-vars.sh
+. "$_termnav_root/lib/termnav/shell/wezterm-vars.sh" || return 1
+
 _termnav_wezterm_active() {
   [[ -z "${NVIM:-}" ]] &&
     [[ -n "${TMUX:-}" ||
@@ -27,7 +56,6 @@ _termnav_wezterm_active() {
 }
 
 _termnav_wezterm_set_user_var() {
-  local encoded
   case "$1" in
     IS_NVIM)
       [[ "${_termnav_wezterm_sent_IS_NVIM:-0}" == 1 && "${_termnav_wezterm_last_IS_NVIM-}" == "$2" ]] && return
@@ -56,14 +84,7 @@ _termnav_wezterm_set_user_var() {
       ;;
   esac
 
-  encoded=$(printf '%s' "$2" | base64 | tr -d '\n')
-
-  # shellcheck disable=SC1003 # \033\\ is ESC+backslash (ST), not a quote escape.
-  if [[ -n "${TMUX:-}" ]]; then
-    printf '\ePtmux;\e\033]1337;SetUserVar=%s=%s\007\e\\' "$1" "$encoded"
-  else
-    printf '\033]1337;SetUserVar=%s=%s\007' "$1" "$encoded"
-  fi
+  termnav_wezterm_user_var_sequence "$1" "$2" auto
 }
 
 _termnav_wezterm_remote_link_host() {
