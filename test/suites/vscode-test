@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# vscode-test — VS Code command bridge: dispatch seam, MCP backend, CLI scripts.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+vscode_command_sh="$TERMNAV_ROOT/lib/termnav/shell/vscode-command.sh"
+
+echo "=== vscode-command.sh: backend dispatch seam ==="
+
+seam_dir=$(_tmpdir)
+cat >"$seam_dir/vscode-backend-fake.sh" <<'EOF'
+# shellcheck shell=bash
+termnav_vscode_fake_execute_command() {
+  printf 'fake-backend-called:%s\n' "$1" >>"$FAKE_BACKEND_LOG"
+  return 0
+}
+EOF
+
+fake_log=$(_tmpdir)/fake-backend.log
+FAKE_BACKEND_LOG="$fake_log" TERMNAV_VSCODE_BACKEND=fake bash -c "
+  . '$vscode_command_sh'
+  # Override the backend lookup directory so the dispatcher finds our fake
+  # backend instead of the real one shipped next to vscode-command.sh.
+  _termnav_vscode_command_dir() { printf '%s\n' '$seam_dir'; }
+  termnav_vscode_execute_command 'workbench.action.nextEditor'
+"
+seam_rc=$?
+_assert_exit "dispatcher: fake backend call succeeds" 0 "$seam_rc"
+_assert_eq "dispatcher: routes to the selected backend, not a hardcoded one" \
+  "fake-backend-called:workbench.action.nextEditor" "$(cat "$fake_log")"
+_assert_eq "dispatcher: does not also call any other backend" \
+  "1" "$(wc -l <"$fake_log" | tr -d ' ')"
+
+set +e
+unknown_result=$(
+  TERMNAV_VSCODE_BACKEND=does-not-exist bash -c "
+    . '$vscode_command_sh'
+    termnav_vscode_execute_command 'workbench.action.nextEditor'
+  "
+)
+unknown_rc=$?
+set -e
+_assert_exit "dispatcher: unknown backend fails closed, not open" 1 "$unknown_rc"
+_assert_eq "dispatcher: unknown backend produces no output" "" "$unknown_result"
+
+_test_summary
