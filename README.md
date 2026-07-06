@@ -18,6 +18,10 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
   parent-tmux bubbling for nested local or remote tmux sessions.
 - `bin/wezterm-move-tab`: request WezTerm tab movement, including parent-tmux
   bubbling for nested local or remote tmux sessions.
+- `bin/vscode-switch-tab`: request a VS Code editor tab switch through the
+  pluggable command-execution bridge.
+- `bin/vscode-move-tab`: request a VS Code editor tab move through the
+  pluggable command-execution bridge.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -33,6 +37,11 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
   setup module and advanced consumers.
 - `lib/termnav/shell/wezterm-vars.sh`: shell helpers for emitting WezTerm
   `SetUserVar` OSC requests with raw or tmux-passthrough framing.
+- `lib/termnav/shell/vscode-command.sh`: dispatch seam for executing a VS
+  Code command by ID through a pluggable backend (`TERMNAV_VSCODE_BACKEND`,
+  default `mcp`).
+- `lib/termnav/shell/vscode-backend-mcp.sh`: default backend, calling the
+  `nabheet.vscode-ide-mcp` extension's local HTTP JSON-RPC API.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
   pane context publishing.
 
@@ -60,6 +69,12 @@ this repo owns reusable route parsing and open-through behavior.
 - `eza` for `eza-nvim-links`.
 - `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
   existing ControlMaster connection.
+- `curl` for `vscode-switch-tab`/`vscode-move-tab`'s default MCP backend.
+- VS Code with the `nabheet.vscode-ide-mcp` extension installed and running,
+  for the VS Code tab bridge. The auth token it reads is written by
+  dotfiles' `vscode.sh` merge hook to
+  `${XDG_STATE_HOME:-$HOME/.local/state}/dot/vscode-mcp-auth-token`; this
+  repo only reads that file, never generates or manages the token.
 - `nvim-remote-pane-host` is an optional extension command for custom
   remote-pane workflows.
 
