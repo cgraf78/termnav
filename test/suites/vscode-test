@@ -114,9 +114,22 @@ _assert_contains "MCP backend: sends bearer auth token" \
 _assert_contains "MCP backend: posts to the default port" \
   "http://127.0.0.1:9876/mcp" "$success_calls"
 _assert_contains "MCP backend: calls execute_command with the requested command id" \
-  '\"command\":\"workbench.action.nextEditor\"' "$success_calls"
+  '"command":"workbench.action.nextEditor"' "$success_calls"
 _assert_contains "MCP backend: bounds every call with a timeout" \
   "--max-time" "$success_calls"
+
+# The mock echoes back the full argv, including the -d payload, wrapped as
+# "<arg1> <arg2> ...". -d is always curl's last argument in
+# _termnav_vscode_mcp_post, so the JSON body is everything between the
+# final "<-d> <" marker and the trailing ">". A plain substring match (like
+# the assertion above) can't catch mis-escaped JSON -- it happily matches
+# broken output such as `\"command\":\"...\"` too. Actually decoding the
+# captured payload with a real JSON parser is what caught the triple-escaped
+# `\\\"` bug that substring assertions missed.
+success_payload="${success_calls#*<-d> <}"
+success_payload="${success_payload%>}"
+printf '%s' "$success_payload" | python3 -c 'import json,sys; json.loads(sys.stdin.read())' 2>/dev/null
+_assert_exit "MCP backend: tools/call request body is valid JSON" 0 "$?"
 
 # Case 3: tools/call errors first (uninitialized session), succeeds after
 # an initialize round-trip.

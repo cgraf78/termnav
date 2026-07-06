@@ -32,7 +32,7 @@ _termnav_vscode_mcp_post() {
   curl -sS --max-time 2 -X POST "http://127.0.0.1:${port}/mcp" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer ${token}" \
-    -d "{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"method\\\":\\\"${method}\\\",\\\"params\\\":${params}}"
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\",\"params\":${params}}"
 }
 
 # Tries tools/call directly first (the server's documented "direct POST,
@@ -47,13 +47,13 @@ termnav_vscode_mcp_execute_command() {
 
   # Construct call params with escaped quotes so the entire JSON-RPC
   # payload has consistent escaping when passed to curl.
-  call_params=$(printf '{\\\"name\\\":\\\"execute_command\\\",\\\"arguments\\\":{\\\"command\\\":\\\"%s\\\"}}' "$command_id")
+  call_params=$(printf '{\"name\":\"execute_command\",\"arguments\":{\"command\":\"%s\"}}' "$command_id")
 
   response="$(_termnav_vscode_mcp_post 'tools/call' "$call_params" "$token" "$port")" || return 1
   [[ -n "$response" ]] || return 1
   [[ "$response" == *'"error"'* ]] || return 0
 
-  _termnav_vscode_mcp_post 'initialize' '{\\\"protocolVersion\\\":\\\"2024-11-05\\\",\\\"capabilities\\\":{}}' "$token" "$port" >/dev/null || return 1
+  _termnav_vscode_mcp_post 'initialize' '{"protocolVersion":"2024-11-05","capabilities":{}}' "$token" "$port" >/dev/null || return 1
   response="$(_termnav_vscode_mcp_post 'tools/call' "$call_params" "$token" "$port")" || return 1
   [[ -n "$response" && "$response" != *'"error"'* ]]
 }
