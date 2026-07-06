@@ -45,7 +45,8 @@ termnav_vscode_mcp_execute_command() {
   token="$(_termnav_vscode_mcp_auth_token)" || return 1
   port="$(_termnav_vscode_mcp_port)"
 
-  # Escape the command ID for JSON by replacing quotes
+  # Construct call params with escaped quotes so the entire JSON-RPC
+  # payload has consistent escaping when passed to curl.
   call_params=$(printf '{\\\"name\\\":\\\"execute_command\\\",\\\"arguments\\\":{\\\"command\\\":\\\"%s\\\"}}' "$command_id")
 
   response="$(_termnav_vscode_mcp_post 'tools/call' "$call_params" "$token" "$port")" || return 1
