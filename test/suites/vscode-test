@@ -50,4 +50,188 @@ set -e
 _assert_exit "dispatcher: unknown backend fails closed, not open" 1 "$unknown_rc"
 _assert_eq "dispatcher: unknown backend produces no output" "" "$unknown_result"
 
+echo
+echo "=== vscode-backend-mcp.sh: MCP HTTP backend ==="
+
+vscode_backend_mcp_sh="$TERMNAV_ROOT/lib/termnav/shell/vscode-backend-mcp.sh"
+
+_mcp_test_home() {
+  local home token_dir
+  home=$(_tmpdir)
+  token_dir="$home/.local/state/dot"
+  mkdir -p "$token_dir"
+  printf 'test-token-abc123\n' >"$token_dir/vscode-mcp-auth-token"
+  printf '%s\n' "$home"
+}
+
+# Case 1: auth token missing -- must fail fast, no curl invocation at all.
+no_token_home=$(_tmpdir)
+mock_bin=$(_tmpdir)
+cat >"$mock_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'curl called\n' >>"$CURL_CALL_LOG"
+exit 1
+EOF
+chmod +x "$mock_bin/curl"
+curl_call_log=$(_tmpdir)/no-token-curl.log
+set +e
+HOME="$no_token_home" CURL_CALL_LOG="$curl_call_log" PATH="$mock_bin:$PATH" bash -c "
+  . '$vscode_command_sh'
+  . '$vscode_backend_mcp_sh'
+  termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+"
+no_token_rc=$?
+set -e
+_assert_exit "MCP backend: missing auth token fails" 1 "$no_token_rc"
+_assert_file_missing "MCP backend: missing auth token never invokes curl" "$curl_call_log"
+
+# Case 2: successful direct tools/call (no initialize needed).
+success_home=$(_mcp_test_home)
+mock_bin=$(_tmpdir)
+cat >"$mock_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'argv:'
+  printf ' <%s>' "$@"
+  printf '\n'
+} >>"$CURL_CALL_LOG"
+printf '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}'
+EOF
+chmod +x "$mock_bin/curl"
+success_log=$(_tmpdir)/success-curl.log
+HOME="$success_home" CURL_CALL_LOG="$success_log" PATH="$mock_bin:$PATH" bash -c "
+  . '$vscode_command_sh'
+  . '$vscode_backend_mcp_sh'
+  termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+"
+success_rc=$?
+_assert_exit "MCP backend: successful direct tools/call returns success" 0 "$success_rc"
+success_calls=$(cat "$success_log")
+_assert_eq "MCP backend: exactly one curl call when no initialize is needed" \
+  "1" "$(printf '%s\n' "$success_calls" | grep -c '^argv:')"
+_assert_contains "MCP backend: sends bearer auth token" \
+  "Authorization: Bearer test-token-abc123" "$success_calls"
+_assert_contains "MCP backend: posts to the default port" \
+  "http://127.0.0.1:9876/mcp" "$success_calls"
+_assert_contains "MCP backend: calls execute_command with the requested command id" \
+  '\"command\":\"workbench.action.nextEditor\"' "$success_calls"
+_assert_contains "MCP backend: bounds every call with a timeout" \
+  "--max-time" "$success_calls"
+
+# Case 3: tools/call errors first (uninitialized session), succeeds after
+# an initialize round-trip.
+init_home=$(_mcp_test_home)
+mock_bin=$(_tmpdir)
+call_count_file=$(_tmpdir)/call-count
+printf '0\n' >"$call_count_file"
+cat >"$mock_bin/curl" <<EOF
+#!/usr/bin/env bash
+{
+  printf 'argv:'
+  printf ' <%s>' "\$@"
+  printf '\n'
+} >>"\$CURL_CALL_LOG"
+count=\$(cat "$call_count_file")
+count=\$((count + 1))
+printf '%s\n' "\$count" >"$call_count_file"
+case "\$*" in
+  *tools/call*)
+    if [[ "\$count" -eq 1 ]]; then
+      printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"not initialized"}}'
+    else
+      printf '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}'
+    fi
+    ;;
+  *initialize*)
+    printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}'
+    ;;
+esac
+EOF
+chmod +x "$mock_bin/curl"
+init_log=$(_tmpdir)/init-curl.log
+HOME="$init_home" CURL_CALL_LOG="$init_log" PATH="$mock_bin:$PATH" bash -c "
+  . '$vscode_command_sh'
+  . '$vscode_backend_mcp_sh'
+  termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+"
+init_rc=$?
+_assert_exit "MCP backend: succeeds after falling back to initialize" 0 "$init_rc"
+init_calls=$(cat "$init_log")
+_assert_eq "MCP backend: three calls total (tools/call, initialize, tools/call retry)" \
+  "3" "$(printf '%s\n' "$init_calls" | grep -c '^argv:')"
+_assert_contains "MCP backend: retries tools/call after initialize succeeds" \
+  "initialize" "$init_calls"
+
+# Case 4: tools/call fails even after the initialize retry.
+persistent_fail_home=$(_mcp_test_home)
+mock_bin=$(_tmpdir)
+cat >"$mock_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+{
+  printf 'argv:'
+  printf ' <%s>' "$@"
+  printf '\n'
+} >>"$CURL_CALL_LOG"
+case "$*" in
+  *tools/call*)
+    printf '{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"still broken"}}'
+    ;;
+  *initialize*)
+    printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}'
+    ;;
+esac
+EOF
+chmod +x "$mock_bin/curl"
+persistent_fail_log=$(_tmpdir)/persistent-fail-curl.log
+set +e
+HOME="$persistent_fail_home" CURL_CALL_LOG="$persistent_fail_log" PATH="$mock_bin:$PATH" bash -c "
+  . '$vscode_command_sh'
+  . '$vscode_backend_mcp_sh'
+  termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+"
+persistent_fail_rc=$?
+set -e
+_assert_exit "MCP backend: fails when tools/call errors even after initialize" 1 "$persistent_fail_rc"
+
+# Case 5: curl itself fails (connection refused) -- no retry attempted.
+refused_home=$(_mcp_test_home)
+mock_bin=$(_tmpdir)
+cat >"$mock_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'argv: <%s>\n' "$*" >>"$CURL_CALL_LOG"
+exit 7
+EOF
+chmod +x "$mock_bin/curl"
+refused_log=$(_tmpdir)/refused-curl.log
+set +e
+HOME="$refused_home" CURL_CALL_LOG="$refused_log" PATH="$mock_bin:$PATH" bash -c "
+  . '$vscode_command_sh'
+  . '$vscode_backend_mcp_sh'
+  termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+"
+refused_rc=$?
+set -e
+_assert_exit "MCP backend: connection refused fails without retrying" 1 "$refused_rc"
+refused_calls=$(cat "$refused_log")
+_assert_eq "MCP backend: exactly one attempt when curl itself fails" \
+  "1" "$(printf '%s\n' "$refused_calls" | grep -c '^argv:')"
+
+# Case 6: VSCODE_MCP_PORT override changes the target URL.
+port_home=$(_mcp_test_home)
+mock_bin=$(_tmpdir)
+cat >"$mock_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'argv: <%s>\n' "$*" >>"$CURL_CALL_LOG"
+printf '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}'
+EOF
+chmod +x "$mock_bin/curl"
+port_log=$(_tmpdir)/port-curl.log
+HOME="$port_home" CURL_CALL_LOG="$port_log" VSCODE_MCP_PORT=9999 PATH="$mock_bin:$PATH" bash -c "
+  . '$vscode_command_sh'
+  . '$vscode_backend_mcp_sh'
+  termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+"
+_assert_contains "MCP backend: honors VSCODE_MCP_PORT override" \
+  "http://127.0.0.1:9999/mcp" "$(cat "$port_log")"
+
 _test_summary
