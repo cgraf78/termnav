@@ -248,10 +248,9 @@ _assert_contains "MCP backend: honors VSCODE_MCP_PORT override" \
   "http://127.0.0.1:9999/mcp" "$(cat "$port_log")"
 
 echo
-echo "=== vscode-switch-tab / vscode-move-tab: CLI scripts ==="
+echo "=== vscode-switch-tab: CLI script ==="
 
 vscode_switch_tab="$TERMNAV_ROOT/bin/vscode-switch-tab"
-vscode_move_tab="$TERMNAV_ROOT/bin/vscode-move-tab"
 
 set +e
 switch_help=$("$vscode_switch_tab" --help 2>&1)
@@ -259,13 +258,6 @@ switch_help_rc=$?
 set -e
 _assert_exit "vscode-switch-tab: help exits successfully" 0 "$switch_help_rc"
 _assert_contains "vscode-switch-tab: usage text" "usage: vscode-switch-tab" "$switch_help"
-
-set +e
-move_help=$("$vscode_move_tab" --help 2>&1)
-move_help_rc=$?
-set -e
-_assert_exit "vscode-move-tab: help exits successfully" 0 "$move_help_rc"
-_assert_contains "vscode-move-tab: usage text" "usage: vscode-move-tab" "$move_help"
 
 # Isolate CLI direction->command-id mapping with a fake `curl` standing in
 # for the real MCP endpoint, reusing the same technique as Task 2's MCP
@@ -287,15 +279,8 @@ mapping_log=$(_tmpdir)/mapping.log
 : >"$mapping_log"
 HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" "$vscode_switch_tab" next
 HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" "$vscode_switch_tab" previous
-_assert_eq "vscode-switch-tab: next maps to nextEditor, previous to previousEditor" \
-  "$(printf '"command":"workbench.action.nextEditor"\n"command":"workbench.action.previousEditor"')" \
-  "$(grep -oE '"command":"[^"]+"' "$mapping_log")"
-
-: >"$mapping_log"
-HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" "$vscode_move_tab" left
-HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" "$vscode_move_tab" right
-_assert_eq "vscode-move-tab: left maps to moveEditorLeftInGroup, right to moveEditorRightInGroup" \
-  "$(printf '"command":"workbench.action.moveEditorLeftInGroup"\n"command":"workbench.action.moveEditorRightInGroup"')" \
+_assert_eq "vscode-switch-tab: next/previous map to terminal focusNext/focusPrevious" \
+  "$(printf '"command":"workbench.action.terminal.focusNext"\n"command":"workbench.action.terminal.focusPrevious"')" \
   "$(grep -oE '"command":"[^"]+"' "$mapping_log")"
 
 set +e
@@ -311,7 +296,6 @@ echo "=== shdeps-installed symlink entry points (vscode) ==="
 vscode_symlink_bin=$(_tmpdir)/bin
 mkdir -p "$vscode_symlink_bin"
 ln -s "$vscode_switch_tab" "$vscode_symlink_bin/vscode-switch-tab"
-ln -s "$vscode_move_tab" "$vscode_symlink_bin/vscode-move-tab"
 
 set +e
 symlink_switch_help=$("$vscode_symlink_bin/vscode-switch-tab" --help 2>&1)
@@ -320,13 +304,5 @@ set -e
 _assert_exit "vscode-switch-tab symlink: help exits successfully" 0 "$symlink_switch_rc"
 _assert_contains "vscode-switch-tab symlink: resolves dependency libraries" \
   "usage: vscode-switch-tab" "$symlink_switch_help"
-
-set +e
-symlink_move_help=$("$vscode_symlink_bin/vscode-move-tab" --help 2>&1)
-symlink_move_rc=$?
-set -e
-_assert_exit "vscode-move-tab symlink: help exits successfully" 0 "$symlink_move_rc"
-_assert_contains "vscode-move-tab symlink: resolves dependency libraries" \
-  "usage: vscode-move-tab" "$symlink_move_help"
 
 _test_summary

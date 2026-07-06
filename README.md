@@ -18,10 +18,10 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
   parent-tmux bubbling for nested local or remote tmux sessions.
 - `bin/wezterm-move-tab`: request WezTerm tab movement, including parent-tmux
   bubbling for nested local or remote tmux sessions.
-- `bin/vscode-switch-tab`: request a VS Code editor tab switch through the
-  pluggable command-execution bridge.
-- `bin/vscode-move-tab`: request a VS Code editor tab move through the
-  pluggable command-execution bridge.
+- `bin/vscode-switch-tab`: request a VS Code integrated-terminal tab switch
+  through the pluggable command-execution bridge. There is no matching
+  move/reorder command because VS Code exposes no command to reorder
+  terminal tabs (drag-only).
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -69,7 +69,7 @@ this repo owns reusable route parsing and open-through behavior.
 - `eza` for `eza-nvim-links`.
 - `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
   existing ControlMaster connection.
-- `curl` for `vscode-switch-tab`/`vscode-move-tab`'s default MCP backend.
+- `curl` for `vscode-switch-tab`'s default MCP backend.
 - VS Code with the `nabheet.vscode-ide-mcp` extension installed and running,
   for the VS Code tab bridge. The auth token it reads is written by
   dotfiles' `vscode.sh` merge hook to

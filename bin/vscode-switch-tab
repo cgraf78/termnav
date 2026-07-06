@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ask VS Code to switch the active editor tab.
+# Ask VS Code to switch the focused integrated-terminal tab.
 
 set -euo pipefail
 
@@ -35,9 +35,11 @@ _usage() {
 usage: vscode-switch-tab [next|previous]
 
 Ask VS Code (via its pluggable command-execution bridge) to switch the
-active editor tab. tmux/Neovim bindings are the common caller, invoked when
-there is nothing left to switch locally and the outer terminal is VS Code's
-integrated terminal.
+focused integrated-terminal tab. tmux/Neovim bindings are the common
+caller, invoked when there is nothing left to switch locally and the outer
+terminal is VS Code's integrated terminal. With a single terminal open the
+command is a silent no-op, matching how every other tab layer behaves when
+it has nothing left to switch.
 
 Arguments:
   next|previous      Direction to switch. Defaults to next.
@@ -73,7 +75,7 @@ while (($#)); do
   esac
 done
 
-command_id="workbench.action.nextEditor"
-[[ "$direction" == "previous" ]] && command_id="workbench.action.previousEditor"
+command_id="workbench.action.terminal.focusNext"
+[[ "$direction" == "previous" ]] && command_id="workbench.action.terminal.focusPrevious"
 
 termnav_vscode_execute_command "$command_id"
