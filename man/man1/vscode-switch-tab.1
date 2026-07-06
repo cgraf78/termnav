@@ -1,0 +1,50 @@
+.TH VSCODE-SWITCH-TAB 1 "2026-07-06" "termnav" "User Commands"
+.SH NAME
+vscode-switch-tab \- request a VS Code editor tab switch
+.SH SYNOPSIS
+.B vscode-switch-tab
+.RI [ next | previous ]
+.SH DESCRIPTION
+.B vscode-switch-tab
+asks VS Code, through its pluggable command-execution bridge (see
+.B TERMNAV_VSCODE_BACKEND
+below), to switch the active editor tab. Consumers such as tmux and Neovim
+call this when the focused application cannot handle the key itself and
+there is nothing left to switch locally.
+.PP
+Fails silently (non-zero exit, no output) if the bridge is unreachable --
+this is expected whenever VS Code is not the terminal you're actually
+attached to, or its command-execution extension isn't running.
+.SH ARGUMENTS
+.TP
+.B next
+Switch to the next editor tab. This is the default.
+.TP
+.B previous
+Switch to the previous editor tab.
+.SH OPTIONS
+.TP
+.B -h, --help
+Show command help.
+.SH ENVIRONMENT
+.TP
+.B TERMNAV_VSCODE_BACKEND
+Selects the command-execution backend. Defaults to
+.BR mcp .
+.TP
+.B VSCODE_MCP_PORT
+Overrides the MCP backend's target port. Defaults to
+.BR 9876 .
+.SH EXIT STATUS
+.TP
+.B 0
+The command was executed.
+.TP
+.B 1
+The bridge was unreachable or the command failed.
+.TP
+.B 2
+Usage error.
+.SH SEE ALSO
+.BR vscode-move-tab (1),
+.BR wezterm-switch-tab (1)
