@@ -17,3 +17,22 @@ jobs:
     with:
       profiles: base,lua,neovim,tmux,python,openssh-netcat-lsof
       test-command: test/termnav-test
+
+  eza-current:
+    name: Current eza compatibility / Arch
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install test dependencies
+        run: |
+          pacman-key --init
+          pacman-key --populate
+          pacman -Syu --noconfirm bash eza git lua python
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Exercise current eza CLI
+        shell: bash
+        run: test/suites/wezterm-test
