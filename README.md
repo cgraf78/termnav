@@ -108,6 +108,10 @@ Run tests with:
 ./test/termnav-test
 ```
 
+CI also runs the WezTerm suite against Arch's current `eza` package so changes
+to the optional `--hyperlink` argument cannot be hidden by the suite's
+missing-tool skip on other platforms.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).

@@ -32,8 +32,16 @@ lib_dir="${script_dir%/bin}/lib/termnav"
 
 host=$(nvim_link_context_remote_host || true)
 
+# eza 0.23.5 changed --hyperlink from a boolean flag to an optional WHEN
+# argument. Probe the machine-readable exit status instead of parsing version
+# text so distro-packaged legacy releases keep working.
+hyperlink_arg=--hyperlink
+if eza --hyperlink=always --version >/dev/null 2>&1; then
+  hyperlink_arg=--hyperlink=always
+fi
+
 if [[ -z "$host" ]]; then
-  exec eza --hyperlink "$@"
+  exec eza "$hyperlink_arg" "$@"
 fi
 
 has_layout_arg() {
@@ -83,7 +91,7 @@ rewrite_remote_file_links() {
 }
 
 export TERMNAV_REMOTE_LINK_HOST="$host"
-eza_args=(--hyperlink)
+eza_args=("$hyperlink_arg")
 if [[ -t 1 || "${TERMNAV_EZA_NVIM_LINKS_FORCE_TTY:-0}" = 1 ]]; then
   # Remote sessions need the pipe below so we can rewrite OSC-8 file:// links
   # with the remote host. Since that pipe hides the real terminal from eza,

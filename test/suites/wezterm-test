@@ -48,6 +48,9 @@ ln -s "$wezterm_switch_tab" "$symlink_bin/wezterm-switch-tab"
 ln -s "$wezterm_move_tab" "$symlink_bin/wezterm-move-tab"
 cat >"$mock_bin/eza" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${EZA_MOCK_LEGACY:-0}" = 1 && "$*" == "--hyperlink=always --version" ]]; then
+  exit 3
+fi
 printf 'eza'
 for arg in "$@"; do
   printf ' <%s>' "$arg"
@@ -90,7 +93,16 @@ _assert_contains "nvim-tmux-open symlink: usage comes from dependency" \
   "usage: nvim-tmux-open" "$symlink_usage"
 
 symlink_eza=$(PATH="$mock_bin:$PATH" "$symlink_bin/eza-nvim-links" --all)
-_assert_eq "eza-nvim-links symlink: resolves dependency library" "eza <--hyperlink> <--all>" "$symlink_eza"
+_assert_eq "eza-nvim-links symlink: resolves dependency library" \
+  "eza <--hyperlink=always> <--all>" "$symlink_eza"
+
+legacy_eza=$(
+  EZA_MOCK_LEGACY=1 \
+    PATH="$mock_bin:$PATH" \
+    "$symlink_bin/eza-nvim-links" /tmp/listed
+)
+_assert_eq "eza-nvim-links symlink: falls back for legacy eza" \
+  "eza <--hyperlink> </tmp/listed>" "$legacy_eza"
 
 symlink_host=$(TERMNAV_REMOTE_LINK_HOST=remote.example "$symlink_bin/nvim-link-host")
 _assert_eq "nvim-link-host symlink: resolves dependency libraries" \
@@ -773,10 +785,13 @@ if command -v eza >/dev/null 2>&1; then
   mkdir -p "$eza_tmp/listed"
   touch "$eza_tmp/listed/README.md"
   eza_target=$(realpath "$eza_tmp/listed/README.md")
-  eza_output=$(eza --hyperlink "$eza_tmp/listed")
-  _assert_contains "eza emits OSC-8 file:// targets when output is piped" \
+  eza_output=$(
+    env -u TERMNAV_REMOTE_LINK_HOST -u SSH_CONNECTION -u TMUX \
+      "$eza_linker" "$eza_tmp/listed"
+  )
+  _assert_contains "eza wrapper emits OSC-8 file:// targets when output is piped" \
     "]8;;file://" "$eza_output"
-  _assert_contains "eza hyperlink target keeps the listed directory" \
+  _assert_contains "eza wrapper hyperlink target keeps the listed directory" \
     "$eza_target" "$eza_output"
 else
   echo "  - skipping eza OSC-8 smoke test (eza not installed)"
