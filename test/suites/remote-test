@@ -17,6 +17,8 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 . "$TERMNAV_TEST_DIR/helpers.sh"
 
 lib_dir="$TERMNAV_ROOT/lib/termnav/nvim-open"
+# shellcheck source=../../lib/termnav/remote-command.sh
+. "${lib_dir%/nvim-open}/remote-command.sh"
 # shellcheck source=../../lib/termnav/nvim-open/common.sh
 . "$lib_dir/common.sh"
 # shellcheck source=../../lib/termnav/nvim-open/remote.sh
@@ -47,6 +49,37 @@ else
 fi
 
 echo "=== process-tree fallback ==="
+
+process_snapshot='999 1 999 999 ssh ssh unrelated.example
+201 100 201 210 ssh ssh background.example
+211 210 210 210 sleep sleep 30
+210 100 210 210 /usr/bin/ssh ssh dev1
+100 1 100 210 zsh -zsh'
+_assert_eq "process snapshot: selects the foreground descendant transport" \
+  "ssh dev1" \
+  "$(printf '%s\n' "$process_snapshot" | nvim_open_pane_process_from_snapshot 100 ssh)"
+
+shuffled_snapshot='210 100 210 210 /usr/bin/ssh ssh dev1
+100 1 100 210 zsh -zsh
+201 100 201 210 ssh ssh background.example
+999 1 999 999 ssh ssh unrelated.example'
+_assert_eq "process snapshot: selection does not depend on ps row order" \
+  "ssh dev1" \
+  "$(printf '%s\n' "$shuffled_snapshot" | nvim_open_pane_process_from_snapshot 100 ssh)"
+
+if process=$(
+  printf '%s\n' '300 301 300 300 ssh ssh cycle.example' \
+    '301 300 300 300 zsh zsh' |
+    nvim_open_pane_process_from_snapshot 100 ssh
+); then
+  if [[ -n "$process" ]]; then
+    _fail "process snapshot: cyclic unrelated ancestry must fail closed (got '$process')"
+  else
+    _pass "process snapshot: cyclic unrelated ancestry fails closed"
+  fi
+else
+  _pass "process snapshot: cyclic unrelated ancestry fails closed"
+fi
 
 # Simulate the interactive-pane reality: start_command is the login shell, but
 # the live process tree holds the typed `ssh dev1`. Stub the process-tree
@@ -83,6 +116,27 @@ if host=$(nvim_open_remote_host_from_command ssh "exec /usr/bin/zsh -l" 12345); 
 else
   _pass "host_from_command: bare shell pane reports no host"
 fi
+
+echo "=== remote command resolution ==="
+
+remote_bin="$(_tmpdir)/custom-bin"
+remote_log="$(_tmpdir)/remote-opener.log"
+mkdir -p "$remote_bin"
+cat >"$remote_bin/nvim-tmux-open" <<'EOF'
+#!/bin/sh
+printf '<%s>\n' "$@" >"$TERMNAV_REMOTE_TEST_LOG"
+EOF
+chmod +x "$remote_bin/nvim-tmux-open"
+remote_command=$(termnav_remote_nvim_command tmux-link "/tmp/a b's.txt:4")
+TERMNAV_REMOTE_TEST_LOG="$remote_log" PATH="$remote_bin:/usr/bin:/bin" \
+  /bin/sh -c "$remote_command"
+_assert_eq "remote command: respects a custom install already on PATH" \
+  "$(printf '<tmux-link>\n</tmp/a b'\''s.txt:4>')" "$(cat "$remote_log")"
+
+missing_home="$(_tmpdir)"
+HOME="$missing_home" PATH="/usr/bin:/bin" /bin/sh -c "$remote_command" >/dev/null 2>&1
+remote_missing_rc=$?
+_assert_exit "remote command: missing opener exits 127" 127 "$remote_missing_rc"
 
 echo "=== nvim_open_tmux_send: no-RPC :edit fallback ==="
 

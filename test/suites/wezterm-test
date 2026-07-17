@@ -118,6 +118,12 @@ _assert_contains "nvim-ssh-control-open symlink: checks existing control master"
   "<-O> <check> <remote.example>" "$(cat "$ssh_control_log")"
 _assert_contains "nvim-ssh-control-open symlink: runs remote nvim opener" \
   "nvim-tmux-open" "$(cat "$ssh_control_log")"
+# shellcheck disable=SC2016 # Assertions inspect remote-shell source text.
+_assert_contains "nvim-ssh-control-open symlink: augments the remote PATH" \
+  'PATH="$PATH:$HOME/.local/bin' "$(cat "$ssh_control_log")"
+# shellcheck disable=SC2016 # Assertions inspect remote-shell source text.
+_assert_not_contains "nvim-ssh-control-open symlink: does not pin the opener path" \
+  '$HOME/.local/bin/nvim-tmux-open' "$(cat "$ssh_control_log")"
 
 : >"$ssh_control_log"
 set +e
@@ -387,6 +393,7 @@ route_lua_test=$(_tmpdir)/route-test.lua
 cat >"$route_lua_test" <<'EOF'
 local route_path = arg[1]
 local fixture_path = arg[2]
+local expected_remote_path_command = arg[3]
 local calls = {}
 local sent_text = {}
 local child_calls = {}
@@ -425,6 +432,11 @@ local function check(name, ok)
     error(name, 0)
   end
 end
+
+check(
+  "shell and lua remote PATH policy stays aligned",
+  routes.remote_path_command() == expected_remote_path_command
+)
 
 local function pane(vars, cwd_uri, opts)
   opts = opts or {}
@@ -608,7 +620,7 @@ flush_timers()
 check("direct remote nvim-open sends remote tmux command", sent_text[2]:find("run%-shell ") == 1)
 check(
   "direct remote nvim-open includes resolved target",
-  sent_text[2]:find("~/.local/bin/nvim-tmux-open tmux-link '/remote/repo/src/main.lua:12'", 1, true) ~= nil
+  sent_text[2]:find("command nvim-tmux-open tmux-link '/remote/repo/src/main.lua:12'", 1, true) ~= nil
 )
 
 calls = {}
@@ -756,9 +768,16 @@ check("remote file URI passes host", last_context() == "remote.example")
 
 print("ok")
 EOF
+shell_remote_command=$(
+  # shellcheck source=../../lib/termnav/remote-command.sh
+  . "$TERMNAV_ROOT/lib/termnav/remote-command.sh"
+  termnav_remote_nvim_command tmux-link fixture
+)
+shell_remote_path_command="${shell_remote_command%%; command -v*}"
 if ! route_lua_output=$(_run_lua "$route_lua_test" \
   "$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua" \
-  "$TERMNAV_TEST_DIR/fixtures/nvim-link-routes.tsv"); then
+  "$TERMNAV_TEST_DIR/fixtures/nvim-link-routes.tsv" \
+  "$shell_remote_path_command"); then
   _fail "wezterm route behavior test requires lua or nvim"
   route_lua_output=""
 fi
