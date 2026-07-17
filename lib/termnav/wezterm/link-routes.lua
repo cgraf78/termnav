@@ -163,8 +163,23 @@ function M.new(wezterm)
     return '"' .. tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
   end
 
+  function routes.helper_command(name)
+    local bin_dir = os.getenv("TERMNAV_BIN_DIR")
+    if bin_dir and bin_dir ~= "" then
+      return bin_dir:gsub("/$", "") .. "/" .. name
+    end
+    return name
+  end
+
+  function routes.remote_path_command()
+    return 'PATH="$PATH:$HOME/.local/bin:$HOME/.local/share/mise/shims:'
+      .. '/opt/homebrew/bin:/usr/local/bin"; export PATH'
+  end
+
   function routes.remote_tmux_open_command(path_info)
-    local shell_command = "~/.local/bin/nvim-tmux-open tmux-link " .. routes.shell_quote(path_info)
+    local shell_command = routes.remote_path_command()
+      .. "; command nvim-tmux-open tmux-link "
+      .. routes.shell_quote(path_info)
     return "run-shell " .. routes.tmux_double_quote(shell_command)
   end
 
@@ -211,7 +226,7 @@ function M.new(wezterm)
     end
 
     local ok = wezterm.run_child_process({
-      os.getenv("HOME") .. "/.local/bin/nvim-ssh-control-open",
+      routes.helper_command("nvim-ssh-control-open"),
       remote_host,
       path_info,
     })
@@ -257,7 +272,7 @@ function M.new(wezterm)
 
   function routes.open_in_nvim(window, pane, path_info)
     routes.run_nvim_helper(window, {
-      os.getenv("HOME") .. "/.local/bin/nvim-tmux-open",
+      routes.helper_command("nvim-tmux-open"),
       "link",
       path_info,
       routes.pane_link_cwd(pane),
@@ -283,7 +298,7 @@ function M.new(wezterm)
     -- bytes directly through a local tmux pane would be consumed locally
     -- instead of reaching the remote tmux session.
     routes.run_nvim_helper(window, {
-      os.getenv("HOME") .. "/.local/bin/nvim-tmux-open",
+      routes.helper_command("nvim-tmux-open"),
       "link",
       path_info,
       "",

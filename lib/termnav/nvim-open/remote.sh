@@ -75,60 +75,80 @@ nvim_open_remote_host_from_positional_command() {
   nvim_open_remote_candidate "${words[0]}"
 }
 
-nvim_open_pane_process_command() {
+nvim_open_pane_process_from_snapshot() {
   local pane_pid="$1" pane_command="$2"
 
   [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
 
-  # tmux's pane_start_command is the command that created the pane. For
-  # interactive shells, the active remote transport is usually a descendant
-  # process typed later at the prompt, so inspect the pane process tree too.
-  ps -axww -o pid= -o ppid= -o command= 2>/dev/null |
-    awk -v root="$pane_pid" -v want="$pane_command" '
-      function basename(command, parts, first) {
-        split(command, parts, /[[:space:]]+/)
-        first = parts[1]
-        sub(/^.*\//, "", first)
-        return first
+  awk -v root="$pane_pid" -v want="$pane_command" '
+      function depth(pid, current, steps) {
+        current = pid
+        for (steps = 0; steps <= count; steps++) {
+          if (current == root) {
+            return steps
+          }
+          if (!(current in parent)) {
+            return -1
+          }
+          current = parent[current]
+        }
+        return -1
       }
 
       {
         pid = $1
         ppid = $2
+        pgid = $3
+        tpgid = $4
+        executable = $5
+        if (pid !~ /^[0-9]+$/ || ppid !~ /^[0-9]+$/ ||
+            pgid !~ /^-?[0-9]+$/ || tpgid !~ /^-?[0-9]+$/ || executable == "") {
+          next
+        }
         $1 = ""
         $2 = ""
+        $3 = ""
+        $4 = ""
+        $5 = ""
         sub(/^[[:space:]]+/, "")
-        command[pid] = $0
+        args[pid] = $0
         parent[pid] = ppid
+        process_group[pid] = pgid
+        foreground_group[pid] = tpgid
+        sub(/^.*\//, "", executable)
+        name[pid] = executable
         pids[++count] = pid
       }
 
       END {
         for (i = 1; i <= count; i++) {
           pid = pids[i]
-          if (pid == root) {
-            descendant[pid] = 1
-            continue
-          }
-          parent_pid = pid
-          while (parent_pid in parent) {
-            if (parent[parent_pid] == root) {
-              descendant[pid] = 1
-              break
-            }
-            parent_pid = parent[parent_pid]
+          candidate_depth = depth(pid)
+          if (candidate_depth >= 0 && name[pid] == want &&
+              foreground_group[pid] > 0 && process_group[pid] == foreground_group[pid] &&
+              (candidate_depth > best_depth ||
+               (candidate_depth == best_depth && pid + 0 > best_pid + 0))) {
+            best_depth = candidate_depth
+            best_pid = pid
           }
         }
-
-        for (i = 1; i <= count; i++) {
-          pid = pids[i]
-          if (descendant[pid] && basename(command[pid]) == want) {
-            print command[pid]
-          }
+        if (best_pid != "") {
+          print args[best_pid]
         }
       }
-    ' |
-    tail -1
+    '
+}
+
+nvim_open_pane_process_command() {
+  local pane_pid="$1" pane_command="$2"
+
+  # tmux's pane_start_command is the command that created the pane. For
+  # interactive shells, the active remote transport is usually the foreground
+  # descendant process typed later at the prompt. `comm` identifies the
+  # executable without parsing display text, and process groups distinguish a
+  # foreground transport from stale or background siblings.
+  ps -axww -o pid= -o ppid= -o pgid= -o tpgid= -o comm= -o args= 2>/dev/null |
+    nvim_open_pane_process_from_snapshot "$pane_pid" "$pane_command"
 }
 
 nvim_open_remote_host_from_extension_command() {
@@ -208,7 +228,7 @@ nvim_open_remote_controlmaster() {
 nvim_open_remote_tmux_fallback() {
   local remote_host="$1" input="$2" tmux_panes="$3"
   local pane_command pane_id pane_pid pane_start_command remote_pane=""
-  local quoted_command quoted_input shell_command
+  local quoted_command shell_command
 
   # Find a local tmux pane running a known remote session. Local extensions can
   # teach this helper about extra transports with `nvim-remote-pane-host`.
@@ -231,11 +251,10 @@ nvim_open_remote_tmux_fallback() {
   # remote command prompt time to initialize.
   tmux send-keys -t "$remote_pane" C-b :
   sleep 0.15
-  quoted_input=$(nvim_open_shell_quote "$input")
   # This command executes inside the remote tmux server. Use the same
   # user-facing wrapper as local tmux clicks so a missing remote nvim produces a
   # status message instead of a raw `run-shell` failure.
-  shell_command="\$HOME/.local/bin/nvim-tmux-open tmux-link ${quoted_input}"
+  shell_command=$(termnav_remote_nvim_command tmux-link "$input")
   quoted_command=$(nvim_open_tmux_quote "$shell_command")
   tmux send-keys -t "$remote_pane" -l "run-shell ${quoted_command}"
   tmux send-keys -t "$remote_pane" Enter

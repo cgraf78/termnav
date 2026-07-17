@@ -3,6 +3,28 @@
 
 set -o pipefail
 
+_termnav_script_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_termnav_script_dir() {
+  local path="$1" dir link
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_termnav_script_parent "$path")" && pwd) || return 1
+    link=$(readlink "$path") || return 1
+    [[ "$link" == /* ]] || link="$dir/$link"
+    path="$link"
+  done
+  cd -P -- "$(_termnav_script_parent "$path")" && pwd
+}
+
+script_dir=$(_termnav_script_dir "${BASH_SOURCE[0]}") || exit 2
+# shellcheck source=../lib/termnav/remote-command.sh
+. "${script_dir%/bin}/lib/termnav/remote-command.sh" || exit 2
+
 host="${1:-}"
 target="${2:-}"
 
@@ -37,10 +59,6 @@ if ! host_allowed; then
   exit 13
 fi
 
-shell_quote() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
-
 ssh_common_opts=(
   -o BatchMode=yes
   -o ConnectTimeout=1
@@ -57,7 +75,7 @@ if ! ssh "${ssh_common_opts[@]}" -O check "$host" >/dev/null 2>&1; then
   exit 10
 fi
 
-remote_command="\"\$HOME/.local/bin/nvim-tmux-open\" link $(shell_quote "$target") '' terminal"
+remote_command=$(termnav_remote_nvim_command link "$target" "" terminal)
 # shellcheck disable=SC2029 # remote_command is built for the remote shell.
 if ssh "${ssh_common_opts[@]}" "$host" "$remote_command"; then
   exit 0

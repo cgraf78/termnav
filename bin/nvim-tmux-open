@@ -9,6 +9,9 @@
 set -o pipefail
 
 # GUI apps and remote noninteractive ssh commands don't inherit shell PATH.
+# Prefer the user's toolchain when a stripped GUI PATH also exposes older
+# system binaries. Remote command routing separately preserves its remote PATH
+# first so custom server-side installs remain authoritative.
 PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 _termnav_script_parent() {
@@ -35,6 +38,8 @@ script_dir=$(_termnav_script_dir "${BASH_SOURCE[0]}") || {
 }
 lib_dir="${script_dir%/bin}/lib/termnav/nvim-open"
 
+# shellcheck source=../lib/termnav/remote-command.sh
+. "${lib_dir%/nvim-open}/remote-command.sh" || exit 1
 # shellcheck source=../lib/termnav/nvim-open/common.sh
 . "$lib_dir/common.sh" || exit 1
 # shellcheck source=../lib/termnav/nvim-open/remote.sh
