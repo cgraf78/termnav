@@ -1087,6 +1087,8 @@ PY
 
 test_home="$tmp/home"
 mkdir -p "$test_home/.local/state/nvim-tmux-open/panes"
+xdg_state_home="$tmp/xdg-state"
+mkdir -p "$xdg_state_home/nvim-tmux-open/panes"
 mkdir -p "$test_home/.local/share/mise/shims"
 ln -s "$mock_bin/nvim" "$test_home/.local/share/mise/shims/nvim"
 ln -s "$mock_bin/tmux" "$test_home/.local/share/mise/shims/tmux"
@@ -1100,13 +1102,14 @@ if [[ -z "$listener_one" || -z "$listener_two" ]]; then
   _test_summary
 fi
 
-printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
+printf '%s\n' "$socket_two" >"$xdg_state_home/nvim-tmux-open/current"
 touch "$tmp/missing-panes"
 NVIM_MOCK_LOG="$tmp/colon-nvim.log" \
   NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
   TMUX_MOCK_PANES="$tmp/missing-panes" \
   TMUX_MOCK_LOG="$tmp/colon-tmux.log" \
   HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
   PATH="$mock_bin:$PATH" \
   "$helper" link '/tmp/path:with:colon.txt:12:3' '/tmp' nvim >/dev/null 2>&1
 colon_call=$(cat "$tmp/colon-nvim.log")
@@ -1114,6 +1117,8 @@ _assert_contains "helper keeps colons in file paths before :line:col" \
   "'/tmp/path:with:colon.txt', 12, 3" "$colon_call"
 _assert_contains "helper forwards click source to nvim rpc" \
   "'nvim'" "$colon_call"
+_assert_file_missing "helper honors XDG state instead of the HOME fallback" \
+  "$test_home/.local/state/nvim-tmux-open/current"
 
 printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
 NVIM_MOCK_LOG="$tmp/quoted-nvim.log" \

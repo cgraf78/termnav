@@ -270,21 +270,60 @@ result=$(_nvim_lua "
 _assert_eq "open_now: cli mode preserves literal HOME file references" \
   "$NVIM_TMUX_OPEN_HOME/.config/shell/\$HOME/.local/share/example/core/shell-loader.sh" "$result"
 
+NVIM_TMUX_OPEN_HOME=$(_tmpdir)
 NVIM_TMUX_OPEN_STATE=$(_tmpdir)
 result=$(_nvim_lua "
   vim.env.TMUX = nil
   vim.env.TMUX_PANE = nil
   local old_home = vim.env.HOME
-  vim.env.HOME = '$NVIM_TMUX_OPEN_STATE'
+  local old_state_home = vim.env.XDG_STATE_HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_HOME'
+  vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_STATE'
   local opener = dofile('$opener_module')
   opener.setup()
-  local current = vim.fn.readfile(vim.fn.expand('~/.local/state/nvim-tmux-open/current'))[1]
+  local current = vim.fn.readfile('$NVIM_TMUX_OPEN_STATE/nvim-tmux-open/current')[1]
   print(tostring(current == vim.v.servername))
-  print(vim.fn.isdirectory(vim.fn.expand('~/.local/state/nvim-tmux-open/panes')))
+  print(vim.fn.isdirectory('$NVIM_TMUX_OPEN_STATE/nvim-tmux-open/panes'))
+  print(vim.fn.filereadable('$NVIM_TMUX_OPEN_HOME/.local/state/nvim-tmux-open/current'))
   vim.env.HOME = old_home
+  vim.env.XDG_STATE_HOME = old_state_home
 ")
-expected="$(printf 'true\n1')"
-_assert_eq "setup: publishes a discoverable current nvim outside tmux" "$expected" "$result"
+expected="$(printf 'true\n1\n0')"
+_assert_eq "setup: publishes current nvim under XDG_STATE_HOME" "$expected" "$result"
+
+NVIM_TMUX_OPEN_FALLBACK=$(_tmpdir)
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local old_home = vim.env.HOME
+  local old_state_home = vim.env.XDG_STATE_HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_FALLBACK'
+  vim.env.XDG_STATE_HOME = ''
+  local opener = dofile('$opener_module')
+  opener.setup()
+  local current = vim.fn.readfile('$NVIM_TMUX_OPEN_FALLBACK/.local/state/nvim-tmux-open/current')[1]
+  print(tostring(current == vim.v.servername))
+  vim.env.HOME = old_home
+  vim.env.XDG_STATE_HOME = old_state_home
+")
+_assert_eq "setup: empty XDG_STATE_HOME falls back below HOME" "true" "$result"
+
+NVIM_TMUX_OPEN_RELATIVE=$(_tmpdir)
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local old_home = vim.env.HOME
+  local old_state_home = vim.env.XDG_STATE_HOME
+  vim.env.HOME = '$NVIM_TMUX_OPEN_RELATIVE'
+  vim.env.XDG_STATE_HOME = 'relative/state'
+  local opener = dofile('$opener_module')
+  opener.setup()
+  local current = vim.fn.readfile('$NVIM_TMUX_OPEN_RELATIVE/.local/state/nvim-tmux-open/current')[1]
+  print(tostring(current == vim.v.servername))
+  vim.env.HOME = old_home
+  vim.env.XDG_STATE_HOME = old_state_home
+")
+_assert_eq "setup: relative XDG_STATE_HOME falls back below HOME" "true" "$result"
 
 result=$(_nvim_lua "
   local opener = dofile('$opener_module')

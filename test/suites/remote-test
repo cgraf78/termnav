@@ -24,6 +24,26 @@ lib_dir="$TERMNAV_ROOT/lib/termnav/nvim-open"
 # shellcheck source=../../lib/termnav/nvim-open/remote.sh
 . "$lib_dir/remote.sh"
 
+echo "=== state directory resolution ==="
+
+state_home="$(_tmpdir)/home"
+xdg_state_home="$(_tmpdir)/state"
+_assert_eq "state directory: defaults below HOME" \
+  "$state_home/.local/state/nvim-tmux-open" \
+  "$(
+    unset XDG_STATE_HOME
+    HOME="$state_home" nvim_open_state_dir
+  )"
+_assert_eq "state directory: honors XDG_STATE_HOME" \
+  "$xdg_state_home/nvim-tmux-open" \
+  "$(XDG_STATE_HOME="$xdg_state_home" nvim_open_state_dir)"
+_assert_eq "state directory: rejects relative XDG_STATE_HOME" \
+  "$state_home/.local/state/nvim-tmux-open" \
+  "$(HOME="$state_home" XDG_STATE_HOME=relative/state nvim_open_state_dir)"
+XDG_STATE_HOME="$xdg_state_home" nvim_open_log "xdg-state-test"
+_assert_file_exists "log file: honors XDG_STATE_HOME" \
+  "$xdg_state_home/wezterm-nvim-open.log"
+
 echo "=== positional transport-host parsing ==="
 
 # A pane launched directly into the transport: start_command is the ssh argv,
