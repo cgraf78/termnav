@@ -96,6 +96,14 @@ cross-process protocol between shell/Neovim publishers and WezTerm route
 consumers. Configure integrations through the modules above instead of setting
 or reading those names directly.
 
+Neovim socket discovery state lives under
+`${XDG_STATE_HOME:-$HOME/.local/state}/nvim-tmux-open`. The opener's diagnostic
+log uses the same state root at `wezterm-nvim-open.log`. As required by the XDG
+specification, relative values are ignored. Set `XDG_STATE_HOME` to an absolute
+path in the environment that starts WezTerm, tmux, and Neovim; setting it only
+inside a child interactive shell cannot change an already-running GUI or tmux
+server's environment.
+
 Set `TERMNAV_SSH_CONTROL_HOSTS` to a comma-separated allowlist of host aliases
 that `bin/nvim-ssh-control-open` may contact through an existing SSH
 ControlMaster connection. The helper fails closed when the variable is unset

@@ -13,7 +13,15 @@ local _G = _G
 
 local M = {}
 
-local state_dir = vim.fn.expand("~/.local/state/nvim-tmux-open")
+local function state_home()
+  local path = vim.env.XDG_STATE_HOME
+  if not path or not path:match("^/") then
+    return vim.fn.expand("~/.local/state")
+  end
+  return path
+end
+
+local state_dir = state_home() .. "/nvim-tmux-open"
 local server_address
 
 local function pane_key()

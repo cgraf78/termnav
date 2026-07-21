@@ -1,8 +1,23 @@
 # shellcheck shell=bash
 
-log_file="$HOME/.local/state/wezterm-nvim-open.log"
+nvim_open_state_home() {
+  case "${XDG_STATE_HOME:-}" in
+    /*) printf '%s\n' "$XDG_STATE_HOME" ;;
+    *) printf '%s/.local/state\n' "$HOME" ;;
+  esac
+}
+
+nvim_open_state_dir() {
+  printf '%s/nvim-tmux-open\n' "$(nvim_open_state_home)"
+}
+
+nvim_open_log_file() {
+  printf '%s/wezterm-nvim-open.log\n' "$(nvim_open_state_home)"
+}
 
 nvim_open_log() {
+  local log_file
+  log_file=$(nvim_open_log_file)
   mkdir -p "${log_file%/*}" 2>/dev/null || true
   printf '%s helper %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$log_file" 2>/dev/null || true
 }
@@ -88,7 +103,7 @@ nvim_open_rpc() {
   local socket socket_file state_dir seen_sockets
   local -a socket_files
 
-  state_dir="$HOME/.local/state/nvim-tmux-open"
+  state_dir=$(nvim_open_state_dir)
   socket_files+=("$state_dir/current")
   for socket_file in "$state_dir"/panes/*; do
     [[ -e "$socket_file" ]] && socket_files+=("$socket_file")
@@ -126,10 +141,11 @@ nvim_open_pane_key() {
 
 nvim_open_pane_socket() {
   local pane_id="$1" target_file="$2" target_line="$3" target_col="$4" target_cwd="$5" source="$6"
-  local key socket socket_file
+  local key socket socket_file state_dir
 
   key=$(nvim_open_pane_key "$pane_id") || return 1
-  socket_file="$HOME/.local/state/nvim-tmux-open/panes/$key"
+  state_dir=$(nvim_open_state_dir)
+  socket_file="$state_dir/panes/$key"
   [[ -r "$socket_file" ]] || return 1
   IFS= read -r socket <"$socket_file" || socket=""
   [[ -n "$socket" ]] || return 1
