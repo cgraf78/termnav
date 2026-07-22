@@ -15,13 +15,20 @@ local M = {}
 
 local function state_home()
   local path = vim.env.XDG_STATE_HOME
-  if not path or not path:match("^/") then
-    return vim.fn.expand("~/.local/state")
+  if type(path) == "string" and path:match("^/") then
+    return path
   end
-  return path
+
+  local home = vim.env.HOME
+  if type(home) == "string" and home ~= "" then
+    return home .. "/.local/state"
+  end
+
+  return nil
 end
 
-local state_dir = state_home() .. "/nvim-tmux-open"
+local state_root = state_home()
+local state_dir = state_root and (state_root .. "/nvim-tmux-open") or nil
 local server_address
 
 local function pane_key()
@@ -53,6 +60,9 @@ function M.server()
   if vim.v.servername ~= "" then
     server_address = vim.v.servername
   else
+    if not state_dir then
+      return ""
+    end
     local socket = state_dir .. "/nvim-" .. pane_key() .. ".sock"
     vim.fn.delete(socket)
     server_address = vim.fn.serverstart(socket)
@@ -260,6 +270,11 @@ function M.open(path, line, col, base_cwd, source)
 end
 
 function M.setup()
+  _G.nvim_tmux_open = M.open
+  if not state_dir then
+    return false
+  end
+
   vim.fn.mkdir(state_dir, "p")
 
   local function publish()
@@ -295,7 +310,7 @@ function M.setup()
     end,
   })
 
-  _G.nvim_tmux_open = M.open
+  return true
 end
 
 return M

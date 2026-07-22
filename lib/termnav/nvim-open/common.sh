@@ -1,23 +1,48 @@
 # shellcheck shell=bash
 
-nvim_open_state_home() {
+nvim_open_resolve_state_home() {
   case "${XDG_STATE_HOME:-}" in
-    /*) printf '%s\n' "$XDG_STATE_HOME" ;;
-    *) printf '%s/.local/state\n' "$HOME" ;;
+    /*) REPLY="$XDG_STATE_HOME" ;;
+    *)
+      if [[ -n "${HOME:-}" ]]; then
+        REPLY="$HOME/.local/state"
+      else
+        REPLY=""
+        return 1
+      fi
+      ;;
   esac
 }
 
+nvim_open_state_home() {
+  nvim_open_resolve_state_home || return 1
+  printf '%s\n' "$REPLY"
+}
+
+nvim_open_resolve_state_dir() {
+  nvim_open_resolve_state_home || return 1
+  REPLY="$REPLY/nvim-tmux-open"
+}
+
 nvim_open_state_dir() {
-  printf '%s/nvim-tmux-open\n' "$(nvim_open_state_home)"
+  nvim_open_resolve_state_dir || return 1
+  printf '%s\n' "$REPLY"
+}
+
+nvim_open_resolve_log_file() {
+  nvim_open_resolve_state_home || return 1
+  REPLY="$REPLY/wezterm-nvim-open.log"
 }
 
 nvim_open_log_file() {
-  printf '%s/wezterm-nvim-open.log\n' "$(nvim_open_state_home)"
+  nvim_open_resolve_log_file || return 1
+  printf '%s\n' "$REPLY"
 }
 
 nvim_open_log() {
   local log_file
-  log_file=$(nvim_open_log_file)
+  nvim_open_resolve_log_file || return 0
+  log_file="$REPLY"
   mkdir -p "${log_file%/*}" 2>/dev/null || true
   printf '%s helper %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$log_file" 2>/dev/null || true
 }
@@ -103,7 +128,8 @@ nvim_open_rpc() {
   local socket socket_file state_dir seen_sockets
   local -a socket_files
 
-  state_dir=$(nvim_open_state_dir)
+  nvim_open_resolve_state_dir || return 1
+  state_dir="$REPLY"
   socket_files+=("$state_dir/current")
   for socket_file in "$state_dir"/panes/*; do
     [[ -e "$socket_file" ]] && socket_files+=("$socket_file")
@@ -144,7 +170,8 @@ nvim_open_pane_socket() {
   local key socket socket_file state_dir
 
   key=$(nvim_open_pane_key "$pane_id") || return 1
-  state_dir=$(nvim_open_state_dir)
+  nvim_open_resolve_state_dir || return 1
+  state_dir="$REPLY"
   socket_file="$state_dir/panes/$key"
   [[ -r "$socket_file" ]] || return 1
   IFS= read -r socket <"$socket_file" || socket=""

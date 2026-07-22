@@ -64,6 +64,14 @@ mode.
 .TP
 .B 2
 Usage error.
+.SH ENVIRONMENT
+.TP
+.B XDG_STATE_HOME
+Absolute base directory for Neovim socket discovery and diagnostic state.
+Empty and relative values fall back to
+.IR $HOME/.local/state .
+When neither base directory is available, filesystem discovery and publication
+are disabled rather than writing below the filesystem root.
 .SH SEE ALSO
 .BR tmux-follow-click (1),
 .BR nvim-link-host (1),

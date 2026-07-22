@@ -5,20 +5,32 @@
 #
 # Contract with dotfiles: the auth token is written by
 # ~/.local/lib/dot/core/merge-hooks/vscode.sh to
-# ${XDG_STATE_HOME:-$HOME/.local/state}/dot/vscode-mcp-auth-token. This file
-# only reads it -- it never generates or manages the token.
+# an absolute $XDG_STATE_HOME/dot/vscode-mcp-auth-token, falling back below
+# $HOME when the XDG value is empty or relative. This file only reads it -- it
+# never generates or manages the token.
 
 _termnav_vscode_mcp_port() {
   printf '%s\n' "${VSCODE_MCP_PORT:-9876}"
 }
 
 _termnav_vscode_mcp_auth_token_path() {
-  printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/dot/vscode-mcp-auth-token"
+  case "${XDG_STATE_HOME:-}" in
+    /*) REPLY="$XDG_STATE_HOME/dot/vscode-mcp-auth-token" ;;
+    *)
+      if [[ -n "${HOME:-}" ]]; then
+        REPLY="$HOME/.local/state/dot/vscode-mcp-auth-token"
+      else
+        REPLY=""
+        return 1
+      fi
+      ;;
+  esac
 }
 
 _termnav_vscode_mcp_auth_token() {
   local path
-  path="$(_termnav_vscode_mcp_auth_token_path)"
+  _termnav_vscode_mcp_auth_token_path || return 1
+  path="$REPLY"
   [[ -r "$path" ]] || return 1
   cat "$path"
 }

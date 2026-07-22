@@ -26,22 +26,25 @@ tmux_follow_register_token_detector() {
 }
 
 tmux_follow_extension_dir() {
-  local config_home
-
   if [[ -n "${TERMNAV_TMUX_FOLLOW_EXTENSION_DIR:-}" ]]; then
-    printf '%s\n' "$TERMNAV_TMUX_FOLLOW_EXTENSION_DIR"
+    REPLY="$TERMNAV_TMUX_FOLLOW_EXTENSION_DIR"
     return 0
   fi
 
   # Token policy is user configuration, not part of the installed executable.
   # Keep the default under XDG config so the standalone termnav repo can be
   # installed by shdeps without depending on any caller-specific layout.
-  config_home="${XDG_CONFIG_HOME:-}"
-  if [[ -z "$config_home" ]]; then
-    [[ -n "${HOME:-}" ]] || return 1
-    config_home="$HOME/.config"
-  fi
-  printf '%s\n' "$config_home/termnav/tmux-follow/extensions.d"
+  case "${XDG_CONFIG_HOME:-}" in
+    /*) REPLY="$XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d" ;;
+    *)
+      if [[ -n "${HOME:-}" ]]; then
+        REPLY="$HOME/.config/termnav/tmux-follow/extensions.d"
+      else
+        REPLY=""
+        return 1
+      fi
+      ;;
+  esac
 }
 
 tmux_follow_source_extensions() {
@@ -50,7 +53,8 @@ tmux_follow_source_extensions() {
   local had_nullglob=0
   local extensions=()
 
-  extension_dir=$(tmux_follow_extension_dir)
+  tmux_follow_extension_dir || return 0
+  extension_dir="$REPLY"
   [[ -d "$extension_dir" ]] || return 0
 
   shopt -q nullglob && had_nullglob=1

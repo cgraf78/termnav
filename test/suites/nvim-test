@@ -325,6 +325,35 @@ result=$(_nvim_lua "
 ")
 _assert_eq "setup: relative XDG_STATE_HOME falls back below HOME" "true" "$result"
 
+NVIM_TMUX_OPEN_NEWLINE=$(_tmpdir)
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  vim.env.HOME = nil
+  local state_home = '$NVIM_TMUX_OPEN_NEWLINE' .. string.char(10)
+  vim.env.XDG_STATE_HOME = state_home
+  local opener = dofile('$opener_module')
+  print(tostring(opener.setup()))
+  print(vim.fn.filereadable(state_home .. '/nvim-tmux-open/current'))
+")
+expected="$(printf 'true\n1')"
+_assert_eq "setup: preserves absolute XDG state trailing newline without HOME" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  vim.env.HOME = nil
+  vim.env.XDG_STATE_HOME = 'relative/state'
+  local opener = dofile('$opener_module')
+  print(tostring(opener.setup()))
+  print(vim.fn.isdirectory('/.local/state/nvim-tmux-open'))
+  print(type(_G.nvim_tmux_open))
+")
+expected="$(printf 'false\n0\nfunction')"
+_assert_eq "setup: no state root disables publication without inventing a path" \
+  "$expected" "$result"
+
 result=$(_nvim_lua "
   local opener = dofile('$opener_module')
   print(tostring(opener.server() ~= ''))

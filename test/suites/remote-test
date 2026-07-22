@@ -40,6 +40,23 @@ _assert_eq "state directory: honors XDG_STATE_HOME" \
 _assert_eq "state directory: rejects relative XDG_STATE_HOME" \
   "$state_home/.local/state/nvim-tmux-open" \
   "$(HOME="$state_home" XDG_STATE_HOME=relative/state nvim_open_state_dir)"
+XDG_STATE_HOME="$xdg_state_home"$'\n'
+unset HOME
+nvim_open_resolve_state_dir
+_assert_eq "state directory: preserves XDG trailing newline bytes" \
+  "$XDG_STATE_HOME/nvim-tmux-open" "$REPLY"
+nvim_open_log "newline-xdg-state-test"
+_assert_file_exists "log file: preserves XDG trailing newline bytes" \
+  "$XDG_STATE_HOME/wezterm-nvim-open.log"
+unset XDG_STATE_HOME
+REPLY="stale"
+if nvim_open_resolve_state_dir; then
+  _fail "state directory: fails closed without XDG_STATE_HOME or HOME"
+else
+  _pass "state directory: fails closed without XDG_STATE_HOME or HOME"
+fi
+_assert_eq "state directory: missing roots clear stale resolver output" "" "$REPLY"
+HOME="$state_home"
 XDG_STATE_HOME="$xdg_state_home" nvim_open_log "xdg-state-test"
 _assert_file_exists "log file: honors XDG_STATE_HOME" \
   "$xdg_state_home/wezterm-nvim-open.log"

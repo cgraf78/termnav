@@ -27,7 +27,12 @@ paths, and terminal-specific Neovim link schemes.
 .SH EXTENSIONS
 .B tmux-follow-click
 loads optional shell extensions from
-.IR ${XDG_CONFIG_HOME:-~/.config}/termnav/tmux-follow/extensions.d/*.sh .
+an absolute
+.IR $XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d/*.sh ,
+falling back to
+.IR $HOME/.config/termnav/tmux-follow/extensions.d/*.sh .
+Empty and relative XDG config paths are ignored. When neither base directory is
+available, no optional extensions are loaded.
 Set
 .B TERMNAV_TMUX_FOLLOW_EXTENSION_DIR
 to use another directory.
@@ -43,6 +48,9 @@ and returning success.
 .TP
 .B TERMNAV_TMUX_FOLLOW_EXTENSION_DIR
 Override directory for token detector extensions.
+.TP
+.B XDG_CONFIG_HOME
+Absolute base directory for token detector extensions.
 .SH EXIT STATUS
 .TP
 .B 0

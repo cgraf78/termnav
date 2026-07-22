@@ -333,13 +333,43 @@ tmux_follow_register_token_detector tmux_follow_xdg_token
 EOF
 : >"$browser_tty"
 TMUX_FOLLOW_LOG="$tmp/extension-xdg-url-nvim.log" \
-  XDG_CONFIG_HOME="$xdg_home" \
-  PATH="$mock_bin:$PATH" \
+  env -u HOME XDG_CONFIG_HOME="$xdg_home" PATH="$mock_bin:$PATH" \
   "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
 _assert_eq "tmux follow helper loads XDG extension tokens without nvim routing" \
   "" "$(cat "$tmp/extension-xdg-url-nvim.log" 2>/dev/null || true)"
 _assert_contains "tmux follow helper loads XDG extension tokens" \
   "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
+
+fallback_home="$tmp/extension-fallback-home"
+mkdir -p "$fallback_home/.config/termnav/tmux-follow/extensions.d"
+cp "$xdg_home/termnav/tmux-follow/extensions.d/90-test.sh" \
+  "$fallback_home/.config/termnav/tmux-follow/extensions.d/90-test.sh"
+: >"$browser_tty"
+TMUX_FOLLOW_LOG="$tmp/extension-relative-url-nvim.log" \
+  HOME="$fallback_home" XDG_CONFIG_HOME=relative/config PATH="$mock_bin:$PATH" \
+  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
+_assert_contains "tmux follow helper rejects relative XDG config and uses HOME" \
+  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
+
+newline_extension_dir="$tmp/extension-newline"$'\n'
+mkdir -p "$newline_extension_dir"
+cp "$xdg_home/termnav/tmux-follow/extensions.d/90-test.sh" \
+  "$newline_extension_dir/90-test.sh"
+: >"$browser_tty"
+TMUX_FOLLOW_LOG="$tmp/extension-newline-url-nvim.log" \
+  env -u HOME TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="$newline_extension_dir" \
+  PATH="$mock_bin:$PATH" \
+  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
+_assert_contains "tmux follow helper preserves explicit extension path bytes" \
+  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
+
+: >"$browser_tty"
+TMUX_FOLLOW_LOG="$tmp/extension-missing-root-nvim.log" \
+  env -u HOME -u TERMNAV_TMUX_FOLLOW_EXTENSION_DIR XDG_CONFIG_HOME=relative/config \
+  PATH="$mock_bin:$PATH" \
+  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
+_assert_eq "tmux follow helper skips extensions when no config root exists" \
+  "" "$(cat "$browser_tty")"
 
 TMUX_FOLLOW_LOG="$tmp/noise.log" \
   PATH="$mock_bin:$PATH" \
