@@ -73,13 +73,18 @@ this repo owns reusable route parsing and open-through behavior.
 - VS Code with the `nabheet.vscode-ide-mcp` extension installed and running,
   for the VS Code tab bridge. The auth token it reads is written by
   dotfiles' `vscode.sh` merge hook to
-  `${XDG_STATE_HOME:-$HOME/.local/state}/dot/vscode-mcp-auth-token`; this
-  repo only reads that file, never generates or manages the token.
+  an absolute `$XDG_STATE_HOME/dot/vscode-mcp-auth-token`, or to
+  `$HOME/.local/state/dot/vscode-mcp-auth-token` when the XDG value is empty or
+  relative; this repo only reads that file, never generates or manages the
+  token. The backend fails closed when neither base directory is available.
 - `nvim-remote-pane-host` is an optional extension command for custom
   remote-pane workflows.
 
 `tmux-follow-click` loads environment-specific token detectors from
-`${XDG_CONFIG_HOME:-~/.config}/termnav/tmux-follow/extensions.d/*.sh`. Set
+an absolute `$XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d/*.sh`, falling
+back to `$HOME/.config/termnav/tmux-follow/extensions.d/*.sh` when the XDG value
+is empty or relative. With neither base directory, it simply loads no optional
+extensions. Set
 `TERMNAV_TMUX_FOLLOW_EXTENSION_DIR` for tests or managed deployments that keep
 those detectors somewhere else. Detector files call
 `tmux_follow_register_token_detector <function>`; detectors claim a token by
@@ -97,9 +102,12 @@ consumers. Configure integrations through the modules above instead of setting
 or reading those names directly.
 
 Neovim socket discovery state lives under
-`${XDG_STATE_HOME:-$HOME/.local/state}/nvim-tmux-open`. The opener's diagnostic
-log uses the same state root at `wezterm-nvim-open.log`. As required by the XDG
-specification, relative values are ignored. Set `XDG_STATE_HOME` to an absolute
+an absolute `$XDG_STATE_HOME/nvim-tmux-open`, falling back to
+`$HOME/.local/state/nvim-tmux-open`. The opener's diagnostic log uses the same
+state root at `wezterm-nvim-open.log`. As required by the XDG specification,
+empty and relative values are ignored. Without either base directory,
+filesystem discovery and publication are disabled rather than writing below
+`/`. Set `XDG_STATE_HOME` to an absolute
 path in the environment that starts WezTerm, tmux, and Neovim; setting it only
 inside a child interactive shell cannot change an already-running GUI or tmux
 server's environment.

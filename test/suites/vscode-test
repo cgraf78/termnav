@@ -55,6 +55,43 @@ echo "=== vscode-backend-mcp.sh: MCP HTTP backend ==="
 
 vscode_backend_mcp_sh="$TERMNAV_ROOT/lib/termnav/shell/vscode-backend-mcp.sh"
 
+path_home=$(_tmpdir)
+path_result=$(HOME="$path_home" XDG_STATE_HOME=relative/state bash -c "
+  . '$vscode_backend_mcp_sh'
+  _termnav_vscode_mcp_auth_token_path
+  printf '%s' \"\$REPLY\"
+")
+_assert_eq "MCP backend: relative XDG state falls back below HOME" \
+  "$path_home/.local/state/dot/vscode-mcp-auth-token" "$path_result"
+
+set +e
+env -u HOME XDG_STATE_HOME=relative/state bash -c "
+  . '$vscode_backend_mcp_sh'
+  _termnav_vscode_mcp_auth_token_path
+" >/dev/null 2>&1
+missing_path_rc=$?
+set -e
+_assert_exit "MCP backend: missing absolute XDG state and HOME fails closed" 1 "$missing_path_rc"
+
+newline_state=$(_tmpdir)/state$'\n'
+mkdir -p "$newline_state/dot"
+printf 'newline-token-abc123\n' >"$newline_state/dot/vscode-mcp-auth-token"
+newline_bin=$(_tmpdir)
+newline_log=$(_tmpdir)/newline-curl.log
+cat >"$newline_bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf ' <%s>' "$@" >"$CURL_CALL_LOG"
+printf '{"jsonrpc":"2.0","id":1,"result":{"content":[]}}'
+EOF
+chmod +x "$newline_bin/curl"
+env -u HOME XDG_STATE_HOME="$newline_state" CURL_CALL_LOG="$newline_log" \
+  PATH="$newline_bin:$PATH" bash -c "
+    . '$vscode_backend_mcp_sh'
+    termnav_vscode_mcp_execute_command 'workbench.action.nextEditor'
+  "
+_assert_contains "MCP backend: preserves XDG state trailing newline bytes" \
+  "Authorization: Bearer newline-token-abc123" "$(cat "$newline_log")"
+
 _mcp_test_home() {
   local home token_dir
   home=$(_tmpdir)
