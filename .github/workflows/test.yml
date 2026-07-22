@@ -15,7 +15,7 @@ jobs:
   shell:
     uses: cgraf78/actions/.github/workflows/shell-ci.yml@7d88c3afa6e51a83e9cfefb0c12f503155e17952
     with:
-      profiles: base,lua,neovim,tmux,python,openssh-netcat-lsof
+      profiles: base,shellcheck,lua,neovim,tmux,python,openssh-netcat-lsof
       test-command: test/termnav-test
 
   eza-current:

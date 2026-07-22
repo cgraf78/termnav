@@ -4,6 +4,79 @@
 set -euo pipefail
 
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+root="${test_dir%/test}"
+
+# Keep runtime entry points explicit so additions require a lint review.
+runtime_shell_files=(
+  "$root/bin/eza-nvim-links"
+  "$root/bin/nvim-link-host"
+  "$root/bin/nvim-ssh-control-open"
+  "$root/bin/nvim-tmux-open"
+  "$root/bin/tmux-follow-click"
+  "$root/bin/vscode-switch-tab"
+  "$root/bin/wezterm-move-tab"
+  "$root/bin/wezterm-switch-tab"
+  "$root/lib/termnav/nvim-link-context.sh"
+  "$root/lib/termnav/nvim-open/cli.sh"
+  "$root/lib/termnav/nvim-open/common.sh"
+  "$root/lib/termnav/nvim-open/link.sh"
+  "$root/lib/termnav/nvim-open/remote.sh"
+  "$root/lib/termnav/remote-command.sh"
+  "$root/lib/termnav/shell/vscode-backend-mcp.sh"
+  "$root/lib/termnav/shell/vscode-command.sh"
+  "$root/lib/termnav/shell/wezterm-vars.sh"
+  "$root/share/termnav/shell.sh"
+)
+
+check_runtime_shell_inventory() {
+  local file first_line listed discovered
+  listed=$(
+    for file in "${runtime_shell_files[@]}"; do
+      printf '%s\n' "${file#"$root"/}"
+    done | LC_ALL=C sort
+  )
+  discovered=$(
+    while IFS= read -r file; do
+      case "$file" in
+        *.sh | *.sh.template)
+          printf '%s\n' "$file"
+          continue
+          ;;
+      esac
+      first_line=""
+      IFS= read -r first_line <"$root/$file" || true
+      if [[ "$first_line" == '#!'*bash* ||
+        "$first_line" == '#!'*dash* ||
+        "$first_line" == '#!'*ksh* ||
+        "$first_line" == '#!'*/sh ||
+        "$first_line" == '#!'*'/sh '* ||
+        "$first_line" == '#!'*' sh' ||
+        "$first_line" == '#!'*' sh '* ||
+        "$first_line" == '# shellcheck shell=bash' ||
+        "$first_line" == '# shellcheck shell=dash' ||
+        "$first_line" == '# shellcheck shell=ksh' ||
+        "$first_line" == '# shellcheck shell=sh' ]]; then
+        printf '%s\n' "$file"
+      fi
+    done < <(git -C "$root" ls-files -- bin lib share)
+  )
+  discovered=$(printf '%s\n' "$discovered" | sed '/^$/d' | LC_ALL=C sort)
+
+  if [[ "$listed" != "$discovered" ]]; then
+    printf 'termnav-test: runtime shell inventory is stale\n' >&2
+    diff -u \
+      <(printf '%s\n' "$listed") \
+      <(printf '%s\n' "$discovered") >&2 || true
+    return 1
+  fi
+}
+
+check_runtime_shell_inventory
+shellcheck -x -P SCRIPTDIR \
+  "${runtime_shell_files[@]}" \
+  "$test_dir/termnav-test" \
+  "$test_dir/helpers.sh" \
+  "$test_dir"/suites/*-test
 
 for suite in "$test_dir"/suites/*-test; do
   "$suite"
