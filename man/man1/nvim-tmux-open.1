@@ -72,6 +72,20 @@ Empty and relative values fall back to
 .IR $HOME/.local/state .
 When neither base directory is available, filesystem discovery and publication
 are disabled rather than writing below the filesystem root.
+Discovery records use owner-only permissions, atomic publication, and
+tmux-server, pane, and Neovim-process scoping so concurrent editors do not
+replace or remove one another's registrations. Each scope uses a complete
+atomic latest record for ordering, while a final versioned per-process commit
+record keeps partial initial publications undiscoverable. Encoded pane
+identities use bounded path components.
+.TP
+.B XDG_RUNTIME_DIR
+Absolute base directory for a private Termnav socket directory when Neovim does
+not already expose a record-safe RPC address. Long or unavailable runtime paths
+use a short, private
+.I /tmp/termnav-UID
+fallback so the socket stays within platform path limits. Runtime paths
+containing newlines also use this fallback so discovery records remain valid.
 .SH SEE ALSO
 .BR tmux-follow-click (1),
 .BR nvim-link-host (1),

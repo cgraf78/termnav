@@ -30,24 +30,160 @@ end
 local state_root = state_home()
 local state_dir = state_root and (state_root .. "/nvim-tmux-open") or nil
 local server_address
+local owned_socket
+local uv = vim.uv or vim.loop
+local publish_counter = 0
+
+local function user_id()
+  if type(uv.os_get_passwd) == "function" then
+    local passwd = uv.os_get_passwd()
+    if type(passwd) == "table" and passwd.uid ~= nil then
+      return passwd.uid
+    end
+  end
+  return vim.fn.getuid()
+end
+
+local function hex_encode(value)
+  return (value:gsub(".", function(char)
+    return string.format("%02x", string.byte(char))
+  end))
+end
+
+local function registry_key(value)
+  local encoded = hex_encode(value)
+  local components = {}
+  local offset = 1
+  while offset <= #encoded do
+    local prefix = offset == 1 and "v1-" or ""
+    components[#components + 1] = prefix .. encoded:sub(offset, offset + 119)
+    offset = offset + 120
+  end
+  return table.concat(components, "/")
+end
+
+local function tmux_identity()
+  local tmux = vim.env.TMUX
+  if type(tmux) ~= "string" then
+    return "", ""
+  end
+
+  local socket, server_pid = tmux:match("^(.*),([^,]*),[^,]*$")
+  if not socket then
+    return tmux, ""
+  end
+  return socket, server_pid
+end
 
 local function pane_key()
   local pane = vim.env.TMUX_PANE
-  local tmux = vim.env.TMUX
-  local socket = tmux and tmux:match("^[^,]+")
   if pane and pane ~= "" then
-    local key = pane
-    if socket and socket ~= "" then
-      key = socket .. ":" .. pane
-    end
-    return key:gsub("[^%w_.-]", "_")
+    local socket, server_pid = tmux_identity()
+    return registry_key(socket .. "\0" .. server_pid .. "\0" .. pane)
   end
-  return tostring(vim.fn.getpid())
+  return registry_key("\0\0" .. tostring(vim.fn.getpid()))
 end
 
-local function write(path, value)
-  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
-  vim.fn.writefile({ value }, path)
+local process_pid = tostring(vim.fn.getpid())
+local process_nonce = tostring(uv.hrtime()):gsub("[^%w_.-]", "_")
+local owner_key = "p" .. process_pid .. "-" .. process_nonce
+local socket_key = process_pid .. "-" .. process_nonce
+
+local function ensure_private_dir(path)
+  if vim.fn.mkdir(path, "p", 448) == -1 and vim.fn.isdirectory(path) ~= 1 then
+    error("cannot create private registry directory: " .. path)
+  end
+  if vim.fn.setfperm(path, "rwx------") ~= 1 then
+    error("cannot secure registry directory: " .. path)
+  end
+end
+
+local function ensure_private_runtime_dir(path)
+  if vim.fn.mkdir(path, "p", 448) == -1 then
+    error("cannot create private socket directory: " .. path)
+  end
+  local stat, stat_error = uv.fs_lstat(path)
+  if not stat or stat.type ~= "directory" then
+    local detail = stat_error or (stat and stat.type) or "unknown file type"
+    error("unsafe socket directory: " .. path .. ": " .. tostring(detail))
+  end
+  local uid = user_id()
+  if stat.uid and uid >= 0 and stat.uid ~= uid then
+    error("socket directory is owned by another user: " .. path)
+  end
+  if vim.fn.setfperm(path, "rwx------") ~= 1 then
+    error("cannot secure socket directory: " .. path)
+  end
+end
+
+local function socket_path()
+  local basename = "nvim-" .. socket_key .. ".sock"
+  local candidates = {}
+  local runtime = vim.env.XDG_RUNTIME_DIR
+  if
+    type(runtime) == "string"
+    and runtime:match("^/")
+    and not runtime:find("\n", 1, true)
+    and vim.fn.isdirectory(runtime) == 1
+  then
+    candidates[#candidates + 1] = runtime .. "/termnav"
+  end
+  candidates[#candidates + 1] = "/tmp/termnav-" .. tostring(user_id())
+
+  -- macOS has the smaller common Unix-domain socket limit. Staying below 100
+  -- bytes leaves room for the terminating NUL on every supported platform.
+  for _, directory in ipairs(candidates) do
+    local path = directory .. "/" .. basename
+    if #path <= 100 then
+      ensure_private_runtime_dir(directory)
+      return path
+    end
+  end
+  error("cannot create a Neovim socket within the platform path limit")
+end
+
+local function atomic_write(path, value)
+  publish_counter = publish_counter + 1
+  local temp = path .. ".tmp." .. owner_key .. "." .. tostring(publish_counter)
+  local fd, open_error = uv.fs_open(temp, "wx", 384)
+  if not fd then
+    error("cannot create registry record: " .. tostring(open_error))
+  end
+
+  local function abort(message)
+    pcall(uv.fs_close, fd)
+    pcall(uv.fs_unlink, temp)
+    error(message)
+  end
+
+  local content = value .. "\n"
+  local written, write_error = uv.fs_write(fd, content, -1)
+  if written ~= #content then
+    abort("cannot write registry record: " .. tostring(write_error or "short write"))
+  end
+  local synced, sync_error = uv.fs_fsync(fd)
+  if not synced then
+    abort("cannot sync registry record: " .. tostring(sync_error))
+  end
+  local closed, close_error = uv.fs_close(fd)
+  fd = nil
+  if not closed then
+    pcall(uv.fs_unlink, temp)
+    error("cannot close registry record: " .. tostring(close_error))
+  end
+  local renamed, rename_error = uv.fs_rename(temp, path)
+  if not renamed then
+    pcall(uv.fs_unlink, temp)
+    error("cannot publish registry record: " .. tostring(rename_error))
+  end
+end
+
+local function publication_record(address)
+  if type(address) ~= "string" or address == "" or address:find("\n", 1, true) then
+    error("cannot publish an invalid Neovim socket address")
+  end
+  local sequence = string.format("%020.0f", uv.hrtime())
+  return table.concat({ "v2", sequence, owner_key, address }, "\n")
 end
 
 function M.server()
@@ -57,18 +193,37 @@ function M.server()
     return server_address
   end
 
-  if vim.v.servername ~= "" then
+  if vim.v.servername ~= "" and not vim.v.servername:find("\n", 1, true) then
     server_address = vim.v.servername
   else
     if not state_dir then
       return ""
     end
-    local socket = state_dir .. "/nvim-" .. pane_key() .. ".sock"
+    ensure_private_dir(state_dir)
+    local socket = socket_path()
     vim.fn.delete(socket)
-    server_address = vim.fn.serverstart(socket)
+    local started = vim.fn.serverstart(socket)
+    if type(started) ~= "string" or started == "" then
+      error("cannot start Neovim RPC server at " .. socket)
+    end
+    server_address = started
+    owned_socket = socket
   end
 
   return server_address
+end
+
+local function stop_owned_server()
+  if not owned_socket then
+    return
+  end
+
+  if server_address and server_address ~= "" then
+    pcall(vim.fn.serverstop, server_address)
+  end
+  pcall(vim.fn.delete, owned_socket)
+  owned_socket = nil
+  server_address = nil
 end
 
 local function normal_win()
@@ -138,7 +293,6 @@ local function realpath(path)
     return path
   end
 
-  local uv = vim.uv or vim.loop
   if uv and uv.fs_realpath then
     local ok, resolved = pcall(uv.fs_realpath, path)
     if ok and resolved and resolved ~= "" then
@@ -275,15 +429,45 @@ function M.setup()
     return false
   end
 
-  vim.fn.mkdir(state_dir, "p")
+  local registry_dir = state_dir .. "/registry"
+  local panes_dir = registry_dir .. "/panes"
+  local current_dir = registry_dir .. "/current"
+  local owners_dir = registry_dir .. "/owners"
+  local pane_dir = panes_dir .. "/" .. pane_key()
+  local pane_owners_dir = pane_dir .. "/owners"
+  local current_owners_dir = current_dir .. "/owners"
+  local pane_record = pane_owners_dir .. "/" .. owner_key
+  local current_record = current_owners_dir .. "/" .. owner_key
+  local pane_latest = pane_dir .. "/latest"
+  local current_latest = current_dir .. "/latest"
+  local owner_record = owners_dir .. "/" .. owner_key
+
+  ensure_private_dir(state_dir)
+  ensure_private_dir(registry_dir)
+  ensure_private_dir(panes_dir)
+  ensure_private_dir(current_dir)
+  ensure_private_dir(owners_dir)
+  ensure_private_dir(pane_dir)
+  ensure_private_dir(pane_owners_dir)
+  ensure_private_dir(current_owners_dir)
 
   local function publish()
     local address = M.server()
-    write(state_dir .. "/panes/" .. pane_key(), address)
-    write(state_dir .. "/current", address)
+    local record = publication_record(address)
+    atomic_write(pane_record, record)
+    atomic_write(current_record, record)
+    -- Each complete latest record is its scope's linearization point. Scope
+    -- readers never need to join a pointer with another mutable file.
+    atomic_write(pane_latest, record)
+    atomic_write(current_latest, record)
   end
 
-  publish()
+  local function cleanup()
+    vim.fn.delete(owner_record)
+    vim.fn.delete(pane_record)
+    vim.fn.delete(current_record)
+    stop_owned_server()
+  end
 
   local group = vim.api.nvim_create_augroup("nvim_tmux_open", { clear = true })
   vim.api.nvim_create_autocmd({
@@ -299,16 +483,18 @@ function M.setup()
 
   vim.api.nvim_create_autocmd("VimLeavePre", {
     group = group,
-    callback = function()
-      vim.fn.delete(state_dir .. "/panes/" .. pane_key())
-      if vim.fn.filereadable(state_dir .. "/current") == 1 then
-        local current = vim.fn.readfile(state_dir .. "/current")[1]
-        if current == M.server() then
-          vim.fn.delete(state_dir .. "/current")
-        end
-      end
-    end,
+    callback = cleanup,
   })
+
+  local published, publish_error = pcall(publish)
+  if published then
+    published, publish_error = pcall(atomic_write, owner_record, "v2")
+  end
+  if not published then
+    pcall(vim.api.nvim_del_augroup_by_id, group)
+    cleanup()
+    error(publish_error)
+  end
 
   return true
 end

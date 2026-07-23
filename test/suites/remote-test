@@ -61,6 +61,59 @@ XDG_STATE_HOME="$xdg_state_home" nvim_open_log "xdg-state-test"
 _assert_file_exists "log file: honors XDG_STATE_HOME" \
   "$xdg_state_home/wezterm-nvim-open.log"
 
+echo "=== pane registry identity ==="
+
+colon_key=$(TMUX='/tmp/a:b,101,0' nvim_open_pane_key '%1')
+slash_key=$(TMUX='/tmp/a/b,101,0' nvim_open_pane_key '%1')
+if [[ "$colon_key" == "$slash_key" ]]; then
+  _fail "pane registry: distinct tmux sockets have injective keys"
+else
+  _pass "pane registry: distinct tmux sockets have injective keys"
+fi
+
+server_one_key=$(TMUX='/tmp/tmux.sock,101,0' nvim_open_pane_key '%1')
+server_two_key=$(TMUX='/tmp/tmux.sock,202,0' nvim_open_pane_key '%1')
+if [[ "$server_one_key" == "$server_two_key" ]]; then
+  _fail "pane registry: restarted tmux servers have distinct keys"
+else
+  _pass "pane registry: restarted tmux servers have distinct keys"
+fi
+
+comma_server_one_key=$(TMUX='/tmp/tmux,comma.sock,101,0' nvim_open_pane_key '%1')
+comma_server_two_key=$(TMUX='/tmp/tmux,comma.sock,202,0' nvim_open_pane_key '%1')
+comma_expected_key="v1-$(printf '%s\0%s\0%s' '/tmp/tmux,comma.sock' 101 '%1' |
+  LC_ALL=C od -An -tx1 -v | tr -d ' \n')"
+_assert_eq "pane registry: parses comma socket identity from tmux metadata suffix" \
+  "$comma_expected_key" "$comma_server_one_key"
+if [[ "$comma_server_one_key" == "$comma_server_two_key" ]]; then
+  _fail "pane registry: comma socket paths preserve restarted server identity"
+else
+  _pass "pane registry: comma socket paths preserve restarted server identity"
+fi
+
+pane_one_key=$(TMUX='/tmp/tmux.sock,101,0' nvim_open_pane_key '%1')
+pane_two_key=$(TMUX='/tmp/tmux.sock,101,0' nvim_open_pane_key '%2')
+if [[ "$pane_one_key" == "$pane_two_key" ]]; then
+  _fail "pane registry: panes in one server have distinct keys"
+else
+  _pass "pane registry: panes in one server have distinct keys"
+fi
+
+long_socket="/tmp/$(printf 'x%.0s' {1..400})"
+long_key=$(TMUX="$long_socket,99999999999999999999,0" \
+  nvim_open_pane_key '%99999999999999999999')
+long_component_ok=true
+old_ifs=$IFS
+IFS=/
+for component in $long_key; do
+  if ((${#component} > 200)); then
+    long_component_ok=false
+  fi
+done
+IFS=$old_ifs
+_assert_eq "pane registry: encoded identity stays below portable component limits" \
+  "true" "$long_component_ok"
+
 echo "=== positional transport-host parsing ==="
 
 # A pane launched directly into the transport: start_command is the ssh argv,
