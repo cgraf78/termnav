@@ -104,8 +104,20 @@ or reading those names directly.
 Neovim socket discovery state lives under
 an absolute `$XDG_STATE_HOME/nvim-tmux-open`, falling back to
 `$HOME/.local/state/nvim-tmux-open`. The opener's diagnostic log uses the same
-state root at `wezterm-nvim-open.log`. As required by the XDG specification,
-empty and relative values are ignored. Without either base directory,
+state root at `wezterm-nvim-open.log`. Discovery records are published
+atomically with owner-only permissions and are scoped to the tmux server,
+pane, and Neovim process so concurrent editors cannot replace or remove one
+another's registrations. Each scope's atomic `latest` record is a complete
+ordering point, while a final versioned per-process commit record keeps partial
+initial publications undiscoverable. Long encoded pane identities are split
+across bounded path components without losing identity information.
+When Neovim does not already expose a record-safe RPC address,
+Termnav creates its socket below an absolute `$XDG_RUNTIME_DIR/termnav` or a
+private, short `/tmp/termnav-UID` fallback so Unix socket path limits do not
+depend on the state-directory length. As required by the XDG specification,
+empty and relative values are ignored. Runtime paths containing newlines also
+use the short fallback so line-oriented discovery records remain valid.
+Without either state base directory,
 filesystem discovery and publication are disabled rather than writing below
 `/`. Set `XDG_STATE_HOME` to an absolute
 path in the environment that starts WezTerm, tmux, and Neovim; setting it only

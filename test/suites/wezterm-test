@@ -9,6 +9,8 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
+# shellcheck source=../../lib/termnav/nvim-open/common.sh
+. "$TERMNAV_ROOT/lib/termnav/nvim-open/common.sh"
 
 helper="$TERMNAV_ROOT/bin/nvim-tmux-open"
 eza_linker="$TERMNAV_ROOT/bin/eza-nvim-links"
@@ -1094,10 +1096,12 @@ ln -s "$mock_bin/nvim" "$test_home/.local/share/mise/shims/nvim"
 ln -s "$mock_bin/tmux" "$test_home/.local/share/mise/shims/tmux"
 socket_one="$tmp/one.sock"
 socket_two="$tmp/two.sock"
+socket_three="$tmp/three.sock"
 listener_one=$(socket_listener "$socket_one")
 listener_two=$(socket_listener "$socket_two")
-trap 'kill "$listener_one" "$listener_two" 2>/dev/null || true; _cleanup' EXIT
-if [[ -z "$listener_one" || -z "$listener_two" ]]; then
+listener_three=$(socket_listener "$socket_three")
+trap 'kill "$listener_one" "$listener_two" "$listener_three" 2>/dev/null || true; _cleanup' EXIT
+if [[ -z "$listener_one" || -z "$listener_two" || -z "$listener_three" ]]; then
   _fail "nvim helper edge cases: create fake nvim RPC sockets"
   _test_summary
 fi
@@ -1119,6 +1123,194 @@ _assert_contains "helper forwards click source to nvim rpc" \
   "'nvim'" "$colon_call"
 _assert_file_missing "helper honors XDG state instead of the HOME fallback" \
   "$test_home/.local/state/nvim-tmux-open/current"
+
+mkdir -p \
+  "$xdg_state_home/nvim-tmux-open/registry/current/owners" \
+  "$xdg_state_home/nvim-tmux-open/registry/owners" \
+  "$xdg_state_home/nvim-tmux-open/registry/panes"
+rm -f "$xdg_state_home/nvim-tmux-open/current"
+_write_registry_record() {
+  local path="$1" sequence="$2" owner="$3" socket="$4"
+  printf 'v2\n%s\n%s\n%s\n' "$sequence" "$owner" "$socket" >"$path"
+}
+_commit_registry_owner() {
+  local registry_root="$1" owner="$2"
+  printf 'v2\n' >"$registry_root/owners/$owner"
+}
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/latest" \
+  00000000000000000002 owner-two "$socket_two"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-one" \
+  00000000000000000001 owner-one "$socket_one"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-two" \
+  00000000000000000002 owner-two "$socket_two"
+_commit_registry_owner "$xdg_state_home/nvim-tmux-open/registry" owner-one
+_commit_registry_owner "$xdg_state_home/nvim-tmux-open/registry" owner-two
+NVIM_MOCK_LOG="$tmp/registry-current-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/registry-current-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/registry-current.txt:3:4' '/tmp' terminal >/dev/null 2>&1
+registry_current_call=$(cat "$tmp/registry-current-nvim.log")
+_assert_contains "helper prefers the atomically published current owner record" \
+  "server=$socket_two" "$registry_current_call"
+_assert_not_contains "helper does not probe an older current owner first" \
+  "server=$socket_one" "$registry_current_call"
+
+dead_owner="$xdg_state_home/nvim-tmux-open/registry/current/owners/corrupt-owner"
+_write_registry_record "$dead_owner" \
+  00000000000000000003 corrupt-owner "$socket_one"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/latest" \
+  00000000000000000003 corrupt-owner "$socket_one"
+printf 'v3\n' >"$xdg_state_home/nvim-tmux-open/registry/owners/corrupt-owner"
+NVIM_MOCK_LOG="$tmp/dead-owner-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/dead-owner-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/dead-owner.txt:3:4' '/tmp' terminal >/dev/null 2>&1
+dead_owner_call=$(cat "$tmp/dead-owner-nvim.log")
+_assert_contains "helper rejects an unsupported commit marker and falls through" \
+  "server=$socket_two" "$dead_owner_call"
+_assert_file_exists "helper does not prune corrupt records using a reusable PID" "$dead_owner"
+
+rm -f "$xdg_state_home/nvim-tmux-open/registry/owners/corrupt-owner"
+ln -s owner-two "$xdg_state_home/nvim-tmux-open/registry/owners/corrupt-owner"
+NVIM_MOCK_LOG="$tmp/symlink-marker-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/symlink-marker-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/symlink-marker.txt:3:4' '/tmp' terminal >/dev/null 2>&1
+symlink_marker_call=$(cat "$tmp/symlink-marker-nvim.log")
+_assert_contains "helper rejects a symlink commit marker" \
+  "server=$socket_two" "$symlink_marker_call"
+
+rm -f "$xdg_state_home/nvim-tmux-open/registry/owners/corrupt-owner"
+mkdir "$xdg_state_home/nvim-tmux-open/registry/owners/corrupt-owner"
+NVIM_MOCK_LOG="$tmp/directory-marker-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/directory-marker-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/directory-marker.txt:3:4' '/tmp' terminal >/dev/null 2>&1
+directory_marker_call=$(cat "$tmp/directory-marker-nvim.log")
+_assert_contains "helper rejects a directory commit marker" \
+  "server=$socket_two" "$directory_marker_call"
+rm -rf "$xdg_state_home/nvim-tmux-open/registry/owners/corrupt-owner"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/latest" \
+  00000000000000000002 owner-two "$socket_two"
+
+printf '%s\n' "$socket_one" >"$xdg_state_home/nvim-tmux-open/current"
+touch -t 202001010000 "$xdg_state_home/nvim-tmux-open/registry/current/latest"
+touch -t 202101010000 "$xdg_state_home/nvim-tmux-open/current"
+NVIM_MOCK_LOG="$tmp/mixed-current-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_one" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/mixed-current-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/mixed-current.txt:5:6' '/tmp' terminal >/dev/null 2>&1
+mixed_current_call=$(cat "$tmp/mixed-current-nvim.log")
+_assert_contains "helper honors a newer legacy current record during upgrades" \
+  "server=$socket_one" "$mixed_current_call"
+_assert_not_contains "helper does not probe an older owner record before newer legacy current" \
+  "server=$socket_two" "$mixed_current_call"
+
+printf 'v2\n00000000000000000003\nmissing-owner\n' \
+  >"$xdg_state_home/nvim-tmux-open/registry/current/latest"
+touch -t 202201010000 "$xdg_state_home/nvim-tmux-open/registry/current/latest"
+touch -t 202001010000 "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-two"
+touch -t 202101010000 "$xdg_state_home/nvim-tmux-open/current"
+NVIM_MOCK_LOG="$tmp/stale-latest-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_one" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/stale-latest-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/stale-latest.txt:5:6' '/tmp' terminal >/dev/null 2>&1
+stale_latest_call=$(cat "$tmp/stale-latest-nvim.log")
+_assert_contains "helper ignores a newer malformed self-contained latest record" \
+  "server=$socket_one" "$stale_latest_call"
+_assert_not_contains "helper compares legacy recency with a usable owner record" \
+  "server=$socket_two" "$stale_latest_call"
+
+rm -f "$xdg_state_home/nvim-tmux-open/current" \
+  "$xdg_state_home/nvim-tmux-open/registry/current/latest"
+touch -t 202101010000 \
+  "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-one" \
+  "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-two"
+NVIM_MOCK_LOG="$tmp/equal-owner-mtime-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/equal-owner-mtime-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/equal-owner-mtime.txt:5:6' '/tmp' terminal >/dev/null 2>&1
+equal_owner_call=$(cat "$tmp/equal-owner-mtime-nvim.log")
+_assert_contains "helper uses publication sequence when owner mtimes tie" \
+  "server=$socket_two" "$equal_owner_call"
+_assert_not_contains "helper does not use pathname order for equal owner mtimes" \
+  "server=$socket_one" "$equal_owner_call"
+
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/latest" \
+  00000000000000000004 owner-two "$socket_two"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-one" \
+  00000000000000000005 owner-one "$socket_one"
+NVIM_MOCK_LOG="$tmp/linearized-latest-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/linearized-latest-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/linearized-latest.txt:5:6' '/tmp' terminal >/dev/null 2>&1
+linearized_latest_call=$(cat "$tmp/linearized-latest-nvim.log")
+_assert_contains "helper treats the self-contained latest rename as linearization" \
+  "server=$socket_two" "$linearized_latest_call"
+_assert_not_contains "later owner fallback writes cannot supersede latest" \
+  "server=$socket_one" "$linearized_latest_call"
+
+rm -f "$xdg_state_home/nvim-tmux-open/registry/current/latest"
+rm -rf "$xdg_state_home/nvim-tmux-open/registry/current/owners" \
+  "$xdg_state_home/nvim-tmux-open/registry/owners"
+mkdir -p "$xdg_state_home/nvim-tmux-open/registry/current/owners" \
+  "$xdg_state_home/nvim-tmux-open/registry/owners"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-a-newest" \
+  00000000000000000030 owner-a-newest "$tmp/dead.sock"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-b-oldest" \
+  00000000000000000010 owner-b-oldest "$socket_one"
+_write_registry_record "$xdg_state_home/nvim-tmux-open/registry/current/owners/owner-c-middle" \
+  00000000000000000020 owner-c-middle "$socket_two"
+_commit_registry_owner "$xdg_state_home/nvim-tmux-open/registry" owner-a-newest
+_commit_registry_owner "$xdg_state_home/nvim-tmux-open/registry" owner-b-oldest
+_commit_registry_owner "$xdg_state_home/nvim-tmux-open/registry" owner-c-middle
+NVIM_MOCK_LOG="$tmp/dead-newest-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/missing-panes" \
+  TMUX_MOCK_LOG="$tmp/dead-newest-tmux.log" \
+  HOME="$test_home" \
+  XDG_STATE_HOME="$xdg_state_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/dead-newest.txt:5:6' '/tmp' terminal >/dev/null 2>&1
+dead_newest_call=$(cat "$tmp/dead-newest-nvim.log")
+_assert_contains "helper selects the next-newest global owner after a dead owner" \
+  "server=$socket_two" "$dead_newest_call"
+_assert_not_contains "helper does not probe the oldest global owner before the middle owner" \
+  "server=$socket_one" "$dead_newest_call"
+rm -rf "$xdg_state_home/nvim-tmux-open/registry"
+rm -f "$xdg_state_home/nvim-tmux-open/current"
 
 printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/current"
 NVIM_MOCK_LOG="$tmp/quoted-nvim.log" \
@@ -1202,6 +1394,63 @@ _assert_contains "helper link mode uses current-window nvim inside tmux" \
   "server=$socket_two" "$link_current_window_call"
 _assert_not_contains "helper link mode skips global current inside tmux" \
   "server=$socket_one" "$link_current_window_call"
+
+rm -f "$test_home/.local/state/nvim-tmux-open/panes/"*
+registry_key=$(TMUX='/tmp/tmux.sock,1,0' nvim_open_pane_key '%2')
+registry_pane_dir="$test_home/.local/state/nvim-tmux-open/registry/panes/$registry_key"
+mkdir -p "$registry_pane_dir/owners" \
+  "$test_home/.local/state/nvim-tmux-open/registry/owners"
+_write_registry_record "$registry_pane_dir/latest" \
+  00000000000000000002 owner-two "$socket_two"
+_write_registry_record "$registry_pane_dir/owners/owner-one" \
+  00000000000000000001 owner-one "$socket_one"
+_write_registry_record "$registry_pane_dir/owners/owner-two" \
+  00000000000000000002 owner-two "$socket_two"
+_commit_registry_owner "$test_home/.local/state/nvim-tmux-open/registry" owner-one
+_commit_registry_owner "$test_home/.local/state/nvim-tmux-open/registry" owner-two
+NVIM_MOCK_LOG="$tmp/registry-pane-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/current-window-panes" \
+  TMUX_MOCK_LOG="$tmp/registry-pane-tmux.log" \
+  TMUX="/tmp/tmux.sock,1,0" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/registry-pane.txt:8:9' '/tmp' terminal >/dev/null 2>&1
+registry_pane_call=$(cat "$tmp/registry-pane-nvim.log")
+_assert_contains "helper resolves the owner-scoped current-window pane record" \
+  "server=$socket_two" "$registry_pane_call"
+_assert_not_contains "helper does not probe an older pane owner first" \
+  "server=$socket_one" "$registry_pane_call"
+
+rm -rf "$registry_pane_dir/owners" \
+  "$test_home/.local/state/nvim-tmux-open/registry/owners"
+rm -f "$registry_pane_dir/latest"
+mkdir -p "$registry_pane_dir/owners" \
+  "$test_home/.local/state/nvim-tmux-open/registry/owners"
+_write_registry_record "$registry_pane_dir/owners/owner-a-newest" \
+  00000000000000000030 owner-a-newest "$socket_one"
+_write_registry_record "$registry_pane_dir/owners/owner-b-oldest" \
+  00000000000000000010 owner-b-oldest "$socket_three"
+_write_registry_record "$registry_pane_dir/owners/owner-c-middle" \
+  00000000000000000020 owner-c-middle "$socket_two"
+_commit_registry_owner "$test_home/.local/state/nvim-tmux-open/registry" owner-a-newest
+_commit_registry_owner "$test_home/.local/state/nvim-tmux-open/registry" owner-b-oldest
+_commit_registry_owner "$test_home/.local/state/nvim-tmux-open/registry" owner-c-middle
+NVIM_MOCK_LOG="$tmp/failing-newest-pane-nvim.log" \
+  NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
+  TMUX_MOCK_PANES="$tmp/current-window-panes" \
+  TMUX_MOCK_LOG="$tmp/failing-newest-pane-tmux.log" \
+  TMUX="/tmp/tmux.sock,1,0" \
+  HOME="$test_home" \
+  PATH="$mock_bin:$PATH" \
+  "$helper" link '/tmp/failing-newest-pane.txt:8:9' '/tmp' terminal >/dev/null 2>&1
+failing_newest_pane_call=$(cat "$tmp/failing-newest-pane-nvim.log")
+_assert_contains "helper selects the next-newest pane owner after RPC failure" \
+  "server=$socket_two" "$failing_newest_pane_call"
+_assert_not_contains "helper does not probe the oldest pane owner before the middle owner" \
+  "server=$socket_three" "$failing_newest_pane_call"
+rm -rf "$test_home/.local/state/nvim-tmux-open/registry"
+printf '%s\n' "$socket_two" >"$test_home/.local/state/nvim-tmux-open/panes/_tmp_tmux.sock__2"
 
 cat >"$tmp/no-current-window-nvim-panes" <<'EOF'
 %1	bash

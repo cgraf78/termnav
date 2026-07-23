@@ -9,6 +9,8 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
+# shellcheck source=../../lib/termnav/nvim-open/common.sh
+. "$TERMNAV_ROOT/lib/termnav/nvim-open/common.sh"
 
 _nvim_lua() {
   nvim --headless --noplugin -u NONE -i NONE \
@@ -281,15 +283,272 @@ result=$(_nvim_lua "
   vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_STATE'
   local opener = dofile('$opener_module')
   opener.setup()
-  local current = vim.fn.readfile('$NVIM_TMUX_OPEN_STATE/nvim-tmux-open/current')[1]
+  local current_record = vim.fn.glob('$NVIM_TMUX_OPEN_STATE/nvim-tmux-open/registry/current/owners/*', false, true)[1]
+  local current = vim.fn.readfile(current_record)[4]
   print(tostring(current == vim.v.servername))
-  print(vim.fn.isdirectory('$NVIM_TMUX_OPEN_STATE/nvim-tmux-open/panes'))
-  print(vim.fn.filereadable('$NVIM_TMUX_OPEN_HOME/.local/state/nvim-tmux-open/current'))
+  print(vim.fn.isdirectory('$NVIM_TMUX_OPEN_STATE/nvim-tmux-open/registry/panes'))
+  print(vim.fn.isdirectory('$NVIM_TMUX_OPEN_HOME/.local/state/nvim-tmux-open/registry'))
   vim.env.HOME = old_home
   vim.env.XDG_STATE_HOME = old_state_home
 ")
 expected="$(printf 'true\n1\n0')"
 _assert_eq "setup: publishes current nvim under XDG_STATE_HOME" "$expected" "$result"
+
+NVIM_TMUX_OPEN_REGISTRY=$(_tmpdir)
+registry_socket='/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+registry_key=$(TMUX="$registry_socket,101,0" nvim_open_pane_key '%1')
+result=$(
+  umask 000
+  _nvim_lua "
+  vim.env.HOME = nil
+  vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_REGISTRY'
+  vim.env.TMUX = '$registry_socket,101,0'
+  vim.env.TMUX_PANE = '%1'
+  local opener = dofile('$opener_module')
+  opener.setup()
+  local root = '$NVIM_TMUX_OPEN_REGISTRY/nvim-tmux-open'
+  local pane_records = vim.fn.glob(root .. '/registry/panes/**/owners/*', false, true)
+  local current_records = vim.fn.glob(root .. '/registry/current/owners/*', false, true)
+  local pane_dir = vim.fn.fnamemodify(vim.fn.fnamemodify(pane_records[1] or '', ':h'), ':h')
+  print(#pane_records)
+  print(#current_records)
+  print(pane_dir:sub(#(root .. '/registry/panes/') + 1))
+  print(vim.fn.getfperm(root))
+  print(vim.fn.getfperm(root .. '/registry'))
+  print(vim.fn.getfperm(root .. '/registry/panes'))
+  print(vim.fn.getfperm(root .. '/registry/current'))
+  print(vim.fn.getfperm(pane_dir))
+  print(vim.fn.getfperm(pane_dir .. '/owners'))
+  print(vim.fn.getfperm(root .. '/registry/current/owners'))
+  print(vim.fn.getfperm(pane_records[1] or ''))
+  print(vim.fn.getfperm(current_records[1] or ''))
+  print(vim.fn.getfperm(pane_dir .. '/latest'))
+  print(vim.fn.getfperm(root .. '/registry/current/latest'))
+  print(tostring(vim.fn.readfile(pane_records[1] or '')[4] == opener.server()))
+  print(tostring(vim.fn.readfile(current_records[1] or '')[4] == opener.server()))
+  print(tostring(vim.fn.readfile(pane_dir .. '/latest')[3] == vim.fn.fnamemodify(pane_records[1] or '', ':t')))
+  print(tostring(vim.fn.readfile(root .. '/registry/current/latest')[3] == vim.fn.fnamemodify(current_records[1] or '', ':t')))
+  print(#vim.fn.glob(root .. '/registry/**/*.tmp.*', false, true))
+"
+)
+expected="$(printf '1\n1\n%s\nrwx------\nrwx------\nrwx------\nrwx------\nrwx------\nrwx------\nrwx------\nrw-------\nrw-------\nrw-------\nrw-------\ntrue\ntrue\ntrue\ntrue\n0' "$registry_key")"
+_assert_eq "setup: publishes private atomic owner-scoped registry records" \
+  "$expected" "$result"
+
+NVIM_TMUX_OPEN_COMMA=$(_tmpdir)
+for server_pid in 101 202; do
+  _nvim_lua "
+    vim.env.HOME = nil
+    vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_COMMA'
+    vim.env.TMUX = '/tmp/tmux,comma.sock,$server_pid,0'
+    vim.env.TMUX_PANE = '%1'
+    local opener = dofile('$opener_module')
+    opener.setup()
+  " >/dev/null
+done
+comma_server_one_key=$(TMUX='/tmp/tmux,comma.sock,101,0' nvim_open_pane_key '%1')
+comma_server_two_key=$(TMUX='/tmp/tmux,comma.sock,202,0' nvim_open_pane_key '%1')
+result="$(
+  printf '%s\n' "$([[ -d "$NVIM_TMUX_OPEN_COMMA/nvim-tmux-open/registry/panes/$comma_server_one_key" ]] && echo true || echo false)"
+  printf '%s\n' "$([[ -d "$NVIM_TMUX_OPEN_COMMA/nvim-tmux-open/registry/panes/$comma_server_two_key" ]] && echo true || echo false)"
+  pane_dir_count=0
+  for pane_dir in "$NVIM_TMUX_OPEN_COMMA/nvim-tmux-open/registry/panes"/*; do
+    [[ -d "$pane_dir" ]] && pane_dir_count=$((pane_dir_count + 1))
+  done
+  printf '%s\n' "$pane_dir_count"
+)"
+expected="$(printf 'true\ntrue\n2')"
+_assert_eq "setup: shell and Lua preserve comma socket server identity" \
+  "$expected" "$result"
+
+rename_failure_ok=true
+for fail_at in 1 2 3 4 5; do
+  NVIM_TMUX_OPEN_FAILURE=$(_tmpdir)
+  result=$(_nvim_lua "
+    vim.env.HOME = nil
+    vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_FAILURE'
+    vim.env.TMUX = '/tmp/failure.sock,303,0'
+    vim.env.TMUX_PANE = '%3'
+    local uv = vim.uv or vim.loop
+    local real_rename = uv.fs_rename
+    local rename_count = 0
+    uv.fs_rename = function(...)
+      rename_count = rename_count + 1
+      if rename_count == $fail_at then
+        return nil, 'injected rename failure'
+      end
+      return real_rename(...)
+    end
+    local opener = dofile('$opener_module')
+    local ok = pcall(opener.setup)
+    uv.fs_rename = real_rename
+    local root = '$NVIM_TMUX_OPEN_FAILURE/nvim-tmux-open/registry'
+    local committed = vim.fn.glob(root .. '/owners/*', false, true)
+    local retried = pcall(opener.setup)
+    local address = opener.server()
+    print(tostring(ok))
+    print(#committed)
+    print(#vim.fn.glob(root .. '/**/*.tmp.*', false, true))
+    print(tostring(retried))
+    print(vim.fn.getftype(address))
+  ")
+  expected="$(printf 'false\n0\n0\ntrue\nsocket')"
+  if [[ "$result" != "$expected" ]]; then
+    rename_failure_ok=false
+    printf '  rename failure %s: expected %q, got %q\n' \
+      "$fail_at" "$expected" "$result" >&2
+  fi
+done
+_assert_eq "setup: every publication rename rolls back and can retry in-process" \
+  "true" "$rename_failure_ok"
+
+owned_failure_ok=true
+for fail_at in 1 2 3 4 5; do
+  result=$(_nvim_lua "
+  local real_vim = vim
+  local rename_count = 0
+  local start_count = 0
+  local stop_count = 0
+  local fail_at = $fail_at
+  local next_fd = 10
+  _G.vim = {
+    env = {
+      HOME = nil,
+      XDG_STATE_HOME = '/state',
+      XDG_RUNTIME_DIR = '/runtime',
+      TMUX = '/tmp/tmux.sock,1,0',
+      TMUX_PANE = '%1',
+    },
+    api = {
+      nvim_create_augroup = function() return 1 end,
+      nvim_create_autocmd = function() return 1 end,
+      nvim_del_augroup_by_id = function() end,
+    },
+    fn = {
+      delete = function() return 0 end,
+      getpid = function() return 4321 end,
+      getuid = function() return 501 end,
+      isdirectory = function() return 1 end,
+      mkdir = function() return 1 end,
+      serverstart = function(path) start_count = start_count + 1; return path end,
+      serverstop = function() stop_count = stop_count + 1; return 0 end,
+      setfperm = function() return 1 end,
+    },
+    uv = {
+      fs_close = function() return true end,
+      fs_fsync = function() return true end,
+      fs_lstat = function() return { type = 'directory', uid = 501 } end,
+      fs_open = function() next_fd = next_fd + 1; return next_fd end,
+      fs_rename = function()
+        rename_count = rename_count + 1
+        if rename_count == fail_at then return nil, 'injected rename failure' end
+        return true
+      end,
+      fs_unlink = function() return true end,
+      fs_write = function(_, content) return #content end,
+      hrtime = function() return 1234 end,
+    },
+    v = { servername = '' },
+  }
+  local opener = dofile('$opener_module')
+  local first_ok = pcall(opener.setup)
+  fail_at = -1
+  local retry_ok = pcall(opener.setup)
+  _G.vim = real_vim
+  print(tostring(first_ok))
+  print(tostring(retry_ok))
+  print(start_count)
+  print(stop_count)
+  ")
+  expected="$(printf 'false\ntrue\n2\n1')"
+  if [[ "$result" != "$expected" ]]; then
+    owned_failure_ok=false
+    printf '  owned-socket failure %s: expected %q, got %q\n' \
+      "$fail_at" "$expected" "$result" >&2
+  fi
+done
+_assert_eq "setup: every failed owned-socket publication stops and clears cache" \
+  "true" "$owned_failure_ok"
+
+NVIM_TMUX_OPEN_CONCURRENT=$(_tmpdir)
+registry_ready_one="$NVIM_TMUX_OPEN_CONCURRENT/ready-one"
+registry_ready_two="$NVIM_TMUX_OPEN_CONCURRENT/ready-two"
+registry_stop_one="$NVIM_TMUX_OPEN_CONCURRENT/stop-one"
+registry_stop_two="$NVIM_TMUX_OPEN_CONCURRENT/stop-two"
+
+_registry_record_count() {
+  local count=0 record
+  for record in "$NVIM_TMUX_OPEN_CONCURRENT/nvim-tmux-open/registry/current/owners"/*; do
+    [[ -f "$record" ]] && count=$((count + 1))
+  done
+  printf '%s\n' "$count"
+}
+
+_wait_for_registry_condition() {
+  local kind="$1" expected="$2" attempt=0
+  while ((attempt < 200)); do
+    if [[ "$kind" == file && -f "$expected" ]]; then
+      return 0
+    fi
+    if [[ "$kind" == count && "$(_registry_record_count)" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.05
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+_start_registry_owner() {
+  local ready="$1" stop="$2" log="$3"
+  nvim --headless --noplugin -u NONE -i NONE \
+    -c "lua vim.env.HOME = nil; vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_CONCURRENT'; vim.env.TMUX = '/tmp/concurrent.sock,404,0'; vim.env.TMUX_PANE = '%4'; local opener = dofile('$opener_module'); opener.setup(); vim.fn.writefile({'ready'}, '$ready'); vim.wait(15000, function() return vim.fn.filereadable('$stop') == 1 end)" \
+    -c 'qa!' >"$log" 2>&1 &
+  REPLY=$!
+}
+
+_start_registry_owner "$registry_ready_one" "$registry_stop_one" \
+  "$NVIM_TMUX_OPEN_CONCURRENT/owner-one.log"
+registry_pid_one=$REPLY
+_wait_for_registry_condition file "$registry_ready_one"
+registry_ready_one_rc=$?
+_start_registry_owner "$registry_ready_two" "$registry_stop_two" \
+  "$NVIM_TMUX_OPEN_CONCURRENT/owner-two.log"
+registry_pid_two=$REPLY
+_wait_for_registry_condition file "$registry_ready_two"
+registry_ready_two_rc=$?
+_wait_for_registry_condition count 2
+registry_two_count_rc=$?
+
+if [[ "$registry_ready_one_rc" -eq 0 && "$registry_ready_two_rc" -eq 0 &&
+  "$registry_two_count_rc" -eq 0 ]]; then
+  _pass "setup: concurrent owners publish separate pane records"
+else
+  _fail "setup: concurrent owners publish separate pane records"
+fi
+
+: >"$registry_stop_one"
+wait "$registry_pid_one"
+registry_owner_one_rc=$?
+_wait_for_registry_condition count 1
+registry_one_count_rc=$?
+if [[ "$registry_owner_one_rc" -eq 0 && "$registry_one_count_rc" -eq 0 ]] &&
+  kill -0 "$registry_pid_two" 2>/dev/null; then
+  _pass "cleanup: one owner cannot remove a concurrent owner's pane record"
+else
+  _fail "cleanup: one owner cannot remove a concurrent owner's pane record"
+fi
+
+: >"$registry_stop_two"
+wait "$registry_pid_two"
+registry_owner_two_rc=$?
+_wait_for_registry_condition count 0
+registry_zero_count_rc=$?
+if [[ "$registry_owner_two_rc" -eq 0 && "$registry_zero_count_rc" -eq 0 ]]; then
+  _pass "cleanup: each owner removes its own pane record"
+else
+  _fail "cleanup: each owner removes its own pane record"
+fi
 
 NVIM_TMUX_OPEN_FALLBACK=$(_tmpdir)
 result=$(_nvim_lua "
@@ -301,7 +560,8 @@ result=$(_nvim_lua "
   vim.env.XDG_STATE_HOME = ''
   local opener = dofile('$opener_module')
   opener.setup()
-  local current = vim.fn.readfile('$NVIM_TMUX_OPEN_FALLBACK/.local/state/nvim-tmux-open/current')[1]
+  local current_record = vim.fn.glob('$NVIM_TMUX_OPEN_FALLBACK/.local/state/nvim-tmux-open/registry/current/owners/*', false, true)[1]
+  local current = vim.fn.readfile(current_record)[4]
   print(tostring(current == vim.v.servername))
   vim.env.HOME = old_home
   vim.env.XDG_STATE_HOME = old_state_home
@@ -318,7 +578,8 @@ result=$(_nvim_lua "
   vim.env.XDG_STATE_HOME = 'relative/state'
   local opener = dofile('$opener_module')
   opener.setup()
-  local current = vim.fn.readfile('$NVIM_TMUX_OPEN_RELATIVE/.local/state/nvim-tmux-open/current')[1]
+  local current_record = vim.fn.glob('$NVIM_TMUX_OPEN_RELATIVE/.local/state/nvim-tmux-open/registry/current/owners/*', false, true)[1]
+  local current = vim.fn.readfile(current_record)[4]
   print(tostring(current == vim.v.servername))
   vim.env.HOME = old_home
   vim.env.XDG_STATE_HOME = old_state_home
@@ -334,7 +595,7 @@ result=$(_nvim_lua "
   vim.env.XDG_STATE_HOME = state_home
   local opener = dofile('$opener_module')
   print(tostring(opener.setup()))
-  print(vim.fn.filereadable(state_home .. '/nvim-tmux-open/current'))
+  print(#vim.fn.glob(state_home .. '/nvim-tmux-open/registry/current/owners/*', false, true))
 ")
 expected="$(printf 'true\n1')"
 _assert_eq "setup: preserves absolute XDG state trailing newline without HOME" \
@@ -359,6 +620,63 @@ result=$(_nvim_lua "
   print(tostring(opener.server() ~= ''))
 ")
 _assert_eq "server: exposes the socket address used for publication" "true" "$result"
+
+result=$(_nvim_lua "
+  local real_vim = vim
+  local started = ''
+  local long_runtime = '/' .. string.rep('runtime-', 20)
+  _G.vim = {
+    env = {
+      HOME = nil,
+      XDG_STATE_HOME = '/state',
+      XDG_RUNTIME_DIR = long_runtime,
+      TMUX = '/tmp/tmux.sock,1,0',
+      TMUX_PANE = '%1',
+    },
+    fn = {
+      delete = function() return 0 end,
+      getpid = function() return 4321 end,
+      getuid = function() return 501 end,
+      isdirectory = function() return 1 end,
+      mkdir = function() return 1 end,
+      serverstart = function(path) started = path; return path end,
+      setfperm = function() return 1 end,
+    },
+    uv = {
+      fs_lstat = function() return { type = 'directory', uid = 501 } end,
+      hrtime = function() return 1234 end,
+    },
+    v = { servername = '' },
+  }
+  local opener = dofile('$opener_module')
+  _G.vim = real_vim
+  print(opener.server())
+  print(tostring(#started <= 100))
+")
+expected="$(printf '/tmp/termnav-501/nvim-4321-1234.sock\ntrue')"
+_assert_eq "server: long runtime paths fall back within Unix socket limits" \
+  "$expected" "$result"
+
+NVIM_TMUX_OPEN_RUNTIME=$(_tmpdir)
+newline_runtime="$NVIM_TMUX_OPEN_RUNTIME/runtime"$'\nline'
+mkdir -p "$newline_runtime"
+result=$(XDG_RUNTIME_DIR="$newline_runtime" _nvim_lua "
+  vim.env.HOME = nil
+  vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_RUNTIME/state'
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local opener = dofile('$opener_module')
+  opener.setup()
+  local record_path = vim.fn.glob('$NVIM_TMUX_OPEN_RUNTIME/state/nvim-tmux-open/registry/current/owners/*', false, true)[1]
+  local record = vim.fn.readfile(record_path)
+  local address = opener.server()
+  print(#record)
+  print(tostring(record[4] == address))
+  print(tostring(not address:find(string.char(10), 1, true)))
+")
+expected="$(printf '4\ntrue\ntrue')"
+_assert_eq "setup: newline runtime publishes a readable fallback socket record" \
+  "$expected" "$result"
 
 echo ""
 echo "=== nvim setup ==="

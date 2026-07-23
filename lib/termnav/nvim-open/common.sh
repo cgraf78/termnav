@@ -123,14 +123,111 @@ nvim_open_socket() {
   nvim --server "$socket" --remote-expr "$expr" >/dev/null 2>&1
 }
 
+_nvim_open_owner_committed() {
+  local marker="$1" line
+  local -a lines=()
+  [[ -f "$marker" && ! -L "$marker" && -r "$marker" ]] || return 1
+  while IFS= read -r line; do
+    lines[${#lines[@]}]="$line"
+    ((${#lines[@]} <= 1)) || return 1
+  done <"$marker"
+  ((${#lines[@]} == 1)) && [[ "${lines[0]}" == v2 ]]
+}
+
+_nvim_open_read_registry_record() {
+  local record="$1" expected_owner="${2:-}" registry_root="$3" line
+  local -a lines=()
+
+  [[ -f "$record" && ! -L "$record" && -r "$record" ]] || return 1
+  while IFS= read -r line; do
+    lines[${#lines[@]}]="$line"
+    ((${#lines[@]} <= 4)) || return 1
+  done <"$record"
+  ((${#lines[@]} == 4)) || return 1
+  [[ "${lines[0]}" == v2 ]] || return 1
+  ((${#lines[1]} == 20)) || return 1
+  case "${lines[1]}" in *[!0-9]*) return 1 ;; esac
+  case "${lines[2]}" in
+    "" | "." | ".." | *[![:alnum:]_.-]*) return 1 ;;
+  esac
+  [[ -z "$expected_owner" || "${lines[2]}" == "$expected_owner" ]] || return 1
+  [[ -n "${lines[3]}" ]] || return 1
+  _nvim_open_owner_committed "$registry_root/owners/${lines[2]}" || return 1
+  REPLY_SEQUENCE="${lines[1]}"
+  REPLY_OWNER="${lines[2]}"
+  REPLY_SOCKET="${lines[3]}"
+}
+
+_nvim_open_ordered_owner_records() {
+  local owners_dir="$1" registry_root="$2" record sequence owner insert previous
+  local LC_ALL=C
+  local -a records=() sequences=() owners=()
+
+  REPLY_RECORDS=()
+  for record in "$owners_dir"/*; do
+    [[ -e "$record" ]] || continue
+    _nvim_open_read_registry_record "$record" "${record##*/}" "$registry_root" || continue
+    sequence=$REPLY_SEQUENCE
+    owner=$REPLY_OWNER
+    insert=${#records[@]}
+    while ((insert > 0)); do
+      previous=$((insert - 1))
+      if [[ "$sequence" > "${sequences[$previous]}" ||
+        ("$sequence" == "${sequences[$previous]}" && "$owner" > "${owners[$previous]}") ]]; then
+        records[insert]="${records[previous]}"
+        sequences[insert]="${sequences[previous]}"
+        owners[insert]="${owners[previous]}"
+        insert=$previous
+      else
+        break
+      fi
+    done
+    records[insert]="$record"
+    sequences[insert]="$sequence"
+    owners[insert]="$owner"
+  done
+  REPLY_RECORDS=("${records[@]}")
+}
+
 nvim_open_rpc() {
   local target_file="$1" target_line="$2" target_col="$3" target_cwd="$4" source="$5"
-  local socket socket_file state_dir seen_sockets
-  local -a socket_files
+  local socket socket_file state_dir registry_root seen_sockets latest_file legacy_file
+  local preferred_record="" new_activity=""
+  local legacy_first=0
+  local -a socket_files=() owner_records=() REPLY_RECORDS=()
 
   nvim_open_resolve_state_dir || return 1
   state_dir="$REPLY"
-  socket_files+=("$state_dir/current")
+  registry_root="$state_dir/registry"
+
+  latest_file="$registry_root/current/latest"
+  legacy_file="$state_dir/current"
+
+  if _nvim_open_read_registry_record "$latest_file" "" "$registry_root"; then
+    preferred_record="$latest_file"
+    new_activity="$latest_file"
+  fi
+  _nvim_open_ordered_owner_records "$registry_root/current/owners" "$registry_root"
+  owner_records=("${REPLY_RECORDS[@]}")
+  if [[ -z "$new_activity" ]]; then
+    new_activity=${owner_records[0]:-}
+  fi
+  # A tie cannot establish which format was written last. Prefer the legacy
+  # record during rolling upgrades so a stale new-format record cannot win.
+  if [[ -e "$legacy_file" && (-z "$new_activity" || ! "$new_activity" -nt "$legacy_file") ]]; then
+    socket_files+=("$legacy_file")
+    legacy_first=1
+  fi
+  if [[ -n "$preferred_record" ]]; then
+    socket_files+=("$preferred_record")
+  fi
+  for socket_file in "${owner_records[@]}"; do
+    socket_files+=("$socket_file")
+  done
+
+  # Read the legacy singleton registry during rolling upgrades. New publishers
+  # use owner-scoped records and never create these paths.
+  [[ "$legacy_first" == 1 ]] || socket_files+=("$legacy_file")
   for socket_file in "$state_dir"/panes/*; do
     [[ -e "$socket_file" ]] && socket_files+=("$socket_file")
   done
@@ -138,14 +235,21 @@ nvim_open_rpc() {
   seen_sockets=$'\n'
   for socket_file in "${socket_files[@]}"; do
     [[ -r "$socket_file" ]] || continue
-    IFS= read -r socket <"$socket_file" || socket=""
+    case "$socket_file" in
+      "$registry_root"/*/owners/*)
+        _nvim_open_read_registry_record "$socket_file" "${socket_file##*/}" "$registry_root" || continue
+        socket="$REPLY_SOCKET"
+        ;;
+      "$latest_file")
+        _nvim_open_read_registry_record "$socket_file" "" "$registry_root" || continue
+        socket="$REPLY_SOCKET"
+        ;;
+      *) IFS= read -r socket <"$socket_file" || socket="" ;;
+    esac
     [[ -n "$socket" ]] || continue
     [[ "$seen_sockets" != *$'\n'"$socket"$'\n'* ]] || continue
     seen_sockets+="$socket"$'\n'
-    if [[ ! -S "$socket" ]]; then
-      rm -f "$socket_file"
-      continue
-    fi
+    [[ -S "$socket" ]] || continue
     if nvim_open_socket "$socket" "$target_file" "$target_line" "$target_col" "$target_cwd" "$source"; then
       return 0
     fi
@@ -156,6 +260,36 @@ nvim_open_rpc() {
 }
 
 nvim_open_pane_key() {
+  local pane="$1" tmux_value="${TMUX:-}" tmux_socket tmux_fields tmux_pid key
+  local chunk first=1
+  [[ -n "$pane" ]] || return 1
+
+  tmux_fields="${tmux_value%,*}"
+  if [[ "$tmux_fields" == "$tmux_value" || "$tmux_fields" != *,* ]]; then
+    tmux_socket="$tmux_value"
+    tmux_pid=""
+  else
+    tmux_socket="${tmux_fields%,*}"
+    tmux_pid="${tmux_fields##*,}"
+  fi
+
+  key=$(printf '%s\0%s\0%s' "$tmux_socket" "$tmux_pid" "$pane" |
+    LC_ALL=C od -An -tx1 -v | tr -d ' \n') || return 1
+  [[ -n "$key" ]] || return 1
+  while [[ -n "$key" ]]; do
+    chunk="${key:0:120}"
+    key="${key:120}"
+    if [[ "$first" == 1 ]]; then
+      printf 'v1-%s' "$chunk"
+      first=0
+    else
+      printf '/%s' "$chunk"
+    fi
+  done
+  printf '\n'
+}
+
+nvim_open_legacy_pane_key() {
   local pane="$1" tmux_socket="${TMUX%%,*}" key
   [[ -n "$pane" ]] || return 1
   key="$pane"
@@ -167,16 +301,62 @@ nvim_open_pane_key() {
 
 nvim_open_pane_socket() {
   local pane_id="$1" target_file="$2" target_line="$3" target_col="$4" target_cwd="$5" source="$6"
-  local key socket socket_file state_dir
+  local key legacy_key socket socket_file state_dir registry_root latest_file legacy_file
+  local preferred_record="" new_activity=""
+  local legacy_first=0 seen_sockets
+  local -a socket_files=() owner_records=() REPLY_RECORDS=()
 
   key=$(nvim_open_pane_key "$pane_id") || return 1
+  legacy_key=$(nvim_open_legacy_pane_key "$pane_id") || return 1
   nvim_open_resolve_state_dir || return 1
   state_dir="$REPLY"
-  socket_file="$state_dir/panes/$key"
-  [[ -r "$socket_file" ]] || return 1
-  IFS= read -r socket <"$socket_file" || socket=""
-  [[ -n "$socket" ]] || return 1
-  nvim_open_socket "$socket" "$target_file" "$target_line" "$target_col" "$target_cwd" "$source"
+  registry_root="$state_dir/registry"
+  latest_file="$registry_root/panes/$key/latest"
+  legacy_file="$state_dir/panes/$legacy_key"
+
+  if _nvim_open_read_registry_record "$latest_file" "" "$registry_root"; then
+    preferred_record="$latest_file"
+    new_activity="$latest_file"
+  fi
+  _nvim_open_ordered_owner_records "$registry_root/panes/$key/owners" "$registry_root"
+  owner_records=("${REPLY_RECORDS[@]}")
+  if [[ -z "$new_activity" ]]; then
+    new_activity=${owner_records[0]:-}
+  fi
+  if [[ -e "$legacy_file" && (-z "$new_activity" || ! "$new_activity" -nt "$legacy_file") ]]; then
+    socket_files+=("$legacy_file")
+    legacy_first=1
+  fi
+  if [[ -n "$preferred_record" ]]; then
+    socket_files+=("$preferred_record")
+  fi
+  for socket_file in "${owner_records[@]}"; do
+    socket_files+=("$socket_file")
+  done
+  [[ "$legacy_first" == 1 ]] || socket_files+=("$legacy_file")
+
+  seen_sockets=$'\n'
+  for socket_file in "${socket_files[@]}"; do
+    [[ -r "$socket_file" ]] || continue
+    case "$socket_file" in
+      "$registry_root"/*/owners/*)
+        _nvim_open_read_registry_record "$socket_file" "${socket_file##*/}" "$registry_root" || continue
+        socket="$REPLY_SOCKET"
+        ;;
+      "$latest_file")
+        _nvim_open_read_registry_record "$socket_file" "" "$registry_root" || continue
+        socket="$REPLY_SOCKET"
+        ;;
+      *) IFS= read -r socket <"$socket_file" || socket="" ;;
+    esac
+    [[ -n "$socket" ]] || continue
+    [[ "$seen_sockets" != *$'\n'"$socket"$'\n'* ]] || continue
+    seen_sockets+="$socket"$'\n'
+    if nvim_open_socket "$socket" "$target_file" "$target_line" "$target_col" "$target_cwd" "$source"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 nvim_open_tmux_send() {
