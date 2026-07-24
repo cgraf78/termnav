@@ -681,6 +681,56 @@ _assert_eq "setup: newline runtime publishes a readable fallback socket record" 
 echo ""
 echo "=== nvim setup ==="
 
+NVIM_TMUX_REPEATED_SETUP=$(_tmpdir)
+ln -s "$TERMNAV_ROOT/lib/termnav/nvim" "$NVIM_TMUX_REPEATED_SETUP/nvim-link"
+result=$(_nvim_lua "
+  vim.env.HOME = nil
+  vim.env.XDG_STATE_HOME = '$NVIM_TMUX_REPEATED_SETUP'
+  vim.env.TMUX = '/tmp/repeated-setup.sock,505,0'
+  vim.env.TMUX_PANE = '%5'
+  vim.cmd('cd $TERMNAV_ROOT')
+
+  local options = {
+    publish_delay_ms = -1,
+    wezterm_vars = { set = function() return true end },
+  }
+  dofile('lib/termnav/nvim/setup.lua').setup(options)
+  dofile('$setup_module').setup(options)
+  dofile('$NVIM_TMUX_REPEATED_SETUP/nvim-link/setup.lua').setup(options)
+  local root = '$NVIM_TMUX_REPEATED_SETUP/nvim-tmux-open/registry'
+  print(#vim.fn.glob(root .. '/owners/*', false, true))
+  print(#vim.fn.glob(root .. '/panes/**/owners/*', false, true))
+  print(#vim.fn.glob(root .. '/current/owners/*', false, true))
+  vim.api.nvim_exec_autocmds('VimLeavePre', {})
+  print(#vim.fn.glob(root .. '/owners/*', false, true))
+  print(#vim.fn.glob(root .. '/panes/**/owners/*', false, true))
+  print(#vim.fn.glob(root .. '/current/owners/*', false, true))
+")
+expected="$(printf '1\n1\n1\n0\n0\n0\n')"
+_assert_eq "nvim setup: source aliases share one owner and cleanup retires it" \
+  "$expected" "$result"
+
+NVIM_TMUX_DISTINCT_SETUP=$(_tmpdir)
+for copy in one two; do
+  mkdir -p "$NVIM_TMUX_DISTINCT_SETUP/$copy/lib/termnav"
+  cp -R "$TERMNAV_ROOT/lib/termnav/nvim" \
+    "$NVIM_TMUX_DISTINCT_SETUP/$copy/lib/termnav/"
+done
+result=$(_nvim_lua "
+  vim.env.HOME = nil
+  vim.env.XDG_STATE_HOME = '$NVIM_TMUX_DISTINCT_SETUP/state'
+
+  local options = { wezterm_vars = {} }
+  vim.cmd('cd $NVIM_TMUX_DISTINCT_SETUP/one')
+  local first = dofile('lib/termnav/nvim/setup.lua').new(options)
+  vim.cmd('cd $NVIM_TMUX_DISTINCT_SETUP/two')
+  local second = dofile('lib/termnav/nvim/setup.lua').new(options)
+  print(tostring(first.opener ~= second.opener))
+")
+expected="true"
+_assert_eq "nvim setup: identical relative paths in distinct installs stay isolated" \
+  "$expected" "$result"
+
 NVIM_TMUX_SETUP_TMP=$(_tmpdir)
 mkdir -p "$NVIM_TMUX_SETUP_TMP/local"
 NVIM_TMUX_SETUP_TMP=$(realpath "$NVIM_TMUX_SETUP_TMP")

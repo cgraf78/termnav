@@ -35,7 +35,16 @@ local function load_sibling(name)
 end
 
 local function default_opener()
-  return load_sibling("nvim-tmux-open.lua")
+  local path = source_dir() .. "/nvim-tmux-open.lua"
+  local canonical = vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
+  -- Reuse one process-scoped owner across config reloads and source aliases.
+  local cache_key = "termnav.nvim.default_opener:" .. canonical
+  local opener = package.loaded[cache_key]
+  if opener == nil then
+    opener = dofile(path)
+    package.loaded[cache_key] = opener
+  end
+  return opener
 end
 
 local function default_wezterm_vars()
