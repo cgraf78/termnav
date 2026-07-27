@@ -1517,6 +1517,7 @@ remote_cmd_system_path=$(printf '%s:%s' \
   "$(dirname "$(command -v awk)")")
 env -i \
   HOME="$remote_cmd_home" \
+  LD_PRELOAD="${LD_PRELOAD:-}" \
   PATH="$remote_cmd_path:$remote_cmd_system_path" \
   NVIM_MOCK_LOG="$tmp/remote-cmd-env-nvim.log" \
   NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
