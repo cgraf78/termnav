@@ -128,6 +128,15 @@ local function socket_path()
   then
     candidates[#candidates + 1] = runtime .. "/termnav"
   end
+  local temporary = vim.env.TMPDIR
+  if
+    type(temporary) == "string"
+    and temporary:match("^/")
+    and not temporary:find("\n", 1, true)
+    and vim.fn.isdirectory(temporary) == 1
+  then
+    candidates[#candidates + 1] = temporary .. "/termnav-" .. tostring(user_id())
+  end
   candidates[#candidates + 1] = "/tmp/termnav-" .. tostring(user_id())
 
   -- macOS has the smaller common Unix-domain socket limit. Staying below 100

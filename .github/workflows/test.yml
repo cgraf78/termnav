@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@1db322ef8a998a904974d0c81fb94515d1b16973
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@663f83780f58f231e810d0c9eca642bbf859353b
     with:
       matrix-set: full
       profiles: base,shellcheck,lua,neovim,tmux,python,openssh-netcat-lsof

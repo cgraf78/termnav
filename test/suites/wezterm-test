@@ -1512,9 +1512,13 @@ echo Linux
 EOF
 chmod +x "$remote_cmd_path/uname"
 printf '%s\n' "$socket_two" >"$remote_cmd_home/.local/state/nvim-tmux-open/current"
+remote_cmd_system_path=$(printf '%s:%s' \
+  "$(dirname "$(command -v sh)")" \
+  "$(dirname "$(command -v awk)")")
 env -i \
   HOME="$remote_cmd_home" \
-  PATH="$remote_cmd_path:/usr/bin:/bin" \
+  LD_PRELOAD="${LD_PRELOAD:-}" \
+  PATH="$remote_cmd_path:$remote_cmd_system_path" \
   NVIM_MOCK_LOG="$tmp/remote-cmd-env-nvim.log" \
   NVIM_MOCK_SUCCESS_SOCKET="$socket_two" \
   TMUX_MOCK_PANES="$tmp/missing-panes" \
