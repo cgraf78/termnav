@@ -665,7 +665,6 @@ newline_runtime="$NVIM_TMUX_OPEN_RUNTIME/runtime"$'\nline'
 mkdir -p "$newline_runtime"
 result=$(XDG_RUNTIME_DIR="$newline_runtime" _nvim_lua "
   vim.env.HOME = nil
-  vim.env.TMPDIR = '$NVIM_TMUX_OPEN_RUNTIME'
   vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_RUNTIME/state'
   vim.env.TMUX = nil
   vim.env.TMUX_PANE = nil
