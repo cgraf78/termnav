@@ -230,9 +230,11 @@ result=$(_nvim_lua "
   vim.cmd('terminal')
   local win = vim.api.nvim_get_current_win()
   opener.open_now('$NVIM_TMUX_OPEN_TMP/external-click.txt', 1, 0, '', 'terminal')
-  print(vim.api.nvim_buf_get_name(0))
-  print(tostring(vim.api.nvim_get_current_win() == win))
-  print(#vim.api.nvim_list_tabpages())
+  print(table.concat({
+    vim.api.nvim_buf_get_name(0),
+    tostring(vim.api.nvim_get_current_win() == win),
+    tostring(#vim.api.nvim_list_tabpages()),
+  }, string.char(10)))
 ")
 expected="$(printf '%s\ntrue\n1' "$NVIM_TMUX_OPEN_EXPECTED")"
 _assert_eq "open_now: external terminal clicks reuse current window when needed" "$expected" "$result"
@@ -414,6 +416,7 @@ for fail_at in 1 2 3 4 5; do
   _G.vim = {
     env = {
       HOME = nil,
+      TMPDIR = '/tmp',
       XDG_STATE_HOME = '/state',
       XDG_RUNTIME_DIR = '/runtime',
       TMUX = '/tmp/tmux.sock,1,0',
@@ -662,6 +665,7 @@ newline_runtime="$NVIM_TMUX_OPEN_RUNTIME/runtime"$'\nline'
 mkdir -p "$newline_runtime"
 result=$(XDG_RUNTIME_DIR="$newline_runtime" _nvim_lua "
   vim.env.HOME = nil
+  vim.env.TMPDIR = '$NVIM_TMUX_OPEN_RUNTIME'
   vim.env.XDG_STATE_HOME = '$NVIM_TMUX_OPEN_RUNTIME/state'
   vim.env.TMUX = nil
   vim.env.TMUX_PANE = nil
