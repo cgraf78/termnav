@@ -8,6 +8,15 @@
 # shellcheck disable=SC2034 # public marker for callers that verify the loader ran.
 TERMNAV_SHELL_LOADED=1
 
+# Prompt hooks share this cache in the current shell. Re-sourcing the integration
+# intentionally refreshes it, matching the low-level tmux-client cache.
+_termnav_wezterm_remote_link_host_cache_set=0
+_termnav_wezterm_remote_link_host_cache_tmux=""
+_termnav_wezterm_remote_link_host_cache_ssh=""
+_termnav_wezterm_remote_link_host_cache_at=0
+_termnav_wezterm_remote_link_host_cache_value=""
+_termnav_wezterm_remote_link_host_result=""
+
 # ---------------------------------------------------------------------------
 # Public API - stable shell integration surface
 # ---------------------------------------------------------------------------
@@ -87,12 +96,38 @@ _termnav_wezterm_set_user_var() {
   termnav_wezterm_user_var_sequence "$1" "$2" auto
 }
 
-_termnav_wezterm_remote_link_host() {
-  local tmux_value
+_termnav_wezterm_remote_link_host_get() {
+  local age now="${SECONDS-}" tmux_value
 
-  if [[ -n "${TERMNAV_REMOTE_LINK_HOST:-}" ]]; then
-    printf '%s\n' "$TERMNAV_REMOTE_LINK_HOST"
+  _termnav_wezterm_remote_link_host_result=""
+
+  # If a caller replaced a value previously exported by Termnav, ownership has
+  # transferred to the caller and the new value is an explicit override.
+  if [[ -n "${_TERMNAV_REMOTE_LINK_HOST_DISCOVERED:-}" &&
+    "${TERMNAV_REMOTE_LINK_HOST:-}" != "$_TERMNAV_REMOTE_LINK_HOST_DISCOVERED" ]]; then
+    unset _TERMNAV_REMOTE_LINK_HOST_DISCOVERED
+  fi
+  if [[ -n "${TERMNAV_REMOTE_LINK_HOST:-}" &&
+    -z "${_TERMNAV_REMOTE_LINK_HOST_DISCOVERED:-}" ]]; then
+    _termnav_wezterm_remote_link_host_result="$TERMNAV_REMOTE_LINK_HOST"
     return
+  fi
+
+  # Remote identity changes far less often than prompt hooks run. Keep negative
+  # results too, but only briefly so a persistent transport can seed tmux state
+  # after this shell has started. SECONDS is builtin in Bash 3.2 and zsh.
+  case "$now" in
+    '' | *[!0-9]*) now="" ;;
+    *) now=$((10#$now)) ;;
+  esac
+  if [[ -n "$now" && "${_termnav_wezterm_remote_link_host_cache_set:-0}" == 1 &&
+    "${_termnav_wezterm_remote_link_host_cache_tmux-}" == "${TMUX:-}" &&
+    "${_termnav_wezterm_remote_link_host_cache_ssh-}" == "${SSH_CONNECTION:-}" ]]; then
+    age=$((now - _termnav_wezterm_remote_link_host_cache_at))
+    if ((age >= 0 && age < 5)); then
+      _termnav_wezterm_remote_link_host_result="$_termnav_wezterm_remote_link_host_cache_value"
+      return
+    fi
   fi
 
   if [[ -n "${TMUX:-}" ]]; then
@@ -103,24 +138,54 @@ _termnav_wezterm_remote_link_host() {
     if [[ "$tmux_value" == TERMNAV_REMOTE_LINK_HOST=* ]]; then
       tmux_value="${tmux_value#TERMNAV_REMOTE_LINK_HOST=}"
       if [[ -n "$tmux_value" ]]; then
-        printf '%s\n' "$tmux_value"
-        return
+        _termnav_wezterm_remote_link_host_result="$tmux_value"
       fi
     fi
   fi
 
-  if [[ -n "${SSH_CONNECTION:-}" ]]; then
-    hostname -s 2>/dev/null || hostname 2>/dev/null || true
+  if [[ -z "$_termnav_wezterm_remote_link_host_result" && -n "${SSH_CONNECTION:-}" ]]; then
+    _termnav_wezterm_remote_link_host_result=$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)
   fi
+
+  if [[ -n "$now" ]]; then
+    _termnav_wezterm_remote_link_host_cache_set=1
+    _termnav_wezterm_remote_link_host_cache_tmux="${TMUX:-}"
+    _termnav_wezterm_remote_link_host_cache_ssh="${SSH_CONNECTION:-}"
+    _termnav_wezterm_remote_link_host_cache_at=$now
+    _termnav_wezterm_remote_link_host_cache_value="$_termnav_wezterm_remote_link_host_result"
+  else
+    # An unusable clock cannot bound staleness, so retain correctness by querying
+    # again rather than turning this short cache into a permanent one.
+    _termnav_wezterm_remote_link_host_cache_set=0
+  fi
+}
+
+_termnav_wezterm_remote_link_host() {
+  _termnav_wezterm_remote_link_host_get
+  if [[ -n "$_termnav_wezterm_remote_link_host_result" ]]; then
+    printf '%s\n' "$_termnav_wezterm_remote_link_host_result"
+  fi
+  return 0
 }
 
 _termnav_wezterm_publish_link_context() {
   local remote_host
-  remote_host="$(_termnav_wezterm_remote_link_host)"
+  _termnav_wezterm_remote_link_host_get
+  remote_host="$_termnav_wezterm_remote_link_host_result"
   # Hyperlink-aware tools run as shell children, so export the same host that
-  # WezTerm receives via user vars. Host-specific config can override it.
-  if [[ -n "$remote_host" && -z "${TERMNAV_REMOTE_LINK_HOST:-}" ]]; then
+  # WezTerm receives via user vars. Track values exported here separately so
+  # cache expiry and tmux changes may refresh them without overriding users.
+  if [[ -n "${_TERMNAV_REMOTE_LINK_HOST_DISCOVERED:-}" &&
+    "${TERMNAV_REMOTE_LINK_HOST:-}" == "$_TERMNAV_REMOTE_LINK_HOST_DISCOVERED" ]]; then
+    if [[ -n "$remote_host" ]]; then
+      export TERMNAV_REMOTE_LINK_HOST="$remote_host"
+      export _TERMNAV_REMOTE_LINK_HOST_DISCOVERED="$remote_host"
+    else
+      unset TERMNAV_REMOTE_LINK_HOST _TERMNAV_REMOTE_LINK_HOST_DISCOVERED
+    fi
+  elif [[ -n "$remote_host" && -z "${TERMNAV_REMOTE_LINK_HOST:-}" ]]; then
     export TERMNAV_REMOTE_LINK_HOST="$remote_host"
+    export _TERMNAV_REMOTE_LINK_HOST_DISCOVERED="$remote_host"
   fi
 
   # Regex fallback links need cwd from the producing pane. WezTerm's process
