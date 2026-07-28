@@ -222,6 +222,20 @@ if [[ "$*" == "show-environment -g TERMNAV_REMOTE_LINK_HOST" ]]; then
   fi
   exit 1
 fi
+if [[ "${1:-}" == "display-message" && "$*" == *'; show-environment -g TERMNAV_REMOTE_LINK_HOST' ]]; then
+  if [[ "${TMUX_MOCK_DISPLAY_FAIL:-0}" == 1 ]]; then
+    exit 1
+  fi
+  if [[ "${TMUX_MOCK_DISPLAY_EMPTY:-0}" == 1 ]]; then
+    exit 0
+  fi
+  printf 't%s\n' "${TMUX_MOCK_TERMNAME:-tmux-256color}"
+  if [[ -n "${TMUX_MOCK_REMOTE_LINK_HOST:-}" ]]; then
+    printf 'TERMNAV_REMOTE_LINK_HOST=%s\n' "$TMUX_MOCK_REMOTE_LINK_HOST"
+    exit 0
+  fi
+  exit 1
+fi
 if [[ "${TMUX_MOCK_DISPLAY_FAIL:-0}" == 1 ]]; then
   exit 1
 fi
@@ -394,6 +408,63 @@ for test_shell in bash zsh; do
 
   : >"$shell_tmux_log"
   # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+  startup_publish_output=$(
+    TMUX=/tmp/tmux-startup,1,0 \
+      TMUX_MOCK_REMOTE_LINK_HOST=remote.example \
+      TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+      PATH="$shell_tmux_mock:$PATH" \
+      SHELL_INTEGRATION="$shell_integration" \
+      "${test_shell_command[@]}" -c '
+        SECONDS=100
+        source "$SHELL_INTEGRATION" >/dev/null
+        printf "queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+        printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+      '
+  )
+  _assert_contains "shell integration: $test_shell startup shares one tmux context query" \
+    "queries=1" "$startup_publish_output"
+  _assert_contains "shell integration: $test_shell shared startup query publishes global remote host" \
+    "host=remote.example" "$startup_publish_output"
+  _assert_contains "shell integration: $test_shell shared startup query reads global tmux environment" \
+    "show-environment -g TERMNAV_REMOTE_LINK_HOST" "$(cat "$shell_tmux_log")"
+
+  for query_result in failure empty; do
+    : >"$shell_tmux_log"
+    case "$query_result" in
+      failure) query_fail=1 query_empty=0 ;;
+      empty) query_fail=0 query_empty=1 ;;
+    esac
+    # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+    startup_recovery_output=$(
+      TMUX=/tmp/tmux-startup-recovery,1,0 \
+        TMUX_MOCK_DISPLAY_FAIL="$query_fail" \
+        TMUX_MOCK_DISPLAY_EMPTY="$query_empty" \
+        TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+        PATH="$shell_tmux_mock:$PATH" \
+        SHELL_INTEGRATION="$shell_integration" \
+        "${test_shell_command[@]}" -c '
+          SECONDS=100
+          source "$SHELL_INTEGRATION" >/dev/null
+          printf "initial=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+
+          unset TMUX_MOCK_DISPLAY_FAIL TMUX_MOCK_DISPLAY_EMPTY
+          export TMUX_MOCK_REMOTE_LINK_HOST=remote.example
+          SECONDS=106
+          _termnav_wezterm_publish_link_context >/dev/null
+          printf "recovered=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+          printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+        '
+    )
+    _assert_contains "shell integration: $test_shell startup $query_result uses one tmux query" \
+      "initial=1" "$startup_recovery_output"
+    _assert_contains "shell integration: $test_shell startup $query_result retries on expiry" \
+      "recovered=2" "$startup_recovery_output"
+    _assert_contains "shell integration: $test_shell startup $query_result recovers remote host" \
+      "host=remote.example" "$startup_recovery_output"
+  done
+
+  : >"$shell_tmux_log"
+  # shellcheck disable=SC2016 # Variables expand in the selected child shell.
   warm_publish_output=$(
     TMUX=/tmp/tmux-warm,1,0 \
       TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
@@ -419,8 +490,8 @@ for test_shell in bash zsh; do
   )
   _assert_contains "shell integration: $test_shell warm publish cycle performs no tmux query" \
     "warm=0" "$warm_publish_output"
-  _assert_contains "shell integration: $test_shell expired client and host caches each refresh once" \
-    "expired=2" "$warm_publish_output"
+  _assert_contains "shell integration: $test_shell expired client and host caches share one refresh query" \
+    "expired=1" "$warm_publish_output"
   _assert_contains "shell integration: $test_shell expired host cache observes updated tmux value" \
     "host=remote.example" "$warm_publish_output"
 done
@@ -483,7 +554,9 @@ explicit_override_output=$(
       printf "host=%s\n" "$TERMNAV_REMOTE_LINK_HOST"
     '
 )
-explicit_override_query_count=$(grep -c '^show-environment ' "$shell_tmux_log" || true)
+explicit_override_query_count=$(
+  grep -Fc '; show-environment -g TERMNAV_REMOTE_LINK_HOST' "$shell_tmux_log" || true
+)
 _assert_contains "shell integration: preserves an explicit remote-host override" \
   "host=explicit.example" "$explicit_override_output"
 _assert_eq "shell integration: explicit override skips remote-host discovery" \

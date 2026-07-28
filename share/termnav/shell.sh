@@ -97,7 +97,7 @@ _termnav_wezterm_set_user_var() {
 }
 
 _termnav_wezterm_remote_link_host_get() {
-  local age now="${SECONDS-}" tmux_value
+  local age fields nested=0 now="${SECONDS-}" parsed termname
 
   _termnav_wezterm_remote_link_host_result=""
 
@@ -133,14 +133,32 @@ _termnav_wezterm_remote_link_host_get() {
   if [[ -n "${TMUX:-}" ]]; then
     # Some persistent remote transports do not expose SSH_CONNECTION. Their
     # landing helpers can seed tmux's global env so already-running shells can
-    # still publish the same host identity that local link routing uses.
-    tmux_value=$(tmux show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null) || tmux_value=""
-    if [[ "$tmux_value" == TERMNAV_REMOTE_LINK_HOST=* ]]; then
-      tmux_value="${tmux_value#TERMNAV_REMOTE_LINK_HOST=}"
-      if [[ -n "$tmux_value" ]]; then
-        _termnav_wezterm_remote_link_host_result="$tmux_value"
-      fi
-    fi
+    # still publish the same host identity that local link routing uses. Read
+    # client classification in the same call and prime its ordinary TTL cache.
+    _termnav_wezterm_tmux_publish_observation_key="${TMUX:-}"
+    _termnav_wezterm_tmux_publish_observation_nested=""
+    fields=$(tmux display-message -p 't#{client_termname}' \; show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null) || true
+    case "$fields" in
+      t*)
+        parsed="${fields#t}"
+        termname="${parsed%%$'\n'*}"
+        if [[ "$fields" == *$'\n'TERMNAV_REMOTE_LINK_HOST=* ]]; then
+          _termnav_wezterm_remote_link_host_result="${fields#*$'\n'TERMNAV_REMOTE_LINK_HOST=}"
+        fi
+        if [[ -n "$termname" ]]; then
+          case "$termname" in
+            tmux* | screen*) nested=1 ;;
+          esac
+          _termnav_wezterm_tmux_publish_observation_nested=$nested
+          if [[ -n "$now" ]]; then
+            _termnav_wezterm_tmux_client_cache_set=1
+            _termnav_wezterm_tmux_client_cache_key="${TMUX:-}"
+            _termnav_wezterm_tmux_client_cache_nested=$nested
+            _termnav_wezterm_tmux_client_cache_at=$now
+          fi
+        fi
+        ;;
+    esac
   fi
 
   if [[ -z "$_termnav_wezterm_remote_link_host_result" && -n "${SSH_CONNECTION:-}" ]]; then
@@ -161,15 +179,18 @@ _termnav_wezterm_remote_link_host_get() {
 }
 
 _termnav_wezterm_remote_link_host() {
+  _termnav_wezterm_tmux_publish_observation_key=""
   _termnav_wezterm_remote_link_host_get
   if [[ -n "$_termnav_wezterm_remote_link_host_result" ]]; then
     printf '%s\n' "$_termnav_wezterm_remote_link_host_result"
   fi
+  _termnav_wezterm_tmux_publish_observation_key=""
   return 0
 }
 
 _termnav_wezterm_publish_link_context() {
   local remote_host
+  _termnav_wezterm_tmux_publish_observation_key=""
   _termnav_wezterm_remote_link_host_get
   remote_host="$_termnav_wezterm_remote_link_host_result"
   # Hyperlink-aware tools run as shell children, so export the same host that
@@ -205,6 +226,7 @@ _termnav_wezterm_publish_link_context() {
     _termnav_wezterm_set_user_var NVIM_REMOTE_CWD ""
     _termnav_wezterm_set_user_var NVIM_REMOTE_TMUX ""
   fi
+  _termnav_wezterm_tmux_publish_observation_key=""
 }
 
 _termnav_wezterm_preexec() {
