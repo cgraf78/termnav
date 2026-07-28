@@ -1,19 +1,57 @@
 # shellcheck shell=bash
 # Helpers for publishing WezTerm OSC 1337 SetUserVar requests.
 
+# A shell may source this library again after its tmux context changes. Reset the
+# memoized client classification so re-sourcing remains an explicit refresh.
+_termnav_wezterm_tmux_client_cache_set=0
+_termnav_wezterm_tmux_client_cache_key=""
+_termnav_wezterm_tmux_client_cache_nested=0
+_termnav_wezterm_tmux_client_cache_at=0
+
 termnav_wezterm_base64() {
+  # Empty values are common when clearing user vars. Their base64 encoding is
+  # also empty, so avoid two subprocesses on this prompt-time path.
+  [[ -n "$1" ]] || return 0
   printf '%s' "$1" | base64 | tr -d '\n'
 }
 
 termnav_wezterm_tmux_client_is_nested() {
-  local termname
+  local age termname nested=0 now="${SECONDS-}" tmux_key="${TMUX:-}"
 
-  [[ -n "${TMUX:-}" ]] || return 1
-  termname=$(tmux display-message -p "#{client_termname}" 2>/dev/null) || return 1
-  case "$termname" in
-    tmux* | screen*) return 0 ;;
-    *) return 1 ;;
+  [[ -n "$tmux_key" ]] || return 1
+  case "$now" in
+    '' | *[!0-9]*) now="" ;;
+    *) now=$((10#$now)) ;;
   esac
+  if [[ -n "$now" && "${_termnav_wezterm_tmux_client_cache_set:-0}" == 1 &&
+    "${_termnav_wezterm_tmux_client_cache_key-}" == "$tmux_key" ]]; then
+    age=$((now - _termnav_wezterm_tmux_client_cache_at))
+    if ((age >= 0 && age < 5)); then
+      [[ "${_termnav_wezterm_tmux_client_cache_nested:-0}" == 1 ]]
+      return
+    fi
+  fi
+
+  # A failed or empty query is not client state. Leave it uncached so a tmux
+  # server or client that is still attaching can recover on the next publish.
+  termname=$(tmux display-message -p "#{client_termname}" 2>/dev/null) || return 1
+  [[ -n "$termname" ]] || return 1
+  case "$termname" in
+    tmux* | screen*) nested=1 ;;
+  esac
+
+  if [[ -n "$now" ]]; then
+    _termnav_wezterm_tmux_client_cache_set=1
+    _termnav_wezterm_tmux_client_cache_key="$tmux_key"
+    _termnav_wezterm_tmux_client_cache_nested=$nested
+    _termnav_wezterm_tmux_client_cache_at=$now
+  else
+    # Without a usable shell clock, prefer a fresh query over an observation
+    # that could otherwise remain stale for the lifetime of the shell.
+    _termnav_wezterm_tmux_client_cache_set=0
+  fi
+
+  [[ "$nested" == 1 ]]
 }
 
 termnav_wezterm_tmux_passthrough() {

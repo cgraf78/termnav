@@ -210,12 +210,33 @@ _assert_contains "wezterm-move-tab parent: terminates tmux passthrough" \
 
 shell_vars="$TERMNAV_ROOT/lib/termnav/shell/wezterm-vars.sh"
 shell_tmux_mock=$(_tmpdir)/mock-bin
+shell_tmux_log=$(_tmpdir)/tmux-queries.log
 mkdir -p "$shell_tmux_mock"
 cat >"$shell_tmux_mock/tmux" <<'EOF'
 #!/usr/bin/env bash
-printf 'tmux-256color\n'
+printf '%s\n' "$*" >>"${TERMNAV_TMUX_QUERY_LOG:-/dev/null}"
+if [[ "$*" == "show-environment -g TERMNAV_REMOTE_LINK_HOST" ]]; then
+  if [[ -n "${TMUX_MOCK_REMOTE_LINK_HOST:-}" ]]; then
+    printf 'TERMNAV_REMOTE_LINK_HOST=%s\n' "$TMUX_MOCK_REMOTE_LINK_HOST"
+    exit 0
+  fi
+  exit 1
+fi
+if [[ "${TMUX_MOCK_DISPLAY_FAIL:-0}" == 1 ]]; then
+  exit 1
+fi
+if [[ "${TMUX_MOCK_DISPLAY_EMPTY:-0}" == 1 ]]; then
+  exit 0
+fi
+printf '%s\n' "${TMUX_MOCK_TERMNAME:-tmux-256color}"
 EOF
 chmod +x "$shell_tmux_mock/tmux"
+cat >"$shell_tmux_mock/hostname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${TERMNAV_HOSTNAME_QUERY_LOG:-/dev/null}"
+printf '%s\n' "${TERMNAV_HOSTNAME_MOCK_VALUE:-remote.example}"
+EOF
+chmod +x "$shell_tmux_mock/hostname"
 shell_auto_nested=$(
   TMUX=/tmp/tmux-test,1,0 PATH="$shell_tmux_mock:$PATH" bash -c \
     ". '$shell_vars'; termnav_wezterm_user_var_sequence DOT_SWITCH_TAB next auto"
@@ -223,6 +244,358 @@ shell_auto_nested=$(
 shell_auto_count=$(printf '%s' "$shell_auto_nested" | python3 -c 'import sys; data=sys.stdin.buffer.read(); print(data.count(b"\x1bPtmux;"))')
 _assert_eq "shell wezterm vars: auto double-wraps nested tmux clients" \
   "2" "$shell_auto_count"
+
+: >"$shell_tmux_log"
+TMUX=/tmp/tmux-one,1,0 \
+  TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+  PATH="$shell_tmux_mock:$PATH" \
+  SHELL_VARS="$shell_vars" \
+  bash --noprofile --norc -c '
+    source "$SHELL_VARS"
+    termnav_wezterm_user_var_sequence TEST first auto >/dev/null
+    termnav_wezterm_user_var_sequence TEST second auto >/dev/null
+    TMUX=/tmp/tmux-two,1,0
+    termnav_wezterm_user_var_sequence TEST third auto >/dev/null
+    source "$SHELL_VARS"
+    termnav_wezterm_user_var_sequence TEST fourth auto >/dev/null
+  '
+shell_tmux_query_count=$(wc -l <"$shell_tmux_log" | tr -d ' ')
+_assert_eq "shell wezterm vars: caches client query within TTL and invalidates on context changes" \
+  "3" "$shell_tmux_query_count"
+
+: >"$shell_tmux_log"
+shell_tmux_refresh=$(
+  TMUX=/tmp/tmux-client-refresh,1,0 \
+    TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+    PATH="$shell_tmux_mock:$PATH" \
+    SHELL_VARS="$shell_vars" \
+    bash --noprofile --norc -c '
+      SECONDS=100
+      source "$SHELL_VARS"
+      if termnav_wezterm_tmux_client_is_nested; then echo initial=nested; fi
+      export TMUX_MOCK_TERMNAME=xterm-256color
+      SECONDS=104
+      if termnav_wezterm_tmux_client_is_nested; then echo warm=nested; fi
+      SECONDS=106
+      if termnav_wezterm_tmux_client_is_nested; then
+        echo expired=nested
+      else
+        echo expired=direct
+      fi
+    '
+)
+_assert_contains "shell wezterm vars: warm nested-client result stays cached" \
+  "warm=nested" "$shell_tmux_refresh"
+_assert_contains "shell wezterm vars: expired cache observes the attached client" \
+  "expired=direct" "$shell_tmux_refresh"
+_assert_eq "shell wezterm vars: client cache expiry performs one refresh query" \
+  "2" "$(wc -l <"$shell_tmux_log" | tr -d ' ')"
+
+for test_shell in bash zsh; do
+  case "$test_shell" in
+    bash) test_shell_command=(bash --noprofile --norc) ;;
+    zsh) test_shell_command=(zsh -f) ;;
+  esac
+
+  test_clock_cases=(missing)
+  if [[ "$test_shell" == bash ]]; then
+    test_clock_cases+=(nonnumeric)
+  fi
+  for test_clock_case in "${test_clock_cases[@]}"; do
+    : >"$shell_tmux_log"
+    # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+    shell_clockless_refresh=$(
+      TMUX=/tmp/tmux-clockless,1,0 \
+        TERMNAV_CLOCK_CASE="$test_clock_case" \
+        TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+        PATH="$shell_tmux_mock:$PATH" \
+        SHELL_VARS="$shell_vars" \
+        "${test_shell_command[@]}" -c '
+          unset SECONDS
+          if [[ "$TERMNAV_CLOCK_CASE" == nonnumeric ]]; then
+            SECONDS=invalid
+          fi
+          source "$SHELL_VARS"
+          if termnav_wezterm_tmux_client_is_nested; then echo initial=nested; fi
+          export TMUX_MOCK_TERMNAME=xterm-256color
+          if termnav_wezterm_tmux_client_is_nested; then
+            echo refreshed=nested
+          else
+            echo refreshed=direct
+          fi
+        '
+    )
+    _assert_contains "shell wezterm vars: $test_shell $test_clock_case clock leaves client observations uncached" \
+      "refreshed=direct" "$shell_clockless_refresh"
+    _assert_eq "shell wezterm vars: $test_shell $test_clock_case clock repeats the client query" \
+      "2" "$(wc -l <"$shell_tmux_log" | tr -d ' ')"
+  done
+done
+
+: >"$shell_tmux_log"
+TMUX=/tmp/tmux-recovery,1,0 \
+  TMUX_MOCK_DISPLAY_FAIL=1 \
+  TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+  PATH="$shell_tmux_mock:$PATH" \
+  SHELL_VARS="$shell_vars" \
+  bash --noprofile --norc -c '
+    source "$SHELL_VARS"
+    termnav_wezterm_user_var_sequence TEST failed auto >/dev/null
+    unset TMUX_MOCK_DISPLAY_FAIL
+    termnav_wezterm_user_var_sequence TEST recovered auto >/dev/null
+  '
+shell_tmux_recovery_count=$(wc -l <"$shell_tmux_log" | tr -d ' ')
+_assert_eq "shell wezterm vars: failed nested-client query remains retryable" \
+  "2" "$shell_tmux_recovery_count"
+
+: >"$shell_tmux_log"
+TMUX=/tmp/tmux-empty-recovery,1,0 \
+  TMUX_MOCK_DISPLAY_EMPTY=1 \
+  TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+  PATH="$shell_tmux_mock:$PATH" \
+  SHELL_VARS="$shell_vars" \
+  bash --noprofile --norc -c '
+    source "$SHELL_VARS"
+    termnav_wezterm_user_var_sequence TEST empty auto >/dev/null
+    unset TMUX_MOCK_DISPLAY_EMPTY
+    termnav_wezterm_user_var_sequence TEST recovered auto >/dev/null
+  '
+shell_tmux_empty_recovery_count=$(wc -l <"$shell_tmux_log" | tr -d ' ')
+_assert_eq "shell wezterm vars: empty nested-client query remains retryable" \
+  "2" "$shell_tmux_empty_recovery_count"
+
+encoder_mock=$(_tmpdir)/encoder-bin
+encoder_log=$(_tmpdir)/encoder.log
+mkdir -p "$encoder_mock"
+for encoder in base64 tr; do
+  cat >"$encoder_mock/$encoder" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${0##*/}" >>"$TERMNAV_ENCODER_LOG"
+EOF
+  chmod +x "$encoder_mock/$encoder"
+done
+: >"$encoder_log"
+TERMNAV_ENCODER_LOG="$encoder_log" \
+  PATH="$encoder_mock:$PATH" \
+  SHELL_VARS="$shell_vars" \
+  bash --noprofile --norc -c '
+    source "$SHELL_VARS"
+    termnav_wezterm_base64 ""
+  ' >/dev/null
+_assert_eq "shell wezterm vars: empty values skip encoder subprocesses" \
+  "" "$(cat "$encoder_log")"
+
+shell_integration="$TERMNAV_ROOT/share/termnav/shell.sh"
+for test_shell in bash zsh; do
+  case "$test_shell" in
+    bash) test_shell_command=(bash --noprofile --norc) ;;
+    zsh) test_shell_command=(zsh -f) ;;
+  esac
+
+  : >"$shell_tmux_log"
+  # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+  warm_publish_output=$(
+    TMUX=/tmp/tmux-warm,1,0 \
+      TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+      PATH="$shell_tmux_mock:$PATH" \
+      SHELL_INTEGRATION="$shell_integration" \
+      "${test_shell_command[@]}" -c '
+        SECONDS=100
+        source "$SHELL_INTEGRATION" >/dev/null
+        : >"$TERMNAV_TMUX_QUERY_LOG"
+
+        _termnav_wezterm_preexec true >/dev/null
+        _termnav_wezterm_precmd >/dev/null
+        _termnav_wezterm_preexec true >/dev/null
+        _termnav_wezterm_precmd >/dev/null
+        printf "warm=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+
+        export TMUX_MOCK_REMOTE_LINK_HOST=remote.example
+        SECONDS=106
+        _termnav_wezterm_publish_link_context >/dev/null
+        printf "expired=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+        printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+      '
+  )
+  _assert_contains "shell integration: $test_shell warm publish cycle performs no tmux query" \
+    "warm=0" "$warm_publish_output"
+  _assert_contains "shell integration: $test_shell expired client and host caches each refresh once" \
+    "expired=2" "$warm_publish_output"
+  _assert_contains "shell integration: $test_shell expired host cache observes updated tmux value" \
+    "host=remote.example" "$warm_publish_output"
+done
+
+remote_refresh_output=$(
+  TMUX=/tmp/tmux-remote-a,1,0 \
+    TMUX_MOCK_REMOTE_LINK_HOST=remote-a.example \
+    TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+    PATH="$shell_tmux_mock:$PATH" \
+    SHELL_INTEGRATION="$shell_integration" \
+    bash --noprofile --norc -c '
+      SECONDS=100
+      source "$SHELL_INTEGRATION" >/dev/null
+      printf "initial=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+
+      export TMUX_MOCK_REMOTE_LINK_HOST=remote-b.example
+      SECONDS=104
+      _termnav_wezterm_publish_link_context >/dev/null
+      printf "warm=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+
+      SECONDS=106
+      _termnav_wezterm_publish_link_context >/dev/null
+      printf "expired=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+
+      TMUX=/tmp/tmux-remote-b,1,0
+      export TMUX_MOCK_REMOTE_LINK_HOST=remote-c.example
+      _termnav_wezterm_publish_link_context >/dev/null
+      printf "tmux-change=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+
+      export TMUX_MOCK_REMOTE_LINK_HOST=remote-d.example
+      source "$SHELL_INTEGRATION" >/dev/null
+      printf "resource=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+    '
+)
+_assert_contains "shell integration: publishes the initially discovered host" \
+  "initial=remote-a.example" "$remote_refresh_output"
+_assert_contains "shell integration: reuses a discovered host within the TTL" \
+  "warm=remote-a.example" "$remote_refresh_output"
+_assert_contains "shell integration: refreshes a discovered host after the TTL" \
+  "expired=remote-b.example" "$remote_refresh_output"
+_assert_contains "shell integration: TMUX change invalidates a discovered host" \
+  "tmux-change=remote-c.example" "$remote_refresh_output"
+_assert_contains "shell integration: re-source refreshes a discovered host" \
+  "resource=remote-d.example" "$remote_refresh_output"
+
+: >"$shell_tmux_log"
+explicit_override_output=$(
+  TERMNAV_REMOTE_LINK_HOST=explicit.example \
+    TMUX=/tmp/tmux-explicit-a,1,0 \
+    TMUX_MOCK_REMOTE_LINK_HOST=discovered.example \
+    TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+    PATH="$shell_tmux_mock:$PATH" \
+    SHELL_INTEGRATION="$shell_integration" \
+    bash --noprofile --norc -c '
+      SECONDS=100
+      source "$SHELL_INTEGRATION" >/dev/null
+      TMUX=/tmp/tmux-explicit-b,1,0
+      SECONDS=106
+      source "$SHELL_INTEGRATION" >/dev/null
+      printf "host=%s\n" "$TERMNAV_REMOTE_LINK_HOST"
+    '
+)
+explicit_override_query_count=$(grep -c '^show-environment ' "$shell_tmux_log" || true)
+_assert_contains "shell integration: preserves an explicit remote-host override" \
+  "host=explicit.example" "$explicit_override_output"
+_assert_eq "shell integration: explicit override skips remote-host discovery" \
+  "0" "$explicit_override_query_count"
+
+for test_shell in bash zsh; do
+  case "$test_shell" in
+    bash) test_shell_command=(bash --noprofile --norc) ;;
+    zsh) test_shell_command=(zsh -f) ;;
+  esac
+
+  # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+  inactive_child_output=$(
+    NVIM=/tmp/nvim.sock \
+      TMUX=/tmp/tmux-inactive-child,1,0 \
+      TERMNAV_REMOTE_LINK_HOST=parent.example \
+      _TERMNAV_REMOTE_LINK_HOST_DISCOVERED=parent.example \
+      SHELL_INTEGRATION="$shell_integration" \
+      "${test_shell_command[@]}" -c '
+        source "$SHELL_INTEGRATION" >/dev/null
+        printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
+        printf "marker=%s\n" "${_TERMNAV_REMOTE_LINK_HOST_DISCOVERED:-}"
+      '
+  )
+  _assert_contains "shell integration: $test_shell inactive child preserves inherited host" \
+    "host=parent.example" "$inactive_child_output"
+  _assert_contains "shell integration: $test_shell inactive child preserves discovery ownership" \
+    "marker=parent.example" "$inactive_child_output"
+done
+
+shell_hostname_log=$(_tmpdir)/hostname-queries.log
+for test_shell in bash zsh; do
+  case "$test_shell" in
+    bash) test_shell_command=(bash --noprofile --norc) ;;
+    zsh) test_shell_command=(zsh -f) ;;
+  esac
+
+  : >"$shell_hostname_log"
+  # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+  ssh_publish_output=$(
+    SSH_CONNECTION='client-a 1000 server-a 22' \
+      TERMNAV_HOSTNAME_MOCK_VALUE=remote-a.example \
+      TERMNAV_HOSTNAME_QUERY_LOG="$shell_hostname_log" \
+      PATH="$shell_tmux_mock:$PATH" \
+      SHELL_INTEGRATION="$shell_integration" \
+      "${test_shell_command[@]}" -c '
+        SECONDS=100
+        source "$SHELL_INTEGRATION" >/dev/null
+        : >"$TERMNAV_HOSTNAME_QUERY_LOG"
+
+        _termnav_wezterm_preexec true >/dev/null
+        _termnav_wezterm_precmd >/dev/null
+        printf "warm=%s\n" "$(wc -l <"$TERMNAV_HOSTNAME_QUERY_LOG" | tr -d " ")"
+
+        export TERMNAV_HOSTNAME_MOCK_VALUE=remote-b.example
+        SECONDS=106
+        _termnav_wezterm_publish_link_context >/dev/null
+        printf "expired=%s\n" "$(wc -l <"$TERMNAV_HOSTNAME_QUERY_LOG" | tr -d " ")"
+        printf "expired-host=%s\n" "$TERMNAV_REMOTE_LINK_HOST"
+
+        SSH_CONNECTION="client-b 2000 server-b 22"
+        export SSH_CONNECTION TERMNAV_HOSTNAME_MOCK_VALUE=remote-c.example
+        _termnav_wezterm_publish_link_context >/dev/null
+        printf "connection-change=%s\n" "$(wc -l <"$TERMNAV_HOSTNAME_QUERY_LOG" | tr -d " ")"
+        printf "changed-host=%s\n" "$TERMNAV_REMOTE_LINK_HOST"
+      '
+  )
+  _assert_contains "shell integration: $test_shell warm SSH publish skips hostname" \
+    "warm=0" "$ssh_publish_output"
+  _assert_contains "shell integration: $test_shell expired SSH cache refreshes hostname once" \
+    "expired=1" "$ssh_publish_output"
+  _assert_contains "shell integration: $test_shell expired SSH cache refreshes the host" \
+    "expired-host=remote-b.example" "$ssh_publish_output"
+  _assert_contains "shell integration: $test_shell SSH_CONNECTION change invalidates the cache" \
+    "connection-change=2" "$ssh_publish_output"
+  _assert_contains "shell integration: $test_shell SSH_CONNECTION change refreshes the host" \
+    "changed-host=remote-c.example" "$ssh_publish_output"
+
+  test_clock_cases=(missing)
+  if [[ "$test_shell" == bash ]]; then
+    test_clock_cases+=(nonnumeric)
+  fi
+  for test_clock_case in "${test_clock_cases[@]}"; do
+    : >"$shell_hostname_log"
+    # shellcheck disable=SC2016 # Variables expand in the selected child shell.
+    ssh_clockless_output=$(
+      SSH_CONNECTION='client-a 1000 server-a 22' \
+        TERMNAV_CLOCK_CASE="$test_clock_case" \
+        TERMNAV_HOSTNAME_MOCK_VALUE=remote-a.example \
+        TERMNAV_HOSTNAME_QUERY_LOG="$shell_hostname_log" \
+        PATH="$shell_tmux_mock:$PATH" \
+        SHELL_INTEGRATION="$shell_integration" \
+        "${test_shell_command[@]}" -c '
+          unset SECONDS
+          if [[ "$TERMNAV_CLOCK_CASE" == nonnumeric ]]; then
+            SECONDS=invalid
+          fi
+          source "$SHELL_INTEGRATION" >/dev/null
+          : >"$TERMNAV_HOSTNAME_QUERY_LOG"
+
+          export TERMNAV_HOSTNAME_MOCK_VALUE=remote-b.example
+          _termnav_wezterm_publish_link_context >/dev/null
+          printf "queries=%s\n" "$(wc -l <"$TERMNAV_HOSTNAME_QUERY_LOG" | tr -d " ")"
+          printf "host=%s\n" "$TERMNAV_REMOTE_LINK_HOST"
+        '
+    )
+    _assert_contains "shell integration: $test_shell $test_clock_case clock leaves SSH observations uncached" \
+      "queries=1" "$ssh_clockless_output"
+    _assert_contains "shell integration: $test_shell $test_clock_case clock refreshes the SSH host" \
+      "host=remote-b.example" "$ssh_clockless_output"
+  done
+done
 
 echo
 echo "=== WezTerm public hyperlink rules ==="
