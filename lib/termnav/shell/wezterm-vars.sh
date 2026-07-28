@@ -7,6 +7,10 @@ _termnav_wezterm_tmux_client_cache_set=0
 _termnav_wezterm_tmux_client_cache_key=""
 _termnav_wezterm_tmux_client_cache_nested=0
 _termnav_wezterm_tmux_client_cache_at=0
+# Remote-host discovery may classify the client first. Keep that observation
+# only for the surrounding publish, including failed and clockless queries.
+_termnav_wezterm_tmux_publish_observation_key=""
+_termnav_wezterm_tmux_publish_observation_nested=""
 
 termnav_wezterm_base64() {
   # Empty values are common when clearing user vars. Their base64 encoding is
@@ -30,6 +34,13 @@ termnav_wezterm_tmux_client_is_nested() {
       [[ "${_termnav_wezterm_tmux_client_cache_nested:-0}" == 1 ]]
       return
     fi
+  fi
+
+  # Do not immediately repeat a query already attempted by this publish. Empty
+  # means failed or unknown and remains uncached after the publish boundary.
+  if [[ "${_termnav_wezterm_tmux_publish_observation_key-}" == "$tmux_key" ]]; then
+    [[ "${_termnav_wezterm_tmux_publish_observation_nested-}" == 1 ]]
+    return
   fi
 
   # A failed or empty query is not client state. Leave it uncached so a tmux
