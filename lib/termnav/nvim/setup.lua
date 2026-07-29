@@ -78,7 +78,7 @@ function M.new(options)
     clear_events = option_list(options, "clear_events", { "VimLeave", "FocusLost", "VimSuspend" }),
   }
 
-  function ctx.set_user_var(name, value)
+  function ctx.set_user_var(name, value, batch)
     value = tostring(value or "")
     -- WezTerm user vars are terminal OSC writes. Hot editor events should refresh
     -- link context freely, but unchanged values must not keep writing to the tty.
@@ -88,7 +88,7 @@ function M.new(options)
 
     -- Publishing pane metadata is best-effort: startup/focus events will retry if
     -- tmux tty discovery or WezTerm passthrough is briefly unavailable.
-    if ctx.wezterm_vars.set(name, value) then
+    if ctx.wezterm_vars.set(name, value, batch) then
       ctx.published_vars[name] = value
     end
   end
@@ -131,17 +131,22 @@ function M.new(options)
   function ctx.publish()
     local remote_host = ctx.nvim_remote_link_host()
     local cwd = vim.fn.getcwd()
+    local batch = {}
 
-    ctx.set_user_var(user_vars.is_nvim, "true")
-    ctx.set_user_var(user_vars.open_socket, ctx.opener.server())
+    ctx.set_user_var(user_vars.is_nvim, "true", batch)
+    ctx.set_user_var(user_vars.open_socket, ctx.opener.server(), batch)
     -- Terminal text links are produced relative to the process cwd that printed
     -- them, not necessarily the active workspace root or WezTerm's stale pane cwd.
-    ctx.set_user_var(user_vars.link_cwd, cwd)
-    ctx.set_user_var(user_vars.remote_link_host, remote_host)
-    ctx.set_user_var(user_vars.remote_cwd, remote_host ~= "" and cwd or "")
+    ctx.set_user_var(user_vars.link_cwd, cwd, batch)
+    ctx.set_user_var(user_vars.remote_link_host, remote_host, batch)
+    ctx.set_user_var(user_vars.remote_cwd, remote_host ~= "" and cwd or "", batch)
     -- Direct remote-pane routing sends a tmux command through the visible
     -- terminal; advertise it only when the remote nvim is actually inside tmux.
-    ctx.set_user_var(user_vars.remote_tmux, remote_host ~= "" and vim.env.TMUX and "true" or "")
+    ctx.set_user_var(
+      user_vars.remote_tmux,
+      remote_host ~= "" and vim.env.TMUX and "true" or "",
+      batch
+    )
   end
 
   function ctx.refresh()
@@ -150,12 +155,16 @@ function M.new(options)
   end
 
   function ctx.clear()
-    ctx.set_user_var(user_vars.is_nvim, "false")
-    ctx.set_user_var(user_vars.open_socket, "")
-    ctx.set_user_var(user_vars.link_cwd, "")
-    ctx.set_user_var(user_vars.remote_link_host, "")
-    ctx.set_user_var(user_vars.remote_cwd, "")
-    ctx.set_user_var(user_vars.remote_tmux, "")
+    local batch = {}
+    ctx.set_user_var(user_vars.is_nvim, "false", batch)
+    ctx.set_user_var(user_vars.open_socket, "", batch)
+    ctx.set_user_var(user_vars.link_cwd, "", batch)
+    ctx.set_user_var(user_vars.remote_link_host, "", batch)
+    ctx.set_user_var(user_vars.remote_cwd, "", batch)
+    ctx.set_user_var(user_vars.remote_tmux, "", batch)
+    -- The next focus may belong to a newly attached terminal. Republish every
+    -- value even when this clear could not determine the passthrough depth.
+    ctx.published_vars = {}
   end
 
   function ctx.setup()
