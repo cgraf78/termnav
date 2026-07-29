@@ -80,9 +80,38 @@ local function tmux_client_termname()
   return output
 end
 
-local function tmux_client_is_nested()
+local function tmux_client_is_nested(batch)
+  local tmux = vim.env.TMUX
+  local pane = vim.env.TMUX_PANE
+  if type(tmux) ~= "string" or tmux == "" or type(pane) ~= "string" or pane == "" then
+    return false, false
+  end
+
+  local key = tmux .. "\0" .. pane
+  if type(batch) == "table" and batch.tmux_client_key == key then
+    local nested = batch.tmux_client_nested
+    return nested == true, type(nested) == "boolean"
+  end
+
   local termname = tmux_client_termname()
-  return type(termname) == "string" and (termname:match("^tmux") or termname:match("^screen"))
+  if type(batch) == "table" then
+    -- Unknown is shared only for this synchronous batch. A later publish gets a
+    -- fresh table and retries instead of carrying uncertain topology forward.
+    batch.tmux_client_key = key
+    batch.tmux_client_nested = nil
+  end
+  if type(termname) ~= "string" then
+    return false, false
+  end
+
+  local nested = termname:match("^tmux") ~= nil or termname:match("^screen") ~= nil
+  -- A batch exists only for one synchronous setup publish. Sharing a successful
+  -- observation there avoids repeated subprocesses without carrying attachment
+  -- topology across focus, detach, or resume boundaries.
+  if type(batch) == "table" then
+    batch.tmux_client_nested = nested
+  end
+  return nested, true
 end
 
 local function tmux_passthrough(sequence)
@@ -109,7 +138,7 @@ function M.tty_path()
   return tty_path
 end
 
-function M.set(name, value)
+function M.set(name, value, batch)
   local path = M.tty_path()
   if not path then
     return false
@@ -118,8 +147,14 @@ function M.set(name, value)
   local encoded = base64_encode(value or "")
   local osc = ("\027]1337;SetUserVar=%s=%s\007"):format(name, encoded)
   if vim.env.TMUX then
+    local nested, known = tmux_client_is_nested(batch)
+    -- Without a client classification, the required passthrough depth is
+    -- unknown. Report failure before writing so setup retries this variable.
+    if not known then
+      return false
+    end
     osc = tmux_passthrough(osc)
-    if tmux_client_is_nested() then
+    if nested then
       osc = tmux_passthrough(osc)
     end
   end

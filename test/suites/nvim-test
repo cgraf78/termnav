@@ -82,6 +82,8 @@ _assert_eq "wezterm-vars: empty tmux tty is not cached and next publish can reco
   "$expected" "$result"
 
 result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
   local old_base64 = vim.base64
   vim.base64 = nil
   local vars = dofile('$vars_module')
@@ -148,6 +150,97 @@ result=$(_nvim_lua "
 expected="$(printf 'true\n2\nexact')"
 _assert_eq "wezterm-vars: nested tmux clients double-wrap OSC passthrough" \
   "$expected" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = '/tmp/tmux.sock,1,0'
+  vim.env.TMUX_PANE = '%42'
+  local vars = dofile('$vars_module')
+  vars.tty_path = function()
+    return '/dev/pts/42'
+  end
+  local old_system = vim.fn.system
+  local old_open = io.open
+  local calls = 0
+  local writes = {}
+  vim.fn.system = function()
+    calls = calls + 1
+    return calls == 1 and 'xterm-256color\n' or 'tmux-256color\n'
+  end
+  io.open = function()
+    return {
+      write = function(_, text)
+        local esc = string.char(27)
+        local _, count = text:gsub(esc .. 'Ptmux;', '')
+        writes[#writes + 1] = count
+      end,
+      flush = function() end,
+      close = function() end,
+    }
+  end
+  vars.set('FIRST', 'true', {})
+  vars.set('SECOND', 'true', {})
+  print(table.concat({ calls, writes[1], writes[2] }, ' '))
+  vim.fn.system = old_system
+  io.open = old_open
+")
+_assert_eq "wezterm-vars: a new publish observes a changed tmux client" "2 1 2" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = '/tmp/tmux.sock,1,0'
+  vim.env.TMUX_PANE = '%42'
+  vim.env.TERMNAV_REMOTE_LINK_HOST = 'remote.example'
+  local vars = dofile('$vars_module')
+  local setup = dofile('$setup_module')
+  local old_system = vim.fn.system
+  local old_open = io.open
+  local tty_calls = 0
+  local termname_calls = 0
+  local client_ready = false
+  local writes = 0
+  vim.fn.system = function(cmd)
+    if cmd[#cmd] == '#{pane_tty}' then
+      tty_calls = tty_calls + 1
+      return '/dev/pts/42\n'
+    end
+    if cmd[#cmd] == '#{client_termname}' then
+      termname_calls = termname_calls + 1
+      return client_ready and 'xterm-256color\n' or ''
+    end
+    return ''
+  end
+  io.open = function()
+    return {
+      write = function()
+        writes = writes + 1
+      end,
+      flush = function() end,
+      close = function() end,
+    }
+  end
+  local ctx = setup.new({
+    opener = {
+      server = function()
+        return '/tmp/nvim.sock'
+      end,
+    },
+    wezterm_vars = vars,
+  })
+  ctx.publish()
+  print(table.concat({ tty_calls, termname_calls, writes }, ' '))
+  client_ready = true
+  ctx.publish()
+  print(table.concat({ tty_calls, termname_calls, writes }, ' '))
+  client_ready = false
+  ctx.clear()
+  print(table.concat({ tty_calls, termname_calls, writes }, ' '))
+  client_ready = true
+  ctx.publish()
+  print(table.concat({ tty_calls, termname_calls, writes }, ' '))
+  vim.fn.system = old_system
+  io.open = old_open
+")
+_assert_eq "nvim setup: failed client classification retries the same publish values" \
+  "$(printf '1 1 0\n1 2 6\n1 3 6\n1 4 12')" "$result"
 
 result=$(_nvim_lua "
   local opener = dofile('$opener_module')
