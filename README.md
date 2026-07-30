@@ -5,8 +5,9 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-`termnav` owns terminal navigation helpers: WezTerm link routing, tmux
-ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
+`termnav` owns terminal navigation helpers: nearest-scope tab routing,
+WezTerm link routing, tmux ctrl-click follow-through, OSC-8-aware `eza`
+links, and `nvim-tmux-open`.
 
 ## Public API
 
@@ -22,6 +23,9 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
   through the pluggable command-execution bridge. There is no matching
   move/reorder command because VS Code exposes no command to reorder
   terminal tabs (drag-only).
+- `bin/termnav-switch-tab`: switch the nearest outer tab scope from a
+  one-window tmux session, walking locally nested tmux parents before choosing
+  the originating VS Code or WezTerm client.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -39,9 +43,13 @@ ctrl-click follow-through, OSC-8-aware `eza` links, and `nvim-tmux-open`.
   `SetUserVar` OSC requests with raw or tmux-passthrough framing.
 - `lib/termnav/shell/vscode-command.sh`: dispatch seam for executing a VS
   Code command by ID through a pluggable backend (`TERMNAV_VSCODE_BACKEND`,
-  default `mcp`).
-- `lib/termnav/shell/vscode-backend-mcp.sh`: default backend, calling the
-  `nabheet.vscode-ide-mcp` extension's local HTTP JSON-RPC API.
+  automatically `socket` when the adapter is advertised, otherwise `mcp`).
+- `lib/termnav/shell/vscode-backend-socket.sh`: window-scoped backend that
+  posts a direction to the local adapter's owner-only Unix socket.
+- `lib/termnav/shell/vscode-backend-mcp.sh`: legacy backend for direct callers
+  that use the `nabheet.vscode-ide-mcp` extension's local HTTP JSON-RPC API.
+- `share/termnav/vscode/termnav-0.1.0`: local VS Code extension that
+  owns and publishes each window's tab-switch socket.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
   pane context publishing.
 
@@ -56,6 +64,10 @@ dependency manager's contract:
 own keybindings, terminal config, and environment-specific extension files;
 this repo owns reusable route parsing and open-through behavior.
 
+The adapter directory is versioned because VS Code records that directory in
+its extension registry. Adapter releases must bump the manifest version, the
+directory name, and the dotfiles local-extension source row together.
+
 ## Dependencies
 
 - Bash for the CLI entry points and shell loader.
@@ -69,14 +81,14 @@ this repo owns reusable route parsing and open-through behavior.
 - `eza` for `eza-nvim-links`.
 - `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
   existing ControlMaster connection.
-- `curl` for `vscode-switch-tab`'s default MCP backend.
-- VS Code with the `nabheet.vscode-ide-mcp` extension installed and running,
-  for the VS Code tab bridge. The auth token it reads is written by
-  dotfiles' `vscode.sh` merge hook to
-  an absolute `$XDG_STATE_HOME/dot/vscode-mcp-auth-token`, or to
-  `$HOME/.local/state/dot/vscode-mcp-auth-token` when the XDG value is empty or
-  relative; this repo only reads that file, never generates or manages the
-  token. The backend fails closed when neither base directory is available.
+- VS Code with the local `cgraf.termnav` adapter installed, plus `curl` with
+  Unix-socket support. The adapter publishes a private, per-window socket into
+  its terminals; VS Code, VS Code Insiders, Cursor, and compatible builds use
+  the same transport without product-specific CLI discovery.
+- `nabheet.vscode-ide-mcp` is required only by direct legacy callers or when
+  `TERMNAV_VSCODE_BACKEND=mcp` is selected. Its auth token follows the dotfiles
+  `vscode.sh` contract under an absolute
+  `$XDG_STATE_HOME/dot` or the `$HOME/.local/state/dot` fallback.
 - `nvim-remote-pane-host` is an optional extension command for custom
   remote-pane workflows.
 
@@ -100,6 +112,38 @@ The `IS_NVIM` and `NVIM_*` WezTerm user variables are termnav's private
 cross-process protocol between shell/Neovim publishers and WezTerm route
 consumers. Configure integrations through the modules above instead of setting
 or reading those names directly.
+
+### Tab Scope Routing
+
+`termnav-switch-tab` receives the tmux client PID, TTY, and terminal type
+from the key binding that observed the chord. When that client was launched
+inside another local tmux, the helper follows its `TMUX` and `TMUX_PANE`
+environment to the parent server. Only clients whose active pane is the exact
+parent pane are eligible, which keeps linked sessions from stealing a request.
+The most recently active eligible client wins; a unique focused client breaks
+same-second ties, and unresolved ties fail closed. A parent session with
+multiple windows owns the switch immediately, while a one-window parent
+contributes its selected client and traversal continues outward.
+
+At the terminal boundary, WezTerm keeps the OSC user-variable transport. Each
+VS Code window's `cgraf.termnav` adapter owns an owner-only Unix socket and
+publishes its path as `TERMNAV_VSCODE_SOCKET`. Each activation atomically
+claims a random path without depending on telemetry, workspace identity, or
+product-global CLI state. The router reads that value from the originating tmux
+client, so simultaneous windows, including windows on the same workspace, do
+not compete for a fixed port or process-global bridge. After first install,
+reload or restart the editor window so it discovers the adapter, then relaunch
+existing terminal or tmux clients to receive the value. The same terminal
+relaunch is required after an extension-host or editor-window restart.
+Without it the router fails closed; an MCP route is used only when
+`TERMNAV_VSCODE_FALLBACK_BACKEND=mcp` is explicitly set. Standalone
+`vscode-switch-tab` calls retain their legacy MCP default.
+
+When a remote nested tmux parent cannot be reached as a local server, the
+existing WezTerm `DOT_PARENT_SWITCH_TAB` loopback remains the fallback. An
+ordinary SSH or mosh hop cannot carry that output-side loopback into VS Code;
+a one-window remote tmux therefore fails closed there unless the caller
+provides a reverse bridge explicitly.
 
 Neovim socket discovery state lives under
 an absolute `$XDG_STATE_HOME/nvim-tmux-open`, falling back to

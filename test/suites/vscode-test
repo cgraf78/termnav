@@ -38,6 +38,37 @@ _assert_eq "dispatcher: routes to the selected backend, not a hardcoded one" \
 _assert_eq "dispatcher: does not also call any other backend" \
   "1" "$(wc -l <"$fake_log" | tr -d ' ')"
 
+cat >"$seam_dir/vscode-backend-socket.sh" <<'EOF'
+# shellcheck shell=bash
+termnav_vscode_socket_execute_command() {
+  printf 'socket-backend-called:%s\n' "$1" >>"$FAKE_BACKEND_LOG"
+}
+EOF
+cat >"$seam_dir/vscode-backend-mcp.sh" <<'EOF'
+# shellcheck shell=bash
+termnav_vscode_mcp_execute_command() {
+  printf 'mcp-backend-called:%s\n' "$1" >>"$FAKE_BACKEND_LOG"
+}
+EOF
+
+: >"$fake_log"
+FAKE_BACKEND_LOG="$fake_log" env -u TERMNAV_VSCODE_SOCKET bash -c "
+  . '$vscode_command_sh'
+  _termnav_vscode_command_dir() { printf '%s\n' '$seam_dir'; }
+  termnav_vscode_execute_command 'workbench.action.terminal.focusNext'
+"
+_assert_eq "dispatcher: standalone command retains the rollout-safe MCP default" \
+  "mcp-backend-called:workbench.action.terminal.focusNext" "$(cat "$fake_log")"
+
+: >"$fake_log"
+FAKE_BACKEND_LOG="$fake_log" TERMNAV_VSCODE_SOCKET=/tmp/window.sock bash -c "
+  . '$vscode_command_sh'
+  _termnav_vscode_command_dir() { printf '%s\n' '$seam_dir'; }
+  termnav_vscode_execute_command 'workbench.action.terminal.focusNext'
+"
+_assert_eq "dispatcher: advertised window socket upgrades the default backend" \
+  "socket-backend-called:workbench.action.terminal.focusNext" "$(cat "$fake_log")"
+
 set +e
 unknown_result=$(
   TERMNAV_VSCODE_BACKEND=does-not-exist bash -c "
@@ -296,11 +327,7 @@ set -e
 _assert_exit "vscode-switch-tab: help exits successfully" 0 "$switch_help_rc"
 _assert_contains "vscode-switch-tab: usage text" "usage: vscode-switch-tab" "$switch_help"
 
-# Isolate CLI direction->command-id mapping with a fake `curl` standing in
-# for the real MCP endpoint, reusing the same technique as Task 2's MCP
-# backend tests -- this exercises the real dispatcher and real mcp backend
-# end to end, just with the network call stubbed, rather than inventing a
-# second backend-swap mechanism only for this test.
+# Exercise direction mapping through the default MCP backend.
 mapping_home=$(_tmpdir)
 mkdir -p "$mapping_home/.local/state/dot"
 printf 'mapping-test-token\n' >"$mapping_home/.local/state/dot/vscode-mcp-auth-token"
@@ -314,8 +341,10 @@ chmod +x "$mapping_bin/curl"
 
 mapping_log=$(_tmpdir)/mapping.log
 : >"$mapping_log"
-HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" "$vscode_switch_tab" next
-HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" "$vscode_switch_tab" previous
+HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" \
+  env -u TERMNAV_VSCODE_SOCKET "$vscode_switch_tab" next
+HOME="$mapping_home" MAPPING_LOG="$mapping_log" PATH="$mapping_bin:$PATH" \
+  env -u TERMNAV_VSCODE_SOCKET "$vscode_switch_tab" previous
 _assert_eq "vscode-switch-tab: next/previous map to terminal focusNext/focusPrevious" \
   "$(printf '"command":"workbench.action.terminal.focusNext"\n"command":"workbench.action.terminal.focusPrevious"')" \
   "$(grep -oE '"command":"[^"]+"' "$mapping_log")"

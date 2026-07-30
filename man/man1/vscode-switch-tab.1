@@ -1,4 +1,4 @@
-.TH VSCODE-SWITCH-TAB 1 "2026-07-06" "termnav" "User Commands"
+.TH VSCODE-SWITCH-TAB 1 "2026-07-29" "termnav" "User Commands"
 .SH NAME
 vscode-switch-tab \- request a VS Code integrated-terminal tab switch
 .SH SYNOPSIS
@@ -14,9 +14,16 @@ key itself and there is nothing left to switch locally. With a single
 terminal open the request is a silent no-op, matching how every other tab
 layer behaves at its own edge.
 .PP
-Fails silently (non-zero exit, no output) if the bridge is unreachable --
-this is expected whenever VS Code is not the terminal you're actually
-attached to, or its command-execution extension isn't running.
+When the local
+.B cgraf.termnav
+adapter advertises a per-window socket, the command uses it to keep
+simultaneous VS Code windows isolated. Otherwise it retains the MCP backend as
+a rollout fallback. It fails silently (non-zero exit, no output) if the
+selected bridge is unreachable.
+.PP
+Adapter sockets are activation-scoped. Reloading the editor window or its
+extension host requires relaunching existing terminal or tmux clients so they
+receive the new socket path; stale clients fail closed.
 .SH ARGUMENTS
 .TP
 .B next
@@ -31,11 +38,22 @@ Show command help.
 .SH ENVIRONMENT
 .TP
 .B TERMNAV_VSCODE_BACKEND
-Selects the command-execution backend. Defaults to
+Selects the command-execution backend. When unset, a nonempty
+.B TERMNAV_VSCODE_SOCKET
+selects
+.BR socket ;
+otherwise the fallback is
 .BR mcp .
 .TP
+.B TERMNAV_VSCODE_SOCKET
+Owner-only Unix socket published into terminals by the local adapter.
+.TP
+.B TERMNAV_VSCODE_CURL
+HTTP client used by the socket backend. Defaults to
+.BR curl .
+.TP
 .B VSCODE_MCP_PORT
-Overrides the MCP backend's target port. Defaults to
+Overrides the optional MCP backend's target port. Defaults to
 .BR 9876 .
 .SH EXIT STATUS
 .TP
@@ -48,4 +66,5 @@ The bridge was unreachable or the command failed.
 .B 2
 Usage error.
 .SH SEE ALSO
+.BR termnav-switch-tab (1),
 .BR wezterm-switch-tab (1)

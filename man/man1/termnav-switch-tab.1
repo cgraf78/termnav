@@ -1,0 +1,71 @@
+.TH TERMNAV-SWITCH-TAB 1 "2026-07-29" "termnav" "User Commands"
+.SH NAME
+termnav-switch-tab \- switch the nearest parent terminal tab scope
+.SH SYNOPSIS
+.B termnav-switch-tab
+.RI [ next | previous ]
+.B \-\-client\-pid
+.I PID
+.B \-\-client\-tty
+.I TTY
+.B \-\-client\-termtype
+.I TYPE
+.SH DESCRIPTION
+.B termnav-switch-tab
+routes a tab switch outward from a one-window tmux session. It walks locally
+nested tmux clients first and switches the first parent session with multiple
+windows. If no parent tmux owns the request, it delegates to the outer VS Code
+window or WezTerm client.
+.PP
+The tmux binding supplies client identity explicitly so sessions attached from
+multiple terminal windows do not share stale process-global routing state.
+.PP
+For each local parent, only a client whose active pane matches the child tmux
+pane is eligible. The newest client activity wins. A unique focused client
+breaks an activity tie; any remaining ambiguity fails closed.
+.PP
+At a VS Code boundary, the helper uses only the socket published in the
+triggering client's environment. It never uses an inherited process-global
+socket, telemetry identity, or product CLI hook. Terminals already open when
+the adapter is installed must be relaunched once to receive the socket
+variable. First install also requires reloading the editor window so it
+discovers the adapter. Because every adapter activation claims a fresh socket,
+terminal or tmux clients must also be relaunched after an extension-host or
+editor-window restart; stale clients fail closed.
+.SH OPTIONS
+.TP
+.B next
+Switch to the next tab or window. This is the default.
+.TP
+.B previous
+Switch to the previous tab or window.
+.TP
+.BI \-\-client\-pid " PID"
+PID of the tmux client that received the key.
+.TP
+.BI \-\-client\-tty " TTY"
+Terminal device of the tmux client.
+.TP
+.BI \-\-client\-termtype " TYPE"
+Terminal type reported by tmux for the client.
+.TP
+.BR \-h ", " \-\-help
+Show command help.
+.SH ENVIRONMENT
+.TP
+.B TERMNAV_VSCODE_FALLBACK_BACKEND
+Optional backend used only when the triggering VS Code client has no published
+socket. Unset by default so ambiguous VS Code routing fails closed. Set to
+.B mcp
+only when process-global routing is acceptable.
+.TP
+.B TERMNAV_VSCODE_SOCKET
+Read from the triggering tmux client process, not from this helper's inherited
+environment.
+.SH LIMITATIONS
+An ordinary SSH or mosh hop cannot carry the WezTerm output-side parent
+loopback into VS Code. A one-window remote tmux inside VS Code therefore needs
+an explicitly configured reverse bridge or the request fails closed.
+.SH SEE ALSO
+.BR vscode-switch-tab (1),
+.BR wezterm-switch-tab (1)
