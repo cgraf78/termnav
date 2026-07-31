@@ -383,6 +383,35 @@ _cleanup_tab_switch_test() {
 }
 trap _cleanup_tab_switch_test EXIT
 
+process_env_bin=$(_tmpdir)
+process_env_ps_log=$(_tmpdir)/process-env-ps.log
+cat >"$process_env_bin/ps" <<'EOF'
+#!/usr/bin/env bash
+printf '<%s>\n' "$*" >>"$TERMNAV_PROCESS_ENV_PS_LOG"
+printf 'sleep TERM_PROGRAM=WezTerm\n'
+EOF
+chmod +x "$process_env_bin/ps"
+
+_spawn_client TERMNAV_PROCESS_ENV_READY=1
+client_without_term_program=$REPLY
+if [[ -r "/proc/$client_without_term_program/environ" ]]; then
+  : >"$process_env_ps_log"
+  TERMNAV_PROCESS_ENV_PS_LOG="$process_env_ps_log" PATH="$process_env_bin:$PATH" \
+    "$router" next --client-pid "$client_without_term_program" --client-tty /dev/null \
+    --client-termtype xterm-256color
+  _assert_eq "tab router: readable proc miss does not invoke the macOS ps fallback" \
+    "" "$(cat "$process_env_ps_log")"
+else
+  echo "  SKIP: readable /proc environment assertion (/proc unavailable)"
+fi
+
+: >"$process_env_ps_log"
+TERMNAV_PROCESS_ENV_PS_LOG="$process_env_ps_log" PATH="$process_env_bin:$PATH" \
+  "$router" next --client-pid 999999999 --client-tty /dev/null \
+  --client-termtype xterm-256color
+_assert_contains "tab router: missing proc environment retains the ps fallback" \
+  "eww -p 999999999 -o command=" "$(cat "$process_env_ps_log")"
+
 router_bin=$(_tmpdir)
 router_log=$(_tmpdir)/router-code.log
 cat >"$router_bin/curl" <<'EOF'

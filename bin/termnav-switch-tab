@@ -76,6 +76,7 @@ _process_env() {
           ;;
       esac
     done < <(tr '\0' '\n' <"/proc/$pid/environ")
+    return 1
   fi
 
   # macOS has no /proc. The values used by this router contain no spaces, so
