@@ -74,11 +74,14 @@ check_runtime_shell_inventory() {
 }
 
 check_runtime_shell_inventory
-shellcheck -x -P SCRIPTDIR \
-  "${runtime_shell_files[@]}" \
-  "$test_dir/termnav-test" \
-  "$test_dir/helpers.sh" \
-  "$test_dir"/suites/*-test
+# Shared CI lints once in its dedicated job; local runs still lint by default.
+if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
+  shellcheck -x -P SCRIPTDIR \
+    "${runtime_shell_files[@]}" \
+    "$test_dir/termnav-test" \
+    "$test_dir/helpers.sh" \
+    "$test_dir"/suites/*-test
+fi
 
 for suite in "$test_dir"/suites/*-test; do
   "$suite"
