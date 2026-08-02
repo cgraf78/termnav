@@ -51,6 +51,10 @@ local function default_wezterm_vars()
   return load_sibling("wezterm-vars.lua")
 end
 
+local function default_vscode_focus()
+  return load_sibling("vscode-focus.lua").new()
+end
+
 local function option_list(options, name, default)
   local value = options[name]
   if value == nil then
@@ -66,9 +70,12 @@ function M.new(options)
     group_name = options.group_name or "termnav_nvim",
     opener = options.opener or default_opener(),
     wezterm_vars = options.wezterm_vars or default_wezterm_vars(),
+    vscode_focus = options.vscode_focus or default_vscode_focus(),
     publish_delay_ms = options.publish_delay_ms or 100,
     published_vars = {},
     remote_link_host = nil,
+    focused = false,
+    focus_generation = 0,
     publish_events = option_list(
       options,
       "publish_events",
@@ -128,12 +135,14 @@ function M.new(options)
     return ctx.remote_link_host
   end
 
-  function ctx.publish()
+  function ctx.publish_metadata(batch)
+    if not ctx.focused then
+      return
+    end
     local remote_host = ctx.nvim_remote_link_host()
     local cwd = vim.fn.getcwd()
-    local batch = {}
+    batch = batch or {}
 
-    ctx.set_user_var(user_vars.is_nvim, "true", batch)
     ctx.set_user_var(user_vars.open_socket, ctx.opener.server(), batch)
     -- Terminal text links are produced relative to the process cwd that printed
     -- them, not necessarily the active workspace root or WezTerm's stale pane cwd.
@@ -149,6 +158,21 @@ function M.new(options)
     )
   end
 
+  function ctx.claim_focus(batch)
+    if not ctx.focused then
+      ctx.focused = true
+      ctx.focus_generation = ctx.focus_generation + 1
+      ctx.vscode_focus.focus()
+    end
+    ctx.set_user_var(user_vars.is_nvim, "true", batch or {})
+  end
+
+  function ctx.publish()
+    local batch = {}
+    ctx.claim_focus(batch)
+    ctx.publish_metadata(batch)
+  end
+
   function ctx.refresh()
     ctx.remote_link_host = nil
     ctx.publish()
@@ -156,6 +180,9 @@ function M.new(options)
 
   function ctx.clear()
     local batch = {}
+    ctx.focused = false
+    ctx.focus_generation = ctx.focus_generation + 1
+    ctx.vscode_focus.blur()
     ctx.set_user_var(user_vars.is_nvim, "false", batch)
     ctx.set_user_var(user_vars.open_socket, "", batch)
     ctx.set_user_var(user_vars.link_cwd, "", batch)
@@ -171,12 +198,18 @@ function M.new(options)
     local group = vim.api.nvim_create_augroup(ctx.group_name, { clear = true })
 
     ctx.opener.setup()
+    ctx.claim_focus()
 
     -- Lazy-loading configs may call setup after VimEnter. Shell preexec normally
     -- marks the pane before nvim starts; this deferred publish covers non-shell
     -- launches and refreshes socket/cwd metadata once nvim has settled.
     if ctx.publish_delay_ms and ctx.publish_delay_ms >= 0 then
-      vim.defer_fn(ctx.publish, ctx.publish_delay_ms)
+      local generation = ctx.focus_generation
+      vim.defer_fn(function()
+        if ctx.focused and ctx.focus_generation == generation then
+          ctx.publish_metadata()
+        end
+      end, ctx.publish_delay_ms)
     end
 
     vim.api.nvim_create_autocmd(ctx.refresh_events, {
@@ -186,7 +219,7 @@ function M.new(options)
 
     vim.api.nvim_create_autocmd(ctx.publish_events, {
       group = group,
-      callback = ctx.publish,
+      callback = ctx.publish_metadata,
     })
 
     -- Multiple tmux panes share one WezTerm pane. Clear ownership on focus loss
@@ -194,6 +227,13 @@ function M.new(options)
     vim.api.nvim_create_autocmd(ctx.clear_events, {
       group = group,
       callback = ctx.clear,
+    })
+
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = group,
+      callback = function()
+        ctx.vscode_focus.dispose()
+      end,
     })
   end
 

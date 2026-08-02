@@ -777,6 +777,71 @@ _assert_eq "setup: newline runtime publishes a readable fallback socket record" 
 echo ""
 echo "=== nvim setup ==="
 
+result=$(_nvim_lua "
+  local real_uv = vim.uv
+  local uv = vim.loop
+  vim.uv = nil
+  local real_new_timer = uv.new_timer
+  local timers = {}
+  uv.new_timer = function()
+    local timer = { closed = false, stopped = false }
+    function timer:start(_, _, callback)
+      self.callback = callback
+    end
+    function timer:stop()
+      self.stopped = true
+    end
+    function timer:close()
+      self.closed = true
+    end
+    timers[#timers + 1] = timer
+    return timer
+  end
+
+  local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
+    command = '/unused',
+    observed = function() return 1234 end,
+    source = 'nvim-test',
+    run = function(_, callback) callback(0) end,
+  })
+  publisher.focus()
+  local first = timers[1]
+  first.callback()
+  vim.wait(100, function() return #timers == 2 end)
+  print(tostring(first.stopped))
+  print(tostring(first.closed))
+  publisher.dispose()
+  uv.new_timer = real_new_timer
+  vim.uv = real_uv
+")
+expected="$(printf 'true\ntrue')"
+_assert_eq "nvim focus: fired heartbeat closes its libuv timer handle" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
+  local calls = {}
+  local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
+    command = '/unused',
+    observed = function() return 1234 end,
+    source = 'nvim-test',
+    run = function(command, callback)
+      calls[#calls + 1] = { command = command, callback = callback }
+    end,
+  })
+  publisher.focus()
+  publisher.blur()
+  publisher.focus()
+  print(#calls)
+  calls[1].callback(0)
+  print(#calls)
+  print(calls[3].command[2])
+  print(calls[3].command[4])
+  publisher.dispose()
+")
+expected="$(printf '2\n3\nclaim\n2')"
+_assert_eq "nvim focus: refocus during a pending claim reclaims immediately" \
+  "$expected" "$result"
+
 NVIM_TMUX_REPEATED_SETUP=$(_tmpdir)
 ln -s "$TERMNAV_ROOT/lib/termnav/nvim" "$NVIM_TMUX_REPEATED_SETUP/nvim-link"
 result=$(_nvim_lua "
@@ -1014,6 +1079,45 @@ result=$(_nvim_lua "
 ")
 expected="$(printf '1\n6\nNVIM_LINK_CWD=%s/two\nIS_NVIM=false\nNVIM_OPEN_SOCKET=\nNVIM_LINK_CWD=' "$NVIM_TMUX_SETUP_EVENTS")"
 _assert_eq "nvim setup: setup wires publish and clear events with local group policy" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TERMNAV_REMOTE_LINK_HOST = nil
+  vim.env.SSH_CONNECTION = nil
+
+  local setup = dofile('$setup_module')
+  local writes = {}
+  setup.setup({
+    group_name = 'termnav_test_focus_race',
+    publish_delay_ms = -1,
+    opener = {
+      setup = function() end,
+      server = function()
+        return 'nvim.sock'
+      end,
+    },
+    wezterm_vars = {
+      set = function(name, value)
+        if name == 'IS_NVIM' then
+          writes[#writes + 1] = tostring(value)
+        end
+        return true
+      end,
+    },
+  })
+
+  vim.api.nvim_exec_autocmds('FocusLost', {})
+  vim.api.nvim_exec_autocmds('BufEnter', {})
+  vim.api.nvim_exec_autocmds('DirChanged', {})
+  vim.api.nvim_exec_autocmds('WinEnter', {})
+  print(table.concat(writes, ','))
+
+  vim.api.nvim_exec_autocmds('FocusGained', {})
+  print(writes[#writes])
+")
+expected="$(printf 'true,false\ntrue')"
+_assert_eq "nvim setup: background metadata cannot reclaim focus after FocusLost" \
   "$expected" "$result"
 
 _test_summary

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Publish Neovim focus ownership to the VS Code window viewing this terminal.
+
+set -u
+
+_usage() {
+  cat <<'EOF'
+usage: vscode-nvim-focus claim|release SOURCE CYCLE SEQUENCE OBSERVED
+
+Publish an ordered, leased Neovim focus update through the window-scoped
+Termnav adapter. Inside tmux, claims go only to focused clients displaying the
+current pane; releases go to every attached client so prior owners are cleared.
+EOF
+}
+
+_die() {
+  printf 'vscode-nvim-focus: %s\n' "$*" >&2
+  exit 2
+}
+
+_is_uint() {
+  case "$1" in
+    "" | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+_is_js_uint() {
+  _is_uint "$1" || return 1
+  ((${#1} < 16)) && return 0
+  ((${#1} > 16)) && return 1
+  ((10#$1 < 9007199254740992))
+}
+
+_process_env() {
+  local pid="$1" name="$2" entry
+
+  _is_uint "$pid" || return 1
+  if [[ -r "/proc/$pid/environ" ]]; then
+    while IFS= read -r entry; do
+      case "$entry" in
+        "$name="*)
+          printf '%s\n' "${entry#*=}"
+          return 0
+          ;;
+      esac
+    done < <(tr '\0' '\n' <"/proc/$pid/environ")
+    return 1
+  fi
+
+  while IFS= read -r entry; do
+    case "$entry" in
+      "$name="*)
+        printf '%s\n' "${entry#*=}"
+        return 0
+        ;;
+    esac
+  done < <(ps eww -p "$pid" -o command= 2>/dev/null | tr ' ' '\n')
+  return 1
+}
+
+_post() {
+  local socket="$1" client_pid="$2" payload
+
+  [[ -n "$socket" ]] || return 0
+  payload="{\"version\":1,\"source\":\"$source\",\"cycle\":$cycle,\"sequence\":$sequence,\"observed\":$observed,\"operation\":\"$operation\",\"clientPid\":$client_pid}"
+  if "${TERMNAV_VSCODE_CURL:-curl}" --silent --show-error --fail --max-time 1 \
+    --unix-socket "$socket" \
+    --header 'Content-Type: application/json' \
+    --header 'Accept: application/json' \
+    --data-binary "$payload" http://localhost/nvim-focus >/dev/null 2>&1; then
+    posted=$((posted + 1))
+    return 0
+  fi
+  failed=$((failed + 1))
+  return 0
+}
+
+(($#)) || {
+  _usage >&2
+  exit 2
+}
+case "$1" in
+  -h | --help)
+    _usage
+    exit 0
+    ;;
+esac
+(($# == 5)) || _die "expected an operation, source, cycle, sequence, and observation"
+
+operation="$1"
+source="$2"
+cycle="$3"
+sequence="$4"
+observed="$5"
+
+case "$operation" in
+  claim | release) ;;
+  *) _die "invalid operation: $operation" ;;
+esac
+case "$source" in
+  "" | *[!A-Za-z0-9_.:-]*) _die "invalid source: $source" ;;
+esac
+((${#source} <= 128)) || _die "invalid source: too long"
+_is_js_uint "$cycle" || _die "invalid cycle: $cycle"
+_is_js_uint "$sequence" || _die "invalid sequence: $sequence"
+_is_js_uint "$observed" || _die "invalid observation: $observed"
+
+posted=0
+failed=0
+
+if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
+  clients=$(tmux list-clients -F \
+    '#{client_pid}|#{pane_id}|#{client_flags}' 2>/dev/null || true)
+  while IFS='|' read -r client_pid pane_id client_flags; do
+    _is_uint "$client_pid" || continue
+    if [[ "$operation" == "claim" ]]; then
+      [[ "$pane_id" == "$TMUX_PANE" ]] || continue
+      case ",$client_flags," in
+        *,focused,*) ;;
+        *) continue ;;
+      esac
+    fi
+    socket=$(_process_env "$client_pid" TERMNAV_VSCODE_SOCKET 2>/dev/null || true)
+    _post "$socket" "$client_pid"
+  done <<<"$clients"
+  ((posted > 0)) && exit 0
+  ((failed > 0)) && exit 1
+  exit 10
+fi
+
+if [[ -n "${TERMNAV_VSCODE_SOCKET:-}" ]]; then
+  _post "$TERMNAV_VSCODE_SOCKET" "$PPID"
+fi
+((posted > 0)) && exit 0
+((failed > 0)) && exit 1
+exit 10

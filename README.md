@@ -23,6 +23,9 @@ links, and `nvim-tmux-open`.
   through the pluggable command-execution bridge. There is no matching
   move/reorder command because VS Code exposes no command to reorder
   terminal tabs (drag-only).
+- `bin/vscode-nvim-focus`: publish ordered, leased Neovim focus ownership to
+  the window-scoped VS Code adapter. Persistent tmux sessions resolve the
+  currently focused client rather than trusting inherited window state.
 - `bin/termnav-switch-tab`: switch the nearest outer tab scope from a
   one-window tmux session, walking locally nested tmux parents before choosing
   the originating VS Code or WezTerm client.
@@ -39,6 +42,8 @@ links, and `nvim-tmux-open`.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
   `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
   setup module and advanced consumers.
+- `lib/termnav/nvim/vscode-focus.lua`: leased VS Code focus publisher used by
+  the Neovim setup module.
 - `lib/termnav/shell/wezterm-vars.sh`: shell helpers for emitting WezTerm
   `SetUserVar` OSC requests with raw or tmux-passthrough framing.
 - `lib/termnav/shell/vscode-command.sh`: dispatch seam for executing a VS
@@ -48,8 +53,9 @@ links, and `nvim-tmux-open`.
   posts a direction to the local adapter's owner-only Unix socket.
 - `lib/termnav/shell/vscode-backend-mcp.sh`: legacy backend for direct callers
   that use the `nabheet.vscode-ide-mcp` extension's local HTTP JSON-RPC API.
-- `share/termnav/vscode/termnav-0.1.0`: local VS Code extension that
-  owns and publishes each window's tab-switch socket.
+- `share/termnav/vscode/termnav-0.2.0`: local VS Code extension that
+  owns and publishes each window's tab-switch socket. New integrations use the
+  latest versioned directory declared by the consuming dotfiles.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
   pane context publishing.
 
@@ -112,6 +118,15 @@ The `IS_NVIM` and `NVIM_*` WezTerm user variables are termnav's private
 cross-process protocol between shell/Neovim publishers and WezTerm route
 consumers. Configure integrations through the modules above instead of setting
 or reading those names directly.
+
+The VS Code adapter exposes the equivalent `termnav.nvimFocused` context key.
+Neovim claims are validated against the active terminal process, ordered across
+focus cycles, and renewed with a short lease. Focus loss, terminal changes,
+terminal closure, editor-window blur, adapter shutdown, and lease expiry all
+reset the key to false. Undefined or stale state therefore keeps normal VS Code
+commands active. In tmux, the publisher reads the socket from each focused
+client process so detach, reattach, pane switches, and simultaneous VS Code
+windows cannot reuse the editor process's older window identity.
 
 ### Tab Scope Routing
 
