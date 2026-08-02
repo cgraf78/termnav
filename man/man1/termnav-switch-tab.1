@@ -62,6 +62,10 @@ only when process-global routing is acceptable.
 .B TERMNAV_VSCODE_SOCKET
 Read from the triggering tmux client process, not from this helper's inherited
 environment.
+.TP
+.B TERMNAV_VSCODE_TOKEN
+Per-window capability read from the same triggering client. Socket and token
+must both be present or routing fails closed.
 .SH LIMITATIONS
 An ordinary SSH or mosh hop cannot carry the WezTerm output-side parent
 loopback into VS Code. A one-window remote tmux inside VS Code therefore needs

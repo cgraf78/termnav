@@ -9,21 +9,28 @@ vscode-nvim-focus \- publish leased Neovim focus ownership to VS Code
 posts an ordered focus update to the window-scoped
 .B cgraf.termnav
 adapter. Neovim integrations call it on focus changes and periodically while
-focused. The adapter uses a short lease so a killed editor, terminal, or tmux
-client cannot leave terminal keybindings enabled indefinitely.
+focused. The adapter authenticates each update with a per-window token and
+verifies that the client-reported process ancestry contains the active terminal
+PID. A short lease ensures a killed editor, terminal, or tmux client cannot
+leave terminal keybindings enabled indefinitely.
 .PP
 Inside tmux, claims are sent only through clients that are focused and display
 the current
 .B TMUX_PANE.
 The socket is read from each tmux client process rather than inherited editor
 state, so attaching a persistent session from another VS Code window does not
-reuse the wrong window identity. Releases are sent to all attached client
-sockets and are ignored unless their source and focus cycle own that window.
+reuse the wrong window identity. The matching token is read from the same
+client. A hidden pane releases its prior ownership, and continued polling lets
+pane return or reattach recover without restarting Neovim. Releases are sent to
+all attached client sockets and are ignored unless their source and focus cycle
+own that window.
 .PP
 Outside tmux, the command uses the inherited
-.B TERMNAV_VSCODE_SOCKET.
-Missing clients, sockets, or adapters fail closed without diagnostics during
-normal focus publication.
+.B TERMNAV_VSCODE_SOCKET
+and
+.B TERMNAV_VSCODE_TOKEN.
+Missing clients, partial credentials, or adapters fail closed without
+diagnostics during normal focus publication.
 .SH ARGUMENTS
 .TP
 .B claim|release
@@ -46,6 +53,10 @@ messages.
 .TP
 .B TERMNAV_VSCODE_SOCKET
 Owner-only Unix socket published into terminals by the local adapter.
+.TP
+.B TERMNAV_VSCODE_TOKEN
+Random per-window capability published with the socket and rotated whenever the
+adapter restarts.
 .TP
 .B TERMNAV_VSCODE_CURL
 HTTP client used to post the update. Defaults to

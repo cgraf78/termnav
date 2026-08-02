@@ -30,7 +30,7 @@ _process_environment() {
   ps eww -p "$pid" -o command= 2>/dev/null | tr ' ' '\n'
 }
 
-extension_dir="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.2.0"
+extension_dir="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.3.0"
 focus_cli="$TERMNAV_ROOT/bin/vscode-nvim-focus"
 
 echo "=== VS Code nvim focus state machine ==="
@@ -41,12 +41,21 @@ _assert_file_exists "focus adapter: versioned manifest is shipped" \
 _assert_file_exists "focus adapter: implementation is shipped" \
   "$extension_dir/extension.js"
 
+extension_source=$(cat "$extension_dir/extension.js" 2>/dev/null || true)
+_assert_not_contains "focus adapter: sandbox does not inspect host procfs" \
+  '"/proc/' "$extension_source"
+_assert_not_contains "focus adapter: sandbox does not spawn host process tools" \
+  'child_process' "$extension_source"
+
 if [[ ! -x "$focus_cli" || ! -r "$extension_dir/extension.js" ]]; then
   _test_summary
 fi
 
 mock_bin=$(_tmpdir)
 focus_log=$(_tmpdir)/focus.log
+token_test=$(printf '0123456789abcdef%.0s' {1..4})
+token_a=$(printf 'a%.0s' {1..64})
+token_b=$(printf 'b%.0s' {1..64})
 cat >"$mock_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 {
@@ -58,7 +67,9 @@ printf '{"ok":true}\n'
 EOF
 chmod +x "$mock_bin/curl"
 
-TERMNAV_VSCODE_SOCKET=/tmp/window.sock TERMNAV_FOCUS_LOG="$focus_log" \
+TERMNAV_VSCODE_SOCKET=/tmp/window.sock \
+  TERMNAV_VSCODE_TOKEN="$token_test" \
+  TERMNAV_FOCUS_LOG="$focus_log" \
   PATH="$mock_bin:$PATH" env -u TMUX -u TMUX_PANE \
   "$focus_cli" claim nvim-a 2 7 12345
 focus_call=$(cat "$focus_log")
@@ -67,8 +78,15 @@ _assert_contains "focus publisher: direct terminal uses its window socket" \
 _assert_contains "focus publisher: posts only to the focus endpoint" \
   "<http://localhost/nvim-focus>" "$focus_call"
 _assert_contains "focus publisher: sends versioned ordered ownership" \
-  '"version":1,"source":"nvim-a","cycle":2,"sequence":7,"observed":12345,"operation":"claim"' \
+  '"version":2,"source":"nvim-a","cycle":2,"sequence":7,"observed":12345,"operation":"claim"' \
   "$focus_call"
+_assert_contains "focus publisher: authenticates its window" \
+  "\"token\":\"$token_test\"" \
+  "$focus_call"
+_assert_contains "focus publisher: reports its terminal ancestry" \
+  '"ancestors":[' "$focus_call"
+_assert_not_contains "focus publisher: no longer trusts a bare client pid" \
+  '"clientPid":' "$focus_call"
 
 set +e
 invalid_output=$("$focus_cli" claim 'bad source' 1 1 1 2>&1)
@@ -78,16 +96,32 @@ _assert_exit "focus publisher: rejects unsafe source identifiers" 2 "$invalid_rc
 _assert_contains "focus publisher: invalid input has an actionable diagnostic" \
   "invalid source" "$invalid_output"
 
+: >"$focus_log"
+set +e
+TERMNAV_VSCODE_SOCKET=/tmp/window.sock TERMNAV_FOCUS_LOG="$focus_log" \
+  PATH="$mock_bin:$PATH" env -u TMUX -u TMUX_PANE -u TERMNAV_VSCODE_TOKEN \
+  "$focus_cli" claim nvim-no-token 1 1 12346
+missing_token_rc=$?
+set -e
+_assert_exit "focus publisher: a socket without its window token is unusable" \
+  10 "$missing_token_rc"
+_assert_eq "focus publisher: missing window token emits no request" \
+  "" "$(cat "$focus_log")"
+
 cat >"$mock_bin/tmux" <<'EOF'
 #!/usr/bin/env bash
 printf '%b' "$TERMNAV_TMUX_CLIENTS"
 EOF
 chmod +x "$mock_bin/tmux"
 
-env TERMNAV_VSCODE_SOCKET=/tmp/window-a.sock sleep 60 &
+env TERMNAV_VSCODE_SOCKET=/tmp/window-a.sock \
+  TERMNAV_VSCODE_TOKEN="$token_a" \
+  sleep 60 &
 client_a=$!
 client_pids+=("$client_a")
-env TERMNAV_VSCODE_SOCKET=/tmp/window-b.sock sleep 60 &
+env TERMNAV_VSCODE_SOCKET=/tmp/window-b.sock \
+  TERMNAV_VSCODE_TOKEN="$token_b" \
+  sleep 60 &
 client_b=$!
 client_pids+=("$client_b")
 for _ in {1..100}; do
@@ -105,6 +139,12 @@ _assert_contains "focus publisher fixture: first client environment is ready" \
 _assert_contains "focus publisher fixture: second client environment is ready" \
   "TERMNAV_VSCODE_SOCKET=/tmp/window-b.sock" \
   "$(_process_environment "$client_b")"
+_assert_contains "focus publisher fixture: first client token is ready" \
+  "TERMNAV_VSCODE_TOKEN=$token_a" \
+  "$(_process_environment "$client_a")"
+_assert_contains "focus publisher fixture: second client token is ready" \
+  "TERMNAV_VSCODE_TOKEN=$token_b" \
+  "$(_process_environment "$client_b")"
 
 : >"$focus_log"
 TERMNAV_TMUX_CLIENTS="$client_a|%1|attached,focused\n$client_b|%2|attached\n" \
@@ -115,6 +155,9 @@ _assert_contains "focus publisher: tmux claim uses the focused client window" \
   "</tmp/window-a.sock>" "$tmux_claim"
 _assert_not_contains "focus publisher: tmux claim ignores another pane" \
   "</tmp/window-b.sock>" "$tmux_claim"
+_assert_contains "focus publisher: tmux claim uses the focused client token" \
+  "\"token\":\"$token_a\"" \
+  "$tmux_claim"
 
 : >"$focus_log"
 TERMNAV_TMUX_CLIENTS="$client_a|%2|attached\n$client_b|%2|attached,focused\n" \
@@ -127,10 +170,22 @@ _assert_contains "focus publisher: release is harmlessly broadcast to attached w
   "</tmp/window-b.sock>" "$tmux_release"
 
 : >"$focus_log"
+TERMNAV_TMUX_CLIENTS="$client_a|%2|attached,focused\n$client_b|%2|attached\n" \
+  TERMNAV_FOCUS_LOG="$focus_log" TMUX=/tmp/tmux.sock,1,0 TMUX_PANE=%1 \
+  PATH="$mock_bin:$PATH" "$focus_cli" claim nvim-hidden 3 4 20002
+hidden_claim=$(cat "$focus_log")
+_assert_contains "focus publisher: a hidden nvim pane releases its prior window" \
+  '"operation":"release"' "$hidden_claim"
+_assert_contains "focus publisher: hidden-pane release reaches the focused client" \
+  "</tmp/window-a.sock>" "$hidden_claim"
+_assert_contains "focus publisher: hidden-pane release clears any other attached window" \
+  "</tmp/window-b.sock>" "$hidden_claim"
+
+: >"$focus_log"
 set +e
 TERMNAV_TMUX_CLIENTS="" TERMNAV_FOCUS_LOG="$focus_log" \
   TMUX=/tmp/tmux.sock,1,0 TMUX_PANE=%1 PATH="$mock_bin:$PATH" \
-  "$focus_cli" claim nvim-detached 1 1 20002
+  "$focus_cli" claim nvim-detached 1 1 20003
 detached_rc=$?
 set -e
 _assert_exit "focus publisher: detached tmux has no renewable owner" 10 "$detached_rc"
@@ -142,6 +197,7 @@ if command -v node >/dev/null 2>&1; then
   cat >"$node_modules/vscode/index.js" <<'EOF'
 const calls = [];
 let rejectNextContext = false;
+let rejectNextCommand = false;
 const listeners = {
   activeTerminal: [],
   closeTerminal: [],
@@ -174,6 +230,10 @@ module.exports = {
         rejectNextContext = false;
         return Promise.reject(new Error("injected setContext failure"));
       }
+      if (command !== "setContext" && rejectNextCommand) {
+        rejectNextCommand = false;
+        return Promise.reject();
+      }
       return Promise.resolve();
     },
   },
@@ -183,6 +243,9 @@ module.exports = {
   __rejectNextContext() {
     rejectNextContext = true;
   },
+  __rejectNextCommand() {
+    rejectNextCommand = true;
+  },
   __terminal: terminal,
 };
 EOF
@@ -190,7 +253,10 @@ EOF
   focus_output=$(
     NODE_PATH="${node_modules%/node_modules}/node_modules" node - "$extension_dir/extension.js" <<'NODE'
 const extension = require(process.argv[2]);
+const fs = require("node:fs");
+const http = require("node:http");
 const vscode = require("vscode");
+const token = ["0123", "4567", "89ab", "cdef"].join("").repeat(4);
 
 let now = 1000;
 let nextTimer = 1;
@@ -207,7 +273,7 @@ const controller = extension.createFocusController({
   clearTimer(id) {
     timers.delete(id);
   },
-  isDescendant: async (pid, ancestor) => pid === ancestor,
+  token,
 });
 
 async function flush() {
@@ -224,14 +290,50 @@ async function advance(milliseconds) {
   await flush();
 }
 
-function message(source, cycle, sequence, observed, operation, clientPid = process.pid) {
-  return { version: 1, source, cycle, sequence, observed, operation, clientPid };
+function message(
+  source,
+  cycle,
+  sequence,
+  observed,
+  operation,
+  ancestors = [process.pid + 2, process.pid + 1, process.pid],
+  messageToken = token,
+) {
+  return {
+    version: 2,
+    source,
+    cycle,
+    sequence,
+    observed,
+    operation,
+    token: messageToken,
+    ancestors,
+  };
 }
 
 function contextValues() {
   return vscode.__calls
     .filter((call) => call[0] === "setContext" && call[1] === "termnav.nvimFocused")
     .map((call) => String(call[2]));
+}
+
+function post(socketPath, requestPath, body) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        socketPath,
+        path: requestPath,
+        method: "POST",
+        headers: { "content-type": "application/json" },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.end(JSON.stringify(body));
+  });
 }
 
 async function main() {
@@ -294,8 +396,24 @@ async function main() {
   await flush();
   console.log("after-pre-blur-claim=" + contextValues().at(-1));
 
-  console.log("dead-pid=" + (await controller.handle(
-    message("nvim-f", 1, 1, 7001, "claim", process.pid + 99),
+  console.log("wrong-terminal=" + (await controller.handle(
+    message("nvim-f", 1, 1, 7001, "claim", [process.pid + 99]),
+  )));
+  console.log("wrong-token=" + (await controller.handle(
+    message("nvim-f", 1, 2, 7002, "claim", [process.pid], "f".repeat(64)),
+  )));
+  console.log("duplicate-ancestry=" + (await controller.handle(
+    message("nvim-f", 1, 3, 7003, "claim", [process.pid, process.pid]),
+  )));
+  console.log("oversized-ancestry=" + (await controller.handle(
+    message(
+      "nvim-f",
+      1,
+      4,
+      7004,
+      "claim",
+      Array.from({ length: 65 }, (_, index) => process.pid + index),
+    ),
   )));
 
   now = 8001;
@@ -311,6 +429,48 @@ async function main() {
   await flush();
   console.log("context-recovery=" + contextValues().at(-1));
   await controller.dispose();
+
+  const socketPath = `/tmp/termnav-focus-test-${process.pid}.sock`;
+  try {
+    fs.unlinkSync(socketPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const server = extension.createServer(controller, token);
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  console.log("switch-no-token=" + (await post(
+    socketPath,
+    "/switch-tab",
+    { direction: "next" },
+  )));
+  console.log("switch-wrong-token=" + (await post(
+    socketPath,
+    "/switch-tab",
+    { direction: "next", token: "f".repeat(64) },
+  )));
+  console.log("switch-valid=" + (await post(
+    socketPath,
+    "/switch-tab",
+    { direction: "next", token },
+  )));
+  vscode.__rejectNextCommand();
+  console.log("switch-command-failure=" + (await post(
+    socketPath,
+    "/switch-tab",
+    { direction: "previous", token },
+  )));
+  console.log("switch-command-recovery=" + (await post(
+    socketPath,
+    "/switch-tab",
+    { direction: "previous", token },
+  )));
+  console.log("switch-command=" + vscode.__calls.some(
+    (call) => call[0] === "workbench.action.terminal.focusNext",
+  ));
+  await new Promise((resolve) => server.close(resolve));
 }
 
 main().catch((error) => {
@@ -347,11 +507,29 @@ NODE
   _assert_contains "focus adapter: delayed pre-blur claims cannot resurrect context" \
     "after-pre-blur-claim=false" "$focus_output"
   _assert_contains "focus adapter: unrelated process cannot claim the active terminal" \
-    "dead-pid=false" "$focus_output"
+    "wrong-terminal=false" "$focus_output"
+  _assert_contains "focus adapter: a different window token cannot claim focus" \
+    "wrong-token=false" "$focus_output"
+  _assert_contains "focus adapter: duplicate ancestry is rejected" \
+    "duplicate-ancestry=false" "$focus_output"
+  _assert_contains "focus adapter: oversized ancestry is rejected" \
+    "oversized-ancestry=false" "$focus_output"
   _assert_contains "focus adapter: reports a failed VS Code context update" \
     "context-failure=true" "$focus_output"
   _assert_contains "focus adapter: one failed context update cannot poison later clears" \
     "context-recovery=false" "$focus_output"
+  _assert_contains "focus adapter: tab switching requires a token" \
+    "switch-no-token=403" "$focus_output"
+  _assert_contains "focus adapter: tab switching rejects another window token" \
+    "switch-wrong-token=403" "$focus_output"
+  _assert_contains "focus adapter: authenticated tab switching succeeds" \
+    "switch-valid=200" "$focus_output"
+  _assert_contains "focus adapter: command rejection returns a bounded error" \
+    "switch-command-failure=500" "$focus_output"
+  _assert_contains "focus adapter: command rejection does not poison later requests" \
+    "switch-command-recovery=200" "$focus_output"
+  _assert_contains "focus adapter: authenticated tab switching invokes VS Code" \
+    "switch-command=true" "$focus_output"
 else
   echo "  SKIP: VS Code focus runtime assertions (node unavailable)"
 fi

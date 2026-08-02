@@ -1,0 +1,39 @@
+{
+  "name": "termnav",
+  "publisher": "cgraf",
+  "displayName": "Termnav",
+  "description": "Provides window-scoped terminal routing and focus context.",
+  "version": "0.3.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cgraf78/termnav.git"
+  },
+  "homepage": "https://github.com/cgraf78/termnav",
+  "bugs": {
+    "url": "https://github.com/cgraf78/termnav/issues"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "neovim",
+    "terminal",
+    "tmux"
+  ],
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./extension.js"
+}

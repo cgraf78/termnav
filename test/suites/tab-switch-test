@@ -12,7 +12,7 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 router="$TERMNAV_ROOT/bin/termnav-switch-tab"
 socket_backend="$TERMNAV_ROOT/lib/termnav/shell/vscode-backend-socket.sh"
-extension_dir="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.2.0"
+extension_dir="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.3.0"
 
 echo "=== generic tab router surface ==="
 
@@ -50,6 +50,8 @@ echo "=== vscode-backend-socket.sh: per-window adapter routing ==="
 
 mock_bin=$(_tmpdir)
 socket_code_log=$(_tmpdir)/socket-code.log
+token_a=$(printf 'a%.0s' {1..64})
+token_b=$(printf 'b%.0s' {1..64})
 cat >"$mock_bin/curl" <<'EOF'
 #!/usr/bin/env bash
 {
@@ -62,7 +64,9 @@ EOF
 chmod +x "$mock_bin/curl"
 
 : >"$socket_code_log"
-TERMNAV_VSCODE_SOCKET=/tmp/termnav-window-a.sock SOCKET_CODE_LOG="$socket_code_log" \
+TERMNAV_VSCODE_SOCKET=/tmp/termnav-window-a.sock \
+  TERMNAV_VSCODE_TOKEN="$token_a" \
+  SOCKET_CODE_LOG="$socket_code_log" \
   PATH="$mock_bin:$PATH" bash -c "
     . '$socket_backend'
     termnav_vscode_socket_execute_command 'workbench.action.terminal.focusNext'
@@ -73,7 +77,10 @@ _assert_contains "socket backend: preserves the originating adapter socket" \
 _assert_contains "socket backend: posts directly through the per-window socket" \
   "cli=<curl>" "$socket_output"
 _assert_contains "socket backend: sends the next direction as JSON" \
-  '{"direction":"next"}' "$socket_output"
+  '"direction":"next"' "$socket_output"
+_assert_contains "socket backend: authenticates the originating window" \
+  "\"token\":\"$token_a\"" \
+  "$socket_output"
 
 set +e
 missing_socket_output=$(env -u TERMNAV_VSCODE_SOCKET PATH="$mock_bin:$PATH" bash -c "
@@ -81,7 +88,14 @@ missing_socket_output=$(env -u TERMNAV_VSCODE_SOCKET PATH="$mock_bin:$PATH" bash
   termnav_vscode_socket_execute_command 'workbench.action.terminal.focusNext'
 " 2>&1)
 missing_socket_rc=$?
+missing_token_output=$(TERMNAV_VSCODE_SOCKET=/tmp/termnav-window.sock \
+  env -u TERMNAV_VSCODE_TOKEN PATH="$mock_bin:$PATH" bash -c "
+    . '$socket_backend'
+    termnav_vscode_socket_execute_command 'workbench.action.terminal.focusNext'
+  " 2>&1)
+missing_token_rc=$?
 unsupported_output=$(TERMNAV_VSCODE_SOCKET=/tmp/termnav-window.sock \
+  TERMNAV_VSCODE_TOKEN="$token_a" \
   PATH="$mock_bin:$PATH" bash -c "
     . '$socket_backend'
     termnav_vscode_socket_execute_command 'workbench.action.nextEditor'
@@ -90,6 +104,8 @@ unsupported_rc=$?
 set -e
 _assert_exit "socket backend: missing per-window socket fails closed" 1 "$missing_socket_rc"
 _assert_eq "socket backend: missing per-window socket is silent" "" "$missing_socket_output"
+_assert_exit "socket backend: missing per-window token fails closed" 1 "$missing_token_rc"
+_assert_eq "socket backend: missing per-window token is silent" "" "$missing_token_output"
 _assert_exit "socket backend: unrelated commands fail closed" 1 "$unsupported_rc"
 _assert_eq "socket backend: unrelated commands are silent" "" "$unsupported_output"
 
@@ -168,6 +184,7 @@ EOF
     NODE_PATH="${node_modules%/node_modules}/node_modules" node - "$extension_dir/extension.js" <<'NODE'
 const fs = require("fs");
 const http = require("http");
+const net = require("net");
 process.env.TERMNAV_TEST_VSCODE_SESSION_ID = "termnav-extension-test-" + process.pid;
 const extension = require(process.argv[2]);
 const vscode = require("vscode");
@@ -239,14 +256,26 @@ async function main() {
   const environmentVariableCollection = makeEnvironmentCollection(environment);
   await extension.activate({ subscriptions, environmentVariableCollection });
   const socketPath = environment.get("TERMNAV_VSCODE_SOCKET");
+  const token = environment.get("TERMNAV_VSCODE_TOKEN");
   const directoryMode = fs.statSync(require("path").dirname(socketPath)).mode & 0o777;
   const socketMode = fs.statSync(socketPath).mode & 0o777;
-  const next = await request(socketPath, "POST", "/switch-tab", { direction: "next" });
-  const previous = await request(socketPath, "POST", "/switch-tab", { direction: "previous" });
-  const invalid = await request(socketPath, "POST", "/switch-tab", { direction: "sideways" });
+  const noToken = await request(socketPath, "POST", "/switch-tab", { direction: "next" });
+  const wrongToken = await request(socketPath, "POST", "/switch-tab", {
+    direction: "next",
+    token: "f".repeat(64),
+  });
+  const next = await request(socketPath, "POST", "/switch-tab", { direction: "next", token });
+  const previous = await request(socketPath, "POST", "/switch-tab", {
+    direction: "previous",
+    token,
+  });
+  const invalid = await request(socketPath, "POST", "/switch-tab", {
+    direction: "sideways",
+    token,
+  });
   const nullBody = await request(socketPath, "POST", "/switch-tab", null);
   const tooLarge = await request(socketPath, "POST", "/switch-tab", "x".repeat(1024));
-  const wrongPath = await request(socketPath, "POST", "/other", { direction: "next" });
+  const wrongPath = await request(socketPath, "POST", "/other", { direction: "next", token });
 
   const sharedWorkspaceValues = new Map([["TERMNAV_VSCODE_SOCKET", socketPath]]);
   const sharedWorkspaceCollection = makeEnvironmentCollection(sharedWorkspaceValues);
@@ -258,8 +287,12 @@ async function main() {
     environmentVariableCollection: sharedWorkspaceCollection,
   });
   const liveSecondWindowPath = sharedWorkspaceValues.get("TERMNAV_VSCODE_SOCKET");
+  const liveSecondWindowToken = sharedWorkspaceValues.get("TERMNAV_VSCODE_TOKEN");
   console.log("same-workspace-windows=" + (
     liveSecondWindowPath === socketPath ? "collide" : "isolated"
+  ));
+  console.log("same-workspace-tokens=" + (
+    liveSecondWindowToken === token ? "collide" : "isolated"
   ));
   await Promise.all(sharedWorkspaceSubscriptions.map(
     (subscription) => Promise.resolve(subscription.dispose()),
@@ -268,6 +301,8 @@ async function main() {
   console.log(vscode.__calls.join("\n"));
   console.log(vscode.__environment.join("\n"));
   console.log("statuses=" + [
+    noToken.status,
+    wrongToken.status,
     next.status,
     previous.status,
     invalid.status,
@@ -280,7 +315,24 @@ async function main() {
   console.log("subscriptions=" + subscriptions.length);
   console.log("collection-persistent=" + environmentVariableCollection.persistent);
 
-  await Promise.all(subscriptions.map((subscription) => Promise.resolve(subscription.dispose())));
+  const stalledClient = net.createConnection(socketPath);
+  await new Promise((resolve, reject) => {
+    stalledClient.once("connect", resolve);
+    stalledClient.once("error", reject);
+  });
+  stalledClient.write(
+    "POST /switch-tab HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{",
+  );
+  const disposal = Promise.all(
+    subscriptions.map((subscription) => Promise.resolve(subscription.dispose())),
+  );
+  const disposalResult = await Promise.race([
+    disposal.then(() => "closed"),
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 250)),
+  ]);
+  console.log("stalled-client-disposal=" + disposalResult);
+  stalledClient.destroy();
+  await disposal;
   for (let attempt = 0; attempt < 100 && pathEntryExists(socketPath); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -289,7 +341,9 @@ async function main() {
     pathEntryExists(socketPath + ".claim") ? "present" : "removed"
   ));
   console.log("environment-cleanup=" + (
-    environment.has("TERMNAV_VSCODE_SOCKET") ? "present" : "removed"
+    environment.has("TERMNAV_VSCODE_SOCKET") || environment.has("TERMNAV_VSCODE_TOKEN")
+      ? "present"
+      : "removed"
   ));
 
   const restartedSubscriptions = [];
@@ -298,7 +352,9 @@ async function main() {
     environmentVariableCollection,
   });
   const restartedSocketPath = environment.get("TERMNAV_VSCODE_SOCKET");
+  const restartedToken = environment.get("TERMNAV_VSCODE_TOKEN");
   console.log("restart-path=" + (restartedSocketPath === socketPath ? "stable" : "changed"));
+  console.log("restart-token=" + (restartedToken === token ? "stable" : "changed"));
   console.log("socket-length=" + restartedSocketPath.length);
   await Promise.all(restartedSubscriptions.map(
     (subscription) => Promise.resolve(subscription.dispose()),
@@ -322,12 +378,14 @@ NODE
     "telemetry-session-independent=isolated" "$extension_output"
   _assert_contains "socket adapter: live windows sharing one workspace stay isolated" \
     "same-workspace-windows=isolated" "$extension_output"
+  _assert_contains "socket adapter: live windows have distinct authentication" \
+    "same-workspace-tokens=isolated" "$extension_output"
   _assert_contains "socket adapter: stored workspace paths are never reassigned" \
     "stored-path-not-reused=fresh" "$extension_output"
   _assert_contains "socket adapter: previous selects the previous integrated terminal" \
     "workbench.action.terminal.focusPrevious" "$extension_output"
   _assert_contains "socket adapter: rejects unknown paths and directions" \
-    "statuses=200,200,400,400,413,404" "$extension_output"
+    "statuses=403,403,200,200,400,400,413,404" "$extension_output"
   _assert_contains "socket adapter: private directory is owner-only" \
     "directory-mode=700" "$extension_output"
   _assert_contains "socket adapter: socket is owner-only" \
@@ -338,14 +396,20 @@ NODE
     "collection-persistent=false" "$extension_output"
   _assert_contains "socket adapter: publishes its per-window socket" \
     "TERMNAV_VSCODE_SOCKET=published" "$extension_output"
+  _assert_contains "socket adapter: publishes its per-window token" \
+    "TERMNAV_VSCODE_TOKEN=published" "$extension_output"
   _assert_contains "socket adapter: removes its socket on disposal" \
     "cleanup=removed" "$extension_output"
+  _assert_contains "socket adapter: stalled clients cannot block disposal" \
+    "stalled-client-disposal=closed" "$extension_output"
   _assert_contains "socket adapter: removes its ownership claim on disposal" \
     "claim-cleanup=removed" "$extension_output"
   _assert_contains "socket adapter: removes its terminal environment on disposal" \
     "environment-cleanup=removed" "$extension_output"
   _assert_contains "socket adapter: extension-host restart cannot reassign an old path" \
     "restart-path=changed" "$extension_output"
+  _assert_contains "socket adapter: extension-host restart rotates authentication" \
+    "restart-token=changed" "$extension_output"
   _assert_eq "socket adapter: path stays below the macOS Unix-socket limit" \
     "true" \
     "$(printf '%s\n' "$extension_output" | sed -n 's/^socket-length=//p' | awk '{ print ($1 < 104 ? "true" : "false") }')"
@@ -370,7 +434,7 @@ _client_has_env() {
 _spawn_client() {
   local expected ready attempts=200
 
-  env -u TMUX -u TMUX_PANE -u TERMNAV_VSCODE_SOCKET \
+  env -u TMUX -u TMUX_PANE -u TERMNAV_VSCODE_SOCKET -u TERMNAV_VSCODE_TOKEN \
     -u VSCODE_IPC_HOOK_CLI -u TERM_PROGRAM "$@" sleep 60 &
   REPLY=$!
   client_pids+=("$REPLY")
@@ -449,9 +513,13 @@ printf '{}\n'
 EOF
 chmod +x "$router_bin/curl"
 
-_spawn_client TERMNAV_VSCODE_SOCKET=/tmp/termnav-window-a.sock TERM_PROGRAM=vscode
+_spawn_client TERMNAV_VSCODE_SOCKET=/tmp/termnav-window-a.sock \
+  TERMNAV_VSCODE_TOKEN="$token_a" \
+  TERM_PROGRAM=vscode
 client_a=$REPLY
-_spawn_client TERMNAV_VSCODE_SOCKET=/tmp/termnav-window-b.sock TERM_PROGRAM=vscode
+_spawn_client TERMNAV_VSCODE_SOCKET=/tmp/termnav-window-b.sock \
+  TERMNAV_VSCODE_TOKEN="$token_b" \
+  TERM_PROGRAM=vscode
 client_b=$REPLY
 
 : >"$router_log"
@@ -466,8 +534,14 @@ _assert_eq "tab router: simultaneous VS Code windows retain separate IPC identit
   "$(sed -n 's/ .*//p' "$router_log")"
 _assert_contains "tab router: forwards next to the first VS Code window" \
   '"direction":"next"' "$(sed -n '1p' "$router_log")"
+_assert_contains "tab router: forwards the first VS Code window token" \
+  "\"token\":\"$token_a\"" \
+  "$(sed -n '1p' "$router_log")"
 _assert_contains "tab router: forwards previous to the second VS Code window" \
   '"direction":"previous"' "$(sed -n '2p' "$router_log")"
+_assert_contains "tab router: forwards the second VS Code window token" \
+  "\"token\":\"$token_b\"" \
+  "$(sed -n '2p' "$router_log")"
 
 _spawn_client VSCODE_IPC_HOOK_CLI=/tmp/not-a-window-identity TERM_PROGRAM=vscode
 client_without_socket=$REPLY

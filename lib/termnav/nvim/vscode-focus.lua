@@ -109,7 +109,7 @@ function M.new(options)
         ctx.claim()
         return
       end
-      if code == 0 or code == 1 then
+      if code == 0 or code == 1 or code == 10 then
         schedule_claim()
       end
     end)
