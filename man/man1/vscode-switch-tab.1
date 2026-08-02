@@ -38,8 +38,10 @@ Show command help.
 .SH ENVIRONMENT
 .TP
 .B TERMNAV_VSCODE_BACKEND
-Selects the command-execution backend. When unset, a nonempty
+Selects the command-execution backend. When unset, paired nonempty
 .B TERMNAV_VSCODE_SOCKET
+and
+.B TERMNAV_VSCODE_TOKEN
 selects
 .BR socket ;
 otherwise the fallback is
@@ -47,6 +49,9 @@ otherwise the fallback is
 .TP
 .B TERMNAV_VSCODE_SOCKET
 Owner-only Unix socket published into terminals by the local adapter.
+.TP
+.B TERMNAV_VSCODE_TOKEN
+Random per-window capability required by the socket backend.
 .TP
 .B TERMNAV_VSCODE_CURL
 HTTP client used by the socket backend. Defaults to

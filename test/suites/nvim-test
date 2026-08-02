@@ -819,6 +819,37 @@ _assert_eq "nvim focus: fired heartbeat closes its libuv timer handle" \
   "$expected" "$result"
 
 result=$(_nvim_lua "
+  local uv = vim.uv or vim.loop
+  local real_new_timer = uv.new_timer
+  local timers = {}
+  uv.new_timer = function()
+    local timer = {}
+    function timer:start(_, _, callback) self.callback = callback end
+    function timer:stop() end
+    function timer:close() end
+    timers[#timers + 1] = timer
+    return timer
+  end
+
+  local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
+    command = '/unused',
+    observed = function() return 1234 end,
+    source = 'nvim-test',
+    run = function(_, callback) callback(10) end,
+  })
+  publisher.focus()
+  print(#timers)
+  timers[1].callback()
+  vim.wait(100, function() return #timers == 2 end)
+  print(#timers)
+  publisher.dispose()
+  uv.new_timer = real_new_timer
+")
+expected="$(printf '1\n2')"
+_assert_eq "nvim focus: detached or hidden panes keep probing for reattach" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
   local calls = {}
   local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
     command = '/unused',

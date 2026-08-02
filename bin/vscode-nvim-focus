@@ -32,6 +32,14 @@ _is_js_uint() {
   ((10#$1 < 9007199254740992))
 }
 
+_is_token() {
+  ((${#1} == 64)) || return 1
+  case "$1" in
+    *[!0-9a-f]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 _process_env() {
   local pid="$1" name="$2" entry
 
@@ -59,11 +67,56 @@ _process_env() {
   return 1
 }
 
+_process_parent_pid() {
+  local pid="$1" key value parent
+
+  _is_uint "$pid" || return 1
+  if [[ -r "/proc/$pid/status" ]]; then
+    while read -r key value _; do
+      if [[ "$key" == "PPid:" ]]; then
+        _is_uint "$value" || return 1
+        printf '%s\n' "$value"
+        return 0
+      fi
+    done <"/proc/$pid/status"
+    return 1
+  fi
+
+  parent=$(ps -p "$pid" -o ppid= 2>/dev/null) || return 1
+  parent=${parent//[[:space:]]/}
+  _is_uint "$parent" || return 1
+  printf '%s\n' "$parent"
+}
+
+_process_ancestry_json() {
+  local current="$1" parent depth=0 seen=":" ancestry=""
+
+  while ((depth < 64)) && _is_uint "$current" && ((10#$current > 0)); do
+    case "$seen" in
+      *":$current:"*) break ;;
+    esac
+    seen+="$current:"
+    if [[ -n "$ancestry" ]]; then
+      ancestry+=","
+    fi
+    ancestry+="$current"
+    depth=$((depth + 1))
+    parent=$(_process_parent_pid "$current") || break
+    current="$parent"
+  done
+
+  [[ -n "$ancestry" ]] || return 1
+  printf '[%s]' "$ancestry"
+}
+
 _post() {
-  local socket="$1" client_pid="$2" payload
+  local socket="$1" token="$2" client_pid="$3" post_operation="${4:-$operation}"
+  local ancestry payload
 
   [[ -n "$socket" ]] || return 0
-  payload="{\"version\":1,\"source\":\"$source\",\"cycle\":$cycle,\"sequence\":$sequence,\"observed\":$observed,\"operation\":\"$operation\",\"clientPid\":$client_pid}"
+  _is_token "$token" || return 0
+  ancestry=$(_process_ancestry_json "$client_pid") || return 0
+  payload="{\"version\":2,\"source\":\"$source\",\"cycle\":$cycle,\"sequence\":$sequence,\"observed\":$observed,\"operation\":\"$post_operation\",\"token\":\"$token\",\"ancestors\":$ancestry}"
   if "${TERMNAV_VSCODE_CURL:-curl}" --silent --show-error --fail --max-time 1 \
     --unix-socket "$socket" \
     --header 'Content-Type: application/json' \
@@ -122,15 +175,24 @@ if [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]]; then
       esac
     fi
     socket=$(_process_env "$client_pid" TERMNAV_VSCODE_SOCKET 2>/dev/null || true)
-    _post "$socket" "$client_pid"
+    token=$(_process_env "$client_pid" TERMNAV_VSCODE_TOKEN 2>/dev/null || true)
+    _post "$socket" "$token" "$client_pid"
   done <<<"$clients"
+  if [[ "$operation" == "claim" && "$posted" -eq 0 ]]; then
+    while IFS='|' read -r client_pid _ _; do
+      _is_uint "$client_pid" || continue
+      socket=$(_process_env "$client_pid" TERMNAV_VSCODE_SOCKET 2>/dev/null || true)
+      token=$(_process_env "$client_pid" TERMNAV_VSCODE_TOKEN 2>/dev/null || true)
+      _post "$socket" "$token" "$client_pid" release
+    done <<<"$clients"
+  fi
   ((posted > 0)) && exit 0
   ((failed > 0)) && exit 1
   exit 10
 fi
 
-if [[ -n "${TERMNAV_VSCODE_SOCKET:-}" ]]; then
-  _post "$TERMNAV_VSCODE_SOCKET" "$PPID"
+if [[ -n "${TERMNAV_VSCODE_SOCKET:-}" && -n "${TERMNAV_VSCODE_TOKEN:-}" ]]; then
+  _post "$TERMNAV_VSCODE_SOCKET" "$TERMNAV_VSCODE_TOKEN" "$PPID"
 fi
 ((posted > 0)) && exit 0
 ((failed > 0)) && exit 1

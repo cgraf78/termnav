@@ -50,12 +50,14 @@ links, and `nvim-tmux-open`.
   Code command by ID through a pluggable backend (`TERMNAV_VSCODE_BACKEND`,
   automatically `socket` when the adapter is advertised, otherwise `mcp`).
 - `lib/termnav/shell/vscode-backend-socket.sh`: window-scoped backend that
-  posts a direction to the local adapter's owner-only Unix socket.
+  posts an authenticated direction to the local adapter's owner-only Unix
+  socket.
 - `lib/termnav/shell/vscode-backend-mcp.sh`: legacy backend for direct callers
   that use the `nabheet.vscode-ide-mcp` extension's local HTTP JSON-RPC API.
-- `share/termnav/vscode/termnav-0.2.0`: local VS Code extension that
-  owns and publishes each window's tab-switch socket. New integrations use the
-  latest versioned directory declared by the consuming dotfiles.
+- `share/termnav/vscode/termnav-0.3.0`: local VS Code extension that
+  owns and publishes each window's tab-switch socket and capability. New
+  integrations use the latest versioned directory declared by the consuming
+  dotfiles.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
   pane context publishing.
 
@@ -120,13 +122,18 @@ consumers. Configure integrations through the modules above instead of setting
 or reading those names directly.
 
 The VS Code adapter exposes the equivalent `termnav.nvimFocused` context key.
-Neovim claims are validated against the active terminal process, ordered across
-focus cycles, and renewed with a short lease. Focus loss, terminal changes,
-terminal closure, editor-window blur, adapter shutdown, and lease expiry all
-reset the key to false. Undefined or stale state therefore keeps normal VS Code
-commands active. In tmux, the publisher reads the socket from each focused
-client process so detach, reattach, pane switches, and simultaneous VS Code
-windows cannot reuse the editor process's older window identity.
+Each activation publishes a random per-window token with its socket. Neovim
+claims must authenticate with that token and include a bounded process ancestry
+containing the active terminal PID. This binds claims to the active terminal
+without requiring the extension host to inspect host procfs across container or
+PID-namespace boundaries. Claims are ordered across focus cycles and renewed
+with a short lease. Focus loss, terminal changes, terminal closure,
+editor-window blur, adapter shutdown, and lease expiry all reset the key to
+false. Undefined, partial, or stale state therefore keeps normal VS Code
+commands active. In tmux, the publisher reads the socket and token from each
+focused client process. A still-running Neovim in a hidden pane actively
+releases its old claim and continues probing so pane return or reattach recovers
+without restarting the editor.
 
 ### Tab Scope Routing
 
@@ -142,11 +149,13 @@ contributes its selected client and traversal continues outward.
 
 At the terminal boundary, WezTerm keeps the OSC user-variable transport. Each
 VS Code window's `cgraf.termnav` adapter owns an owner-only Unix socket and
-publishes its path as `TERMNAV_VSCODE_SOCKET`. Each activation atomically
-claims a random path without depending on telemetry, workspace identity, or
-product-global CLI state. The router reads that value from the originating tmux
-client, so simultaneous windows, including windows on the same workspace, do
-not compete for a fixed port or process-global bridge. After first install,
+publishes its path and random capability as `TERMNAV_VSCODE_SOCKET` and
+`TERMNAV_VSCODE_TOKEN`. Each activation atomically claims a random path and
+rotates the token without depending on telemetry, workspace identity, or
+product-global CLI state. The router reads both values from the originating
+tmux client, so simultaneous windows, including windows on the same workspace,
+do not compete for a fixed port or process-global bridge. A partial socket/token
+pair fails closed. After first install,
 reload or restart the editor window so it discovers the adapter, then relaunch
 existing terminal or tmux clients to receive the value. The same terminal
 relaunch is required after an extension-host or editor-window restart.

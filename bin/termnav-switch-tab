@@ -252,22 +252,26 @@ _parent_scope() {
 }
 
 _route_vscode() {
-  local backend command_id socket
+  local backend command_id socket token
 
   socket=$(_process_env "$CLIENT_PID" TERMNAV_VSCODE_SOCKET 2>/dev/null || true)
+  token=$(_process_env "$CLIENT_PID" TERMNAV_VSCODE_TOKEN 2>/dev/null || true)
   command_id="workbench.action.terminal.focusNext"
   [[ "$direction" == "previous" ]] &&
     command_id="workbench.action.terminal.focusPrevious"
 
   if [[ -n "$socket" ]]; then
+    [[ -n "$token" ]] || return 1
     TERMNAV_VSCODE_BACKEND=socket TERMNAV_VSCODE_SOCKET="$socket" \
+      TERMNAV_VSCODE_TOKEN="$token" \
       termnav_vscode_execute_command "$command_id"
     return
   fi
 
   backend="${TERMNAV_VSCODE_FALLBACK_BACKEND:-}"
   [[ -n "$backend" ]] || return 1
-  TERMNAV_VSCODE_SOCKET="" TERMNAV_VSCODE_BACKEND="$backend" \
+  TERMNAV_VSCODE_SOCKET="" TERMNAV_VSCODE_TOKEN="" \
+    TERMNAV_VSCODE_BACKEND="$backend" \
     termnav_vscode_execute_command "$command_id"
 }
 
