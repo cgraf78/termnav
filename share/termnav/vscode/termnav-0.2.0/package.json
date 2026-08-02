@@ -1,0 +1,22 @@
+{
+  "name": "termnav",
+  "publisher": "cgraf",
+  "displayName": "Termnav",
+  "description": "Provides window-scoped terminal routing and focus context.",
+  "version": "0.2.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./extension.js"
+}

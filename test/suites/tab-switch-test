@@ -12,7 +12,7 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 router="$TERMNAV_ROOT/bin/termnav-switch-tab"
 socket_backend="$TERMNAV_ROOT/lib/termnav/shell/vscode-backend-socket.sh"
-extension_dir="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.1.0"
+extension_dir="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.2.0"
 
 echo "=== generic tab router surface ==="
 
@@ -132,12 +132,26 @@ if command -v node >/dev/null 2>&1; then
   cat >"$node_modules/vscode/index.js" <<'EOF'
 const calls = [];
 const environment = [];
+const terminal = { processId: Promise.resolve(process.pid) };
 
 module.exports = {
   commands: {
     executeCommand(command) {
       calls.push(command);
       return Promise.resolve();
+    },
+  },
+  window: {
+    activeTerminal: terminal,
+    state: { focused: true },
+    onDidChangeActiveTerminal() {
+      return { dispose() {} };
+    },
+    onDidCloseTerminal() {
+      return { dispose() {} };
+    },
+    onDidChangeWindowState() {
+      return { dispose() {} };
     },
   },
   __calls: calls,

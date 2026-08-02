@@ -5,6 +5,7 @@ program	bin/nvim-ssh-control-open
 program	bin/nvim-tmux-open
 program	bin/termnav-switch-tab
 program	bin/tmux-follow-click
+program	bin/vscode-nvim-focus
 program	bin/vscode-switch-tab
 program	bin/wezterm-move-tab
 program	bin/wezterm-switch-tab
@@ -25,6 +26,7 @@ program	test/suites/nvim-test
 program	test/suites/remote-test
 program	test/suites/tab-switch-test
 program	test/suites/tmux-test
+program	test/suites/vscode-focus-test
 program	test/suites/vscode-test
 program	test/suites/wezterm-test
 program	test/termnav-test
