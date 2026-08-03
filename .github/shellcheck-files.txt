@@ -21,6 +21,7 @@ program	lib/termnav/shell/vscode-command.sh
 program	lib/termnav/shell/wezterm-vars.sh
 program	share/termnav/shell.sh
 program	test/helpers.sh
+program	test/suites/ci-contract-test
 program	test/suites/manpage-test
 program	test/suites/nvim-test
 program	test/suites/remote-test

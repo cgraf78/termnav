@@ -5,7 +5,7 @@ on:
     branches: [master, main]
   pull_request:
   schedule:
-    - cron: "0 7 * * *"
+    - cron: "57 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@6258122bd79dc9296b5d529c33fc3aad8f4d5796
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@8eaac8e384ae89e9c1aaf675dd23689cfe73fa7c
     with:
       matrix-set: full
       profiles: base,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
@@ -38,3 +38,21 @@ jobs:
       - name: Exercise current eza CLI
         shell: bash
         run: test/suites/wezterm-test
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs: [shell, eza-current]
+    runs-on: ubuntu-24.04
+    env:
+      SHELL_RESULT: ${{ needs.shell.result }}
+      EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}
+    steps:
+      - name: Require all Termnav compatibility checks
+        shell: bash
+        run: |-
+          printf 'Shell CI: %s\n' "$SHELL_RESULT"
+          printf 'Current eza: %s\n' "$EZA_CURRENT_RESULT"
+
+          test "$SHELL_RESULT" = success
+          test "$EZA_CURRENT_RESULT" = success
