@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+workflow="$root/.github/workflows/test.yml"
+
+fail() {
+  printf 'ci-contract-test: %s\n' "$*" >&2
+  exit 1
+}
+
+content=$(<"$workflow")
+[[ "$content" == *'cron: "57 8 * * *"'* ]] ||
+  fail "daily matrix does not retain its portfolio offset"
+[[ "$content" =~ cgraf78/actions/\.github/workflows/shell-ci\.yml@[0-9a-f]{40} ]] ||
+  fail "Shell CI is not pinned to an immutable revision"
+
+required_job=$(awk '
+  /^  required:$/ { in_required = 1 }
+  in_required && /^  [^ ]/ && $0 != "  required:" { exit }
+  in_required { print }
+' "$workflow")
+
+# These are literal GitHub and shell expressions in the workflow contract.
+# shellcheck disable=SC2016
+for contract in \
+  'name: Required' \
+  'if: ${{ always() }}' \
+  'needs: [shell, eza-current]' \
+  'SHELL_RESULT: ${{ needs.shell.result }}' \
+  'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
+  'test "$SHELL_RESULT" = success' \
+  'test "$EZA_CURRENT_RESULT" = success'; do
+  [[ "$required_job" == *"$contract"* ]] ||
+    fail "Required aggregate is missing: $contract"
+done
+
+printf 'ci-contract-test: ok\n'
