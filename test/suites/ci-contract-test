@@ -4,17 +4,50 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 workflow="$root/.github/workflows/test.yml"
+retry_workflow="$root/.github/workflows/retry-infrastructure.yml"
+lock_file="$root/.github/cgraf78-actions.lock"
 
 fail() {
   printf 'ci-contract-test: %s\n' "$*" >&2
   exit 1
 }
 
+[[ -f "$lock_file" && ! -L "$lock_file" ]] ||
+  fail "cgraf78/actions lock is missing or is not a regular file"
+actions_sha=$(tr -d '\n' <"$lock_file")
+[[ "$actions_sha" =~ ^[0-9a-f]{40}$ ]] &&
+  [[ $(wc -l <"$lock_file") -eq 1 ]] ||
+  fail "cgraf78/actions lock must contain one lowercase full commit SHA"
+
 content=$(<"$workflow")
+retry_content=$(<"$retry_workflow")
+[[ "$content" == *'branches: [main]'* ]] ||
+  fail "push CI does not target only the maintained main branch"
 [[ "$content" == *'cron: "57 8 * * *"'* ]] ||
   fail "daily matrix does not retain its portfolio offset"
-[[ "$content" =~ cgraf78/actions/\.github/workflows/shell-ci\.yml@[0-9a-f]{40} ]] ||
-  fail "Shell CI is not pinned to an immutable revision"
+[[ "$content" == *"cgraf78/actions/.github/workflows/shell-ci.yml@$actions_sha"* ]] ||
+  fail "Shell CI does not use the locked actions revision"
+[[ "$retry_content" == *"cgraf78/actions/.github/actions/infra-retry@$actions_sha"* ]] ||
+  fail "infrastructure retry does not use the locked actions revision"
+
+actions_sync_job=$(awk '
+  /^  actions-sync:$/ { in_sync = 1 }
+  in_sync && /^  [^ ]/ && $0 != "  actions-sync:" { exit }
+  in_sync { print }
+' "$workflow")
+
+for contract in \
+  'name: cgraf78/actions sync' \
+  'runs-on: ubuntu-24.04' \
+  'contents: read' \
+  'persist-credentials: false' \
+  "cgraf78/actions/.github/actions/verify-consumer-sync@$actions_sha"; do
+  [[ "$actions_sync_job" == *"$contract"* ]] ||
+    fail "actions synchronization job is missing: $contract"
+done
+[[ $(printf '%s\n' "$actions_sync_job" | grep -Ec \
+  '^[[:space:]]+- uses:[[:space:]]+actions/checkout@[0-9a-f]{40}([[:space:]]+#[^[:cntrl:]]*)?$') -eq 1 ]] ||
+  fail "actions synchronization checkout is not pinned to a full commit"
 
 required_job=$(awk '
   /^  required:$/ { in_required = 1 }
