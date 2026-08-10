@@ -13,6 +13,9 @@ Suite ownership follows the integration boundary:
   bridge selection.
 - `vscode-test` covers VS Code command backends.
 - `wezterm-test` covers WezTerm link rules.
+- `install-test` covers the standalone checkout-backed command and manpage
+  links, idempotent retargeting, custom destinations, complete source
+  preflight, and refusal to overwrite user-owned paths.
 
 Prefer fake terminal commands and fixture files over depending on an active
 tmux, Neovim, SSH, or WezTerm session.

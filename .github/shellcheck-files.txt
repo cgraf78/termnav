@@ -10,6 +10,7 @@ program	bin/vscode-switch-tab
 program	bin/wezterm-move-tab
 program	bin/wezterm-switch-tab
 program	examples/tmux-follow/extensions.d/example-ticket.sh
+program	install.sh
 program	lib/termnav/nvim-link-context.sh
 program	lib/termnav/nvim-open/cli.sh
 program	lib/termnav/nvim-open/common.sh
@@ -24,6 +25,7 @@ program	share/termnav/shell.sh
 program	test/helpers.sh
 program	test/suites/ci-contract-test
 program	test/suites/examples-test
+program	test/suites/install-test
 program	test/suites/manpage-test
 program	test/suites/nvim-test
 program	test/suites/remote-test

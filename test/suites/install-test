@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# install-test — checkout-backed installation and artifact-drift contract.
+
+set -euo pipefail
+
+test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+root="${test_dir%/test}"
+# shellcheck source=test/helpers.sh
+. "$test_dir/helpers.sh"
+
+commands=(
+  eza-nvim-links
+  nvim-link-host
+  nvim-ssh-control-open
+  nvim-tmux-open
+  termnav-switch-tab
+  tmux-follow-click
+  vscode-nvim-focus
+  vscode-switch-tab
+  wezterm-move-tab
+  wezterm-switch-tab
+)
+
+expected=$(printf '%s\n' "${commands[@]}" | LC_ALL=C sort)
+actual=$(
+  for source in "$root"/bin/*; do
+    [[ -f "$source" && -x "$source" ]] || continue
+    printf '%s\n' "${source##*/}"
+  done | LC_ALL=C sort
+)
+_assert_eq "installer inventory: covers every public command" "$expected" "$actual"
+
+actual=$(
+  for source in "$root"/man/man1/*.1; do
+    [[ -f "$source" ]] || continue
+    name="${source##*/}"
+    printf '%s\n' "${name%.1}"
+  done | LC_ALL=C sort
+)
+_assert_eq "installer inventory: commands and manpages stay paired" "$expected" "$actual"
+
+# Exercise source preflight from an otherwise-complete provider checkout. The
+# missing executable sorts last in the explicit inventory so every earlier
+# source is checked before failure, while no destination may be published.
+missing_provider=$(_tmpdir)/provider
+missing_prefix=$(_tmpdir)/prefix
+mkdir -p "$missing_provider/bin" "$missing_provider/man/man1"
+cp "$root/install.sh" "$missing_provider/install.sh"
+chmod +x "$missing_provider/install.sh"
+missing_command=""
+for command in "${commands[@]}"; do
+  ln -s "$root/bin/$command" "$missing_provider/bin/$command"
+  ln -s "$root/man/man1/$command.1" "$missing_provider/man/man1/$command.1"
+  missing_command="$command"
+done
+rm "$missing_provider/bin/$missing_command"
+set +e
+PREFIX="$missing_prefix" "$missing_provider/install.sh" \
+  >"$missing_prefix.out" 2>"$missing_prefix.err"
+status=$?
+set -e
+_assert_exit "installer: missing source is rejected" 1 "$status"
+_assert_contains "installer: missing source is actionable" \
+  "required executable is missing" "$(<"$missing_prefix.err")"
+if [[ ! -e "$missing_prefix/bin" && ! -L "$missing_prefix/bin" &&
+  ! -e "$missing_prefix/share" && ! -L "$missing_prefix/share" ]]; then
+  _pass "installer: missing source causes no partial install"
+else
+  _fail "installer: missing source causes no partial install"
+fi
+
+prefix=$(_tmpdir)/prefix
+set +e
+PREFIX="$prefix" "$root/install.sh" >"$prefix.out" 2>"$prefix.err"
+status=$?
+set -e
+_assert_exit "installer: succeeds" 0 "$status"
+
+for command in "${commands[@]}"; do
+  command_link="$prefix/bin/$command"
+  man_link="$prefix/share/man/man1/$command.1"
+  if [[ -L "$command_link" ]]; then
+    _pass "installer: links command $command"
+  else
+    _fail "installer: links command $command"
+  fi
+  _assert_eq "installer: command target $command" \
+    "$root/bin/$command" "$(readlink "$command_link" 2>/dev/null || true)"
+  if [[ -L "$man_link" ]]; then
+    _pass "installer: links manpage $command"
+  else
+    _fail "installer: links manpage $command"
+  fi
+  _assert_eq "installer: manpage target $command" \
+    "$root/man/man1/$command.1" "$(readlink "$man_link" 2>/dev/null || true)"
+done
+
+smoke_output=$(TERMNAV_REMOTE_LINK_HOST=example.invalid "$prefix/bin/nvim-link-host") || smoke_output=""
+_assert_eq "installer: installed command resolves provider libraries" "example.invalid" "$smoke_output"
+
+set +e
+PREFIX="$prefix" "$root/install.sh" >"$prefix.reinstall.out" 2>"$prefix.reinstall.err"
+status=$?
+set -e
+_assert_exit "installer: reinstall is idempotent" 0 "$status"
+_assert_eq "installer: reinstall preserves command target" \
+  "$root/bin/eza-nvim-links" "$(readlink "$prefix/bin/eza-nvim-links" 2>/dev/null || true)"
+
+custom_bin=$(_tmpdir)/custom-bin
+custom_man=$(_tmpdir)/custom-man
+set +e
+BIN_DIR="$custom_bin" MAN_DIR="$custom_man" "$root/install.sh" \
+  >"$custom_bin.out" 2>"$custom_bin.err"
+status=$?
+set -e
+_assert_exit "installer: custom destinations succeed" 0 "$status"
+_assert_eq "installer: honors BIN_DIR" \
+  "$root/bin/eza-nvim-links" "$(readlink "$custom_bin/eza-nvim-links" 2>/dev/null || true)"
+_assert_eq "installer: honors MAN_DIR" \
+  "$root/man/man1/eza-nvim-links.1" "$(readlink "$custom_man/eza-nvim-links.1" 2>/dev/null || true)"
+
+retarget=$(_tmpdir)/retarget
+mkdir -p "$retarget/bin" "$retarget/share/man/man1"
+ln -s /missing/old-command "$retarget/bin/eza-nvim-links"
+ln -s /missing/old-manpage "$retarget/share/man/man1/eza-nvim-links.1"
+PREFIX="$retarget" "$root/install.sh" >/dev/null
+_assert_eq "installer: retargets a command symlink" \
+  "$root/bin/eza-nvim-links" "$(readlink "$retarget/bin/eza-nvim-links")"
+_assert_eq "installer: retargets a manpage symlink" \
+  "$root/man/man1/eza-nvim-links.1" "$(readlink "$retarget/share/man/man1/eza-nvim-links.1")"
+
+# Publication is transactional even after preflight succeeds. Fail the final
+# manpage link through PATH so real earlier links have been changed, then prove
+# rollback removes every new link and restores a symlink that was retargeted.
+fake_ln_dir=$(_tmpdir)/fake-ln
+mkdir -p "$fake_ln_dir"
+real_ln=$(command -v ln)
+cat >"$fake_ln_dir/ln" <<'EOF'
+#!/usr/bin/env bash
+ln_args=("$@")
+ln_operand_count=${#ln_args[@]}
+ln_source_operand=${ln_args[$((ln_operand_count - 2))]}
+ln_target_operand=${ln_args[$((ln_operand_count - 1))]}
+if [[ $ln_target_operand == "${FAIL_LN_TARGET:-}" ]]; then
+  printf 'synthetic late link failure\n' >&2
+  exit 73
+fi
+if [[ -n ${FAIL_ROLLBACK_TARGET:-} &&
+  $ln_source_operand == "${FAIL_ROLLBACK_SOURCE:-}" &&
+  $ln_target_operand == "$FAIL_ROLLBACK_TARGET" ]]; then
+  printf 'synthetic rollback link failure\n' >&2
+  exit 74
+fi
+exec "$REAL_LN" "$@"
+EOF
+chmod 0755 "$fake_ln_dir/ln"
+
+first_command=${commands[0]}
+last_command=${commands[${#commands[@]} - 1]}
+prior_target=--help
+transaction_prefix=$(_tmpdir)/transaction-prefix
+mkdir -p "$transaction_prefix/bin"
+"$real_ln" -s -- "$prior_target" "$transaction_prefix/bin/$first_command"
+set +e
+PATH="$fake_ln_dir:$PATH" REAL_LN="$real_ln" \
+  FAIL_LN_TARGET="$transaction_prefix/share/man/man1/$last_command.1" \
+  PREFIX="$transaction_prefix" "$root/install.sh" \
+  >"$transaction_prefix.out" 2>"$transaction_prefix.err"
+status=$?
+set -e
+_assert_exit "installer: late link failure preserves status" 73 "$status"
+_assert_contains "installer: late link failure preserves diagnostic" \
+  "synthetic late link failure" "$(<"$transaction_prefix.err")"
+_assert_eq "installer: rollback restores an option-like symlink target" \
+  "$prior_target" "$(readlink "$transaction_prefix/bin/$first_command" 2>/dev/null || true)"
+transaction_clean=1
+for command in "${commands[@]}"; do
+  if [[ "$command" != "$first_command" &&
+    (-e "$transaction_prefix/bin/$command" || -L "$transaction_prefix/bin/$command") ]]; then
+    transaction_clean=0
+  fi
+  if [[ -e "$transaction_prefix/share/man/man1/$command.1" ||
+    -L "$transaction_prefix/share/man/man1/$command.1" ]]; then
+    transaction_clean=0
+  fi
+done
+if [[ "$transaction_clean" -eq 1 ]]; then
+  _pass "installer: late link failure leaves no new links"
+else
+  _fail "installer: late link failure leaves no new links"
+fi
+
+# A best-effort rollback can itself fail. That secondary diagnostic is useful,
+# but it must not replace the original publication status or error.
+rollback_error_prefix=$(_tmpdir)/rollback-error-prefix
+mkdir -p "$rollback_error_prefix/bin"
+"$real_ln" -s -- "$prior_target" "$rollback_error_prefix/bin/$first_command"
+set +e
+PATH="$fake_ln_dir:$PATH" REAL_LN="$real_ln" \
+  FAIL_LN_TARGET="$rollback_error_prefix/share/man/man1/$last_command.1" \
+  FAIL_ROLLBACK_SOURCE="$prior_target" \
+  FAIL_ROLLBACK_TARGET="$rollback_error_prefix/bin/$first_command" \
+  PREFIX="$rollback_error_prefix" "$root/install.sh" \
+  >"$rollback_error_prefix.out" 2>"$rollback_error_prefix.err"
+status=$?
+set -e
+rollback_error=$(<"$rollback_error_prefix.err")
+_assert_exit "installer: rollback failure preserves primary status" 73 "$status"
+_assert_contains "installer: rollback failure preserves primary diagnostic" \
+  "synthetic late link failure" "$rollback_error"
+_assert_contains "installer: rollback failure is actionable" \
+  "rollback failed to restore symlink" "$rollback_error"
+
+blocked_bin=$(_tmpdir)/blocked-bin
+mkdir -p "$blocked_bin/bin"
+printf 'user command\n' >"$blocked_bin/bin/wezterm-switch-tab"
+set +e
+PREFIX="$blocked_bin" "$root/install.sh" \
+  >"$blocked_bin.out" 2>"$blocked_bin.err"
+status=$?
+set -e
+_assert_exit "installer: refuses a regular command" 1 "$status"
+_assert_file_content "installer: preserves a regular command" \
+  "user command" "$blocked_bin/bin/wezterm-switch-tab"
+if [[ ! -e "$blocked_bin/bin/eza-nvim-links" && ! -L "$blocked_bin/bin/eza-nvim-links" ]]; then
+  _pass "installer: command collision causes no partial install"
+else
+  _fail "installer: command collision causes no partial install"
+fi
+_assert_contains "installer: command collision is actionable" \
+  "refusing to replace non-symlink" "$(<"$blocked_bin.err")"
+
+blocked_man=$(_tmpdir)/blocked-man
+mkdir -p "$blocked_man/share/man/man1"
+printf 'user manpage\n' >"$blocked_man/share/man/man1/wezterm-switch-tab.1"
+set +e
+PREFIX="$blocked_man" "$root/install.sh" \
+  >"$blocked_man.out" 2>"$blocked_man.err"
+status=$?
+set -e
+_assert_exit "installer: refuses a regular manpage" 1 "$status"
+_assert_file_content "installer: preserves a regular manpage" \
+  "user manpage" "$blocked_man/share/man/man1/wezterm-switch-tab.1"
+if [[ ! -e "$blocked_man/bin/eza-nvim-links" && ! -L "$blocked_man/bin/eza-nvim-links" ]]; then
+  _pass "installer: manpage collision causes no partial install"
+else
+  _fail "installer: manpage collision causes no partial install"
+fi
+
+if [[ ! -e "$prefix/lib/termnav" && ! -L "$prefix/lib/termnav" ]]; then
+  _pass "installer: leaves library assets checkout-owned"
+else
+  _fail "installer: leaves library assets checkout-owned"
+fi
+if [[ ! -e "$prefix/share/termnav" && ! -L "$prefix/share/termnav" ]]; then
+  _pass "installer: leaves shared assets checkout-owned"
+else
+  _fail "installer: leaves shared assets checkout-owned"
+fi
+for completion_dir in \
+  "$prefix/share/bash-completion" \
+  "$prefix/share/zsh" \
+  "$prefix/share/fish"; do
+  if [[ ! -e "$completion_dir" && ! -L "$completion_dir" ]]; then
+    _pass "installer: fabricates no completion tree ${completion_dir#"$prefix/"}"
+  else
+    _fail "installer: fabricates no completion tree ${completion_dir#"$prefix/"}"
+  fi
+done
+
+_test_summary
