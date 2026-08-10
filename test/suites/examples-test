@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# examples-test - keep copyable Termnav integrations aligned with public APIs.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+WEZTERM_EXAMPLE="$TERMNAV_ROOT/examples/wezterm.lua"
+NVIM_EXAMPLE="$TERMNAV_ROOT/examples/nvim.lua"
+TMUX_EXAMPLE="$TERMNAV_ROOT/examples/tmux.conf"
+DETECTOR_EXAMPLE="$TERMNAV_ROOT/examples/tmux-follow/extensions.d/example-ticket.sh"
+
+echo "=== termnav: checked-in examples ==="
+
+_assert_file_exists "examples: WezTerm composition is tracked" "$WEZTERM_EXAMPLE"
+_assert_file_exists "examples: Neovim composition is tracked" "$NVIM_EXAMPLE"
+_assert_file_exists "examples: tmux bindings are tracked" "$TMUX_EXAMPLE"
+_assert_file_exists "examples: token detector is tracked" "$DETECTOR_EXAMPLE"
+
+_run_lua() {
+  if command -v lua >/dev/null 2>&1; then
+    lua "$@"
+  elif command -v nvim >/dev/null 2>&1; then
+    nvim --headless --clean -n -u NONE -i NONE -l "$@" 2>&1
+  else
+    return 127
+  fi
+}
+
+if command -v lua >/dev/null 2>&1 || command -v nvim >/dev/null 2>&1; then
+  _td=$(_tmpdir)
+  _wezterm_test="$_td/wezterm-example-test.lua"
+  cat >"$_wezterm_test" <<'LUA'
+local root = assert(os.getenv("TERMNAV_ROOT"))
+local registered = {}
+local wezterm = {
+  hostname = function() return "example-host" end,
+  on = function(name, callback) registered[name] = callback end,
+}
+local shdeps = {}
+function shdeps.dep_file(dependency, asset)
+  assert(dependency == "cgraf78/termnav")
+  return root .. "/" .. asset
+end
+
+local example = dofile(root .. "/examples/wezterm.lua")
+local config = { hyperlink_rules = { { regex = "existing", format = "$0" } } }
+local integration = example.apply({
+  wezterm = wezterm,
+  shdeps = shdeps,
+  config = config,
+})
+
+assert(integration.config == config)
+assert(integration.routes ~= nil)
+assert(#config.hyperlink_rules > 1)
+assert(config.hyperlink_rules[1].regex == "existing")
+assert(type(registered["open-uri"]) == "function")
+print("termnav WezTerm example passed")
+LUA
+  set +e
+  output=$(TERMNAV_ROOT="$TERMNAV_ROOT" _run_lua "$_wezterm_test" 2>&1)
+  rc=$?
+  set -e
+  _assert_exit "examples: WezTerm composition loads" 0 "$rc"
+  _assert_contains "examples: WezTerm composition reports success" \
+    "termnav WezTerm example passed" "$output"
+else
+  echo "  SKIP: WezTerm example requires Lua or Neovim"
+fi
+
+if command -v nvim >/dev/null 2>&1; then
+  _td=${_td:-$(_tmpdir)}
+  _nvim_test="$_td/nvim-example-test.lua"
+  cat >"$_nvim_test" <<'LUA'
+local root = assert(os.getenv("TERMNAV_ROOT"))
+local resolved = false
+local shdeps = {}
+function shdeps.dep_file(dependency, asset)
+  assert(dependency == "cgraf78/termnav")
+  assert(asset == "lib/termnav/nvim/setup.lua")
+  resolved = true
+  return root .. "/" .. asset
+end
+
+local opener = {
+  setup = function() end,
+  server = function() return "" end,
+}
+local wezterm_vars = { set = function() return true end }
+local vscode_focus = {
+  focus = function() end,
+  blur = function() end,
+  dispose = function() end,
+}
+
+local example = dofile(root .. "/examples/nvim.lua")
+local context = example.setup({
+  shdeps = shdeps,
+  termnav_options = {
+    opener = opener,
+    wezterm_vars = wezterm_vars,
+    vscode_focus = vscode_focus,
+    publish_delay_ms = -1,
+    group_name = "termnav_example_test",
+  },
+})
+
+assert(resolved)
+assert(type(context.publish) == "function")
+assert(context.group_name == "termnav_example_test")
+print("termnav Neovim example passed")
+LUA
+  set +e
+  output=$(TERMNAV_ROOT="$TERMNAV_ROOT" \
+    nvim --headless --clean -n -u NONE -i NONE -l "$_nvim_test" 2>&1)
+  rc=$?
+  set -e
+  _assert_exit "examples: Neovim composition loads" 0 "$rc"
+  _assert_contains "examples: Neovim composition reports success" \
+    "termnav Neovim example passed" "$output"
+else
+  echo "  SKIP: Neovim example requires Neovim"
+fi
+
+if command -v tmux >/dev/null 2>&1; then
+  _td=${_td:-$(_tmpdir)}
+  _socket="termnav-example-$$"
+  tmux -L "$_socket" -f "$TMUX_EXAMPLE" new-session -d -s example
+  _assert_exit "examples: tmux config loads" 0 "$?"
+  _assert_eq "examples: tmux config enables mouse routing" "on" \
+    "$(tmux -L "$_socket" show-options -gv mouse)"
+  # Older tmux releases accept a key argument to list-keys but print no
+  # matching row. Inspect the complete root table so the example contract is
+  # portable while still proving both exact provider commands were installed.
+  _tmux_keys=$(tmux -L "$_socket" list-keys -T root)
+  _assert_contains "examples: tmux config wires tab switching" \
+    "termnav-switch-tab" "$_tmux_keys"
+  _assert_contains "examples: tmux config wires Ctrl-click" \
+    "tmux-follow-click" "$_tmux_keys"
+  tmux -L "$_socket" kill-server
+else
+  echo "  SKIP: tmux config example requires tmux"
+fi
+
+# Run the extension through tmux-follow-click rather than sourcing it directly.
+# That proves registration, precedence, and URL dispatch all match production.
+_td=${_td:-$(_tmpdir)}
+_mock_bin="$_td/mock-bin"
+_browser_tty="$_td/browser-tty"
+mkdir -p "$_mock_bin"
+: >"$_browser_tty"
+cat >"$_mock_bin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1 $2 $3" == "display-message -p #{client_tty}" ]]; then
+  printf '%s\n' "$TERMNAV_EXAMPLE_BROWSER_TTY"
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$_mock_bin/tmux"
+
+TMUX="/tmp/termnav-example,1,0" \
+  TERMNAV_EXAMPLE_BROWSER_TTY="$_browser_tty" \
+  TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="${DETECTOR_EXAMPLE%/*}" \
+  PATH="$_mock_bin:$PATH" \
+  "$TERMNAV_ROOT/bin/tmux-follow-click" "" "TICKET-42" "" 0 "/tmp"
+
+python3 - "$_browser_tty" <<'PY'
+import base64
+import re
+import sys
+from pathlib import Path
+
+payload = Path(sys.argv[1]).read_bytes()
+match = re.search(rb"SetUserVar=term_open_url=([A-Za-z0-9+/=]+)", payload)
+assert match, payload
+assert base64.b64decode(match.group(1)) == b"https://issues.example.com/TICKET-42"
+PY
+_assert_exit "examples: custom detector registers and routes its token" 0 "$?"
+
+_test_summary
