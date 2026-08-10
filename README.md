@@ -76,6 +76,13 @@ The adapter directory is versioned because VS Code records that directory in
 its extension registry. Adapter releases must bump the manifest version, the
 directory name, and the dotfiles local-extension source row together.
 
+## Examples
+
+[`examples/`](examples/) contains tested, copyable composition for WezTerm,
+Neovim, tmux, and an XDG token-detector extension. The examples keep terminal
+and editor policy in the consumer while loading Termnav-owned implementations
+through Shdeps.
+
 ## Dependencies
 
 - Bash for the CLI entry points and shell loader.

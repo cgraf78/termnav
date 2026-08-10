@@ -31,6 +31,10 @@ runtime_shell_files=(
   "$root/share/termnav/shell.sh"
 )
 
+example_shell_files=(
+  "$root/examples/tmux-follow/extensions.d/example-ticket.sh"
+)
+
 check_runtime_shell_inventory() {
   local file first_line listed discovered
   listed=$(
@@ -79,6 +83,7 @@ check_runtime_shell_inventory
 if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
     "${runtime_shell_files[@]}" \
+    "${example_shell_files[@]}" \
     "$test_dir/termnav-test" \
     "$test_dir/helpers.sh" \
     "$test_dir"/suites/*-test
