@@ -21,6 +21,10 @@ jobs:
     with:
       matrix-set: full
       profiles: base,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
+      # wezterm-test falls back to `nvim -l`, so Termux does not need a second
+      # standalone Lua runtime. Avoid the current lua54/lua51 collision over
+      # the generic lua++.pc package metadata file.
+      termux-profiles: base,zsh,neovim,tmux,python,openssh-netcat-lsof
       shellcheck-inventory-path: .github/shellcheck-files.txt
       test-command: TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test
 
