@@ -9,6 +9,27 @@
 WezTerm link routing, tmux ctrl-click follow-through, OSC-8-aware `eza`
 links, and `nvim-tmux-open`.
 
+## Install from a checkout
+
+Keep the checkout at a stable path and run:
+
+```bash
+./install.sh
+```
+
+The installer creates checkout-backed symlinks for every public command under
+`$HOME/.local/bin` and for each matching manual page under
+`$HOME/.local/share/man/man1`. Set `PREFIX` to relocate both trees, or set
+`BIN_DIR` and `MAN_DIR` independently. Re-running the installer is safe and
+retargets existing symlinks, but it refuses to replace a non-symlink path.
+Moving or deleting the checkout breaks the installed links.
+
+Command and shell-loader path resolution keeps `lib/termnav/` and
+`share/termnav/` version-coupled to this checkout. The installer creates no
+second library, shared-asset, or completion tree. Continue to resolve those
+non-binary assets through shdeps, or use their absolute paths in this checkout;
+consumers must still select versioned VS Code payloads explicitly.
+
 ## Public API
 
 - `bin/nvim-tmux-open`: open local or remote terminal targets in Neovim.
