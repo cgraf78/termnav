@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# nvim-launcher-test — checks safe reuse of an existing tmux Neovim pane.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+launcher_lib="$TERMNAV_ROOT/lib/termnav/nvim-open/launcher.sh"
+
+echo "=== nvim launcher reuse policy ==="
+
+_assert_file_exists "nvim launcher: sourceable provider exists" "$launcher_lib"
+if [[ -f "$launcher_lib" ]]; then
+  # shellcheck source=/dev/null # The provider path is derived from this checkout.
+  . "$launcher_lib"
+fi
+if ! declare -F termnav_nvim_try_reuse >/dev/null 2>&1; then
+  _fail "nvim launcher: public reuse helper exists"
+  _test_summary
+fi
+
+case_root=$(_tmpdir)
+case_bin="$case_root/bin"
+case_cwd="$case_root/project"
+ps_log="$case_root/ps.log"
+open_log="$case_root/open.log"
+mkdir -p "$case_bin" "$case_cwd"
+
+cat >"$case_bin/nvim-tmux-open" <<'SH'
+#!/usr/bin/env bash
+printf 'open:%s\n' "$*" >>"$TERMNAV_TEST_OPEN_LOG"
+exit "${NVIM_TMUX_OPEN_RC:-0}"
+SH
+
+cat >"$case_bin/ps" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$TERMNAV_TEST_PS_LOG"
+if [[ "$*" == "-ww -o comm= -o args= -p "* ]]; then
+  printf '%s %s\n' \
+    "${TERMNAV_TEST_PS_COMMAND:-zsh}" \
+    "${TERMNAV_TEST_PS_ARGS:-${TERMNAV_TEST_PS_COMMAND:--zsh}}"
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$case_bin/nvim-tmux-open" "$case_bin/ps"
+
+_run_reuse_case() {
+  local proc_mode="$1" parent="$2" parent_arg_count="$3"
+  shift 3
+
+  : >"$ps_log"
+  : >"$open_log"
+  # Arguments are split by parent_arg_count in the child so procfs argv retains
+  # spaces and option boundaries exactly. Remaining arguments are nvim's argv.
+  # shellcheck disable=SC2016 # The child shell builds its own procfs fixture.
+  (
+    cd "$case_cwd" || exit
+    env \
+      TERMNAV_TEST_PROC_MODE="$proc_mode" \
+      TERMNAV_TEST_PARENT="$parent" \
+      TERMNAV_TEST_PARENT_ARG_COUNT="$parent_arg_count" \
+      TERMNAV_TEST_OPEN_LOG="$open_log" \
+      TERMNAV_TEST_PS_LOG="$ps_log" \
+      TERMNAV_TEST_PS_COMMAND="${TERMNAV_TEST_PS_COMMAND:-}" \
+      TERMNAV_TEST_PS_ARGS="${TERMNAV_TEST_PS_ARGS:-}" \
+      TERMNAV_LAUNCHER_LIB="$launcher_lib" \
+      PATH="$case_bin:/usr/bin:/bin" \
+      TMUX=/tmp/termnav-tmux,1,0 \
+      NVIM_LAUNCHER_ALLOW_NONTTY=1 \
+      NVIM_LAUNCHER_PROC_ROOT="$TERMNAV_TEST_PROC_ROOT" \
+      NVIM_TMUX_OPEN_RC="${NVIM_TMUX_OPEN_RC:-0}" \
+      bash --noprofile --norc -c '
+        proc_root="$TERMNAV_TEST_PROC_ROOT"
+        parent_count="$TERMNAV_TEST_PARENT_ARG_COUNT"
+        parent_args=()
+        while [[ "$parent_count" -gt 0 ]]; do
+          parent_args+=("$1")
+          shift
+          parent_count=$((parent_count - 1))
+        done
+
+        if [[ "$TERMNAV_TEST_PROC_MODE" == full ]]; then
+          mkdir -p "$proc_root/$PPID"
+          printf "%s\n" "$TERMNAV_TEST_PARENT" >"$proc_root/$PPID/comm"
+          printf "%s\0" "${parent_args[@]}" >"$proc_root/$PPID/cmdline"
+        elif [[ "$TERMNAV_TEST_PROC_MODE" == empty ]]; then
+          mkdir -p "$proc_root/$PPID"
+          printf "%s\n" "$TERMNAV_TEST_PARENT" >"$proc_root/$PPID/comm"
+          : >"$proc_root/$PPID/cmdline"
+        fi
+
+        source "$TERMNAV_LAUNCHER_LIB"
+        if termnav_nvim_try_reuse "$@"; then
+          printf "status:reused\n"
+        else
+          printf "status:fallback\n"
+        fi
+        cat "$TERMNAV_TEST_OPEN_LOG"
+      ' _ "$@"
+  )
+}
+
+export TERMNAV_TEST_PROC_ROOT="$case_root/proc"
+
+result=$(_run_reuse_case full zsh 2 zsh -z src/app.lua)
+_assert_eq "nvim launcher: interactive tmux file open reuses an existing pane" \
+  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+_assert_eq "nvim launcher: readable procfs avoids the ps fallback" \
+  "" "$(cat "$ps_log")"
+
+result=$(_run_reuse_case full bash 3 bash -c 'nvim src/app.lua' src/app.lua)
+_assert_eq "nvim launcher: procfs rejects shell command parents" \
+  "status:fallback" "$result"
+result=$(_run_reuse_case full bash 2 bash './script with spaces' src/app.lua)
+_assert_eq "nvim launcher: procfs rejects shell script parents" \
+  "status:fallback" "$result"
+result=$(_run_reuse_case full git 2 git commit .git/COMMIT_EDITMSG)
+_assert_eq "nvim launcher: procfs rejects editor-style parents" \
+  "status:fallback" "$result"
+result=$(_run_reuse_case full zsh 1 '/opt/My Shell/zsh' src/app.lua)
+_assert_eq "nvim launcher: procfs preserves a spaced shell argv element" \
+  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+_assert_eq "nvim launcher: authoritative procfs decisions do not invoke ps" \
+  "" "$(cat "$ps_log")"
+
+result=$(_run_reuse_case empty zsh 0 src/app.lua)
+_assert_eq "nvim launcher: empty procfs argv falls back to ps" \
+  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+_assert_contains "nvim launcher: empty procfs argv inspects its parent once" \
+  "-ww -o comm= -o args= -p" "$(cat "$ps_log")"
+
+result=$(_run_reuse_case missing zsh 0 src/app.lua)
+_assert_eq "nvim launcher: missing procfs falls back to ps" \
+  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+
+result=$(
+  TERMNAV_TEST_PS_COMMAND=git \
+    TERMNAV_TEST_PS_ARGS='git commit' \
+    _run_reuse_case missing zsh 0 .git/COMMIT_EDITMSG
+)
+_assert_eq "nvim launcher: ps rejects editor-style parents" \
+  "status:fallback" "$result"
+
+result=$(_run_reuse_case full zsh 2 zsh -z --headless src/app.lua)
+_assert_eq "nvim launcher: flags bypass pane reuse" "status:fallback" "$result"
+_assert_eq "nvim launcher: ineligible arguments skip parent inspection" \
+  "" "$(cat "$ps_log")"
+
+result=$(_run_reuse_case full zsh 2 zsh -z +12 src/app.lua)
+_assert_eq "nvim launcher: command-prefixed opens bypass pane reuse" \
+  "status:fallback" "$result"
+
+result=$(_run_reuse_case full zsh 2 zsh -z src/one.lua src/two.lua)
+_assert_eq "nvim launcher: multiple targets bypass pane reuse" \
+  "status:fallback" "$result"
+
+result=$(
+  TMUX='' NVIM_LAUNCHER_ALLOW_NONTTY=1 \
+    TERMNAV_TEST_OPEN_LOG="$open_log" \
+    PATH="$case_bin:$PATH" \
+    bash --noprofile --norc -c '
+      source "$1"
+      if termnav_nvim_try_reuse src/app.lua; then echo reused; else echo fallback; fi
+    ' _ "$launcher_lib"
+)
+_assert_eq "nvim launcher: outside tmux bypasses pane reuse" "fallback" "$result"
+
+result=$(
+  NVIM_LAUNCHER_FORCE_NEW=1 \
+    NVIM_LAUNCHER_ALLOW_NONTTY=1 \
+    TMUX=/tmp/termnav-tmux,1,0 \
+    TERMNAV_TEST_OPEN_LOG="$open_log" \
+    PATH="$case_bin:$PATH" \
+    bash --noprofile --norc -c '
+      source "$1"
+      if termnav_nvim_try_reuse src/app.lua; then echo reused; else echo fallback; fi
+    ' _ "$launcher_lib"
+)
+_assert_eq "nvim launcher: force-new bypasses pane reuse" "fallback" "$result"
+
+result=$(NVIM_TMUX_OPEN_RC=1 _run_reuse_case full zsh 2 zsh -z src/app.lua)
+_assert_eq "nvim launcher: failed pane routing asks the caller to fall back" \
+  "$(printf 'status:fallback\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+
+_test_summary

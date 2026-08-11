@@ -917,6 +917,23 @@ local function window()
   }
 end
 
+check(
+  "tmux context accepts shell-published state",
+  routes.is_tmux(pane({ TERMNAV_TMUX = "true" }, nil, { foreground = "/bin/bash" }))
+)
+check(
+  "tmux context recognizes a foreground tmux client",
+  routes.is_tmux(pane({}, nil, { foreground = "/usr/bin/tmux" }))
+)
+check(
+  "tmux context recognizes a remote tmux pane",
+  routes.is_tmux(pane({ NVIM_REMOTE_TMUX = "true" }, nil, { foreground = "/bin/ssh" }))
+)
+check(
+  "tmux context rejects an ordinary shell pane",
+  not routes.is_tmux(pane({}, nil, { foreground = "/bin/zsh" }))
+)
+
 local function last()
   return calls[#calls]
 end
