@@ -14,6 +14,13 @@ local user_vars = {
   remote_tmux = "NVIM_REMOTE_TMUX",
 }
 
+-- Shell-only state is separate from the Neovim protocol table above: Neovim
+-- does not own the surrounding shell's tmux membership and must never publish
+-- it. Consumers still read this state only through route helpers.
+local shell_user_vars = {
+  tmux = "TERMNAV_TMUX",
+}
+
 function M.new(wezterm)
   local routes = {}
 
@@ -35,6 +42,17 @@ function M.new(wezterm)
 
   function routes.is_nvim(pane)
     return pane:get_user_vars()[user_vars.is_nvim] == "true"
+  end
+
+  function routes.is_tmux(pane)
+    if not pane or type(pane.get_user_vars) ~= "function" then
+      return false
+    end
+
+    local pane_user_vars = pane:get_user_vars() or {}
+    return pane_user_vars[shell_user_vars.tmux] == "true"
+      or routes.foreground_basename(pane) == "tmux"
+      or routes.remote_tmux_pane(pane)
   end
 
   function routes.file_uri_path(uri)

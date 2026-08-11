@@ -22,11 +22,13 @@ runtime_shell_files=(
   "$root/lib/termnav/nvim-open/cli.sh"
   "$root/lib/termnav/nvim-open/common.sh"
   "$root/lib/termnav/nvim-open/link.sh"
+  "$root/lib/termnav/nvim-open/launcher.sh"
   "$root/lib/termnav/nvim-open/remote.sh"
   "$root/lib/termnav/remote-command.sh"
   "$root/lib/termnav/shell/vscode-backend-socket.sh"
   "$root/lib/termnav/shell/vscode-backend-mcp.sh"
   "$root/lib/termnav/shell/vscode-command.sh"
+  "$root/lib/termnav/shell/file-links.sh"
   "$root/lib/termnav/shell/wezterm-vars.sh"
   "$root/share/termnav/shell.sh"
 )

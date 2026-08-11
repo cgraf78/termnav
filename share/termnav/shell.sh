@@ -26,6 +26,9 @@ _termnav_wezterm_remote_link_host_result=""
 #   Prompt hook callback that marks nvim/vim commands before they start.
 # _termnav_wezterm_precmd
 #   Prompt hook callback that marks the pane as no longer inside nvim/vim.
+# termnav_file_links_need_plain_output
+#   Return success when command output should use plain paths instead of OSC-8
+#   file links for the current terminal or attached tmux client.
 
 _termnav_shell_script_parent() {
   case "$1" in
@@ -55,6 +58,8 @@ _termnav_shell_dir=$(_termnav_shell_script_dir "$_termnav_shell_source_path") ||
 _termnav_root="${_termnav_shell_dir%/share/termnav}"
 # shellcheck source=../../lib/termnav/shell/wezterm-vars.sh
 . "$_termnav_root/lib/termnav/shell/wezterm-vars.sh" || return 1
+# shellcheck source=../../lib/termnav/shell/file-links.sh
+. "$_termnav_root/lib/termnav/shell/file-links.sh" || return 1
 
 _termnav_wezterm_active() {
   [[ -z "${NVIM:-}" ]] &&
@@ -94,6 +99,20 @@ _termnav_wezterm_set_user_var() {
   esac
 
   termnav_wezterm_user_var_sequence "$1" "$2" auto
+}
+
+_termnav_wezterm_publish_tmux_context() {
+  _termnav_wezterm_active || return 0
+
+  # TMUX cannot change during a shell process's lifetime. Publish this once when
+  # the integration loads instead of adding another prompt callback. WezTerm
+  # readers use Termnav's route API, so the raw variable remains a private
+  # provider protocol rather than consumer policy.
+  if [[ -n "${TMUX:-}" ]]; then
+    _termnav_wezterm_set_user_var TERMNAV_TMUX true
+  else
+    _termnav_wezterm_set_user_var TERMNAV_TMUX ""
+  fi
 }
 
 _termnav_wezterm_remote_link_host_get() {
@@ -189,7 +208,7 @@ _termnav_wezterm_remote_link_host() {
 }
 
 _termnav_wezterm_publish_link_context() {
-  local remote_host
+  local publish_tmux_context="${1:-}" remote_host
   _termnav_wezterm_tmux_publish_observation_key=""
   _termnav_wezterm_remote_link_host_get
   remote_host="$_termnav_wezterm_remote_link_host_result"
@@ -226,6 +245,12 @@ _termnav_wezterm_publish_link_context() {
     _termnav_wezterm_set_user_var NVIM_REMOTE_CWD ""
     _termnav_wezterm_set_user_var NVIM_REMOTE_TMUX ""
   fi
+  if [[ "$publish_tmux_context" == with-tmux-context ]]; then
+    # Keep this initial publication inside the same observation boundary as
+    # remote-host discovery. Even a failed tmux query is then shared instead of
+    # immediately repeated merely to frame one more user variable.
+    _termnav_wezterm_publish_tmux_context
+  fi
   _termnav_wezterm_tmux_publish_observation_key=""
 }
 
@@ -261,5 +286,5 @@ _termnav_wezterm_register_hooks() {
 
 if _termnav_wezterm_active; then
   _termnav_wezterm_register_hooks
-  _termnav_wezterm_publish_link_context
+  _termnav_wezterm_publish_link_context with-tmux-context
 fi

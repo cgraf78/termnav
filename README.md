@@ -63,10 +63,17 @@ consumers must still select versioned VS Code payloads explicitly.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
   `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
   setup module and advanced consumers.
+- `lib/termnav/nvim-open/launcher.sh`: sourceable policy for safely reusing an
+  existing Neovim pane for a simple interactive-shell file open. Call
+  `termnav_nvim_try_reuse "$@"`; a nonzero result means the caller must launch
+  and wait for its real editor.
 - `lib/termnav/nvim/vscode-focus.lua`: leased VS Code focus publisher used by
   the Neovim setup module.
 - `lib/termnav/shell/wezterm-vars.sh`: shell helpers for emitting WezTerm
   `SetUserVar` OSC requests with raw or tmux-passthrough framing.
+- `lib/termnav/shell/file-links.sh`: terminal and attached-tmux-client
+  classification for choosing plain paths versus Termnav-routable OSC-8 links.
+  `termnav_file_links_need_plain_output` returns success for plain output.
 - `lib/termnav/shell/vscode-command.sh`: dispatch seam for executing a VS
   Code command by ID through a pluggable backend (`TERMNAV_VSCODE_BACKEND`,
   automatically `socket` when the adapter is advertised, otherwise `mcp`).
@@ -80,7 +87,7 @@ consumers must still select versioned VS Code payloads explicitly.
   integrations use the latest versioned directory declared by the consuming
   dotfiles.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
-  pane context publishing.
+  pane context publishing and file-link mode classification.
 
 Source non-binary assets through shdeps so install locations stay under the
 dependency manager's contract:
@@ -144,10 +151,18 @@ transport already knows the remote host identity that file links should carry.
 test harnesses that need to exercise TTY-restoration behavior while stdout is
 piped.
 
-The `IS_NVIM` and `NVIM_*` WezTerm user variables are termnav's private
-cross-process protocol between shell/Neovim publishers and WezTerm route
-consumers. Configure integrations through the modules above instead of setting
-or reading those names directly.
+The `IS_NVIM`, `NVIM_*`, and `TERMNAV_TMUX` WezTerm user variables are
+termnav's private cross-process protocol between shell/Neovim publishers and
+WezTerm route consumers. Configure integrations through the modules above
+instead of setting or reading those names directly.
+
+The file-link classifier keeps semantic links for an identified WezTerm router,
+uses plain paths in VS Code and otherwise unmarked WSL terminals, and inspects
+the attached tmux client instead of trusting a pane's inherited environment.
+Set `NVIM_LAUNCHER_FORCE_NEW=1` when a managed invocation must bypass pane reuse.
+`NVIM_LAUNCHER_ALLOW_NONTTY=1` and `NVIM_LAUNCHER_ALLOW_NONSHELL_PARENT=1` are
+explicit trust overrides for controlled wrappers and test harnesses; ordinary
+launchers should leave both unset.
 
 The VS Code adapter exposes the equivalent `termnav.nvimFocused` context key.
 Each activation publishes a random per-window token with its socket. Neovim

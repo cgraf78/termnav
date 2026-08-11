@@ -63,4 +63,25 @@ Load the provider-owned shell integration directly; no wrapper file is needed:
 ```
 
 Hook that loader into the shell framework you already use. Termnav exposes the
-callbacks, while the consumer owns when prompt hooks run.
+callbacks, while the consumer owns when prompt hooks run. The same loader also
+exposes `termnav_file_links_need_plain_output`; use its return status to choose
+between a tool's plain-path output and its semantic OSC-8 mode without copying
+terminal or tmux-client detection into shell aliases.
+
+## Neovim command launcher
+
+Consumers that wrap `nvim` can source
+`lib/termnav/nvim-open/launcher.sh` through Shdeps and try the reusable route
+before resolving their real editor:
+
+```bash
+. "$(shdeps dep-file cgraf78/termnav lib/termnav/nvim-open/launcher.sh)"
+if termnav_nvim_try_reuse "$@"; then
+  exit 0
+fi
+exec /path/to/real/nvim "$@"
+```
+
+The helper deliberately returns nonzero for editor-driven calls, shell scripts,
+flags, multiple targets, non-tmux sessions, and failed routing. The wrapper
+therefore retains ownership of real-editor discovery and blocking behavior.
