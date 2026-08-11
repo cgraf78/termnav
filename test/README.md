@@ -7,7 +7,11 @@ focused suites from `test/suites/`.
 Suite ownership follows the integration boundary:
 
 - `nvim-test` covers Neovim helper behavior.
+- `nvim-launcher-test` covers the conservative sourceable policy for reusing an
+  existing Neovim pane from simple interactive-shell file opens.
 - `remote-test` covers remote open routing.
+- `shell-test` covers direct and attached-client file-link classification plus
+  shell-published tmux routing context.
 - `tmux-test` covers tmux command behavior.
 - `tab-switch-test` covers nearest-scope tmux traversal and terminal
   bridge selection.

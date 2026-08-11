@@ -104,10 +104,10 @@ _termnav_wezterm_set_user_var() {
 _termnav_wezterm_publish_tmux_context() {
   _termnav_wezterm_active || return 0
 
-  # TMUX cannot change during a shell process's lifetime. Publish this once when
-  # the integration loads instead of adding another prompt callback. WezTerm
-  # readers use Termnav's route API, so the raw variable remains a private
-  # provider protocol rather than consumer policy.
+  # TMUX cannot change during one shell process's lifetime, but a child tmux or
+  # nested shell can overwrite this pane-scoped WezTerm variable. Reassert the
+  # current shell's value whenever control returns to its prompt. This emits one
+  # local OSC sequence and performs no tmux process query.
   if [[ -n "${TMUX:-}" ]]; then
     _termnav_wezterm_set_user_var TERMNAV_TMUX true
   else
@@ -264,6 +264,7 @@ _termnav_wezterm_preexec() {
 _termnav_wezterm_precmd() {
   _termnav_wezterm_set_user_var IS_NVIM false
   _termnav_wezterm_publish_link_context
+  _termnav_wezterm_publish_tmux_context
 }
 
 _termnav_wezterm_register_hooks() {

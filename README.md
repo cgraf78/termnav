@@ -159,6 +159,10 @@ instead of setting or reading those names directly.
 The file-link classifier keeps semantic links for an identified WezTerm router,
 uses plain paths in VS Code and otherwise unmarked WSL terminals, and inspects
 the attached tmux client instead of trusting a pane's inherited environment.
+Consumers with another native-linkification policy may export
+`TERMNAV_FILE_LINKS_PLAIN=1`; an identified WezTerm router still wins over a
+stale inherited marker. Only recognized classifier fields are retained from an
+attached client's environment.
 Set `NVIM_LAUNCHER_FORCE_NEW=1` when a managed invocation must bypass pane reuse.
 `NVIM_LAUNCHER_ALLOW_NONTTY=1` and `NVIM_LAUNCHER_ALLOW_NONSHELL_PARENT=1` are
 explicit trust overrides for controlled wrappers and test harnesses; ordinary

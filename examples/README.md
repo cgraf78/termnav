@@ -66,7 +66,10 @@ Hook that loader into the shell framework you already use. Termnav exposes the
 callbacks, while the consumer owns when prompt hooks run. The same loader also
 exposes `termnav_file_links_need_plain_output`; use its return status to choose
 between a tool's plain-path output and its semantic OSC-8 mode without copying
-terminal or tmux-client detection into shell aliases.
+terminal or tmux-client detection into shell aliases. A consumer that already
+knows its terminal requires native linkification can export
+`TERMNAV_FILE_LINKS_PLAIN=1`; Termnav applies the same marker to direct and
+attached-tmux-client classification.
 
 ## Neovim command launcher
 
