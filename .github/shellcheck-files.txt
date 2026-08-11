@@ -11,6 +11,8 @@ program	bin/wezterm-move-tab
 program	bin/wezterm-switch-tab
 program	examples/tmux-follow/extensions.d/example-ticket.sh
 program	install.sh
+program	scripts/checkout-installer.conf
+program	support/install-checkout.sh
 program	lib/termnav/nvim-link-context.sh
 program	lib/termnav/nvim-open/cli.sh
 program	lib/termnav/nvim-open/common.sh

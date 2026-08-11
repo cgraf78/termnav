@@ -9,9 +9,17 @@
 WezTerm link routing, tmux ctrl-click follow-through, OSC-8-aware `eza`
 links, and `nvim-tmux-open`.
 
-## Install from a checkout
+## Installation
 
-Keep the checkout at a stable path and run:
+For the simplest checkout-backed install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cgraf78/termnav/main/install.sh | bash
+```
+
+This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
+absolute, or under `$HOME/.local/share` otherwise. To manage the checkout path
+yourself, keep it at a stable path and run:
 
 ```bash
 ./install.sh

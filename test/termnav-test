@@ -87,6 +87,7 @@ if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
     "${runtime_shell_files[@]}" \
     "${example_shell_files[@]}" \
     "$root/install.sh" \
+    "$root/support/install-checkout.sh" \
     "$test_dir/termnav-test" \
     "$test_dir/helpers.sh" \
     "$test_dir"/suites/*-test
