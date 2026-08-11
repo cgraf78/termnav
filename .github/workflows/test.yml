@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@464468328f050e43299298fc0eac8b971ddd38b7
     with:
       matrix-set: full
       profiles: base,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
@@ -42,7 +42,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@0c8c5f1c615fd61b48cc7d5de5225ca491665d80
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@464468328f050e43299298fc0eac8b971ddd38b7
 
   eza-current:
     name: Current eza compatibility / Arch
