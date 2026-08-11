@@ -29,8 +29,13 @@ probe_bin="$probe_root/bin"
 probe_proc="$probe_root/proc"
 mkdir -p "$probe_bin" "$probe_proc"
 
-cat >"$probe_bin/tmux" <<'SH'
-#!/usr/bin/env bash
+# These probes run below `env -i` so the classification cases cannot inherit
+# terminal markers from the developer's shell. On Termux, that isolation also
+# removes the LD_PRELOAD path shim which normally maps `/usr/bin/env` into the
+# app prefix. Give each fixture the absolute interpreter that is already
+# running this suite so the test exercises Termnav rather than the path shim.
+printf '#!%s\n' "$BASH" >"$probe_bin/tmux"
+cat >>"$probe_bin/tmux" <<'SH'
 if [[ -n "${TERMNAV_TEST_TMUX_LOG:-}" ]]; then
   printf '%s\n' "$*" >>"$TERMNAV_TEST_TMUX_LOG"
 fi
@@ -41,8 +46,8 @@ fi
 exit 1
 SH
 
-cat >"$probe_bin/ps" <<'SH'
-#!/usr/bin/env bash
+printf '#!%s\n' "$BASH" >"$probe_bin/ps"
+cat >>"$probe_bin/ps" <<'SH'
 if [[ "$*" == "eww -p ${TERMNAV_TEST_CLIENT_PID:-}" && -n "${TERMNAV_TEST_PS_ENV:-}" ]]; then
   printf '%s\n' "$TERMNAV_TEST_PS_ENV"
   exit 0
