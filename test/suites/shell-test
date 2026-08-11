@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# shell-test — checks reusable interactive-shell routing policy.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+file_links_lib="$TERMNAV_ROOT/lib/termnav/shell/file-links.sh"
+
+echo "=== terminal file-link mode ==="
+
+_assert_file_exists "file-link mode: sourceable provider exists" "$file_links_lib"
+if [[ -f "$file_links_lib" ]]; then
+  # shellcheck source=/dev/null # The provider path is derived from this checkout.
+  . "$file_links_lib"
+fi
+if ! declare -F termnav_file_links_need_plain_output >/dev/null 2>&1; then
+  _fail "file-link mode: public classifier exists"
+  _test_summary
+fi
+
+probe_root=$(_tmpdir)
+probe_bin="$probe_root/bin"
+probe_proc="$probe_root/proc"
+mkdir -p "$probe_bin" "$probe_proc"
+
+# These probes run below `env -i` so the classification cases cannot inherit
+# terminal markers from the developer's shell. On Termux, that isolation also
+# removes the LD_PRELOAD path shim which normally maps `/usr/bin/env` into the
+# app prefix. Give each fixture the absolute interpreter that is already
+# running this suite so the test exercises Termnav rather than the path shim.
+printf '#!%s\n' "$BASH" >"$probe_bin/tmux"
+cat >>"$probe_bin/tmux" <<'SH'
+if [[ -n "${TERMNAV_TEST_TMUX_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$TERMNAV_TEST_TMUX_LOG"
+fi
+if [[ "$1" == display-message && "$2" == -p && "$3" == '#{client_pid}' ]]; then
+  printf '%s\n' "${TERMNAV_TEST_CLIENT_PID:-}"
+  exit 0
+fi
+exit 1
+SH
+
+printf '#!%s\n' "$BASH" >"$probe_bin/ps"
+cat >>"$probe_bin/ps" <<'SH'
+if [[ "$*" == "eww -p ${TERMNAV_TEST_CLIENT_PID:-}" && -n "${TERMNAV_TEST_PS_ENV:-}" ]]; then
+  printf '%s\n' "$TERMNAV_TEST_PS_ENV"
+  exit 0
+fi
+exit 1
+SH
+chmod +x "$probe_bin/tmux" "$probe_bin/ps"
+
+vscode_client_pid=424242
+wsl_client_pid=424243
+wsl_wezterm_client_pid=424244
+plain_client_pid=424245
+mkdir -p \
+  "$probe_proc/$vscode_client_pid" \
+  "$probe_proc/$wsl_client_pid" \
+  "$probe_proc/$wsl_wezterm_client_pid" \
+  "$probe_proc/$plain_client_pid"
+printf 'TERM_PROGRAM=vscode\0VSCODE_IPC_HOOK_CLI=/tmp/vscode.sock\0TERMNAV_SECRET_SENTINEL=must-not-trace\0' \
+  >"$probe_proc/$vscode_client_pid/environ"
+printf 'TERM=xterm-256color\0WSL_DISTRO_NAME=archlinux\0WSL_INTEROP=/run/WSL/1_interop\0' \
+  >"$probe_proc/$wsl_client_pid/environ"
+printf 'WEZTERM_PANE=7\0WSL_DISTRO_NAME=archlinux\0WSL_INTEROP=/run/WSL/1_interop\0' \
+  >"$probe_proc/$wsl_wezterm_client_pid/environ"
+printf 'TERMNAV_FILE_LINKS_PLAIN=1\0' \
+  >"$probe_proc/$plain_client_pid/environ"
+
+_probe_file_link_mode() {
+  # shellcheck disable=SC2016 # The child shell loads and invokes the provider.
+  env -i "$@" \
+    FILE_LINKS_LIB="$file_links_lib" \
+    PATH="$probe_bin:${BASH%/*}:/usr/bin:/bin" \
+    "$BASH" --noprofile --norc -c '
+      source "$FILE_LINKS_LIB"
+      if termnav_file_links_need_plain_output; then
+        printf "plain\n"
+      else
+        printf "rich\n"
+      fi
+    '
+}
+
+_assert_eq "file-link mode: WezTerm keeps routed OSC-8 links" "rich" \
+  "$(_probe_file_link_mode TERM_PROGRAM=WezTerm)"
+_assert_eq "file-link mode: WezTerm wins over stale VS Code markers" "rich" \
+  "$(_probe_file_link_mode TERM_PROGRAM=WezTerm VSCODE_IPC_HOOK_CLI=/tmp/stale.sock)"
+_assert_eq "file-link mode: VS Code uses plain paths" "plain" \
+  "$(_probe_file_link_mode TERM_PROGRAM=vscode)"
+_assert_eq "file-link mode: VS Code Remote uses plain paths" "plain" \
+  "$(_probe_file_link_mode TERM_PROGRAM=vscode SSH_CONNECTION='client 123 host 22')"
+_assert_eq "file-link mode: generic plain marker uses plain paths" "plain" \
+  "$(_probe_file_link_mode TERMNAV_FILE_LINKS_PLAIN=1)"
+_assert_eq "file-link mode: WezTerm wins over a stale generic plain marker" "rich" \
+  "$(_probe_file_link_mode TERM_PROGRAM=WezTerm TERMNAV_FILE_LINKS_PLAIN=1)"
+_assert_eq "file-link mode: unmarked WSL uses plain paths" "plain" \
+  "$(_probe_file_link_mode TERM=xterm-256color WSL_DISTRO_NAME=archlinux WSL_INTEROP=/run/WSL/1_interop)"
+_assert_eq "file-link mode: WSL WezTerm keeps routed OSC-8 links" "rich" \
+  "$(_probe_file_link_mode TERM_PROGRAM=WezTerm WSL_DISTRO_NAME=archlinux WSL_INTEROP=/run/WSL/1_interop)"
+_assert_eq "file-link mode: a WezTerm pane marker keeps routed OSC-8 links" "rich" \
+  "$(_probe_file_link_mode WEZTERM_PANE=7 WSL_DISTRO_NAME=archlinux WSL_INTEROP=/run/WSL/1_interop)"
+_assert_eq "file-link mode: tmux ignores stale pane environment" "rich" \
+  "$(_probe_file_link_mode TERM_PROGRAM=vscode TMUX=/tmp/stale-tmux,1,0)"
+_assert_eq "file-link mode: tmux reads a VS Code client from procfs" "plain" \
+  "$(_probe_file_link_mode \
+    TERM_PROGRAM=WezTerm \
+    TMUX=/tmp/real-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc")"
+_assert_eq "file-link mode: tmux reads a VS Code client through ps" "plain" \
+  "$(_probe_file_link_mode \
+    TERM_PROGRAM=WezTerm \
+    TMUX=/tmp/real-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_root/missing-proc" \
+    TERMNAV_TEST_PS_ENV='TERM_PROGRAM=vscode VSCODE_IPC_HOOK_CLI=/tmp/vscode.sock')"
+_assert_eq "file-link mode: tmux reads an unmarked WSL client" "plain" \
+  "$(_probe_file_link_mode \
+    TERM_PROGRAM=tmux \
+    TMUX=/tmp/wsl-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$wsl_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc")"
+_assert_eq "file-link mode: tmux reads a generic plain client marker" "plain" \
+  "$(_probe_file_link_mode \
+    TERM_PROGRAM=WezTerm \
+    TMUX=/tmp/plain-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$plain_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc")"
+_assert_eq "file-link mode: tmux keeps routed links for a WSL WezTerm client" "rich" \
+  "$(_probe_file_link_mode \
+    TERM_PROGRAM=tmux \
+    TMUX=/tmp/wsl-wezterm-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$wsl_wezterm_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc")"
+
+_probe_file_link_trace() {
+  # The child enables xtrace only after receiving its isolated environment, so
+  # a sentinel can appear solely if provider internals retain unrecognized
+  # attached-client variables in shell state.
+  # shellcheck disable=SC2016
+  env -i "$@" \
+    FILE_LINKS_LIB="$file_links_lib" \
+    PATH="$probe_bin:${BASH%/*}:/usr/bin:/bin" \
+    "$BASH" --noprofile --norc -c '
+      source "$FILE_LINKS_LIB"
+      set -x
+      termnav_file_links_need_plain_output
+    ' 2>&1
+}
+
+proc_trace=$(_probe_file_link_trace \
+  TMUX=/tmp/proc-trace-tmux,1,0 \
+  TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+  TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc")
+_assert_not_contains "file-link mode: procfs client secrets stay out of xtrace" \
+  "TERMNAV_SECRET_SENTINEL" "$proc_trace"
+
+ps_trace=$(_probe_file_link_trace \
+  TMUX=/tmp/ps-trace-tmux,1,0 \
+  TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+  TERMNAV_FILE_LINKS_PROC_ROOT="$probe_root/missing-proc" \
+  TERMNAV_TEST_PS_ENV='TERM_PROGRAM=vscode TERMNAV_SECRET_SENTINEL=must-not-trace')
+_assert_not_contains "file-link mode: ps client secrets stay out of xtrace" \
+  "TERMNAV_SECRET_SENTINEL" "$ps_trace"
+
+tmux_query_log="$probe_root/tmux-queries.log"
+: >"$tmux_query_log"
+cache_output=$(
+  # shellcheck disable=SC2016 # The child shell controls its own SECONDS value.
+  env -i \
+    FILE_LINKS_LIB="$file_links_lib" \
+    PATH="$probe_bin:${BASH%/*}:/usr/bin:/bin" \
+    TMUX=/tmp/cache-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc" \
+    TERMNAV_TEST_TMUX_LOG="$tmux_query_log" \
+    "$BASH" --noprofile --norc -c '
+      source "$FILE_LINKS_LIB"
+      SECONDS=40
+      termnav_file_links_need_plain_output
+      termnav_file_links_need_plain_output
+      SECONDS=41
+      termnav_file_links_need_plain_output
+      wc -l <"$TERMNAV_TEST_TMUX_LOG" | tr -d " "
+    '
+)
+_assert_eq "file-link mode: caches tmux client inspection for one shell second" \
+  "2" "$cache_output"
+
+restored_clock_log="$probe_root/restored-clock-queries.log"
+: >"$restored_clock_log"
+restored_clock_output=$(
+  # shellcheck disable=SC2016 # The child shell controls its own SECONDS value.
+  env -i \
+    FILE_LINKS_LIB="$file_links_lib" \
+    PATH="$probe_bin:${BASH%/*}:/usr/bin:/bin" \
+    TMUX=/tmp/restored-clock-tmux,1,0 \
+    TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+    TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc" \
+    TERMNAV_TEST_TMUX_LOG="$restored_clock_log" \
+    TERMNAV_TEST_RICH_CLIENT_PID="$wsl_wezterm_client_pid" \
+    "$BASH" --noprofile --norc -c '
+      source "$FILE_LINKS_LIB"
+      SECONDS=40
+      termnav_file_links_need_plain_output
+      first_status=$?
+      unset SECONDS
+      TERMNAV_TEST_CLIENT_PID="$TERMNAV_TEST_RICH_CLIENT_PID"
+      termnav_file_links_need_plain_output
+      invalid_clock_status=$?
+      SECONDS=40
+      termnav_file_links_need_plain_output
+      restored_clock_status=$?
+      query_count=$(wc -l <"$TERMNAV_TEST_TMUX_LOG" | tr -d " ")
+      printf "%s %s %s %s\n" \
+        "$first_status" "$invalid_clock_status" "$restored_clock_status" "$query_count"
+    '
+)
+_assert_eq "file-link mode: recreated static clock cannot resurrect stale cache" \
+  "0 1 1 3" "$restored_clock_output"
+
+for clock_shell in bash zsh; do
+  if [[ "$clock_shell" == bash ]]; then
+    clock_shell_path="$BASH"
+    clock_shell_args=(--noprofile --norc)
+  elif ! clock_shell_path=$(command -v zsh 2>/dev/null); then
+    echo "  - skipping file-link cache clock cases in zsh (zsh unavailable)"
+    continue
+  else
+    clock_shell_args=(-f)
+  fi
+
+  clock_modes=(unset)
+  # zsh retains SECONDS as an integer special parameter after unset and coerces
+  # a nonnumeric assignment back to zero. Bash permits a plain string, so only
+  # Bash can exercise that distinct invalid-clock shape.
+  if [[ "$clock_shell" == bash ]]; then
+    clock_modes+=(nonnumeric)
+  fi
+  for clock_mode in "${clock_modes[@]}"; do
+    clock_log="$probe_root/${clock_shell}-${clock_mode}-queries.log"
+    : >"$clock_log"
+    clock_queries=$(
+      # shellcheck disable=SC2016 # The selected child shell owns its clock.
+      env -i \
+        CLOCK_MODE="$clock_mode" \
+        FILE_LINKS_LIB="$file_links_lib" \
+        PATH="$probe_bin:${BASH%/*}:/usr/bin:/bin" \
+        TMUX=/tmp/no-clock-tmux,1,0 \
+        TERMNAV_TEST_CLIENT_PID="$vscode_client_pid" \
+        TERMNAV_FILE_LINKS_PROC_ROOT="$probe_proc" \
+        TERMNAV_TEST_TMUX_LOG="$clock_log" \
+        "$clock_shell_path" "${clock_shell_args[@]}" -c '
+          source "$FILE_LINKS_LIB"
+          unset SECONDS
+          if [[ "$CLOCK_MODE" == nonnumeric ]]; then
+            SECONDS=not-a-clock
+          fi
+          termnav_file_links_need_plain_output
+          termnav_file_links_need_plain_output
+          wc -l <"$TERMNAV_TEST_TMUX_LOG" | tr -d " "
+        '
+    )
+    _assert_eq "file-link mode: $clock_shell $clock_mode clock stays uncached" \
+      "2" "$clock_queries"
+  done
+done
+
+echo
+echo "=== shell tmux context publication ==="
+
+shell_integration="$TERMNAV_ROOT/share/termnav/shell.sh"
+shell_tmux_bin=$(_tmpdir)
+cat >"$shell_tmux_bin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  "display-message -p t#{client_termname} ; show-environment -g TERMNAV_REMOTE_LINK_HOST")
+    printf 'txterm-256color\n'
+    ;;
+  *)
+    printf 'xterm-256color\n'
+    ;;
+esac
+SH
+chmod +x "$shell_tmux_bin/tmux"
+
+tmux_publication=$(
+  TERM_PROGRAM=WezTerm \
+    TMUX=/tmp/termnav-tmux,1,0 \
+    PATH="$shell_tmux_bin:$PATH" \
+    bash --noprofile --norc -c 'source "$1"' _ "$shell_integration"
+)
+_assert_contains "tmux context: shell publishes provider-owned true state" \
+  'SetUserVar=TERMNAV_TMUX=dHJ1ZQ==' "$tmux_publication"
+
+plain_publication=$(
+  TERM_PROGRAM=WezTerm \
+    TMUX='' \
+    bash --noprofile --norc -c 'source "$1"' _ "$shell_integration"
+)
+_assert_contains "tmux context: shell publishes provider-owned empty state" \
+  'SetUserVar=TERMNAV_TMUX=' "$plain_publication"
+
+nvim_publication=$(
+  TERM_PROGRAM=WezTerm \
+    NVIM=/tmp/nvim.sock \
+    bash --noprofile --norc -c 'source "$1"' _ "$shell_integration"
+)
+_assert_not_contains "tmux context: embedded Neovim terminals publish no shell state" \
+  'SetUserVar=TERMNAV_TMUX=' "$nvim_publication"
+
+prompt_publication=$(
+  TERM_PROGRAM=WezTerm \
+    TMUX=/tmp/termnav-tmux,1,0 \
+    PATH="$shell_tmux_bin:$PATH" \
+    bash --noprofile --norc -c '
+      source "$1"
+      _termnav_wezterm_precmd
+      _termnav_wezterm_precmd
+    ' _ "$shell_integration"
+)
+prompt_tmux_count=$(awk 'BEGIN { RS="SetUserVar=TERMNAV_TMUX=" } END { print NR - 1 }' <<<"$prompt_publication")
+_assert_eq "tmux context: every returned prompt reasserts its shell state" \
+  "3" "$prompt_tmux_count"
+
+_test_summary

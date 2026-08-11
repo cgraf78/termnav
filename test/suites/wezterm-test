@@ -917,6 +917,35 @@ local function window()
   }
 end
 
+check(
+  "tmux context accepts shell-published state",
+  routes.is_tmux(pane({ TERMNAV_TMUX = "true" }, nil, { foreground = "/bin/bash" }))
+)
+check(
+  "tmux context recognizes a foreground tmux client",
+  routes.is_tmux(pane({}, nil, { foreground = "/usr/bin/tmux" }))
+)
+check(
+  "tmux context recognizes a remote tmux pane",
+  routes.is_tmux(pane({ NVIM_REMOTE_TMUX = "true" }, nil, { foreground = "/bin/ssh" }))
+)
+check(
+  "current non-tmux shell state overrides stale remote tmux metadata",
+  not routes.is_tmux(pane(
+    { TERMNAV_TMUX = "", NVIM_REMOTE_TMUX = "true" },
+    nil,
+    { foreground = "/bin/zsh" }
+  ))
+)
+check(
+  "foreground tmux wins while a child shell is starting",
+  routes.is_tmux(pane({ TERMNAV_TMUX = "" }, nil, { foreground = "/usr/bin/tmux" }))
+)
+check(
+  "tmux context rejects an ordinary shell pane",
+  not routes.is_tmux(pane({}, nil, { foreground = "/bin/zsh" }))
+)
+
 local function last()
   return calls[#calls]
 end

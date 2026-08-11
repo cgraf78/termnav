@@ -14,9 +14,11 @@ program	install.sh
 program	lib/termnav/nvim-link-context.sh
 program	lib/termnav/nvim-open/cli.sh
 program	lib/termnav/nvim-open/common.sh
+program	lib/termnav/nvim-open/launcher.sh
 program	lib/termnav/nvim-open/link.sh
 program	lib/termnav/nvim-open/remote.sh
 program	lib/termnav/remote-command.sh
+program	lib/termnav/shell/file-links.sh
 program	lib/termnav/shell/vscode-backend-mcp.sh
 program	lib/termnav/shell/vscode-backend-socket.sh
 program	lib/termnav/shell/vscode-command.sh
@@ -27,8 +29,10 @@ program	test/suites/ci-contract-test
 program	test/suites/examples-test
 program	test/suites/install-test
 program	test/suites/manpage-test
+program	test/suites/nvim-launcher-test
 program	test/suites/nvim-test
 program	test/suites/remote-test
+program	test/suites/shell-test
 program	test/suites/tab-switch-test
 program	test/suites/tmux-test
 program	test/suites/vscode-focus-test
