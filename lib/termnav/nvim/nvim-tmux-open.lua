@@ -465,13 +465,17 @@ function M.setup()
     local record = publication_record(address)
     atomic_write(pane_record, record)
     atomic_write(current_record, record)
-    -- Each complete latest record is its scope's linearization point. Scope
-    -- readers never need to join a pointer with another mutable file.
+    -- Each complete latest record is its scope's data linearization point. It
+    -- carries the full socket record; the separate owner marker below proves
+    -- that the publisher committed its initial record set.
     atomic_write(pane_latest, record)
     atomic_write(current_latest, record)
   end
 
   local function cleanup()
+    -- Revoke the owner before removing its records or socket. Readers validate
+    -- every record against this marker, so an exiting instance becomes
+    -- ineligible immediately instead of remaining selectable during teardown.
     vim.fn.delete(owner_record)
     vim.fn.delete(pane_record)
     vim.fn.delete(current_record)
@@ -497,6 +501,8 @@ function M.setup()
 
   local published, publish_error = pcall(publish)
   if published then
+    -- The owner marker is the initial publication's commit point. Writing it
+    -- last prevents a failed setup from authorizing a partial set of records.
     published, publish_error = pcall(atomic_write, owner_record, "v2")
   end
   if not published then
