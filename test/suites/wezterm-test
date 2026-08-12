@@ -19,6 +19,7 @@ nvim_link_host="$TERMNAV_ROOT/bin/nvim-link-host"
 ssh_control_open="$TERMNAV_ROOT/bin/nvim-ssh-control-open"
 wezterm_switch_tab="$TERMNAV_ROOT/bin/wezterm-switch-tab"
 wezterm_move_tab="$TERMNAV_ROOT/bin/wezterm-move-tab"
+wezterm_select_pane="$TERMNAV_ROOT/bin/wezterm-select-pane"
 public_link_rules="$TERMNAV_ROOT/lib/termnav/wezterm/public-link-rules.lua"
 nvim_setup="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua"
 wezterm_routes="$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua"
@@ -48,6 +49,7 @@ ln -s "$nvim_link_host" "$symlink_bin/nvim-link-host"
 ln -s "$ssh_control_open" "$symlink_bin/nvim-ssh-control-open"
 ln -s "$wezterm_switch_tab" "$symlink_bin/wezterm-switch-tab"
 ln -s "$wezterm_move_tab" "$symlink_bin/wezterm-move-tab"
+ln -s "$wezterm_select_pane" "$symlink_bin/wezterm-select-pane"
 cat >"$mock_bin/eza" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${EZA_MOCK_LEGACY:-0}" = 1 && "$*" == "--hyperlink=always --version" ]]; then
@@ -161,6 +163,11 @@ symlink_move_rc=$?
 _assert_exit "wezterm-move-tab symlink: help exits successfully" 0 "$symlink_move_rc"
 _assert_contains "wezterm-move-tab symlink: resolves dependency libraries" \
   "usage: wezterm-move-tab" "$symlink_move_usage"
+symlink_pane_usage=$("$symlink_bin/wezterm-select-pane" --help 2>&1)
+symlink_pane_rc=$?
+_assert_exit "wezterm-select-pane symlink: help exits successfully" 0 "$symlink_pane_rc"
+_assert_contains "wezterm-select-pane symlink: resolves dependency libraries" \
+  "usage: wezterm-select-pane" "$symlink_pane_usage"
 
 echo
 echo "=== WezTerm tab user-var helpers ==="
@@ -207,6 +214,37 @@ _assert_contains "wezterm-move-tab parent: starts tmux passthrough" \
   $'\033Ptmux;\033\033]1337;SetUserVar=DOT_PARENT_MOVE_TAB=' "$parent_move"
 _assert_contains "wezterm-move-tab parent: terminates tmux passthrough" \
   $'\007\033\\' "$parent_move"
+
+for direction in left down up right; do
+  : >"$tab_tty"
+  "$wezterm_select_pane" --parent "$direction" "$tab_tty"
+  parent_pane=$(cat "$tab_tty")
+  _assert_contains "wezterm-select-pane parent $direction: starts tmux passthrough" \
+    $'\033Ptmux;\033\033]1337;SetUserVar=DOT_PARENT_SELECT_PANE=' "$parent_pane"
+  encoded_pane_payload=$(printf '%s' "$parent_pane" |
+    sed -n 's/.*SetUserVar=DOT_PARENT_SELECT_PANE=\([A-Za-z0-9+\/=]*\).*/\1/p')
+  if ! pane_payload=$(printf '%s' "$encoded_pane_payload" | base64 -d 2>/dev/null); then
+    pane_payload=$(printf '%s' "$encoded_pane_payload" | base64 -D 2>/dev/null)
+  fi
+  _assert_contains "wezterm-select-pane parent $direction: carries direction" \
+    "$direction:" "$pane_payload"
+  _assert_contains "wezterm-select-pane parent $direction: terminates tmux passthrough" \
+    $'\007\033\\' "$parent_pane"
+done
+
+set +e
+"$wezterm_select_pane" --parent diagonal "$tab_tty" >/dev/null 2>&1
+invalid_pane_direction_rc=$?
+set -e
+_assert_exit "wezterm-select-pane rejects invalid directions" 2 \
+  "$invalid_pane_direction_rc"
+
+set +e
+"$wezterm_select_pane" left "$tab_tty" >/dev/null 2>&1
+missing_parent_rc=$?
+set -e
+_assert_exit "wezterm-select-pane requires explicit parent routing" 2 \
+  "$missing_parent_rc"
 
 shell_vars="$TERMNAV_ROOT/lib/termnav/shell/wezterm-vars.sh"
 shell_tmux_mock=$(_tmpdir)/mock-bin

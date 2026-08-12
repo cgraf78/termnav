@@ -17,6 +17,7 @@ runtime_shell_files=(
   "$root/bin/vscode-nvim-focus"
   "$root/bin/vscode-switch-tab"
   "$root/bin/wezterm-move-tab"
+  "$root/bin/wezterm-select-pane"
   "$root/bin/wezterm-switch-tab"
   "$root/lib/termnav/nvim-link-context.sh"
   "$root/lib/termnav/nvim-open/cli.sh"

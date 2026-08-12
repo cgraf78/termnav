@@ -8,6 +8,7 @@ program	bin/tmux-follow-click
 program	bin/vscode-nvim-focus
 program	bin/vscode-switch-tab
 program	bin/wezterm-move-tab
+program	bin/wezterm-select-pane
 program	bin/wezterm-switch-tab
 program	examples/tmux-follow/extensions.d/example-ticket.sh
 program	install.sh

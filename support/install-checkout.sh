@@ -22,6 +22,7 @@ commands=(
   vscode-nvim-focus
   vscode-switch-tab
   wezterm-move-tab
+  wezterm-select-pane
   wezterm-switch-tab
 )
 

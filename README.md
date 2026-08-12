@@ -48,6 +48,8 @@ consumers must still select versioned VS Code payloads explicitly.
   parent-tmux bubbling for nested local or remote tmux sessions.
 - `bin/wezterm-move-tab`: request WezTerm tab movement, including parent-tmux
   bubbling for nested local or remote tmux sessions.
+- `bin/wezterm-select-pane`: request directional pane selection in a parent
+  tmux through WezTerm's remote-safe terminal loopback.
 - `bin/vscode-switch-tab`: request a VS Code integrated-terminal tab switch
   through the pluggable command-execution bridge. There is no matching
   move/reorder command because VS Code exposes no command to reorder
