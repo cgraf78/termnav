@@ -178,6 +178,10 @@ _parent_scope() {
   esac
   visited="$visited$socket:$pane|"
 
+  # Several clients can display the same inner pane. Route only through the
+  # unique most recently active client; a unique focused client may break an
+  # activity tie, but any remaining ambiguity must fail closed rather than
+  # switch an unrelated outer session.
   clients=$(TMUX="" command tmux -S "$socket" list-clients -F \
     '#{client_activity}	#{client_pid}	#{client_tty}	#{client_termtype}	#{session_id}	#{session_windows}	#{pane_id}	#{client_flags}' \
     2>/dev/null) || return 1

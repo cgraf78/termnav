@@ -586,6 +586,10 @@ capture_pane_lines() {
   [[ -n "$pane_id" ]] || return 1
   command -v tmux >/dev/null 2>&1 || return 1
 
+  # Mouse coordinates identify a physical screen row, while a path can span
+  # several wrapped rows. Keep both views: the physical capture locates the
+  # click, and the joined capture reconstructs the logical token. The alignment
+  # below falls back to the physical row when tmux cannot join it predictably.
   physical=$(tmux capture-pane -p -S 0 -E - -t "$pane_id" 2>/dev/null) || return 1
   joined=$(tmux capture-pane -p -J -S 0 -E - -t "$pane_id" 2>/dev/null) || return 1
 
