@@ -232,17 +232,14 @@ for direction in left down up right; do
     $'\007\033\\' "$parent_pane"
 done
 
-set +e
-"$wezterm_select_pane" --parent diagonal "$tab_tty" >/dev/null 2>&1
-invalid_pane_direction_rc=$?
-set -e
+invalid_pane_direction_rc=0
+"$wezterm_select_pane" --parent diagonal "$tab_tty" >/dev/null 2>&1 ||
+  invalid_pane_direction_rc=$?
 _assert_exit "wezterm-select-pane rejects invalid directions" 2 \
   "$invalid_pane_direction_rc"
 
-set +e
-"$wezterm_select_pane" left "$tab_tty" >/dev/null 2>&1
-missing_parent_rc=$?
-set -e
+missing_parent_rc=0
+"$wezterm_select_pane" left "$tab_tty" >/dev/null 2>&1 || missing_parent_rc=$?
 _assert_exit "wezterm-select-pane requires explicit parent routing" 2 \
   "$missing_parent_rc"
 
