@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Ask WezTerm to route pane selection to the parent tmux layer.
+
+set -euo pipefail
+
+_termnav_script_parent() {
+  case "$1" in
+    */*) printf '%s\n' "${1%/*}" ;;
+    *) printf '.\n' ;;
+  esac
+}
+
+_termnav_script_dir() {
+  local path="$1" dir target
+  while [[ -L "$path" ]]; do
+    dir=$(cd -P -- "$(_termnav_script_parent "$path")" && pwd) || return 1
+    target=$(readlink "$path") || return 1
+    [[ "$target" == /* ]] || target="$dir/$target"
+    path="$target"
+  done
+  cd -P -- "$(_termnav_script_parent "$path")" && pwd
+}
+
+script_dir=$(_termnav_script_dir "${BASH_SOURCE[0]}") || {
+  echo "wezterm-select-pane: cannot resolve executable path" >&2
+  exit 2
+}
+lib_dir="${script_dir%/bin}/lib/termnav"
+
+# shellcheck source=../lib/termnav/shell/wezterm-vars.sh
+. "$lib_dir/shell/wezterm-vars.sh" || exit 1
+
+_usage() {
+  cat <<'EOF'
+usage: wezterm-select-pane --parent {left|down|up|right} [tty]
+       wezterm-select-pane --parent {left|down|up|right} --tty TTY
+
+Emit a WezTerm OSC 1337 request that asks the parent tmux layer to select an
+adjacent pane. The request uses tmux passthrough for remote nested sessions.
+EOF
+}
+
+_die() {
+  printf 'wezterm-select-pane: %s\n' "$*" >&2
+  exit 2
+}
+
+direction=""
+tty="${WEZTERM_SELECT_PANE_TTY:-}"
+parent=0
+
+while (($#)); do
+  case "$1" in
+    left | down | up | right)
+      [[ -z "$direction" ]] || _die "direction specified more than once"
+      direction="$1"
+      shift
+      ;;
+    --tty)
+      shift
+      (($#)) || _die "--tty requires a value"
+      tty="$1"
+      shift
+      ;;
+    --tty=*)
+      tty="${1#--tty=}"
+      [[ -n "$tty" ]] || _die "--tty requires a value"
+      shift
+      ;;
+    --parent)
+      parent=1
+      shift
+      ;;
+    -h | --help)
+      _usage
+      exit 0
+      ;;
+    --)
+      shift
+      (($# <= 1)) || _die "expected at most one tty"
+      if (($#)); then
+        tty="$1"
+        shift
+      fi
+      ;;
+    -*) _die "unknown option: $1" ;;
+    *)
+      if [[ -n "$tty" ]]; then
+        _die "unexpected argument: $1"
+      fi
+      tty="$1"
+      shift
+      ;;
+  esac
+done
+
+((parent)) || _die "--parent is required"
+case "$direction" in
+  left | down | up | right) ;;
+  *) _die "direction must be left, down, up, or right" ;;
+esac
+
+tty="${tty:-/dev/tty}"
+payload=$(printf '%s:%s.%s.%s' "$direction" "$(date +%s)" "$$" "$RANDOM")
+termnav_wezterm_set_user_var \
+  "DOT_PARENT_SELECT_PANE" "$payload" "$tty" "tmux"
