@@ -90,18 +90,20 @@ def route(scope: str, direction: str) -> bool:
 
     tmux_value = os.environ.get("TMUX", "")
     pane = os.environ.get("TMUX_PANE", "")
+    session = os.environ.get("TERMNAV_TMUX_SESSION", "")
     if tmux_value and pane:
         tmux_socket = tmux_value.rsplit(",", 2)[0]
+        target_pane = f"{session}:.{pane}" if session else pane
         if scope == "pane":
             edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
-            edge = tmux("-S", tmux_socket, "display-message", "-p", "-t", pane, f"#{{{edge_name}}}")
+            edge = tmux("-S", tmux_socket, "display-message", "-p", "-t", target_pane, f"#{{{edge_name}}}")
             if edge.returncode == 0 and edge.stdout.strip() == "0":
-                selected = tmux("-S", tmux_socket, "select-pane", "-t", pane, f"-{PANE_DIRECTIONS[direction]}")
+                selected = tmux("-S", tmux_socket, "select-pane", "-t", target_pane, f"-{PANE_DIRECTIONS[direction]}")
                 if selected.returncode == 0:
                     return True
         else:
             fields = tmux(
-                "-S", tmux_socket, "display-message", "-p", "-t", pane,
+                "-S", tmux_socket, "display-message", "-p", "-t", target_pane,
                 "#{session_id} #{session_windows} #{window_id}",
             )
             if fields.returncode == 0:
@@ -114,9 +116,10 @@ def route(scope: str, direction: str) -> bool:
                     else:
                         listed = tmux(
                             "-S", tmux_socket, "list-windows", "-t", parts[0],
-                            "-F", "#{window_id}",
+                            "-F", "#{window_id} #{window_index}",
                         )
-                        window_ids = listed.stdout.split()
+                        windows = [line.split() for line in listed.stdout.splitlines()]
+                        window_ids = [item[0] for item in windows if len(item) == 2]
                         if listed.returncode != 0 or parts[2] not in window_ids:
                             return False
                         source_index = window_ids.index(parts[2])
@@ -129,7 +132,8 @@ def route(scope: str, direction: str) -> bool:
                         # window indexes are intentionally sparse.
                         moved = tmux(
                             "-S", tmux_socket, "swap-window", "-d",
-                            "-s", parts[2], "-t", window_ids[target_index],
+                            "-s", f"{parts[0]}:{windows[source_index][1]}",
+                            "-t", f"{parts[0]}:{windows[target_index][1]}",
                         )
                         if moved.returncode == 0:
                             return True
@@ -309,24 +313,29 @@ def ssh_command(arguments: list[str]) -> int:
     # from the client currently driving this pane, never tmux's session-global
     # environment (which is shared and last-attacher-wins).
     if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+        server_environment.pop("TERMNAV_TMUX_SESSION", None)
         clients = subprocess.run(
-            ["tmux", "list-clients", "-F", "#{client_activity}\t#{client_pid}\t#{client_tty}\t#{pane_id}\t#{client_flags}"],
+            ["tmux", "list-clients", "-F", "#{client_activity}\t#{client_pid}\t#{client_tty}\t#{pane_id}\t#{client_flags}\t#{session_id}"],
             text=True, capture_output=True, check=False,
         )
         candidates = []
         for line in clients.stdout.splitlines():
             fields = line.split("\t")
-            if len(fields) != 5 or fields[3] != os.environ["TMUX_PANE"] or not fields[0].isdigit() or not fields[1].isdigit():
+            if len(fields) != 6 or fields[3] != os.environ["TMUX_PANE"] or not fields[0].isdigit() or not fields[1].isdigit():
                 continue
             relay = process_env(int(fields[1]), "TERMNAV_PARENT_RELAY")
-            candidates.append((int(fields[0]), "focused" in fields[4].split(","), relay))
+            candidates.append((int(fields[0]), "focused" in fields[4].split(","), relay, fields[5]))
         if candidates:
             newest = max(item[0] for item in candidates)
             leaders = [item for item in candidates if item[0] == newest]
             focused = [item for item in leaders if item[1]]
             chosen = focused if len(focused) == 1 else leaders
-            if len(chosen) == 1 and chosen[0][2]:
-                server_environment["TERMNAV_PARENT_RELAY"] = chosen[0][2]
+            if len(chosen) == 1:
+                server_environment["TERMNAV_TMUX_SESSION"] = chosen[0][3]
+                if chosen[0][2]:
+                    server_environment["TERMNAV_PARENT_RELAY"] = chosen[0][2]
+                else:
+                    server_environment.pop("TERMNAV_PARENT_RELAY", None)
             else:
                 server_environment.pop("TERMNAV_PARENT_RELAY", None)
     server = subprocess.Popen(
