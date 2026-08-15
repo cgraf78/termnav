@@ -177,7 +177,11 @@ for _ in {1..50}; do
   [[ -S "$active_socket" ]] && break
   sleep 0.02
 done
-touch -d '2 minutes ago' "$active_socket"
+python3 - "$active_socket" <<'PY'
+import os
+import sys
+os.utime(sys.argv[1], (1, 1))
+PY
 "$relay" sweep
 _assert_eq "relay sweep: removes an old dead owner socket" false "$([[ -e "$stale_socket" ]] && echo true || echo false)"
 _assert_eq "relay sweep: preserves an old active socket" true "$([[ -S "$active_socket" ]] && echo true || echo false)"
