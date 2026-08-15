@@ -20,6 +20,7 @@ from pathlib import Path
 
 PANE_DIRECTIONS = {"left": "L", "down": "D", "up": "U", "right": "R"}
 WINDOW_DIRECTIONS = {"next": "next-window", "previous": "previous-window"}
+MOVE_DIRECTIONS = {"left": "-", "right": "+"}
 SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {"-bind_address", "-cipher", "-config", "-destination", "-escape_char", "-identity_file", "-jump", "-login_name", "-mac_spec", "-option", "-port", "-query_option", "-remote_forward", "-stdio_forward", "-tag", "-tunnel", "-w"}
 
 
@@ -56,7 +57,9 @@ def valid_request(scope: str, direction: str) -> None:
         die(f"invalid pane direction: {direction}")
     if scope == "window" and direction not in WINDOW_DIRECTIONS:
         die(f"invalid window direction: {direction}")
-    if scope not in {"pane", "window"}:
+    if scope == "move" and direction not in MOVE_DIRECTIONS:
+        die(f"invalid move direction: {direction}")
+    if scope not in {"pane", "window", "move"}:
         die(f"invalid navigation scope: {scope}")
 
 
@@ -97,13 +100,27 @@ def route(scope: str, direction: str) -> bool:
                 if selected.returncode == 0:
                     return True
         else:
-            fields = tmux("-S", tmux_socket, "display-message", "-p", "-t", pane, "#{session_id} #{session_windows}")
+            fields = tmux(
+                "-S", tmux_socket, "display-message", "-p", "-t", pane,
+                "#{session_id} #{session_windows} #{window_index} #{base-index}",
+            )
             if fields.returncode == 0:
                 parts = fields.stdout.split()
-                if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 1:
-                    switched = tmux("-S", tmux_socket, WINDOW_DIRECTIONS[direction], "-t", parts[0])
-                    if switched.returncode == 0:
-                        return True
+                if len(parts) == 4 and all(value.isdigit() for value in parts[1:]) and int(parts[1]) > 1:
+                    if scope == "window":
+                        switched = tmux("-S", tmux_socket, WINDOW_DIRECTIONS[direction], "-t", parts[0])
+                        if switched.returncode == 0:
+                            return True
+                    else:
+                        windows, index, base = map(int, parts[1:])
+                        at_boundary = (direction == "left" and index == base) or (
+                            direction == "right" and index == base + windows - 1
+                        )
+                        if at_boundary:
+                            return True
+                        moved = tmux("-S", tmux_socket, "swap-window", "-d", "-t", f":{MOVE_DIRECTIONS[direction]}")
+                        if moved.returncode == 0:
+                            return True
 
     parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
     if parent:
@@ -349,7 +366,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="termnav-relay")
     subparsers = parser.add_subparsers(dest="command", required=True)
     send = subparsers.add_parser("send")
-    send.add_argument("scope", choices=("pane", "window"))
+    send.add_argument("scope", choices=("pane", "window", "move"))
     send.add_argument("direction")
     send.add_argument("--client-pid", type=int)
     send.add_argument("--client-tty")

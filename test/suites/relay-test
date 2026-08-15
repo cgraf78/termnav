@@ -25,11 +25,13 @@ TERMNAV_PARENT_RELAY="$socket" "$relay" send pane left
 TERMNAV_PARENT_RELAY="$socket" "$relay" send pane down
 TERMNAV_PARENT_RELAY="$socket" "$relay" send window next
 TERMNAV_PARENT_RELAY="$socket" "$relay" send window previous
+TERMNAV_PARENT_RELAY="$socket" "$relay" send move left
+TERMNAV_PARENT_RELAY="$socket" "$relay" send move right
 socket_mode="$(stat -c %a "$socket" 2>/dev/null || stat -f %Lp "$socket")"
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
 _assert_eq "relay: accepts every navigation operation" \
-  $'pane left\npane down\nwindow next\nwindow previous' "$(cat "$log")"
+  $'pane left\npane down\nwindow next\nwindow previous\nmove left\nmove right' "$(cat "$log")"
 _assert_eq "relay: owner-only socket permissions" 600 "$socket_mode"
 _assert_eq "relay: removes its local socket on shutdown" false "$([[ -e "$socket" ]] && echo true || echo false)"
 
@@ -65,10 +67,11 @@ for _ in {1..50}; do
 done
 TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send window previous
 TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send pane right
+TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send move left
 kill "$inner_pid" "$outer_pid"
 wait "$inner_pid" "$outer_pid" 2>/dev/null || true
 _assert_eq "relay: two arbitrary hops preserve forward and reverse operations" \
-  $'window previous\npane right' "$(cat "$chain_log")"
+  $'window previous\npane right\nmove left' "$(cat "$chain_log")"
 
 malformed_socket="$tmp/malformed.sock"
 malformed_log="$tmp/malformed.log"
