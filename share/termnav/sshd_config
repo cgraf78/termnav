@@ -1,0 +1,3 @@
+# Permit the single non-secret routing address used by nested SSH clients.
+# Install as an sshd_config.d fragment on hosts that participate in relaying.
+AcceptEnv TERMNAV_PARENT_RELAY
