@@ -8,18 +8,6 @@
 # shellcheck disable=SC2034 # public marker for callers that verify the loader ran.
 TERMNAV_SHELL_LOADED=1
 
-# Enhance only ordinary interactive SSH logins. Explicit remote commands pass
-# through unchanged, and the wrapper performs exactly one SSH invocation, so
-# authentication and hardware-token prompts are never duplicated.
-ssh() {
-  command termnav-relay ssh "$@"
-}
-
-# OpenSSH leaves the pathname of a closed remote StreamLocal forward behind.
-# Remove only old, owner-held sockets that no longer have a listener; active
-# connections, young bind races, symlinks, and unrelated files are untouched.
-command termnav-relay sweep >/dev/null 2>&1 || true
-
 # Prompt hooks share this cache in the current shell. Re-sourcing the integration
 # intentionally refreshes it, matching the low-level tmux-client cache.
 _termnav_wezterm_remote_link_host_cache_set=0

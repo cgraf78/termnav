@@ -35,7 +35,6 @@ program	test/suites/manpage-test
 program	test/suites/nvim-launcher-test
 program	test/suites/nvim-test
 program	test/suites/remote-test
-program	test/suites/relay-test
 program	test/suites/shell-test
 program	test/suites/tab-switch-test
 program	test/suites/tmux-test

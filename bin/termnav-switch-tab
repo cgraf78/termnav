@@ -353,13 +353,6 @@ _is_uint "$CLIENT_PID" || _die "--client-pid must be a process id"
 [[ -n "$CLIENT_TTY" ]] || _die "--client-tty is required"
 [[ -n "$CLIENT_TERMTYPE" ]] || _die "--client-termtype is required"
 
-# A forwarded SSH relay owns the nearest remote parent. If it is absent or
-# stale, retain the local nested-tmux and terminal-specific compatibility path.
-if "$script_dir/termnav-relay" send window "$direction" \
-  --client-pid "$CLIENT_PID" --client-tty "$CLIENT_TTY" 2>/dev/null; then
-  exit 0
-fi
-
 visited="|"
 for _depth in 1 2 3 4 5 6 7 8; do
   if _parent_scope "$CLIENT_PID"; then
