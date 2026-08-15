@@ -211,7 +211,8 @@ def serve(path: str) -> int:
 def sweep() -> int:
     """Remove only old, owner-held relay sockets that no longer listen."""
     now = time.time()
-    for entry in Path("/tmp").glob("termnav-relay-*.sock"):
+    roots = {Path("/tmp"), Path(tempfile.gettempdir())}
+    for entry in (entry for root in roots for entry in root.glob("termnav-relay-*.sock")):
         try:
             info = entry.lstat()
             if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or now - info.st_mtime < 60:

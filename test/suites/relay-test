@@ -239,10 +239,11 @@ tmux -L "$tmux_socket_name" kill-server
 
 echo
 echo "=== stale socket cleanup ==="
-stale_socket="/tmp/termnav-relay-test-stale-$$.sock"
-active_socket="/tmp/termnav-relay-test-active-$$.sock"
-unrelated_file="/tmp/termnav-relay-test-file-$$.sock"
-symlink_path="/tmp/termnav-relay-test-link-$$.sock"
+portable_tmp=$(python3 -c 'import tempfile; print(tempfile.gettempdir())')
+stale_socket="$portable_tmp/termnav-relay-test-stale-$$.sock"
+active_socket="$portable_tmp/termnav-relay-test-active-$$.sock"
+unrelated_file="$portable_tmp/termnav-relay-test-file-$$.sock"
+symlink_path="$portable_tmp/termnav-relay-test-link-$$.sock"
 python3 - "$stale_socket" <<'PY'
 import os
 import socket
