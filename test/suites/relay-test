@@ -157,6 +157,55 @@ kill "$negative_pid"
 wait "$negative_pid" 2>/dev/null || true
 
 echo
+echo "=== real tmux window movement ==="
+tmux_socket_name="termnav-relay-test-$$"
+tmux -L "$tmux_socket_name" -f /dev/null new-session -d -s target -n first
+tmux_socket_path=$(tmux -L "$tmux_socket_name" display-message -p '#{socket_path}')
+tmux -L "$tmux_socket_name" new-window -d -t target:3 -n middle
+tmux -L "$tmux_socket_name" new-window -d -t target:7 -n last
+tmux -L "$tmux_socket_name" new-session -d -s unrelated -n other-first
+tmux -L "$tmux_socket_name" new-window -d -t unrelated:9 -n other-last
+middle_pane=$(tmux -L "$tmux_socket_name" display-message -p -t target:3 '#{pane_id}')
+first_pane=$(tmux -L "$tmux_socket_name" display-message -p -t target:0 '#{pane_id}')
+last_pane=$(tmux -L "$tmux_socket_name" display-message -p -t target:7 '#{pane_id}')
+move_socket="$tmp/move.sock"
+TMUX="$tmux_socket_path,0,0" TMUX_PANE="$middle_pane" "$relay" serve --socket "$move_socket" &
+move_pid=$!
+for _ in {1..50}; do
+  [[ -S "$move_socket" ]] && break
+  sleep 0.02
+done
+TERMNAV_PARENT_RELAY="$move_socket" "$relay" send move left
+_assert_eq "relay move: left targets the captured pane's gapped-index session" \
+  $'middle\nfirst\nlast' "$(tmux -L "$tmux_socket_name" list-windows -t target -F '#{window_name}')"
+_assert_eq "relay move: leaves another session on the same server untouched" \
+  $'other-first\nother-last' "$(tmux -L "$tmux_socket_name" list-windows -t unrelated -F '#{window_name}')"
+TERMNAV_PARENT_RELAY="$move_socket" "$relay" send move right
+_assert_eq "relay move: right symmetrically restores a non-boundary window" \
+  $'first\nmiddle\nlast' "$(tmux -L "$tmux_socket_name" list-windows -t target -F '#{window_name}')"
+kill "$move_pid"
+wait "$move_pid" 2>/dev/null || true
+
+for boundary_pane in "$first_pane" "$last_pane"; do
+  boundary_socket="$tmp/boundary-${boundary_pane#%}.sock"
+  TMUX="$tmux_socket_path,0,0" TMUX_PANE="$boundary_pane" \
+    "$relay" serve --socket "$boundary_socket" &
+  boundary_pid=$!
+  for _ in {1..50}; do
+    [[ -S "$boundary_socket" ]] && break
+    sleep 0.02
+  done
+  boundary_direction=left
+  [[ "$boundary_pane" == "$last_pane" ]] && boundary_direction=right
+  TERMNAV_PARENT_RELAY="$boundary_socket" "$relay" send move "$boundary_direction"
+  kill "$boundary_pid"
+  wait "$boundary_pid" 2>/dev/null || true
+done
+_assert_eq "relay move: gapped first and last boundaries are no-ops" \
+  $'first\nmiddle\nlast' "$(tmux -L "$tmux_socket_name" list-windows -t target -F '#{window_name}')"
+tmux -L "$tmux_socket_name" kill-server
+
+echo
 echo "=== stale socket cleanup ==="
 stale_socket="/tmp/termnav-relay-test-stale-$$.sock"
 active_socket="/tmp/termnav-relay-test-active-$$.sock"

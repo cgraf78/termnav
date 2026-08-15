@@ -102,23 +102,35 @@ def route(scope: str, direction: str) -> bool:
         else:
             fields = tmux(
                 "-S", tmux_socket, "display-message", "-p", "-t", pane,
-                "#{session_id} #{session_windows} #{window_index} #{base-index}",
+                "#{session_id} #{session_windows} #{window_id}",
             )
             if fields.returncode == 0:
                 parts = fields.stdout.split()
-                if len(parts) == 4 and all(value.isdigit() for value in parts[1:]) and int(parts[1]) > 1:
+                if len(parts) == 3 and parts[1].isdigit() and int(parts[1]) > 1:
                     if scope == "window":
                         switched = tmux("-S", tmux_socket, WINDOW_DIRECTIONS[direction], "-t", parts[0])
                         if switched.returncode == 0:
                             return True
                     else:
-                        windows, index, base = map(int, parts[1:])
-                        at_boundary = (direction == "left" and index == base) or (
-                            direction == "right" and index == base + windows - 1
+                        listed = tmux(
+                            "-S", tmux_socket, "list-windows", "-t", parts[0],
+                            "-F", "#{window_id}",
                         )
-                        if at_boundary:
+                        window_ids = listed.stdout.split()
+                        if listed.returncode != 0 or parts[2] not in window_ids:
+                            return False
+                        source_index = window_ids.index(parts[2])
+                        target_index = source_index + (-1 if direction == "left" else 1)
+                        if target_index < 0 or target_index >= len(window_ids):
                             return True
-                        moved = tmux("-S", tmux_socket, "swap-window", "-d", "-t", f":{MOVE_DIRECTIONS[direction]}")
+                        # Both endpoints are stable IDs so another client's current
+                        # session cannot redirect the mutation between discovery and
+                        # execution. list-windows order defines adjacency even when
+                        # window indexes are intentionally sparse.
+                        moved = tmux(
+                            "-S", tmux_socket, "swap-window", "-d",
+                            "-s", parts[2], "-t", window_ids[target_index],
+                        )
                         if moved.returncode == 0:
                             return True
 
