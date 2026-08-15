@@ -368,4 +368,67 @@ ssh_rc=$?
 set -e
 _assert_exit "ssh relay: preserves the original SSH failure" 37 "$ssh_rc"
 
+echo
+echo "=== directive store ==="
+export XDG_RUNTIME_DIR="$tmp/xdg"
+fake_tmux_socket="$tmp/fake-tmux-sock"
+# Nonce validation: reject traversal/non-hex via arm-test
+_assert_eq "directive: reject bad nonce" "" "$(
+  "$relay" arm-test --tmux-socket "$fake_tmux_socket" --json '{"v":2,"nonce":"../bad","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'"}' 2>&1 || true
+  find "$tmp/xdg" -name "*.json" 2>/dev/null | head -1
+)"
+"$relay" arm-test --tmux-socket "$fake_tmux_socket" \
+  --json '{"v":2,"nonce":"abc123abc123","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/1","local_client_pid":111,"seq":1}'
+directive_file=$(find "$tmp/xdg/termnav-$(id -u)" -name 'abc123abc123.json')
+_assert_eq "directive: file is owner-only" 600 "$(stat -c %a "$directive_file" 2>/dev/null || stat -f %Lp "$directive_file")"
+first_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
+second_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
+_assert_contains "directive: claim returns the armed directive" '"nonce":"abc123abc123"' "$first_claim"
+_assert_eq "directive: a directive can be claimed exactly once" "" "$second_claim"
+# Per-client seq-ordered FIFO: arm bbb then aaa (reverse lexicographic) but seq orders by arm time
+"$relay" arm-test --tmux-socket "$fake_tmux_socket" \
+  --json '{"v":2,"nonce":"bbbbbbbbbbbb","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/1","local_client_pid":111,"seq":2}'
+"$relay" arm-test --tmux-socket "$fake_tmux_socket" \
+  --json '{"v":2,"nonce":"aaaaaaaaaaaa","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/1","local_client_pid":111,"seq":3}'
+fifo_first=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
+fifo_second=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
+_assert_contains "directive: FIFO by seq not lexicographic (bbb first)" '"nonce":"bbbbbbbbbbbb"' "$fifo_first"
+_assert_contains "directive: FIFO second is aaa" '"nonce":"aaaaaaaaaaaa"' "$fifo_second"
+# Per-client isolation: claim-client filters
+"$relay" arm-test --tmux-socket "$fake_tmux_socket" \
+  --json '{"v":2,"nonce":"cccccccccccc","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/2","local_client_pid":222,"seq":4}'
+cross_client=$("$relay" claim-client-test --tmux-socket "$fake_tmux_socket" --client-tty /dev/pts/1 --client-pid 111)
+_assert_eq "directive: per-client claim does not cross" "" "$cross_client"
+# Concurrent _next_seq: arm without explicit seq, letting arm-test assign via _next_seq under flock; two parallel arms must get distinct monotonic seqs (fixes #5)
+# arm-test when seq missing auto-assigns via _next_seq(tmux_socket) under .directives.lock (same lock as production)
+(
+  "$relay" arm-test --tmux-socket "$fake_tmux_socket" \
+    --json '{"v":2,"nonce":"eeeeeeeeeeee","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/1","local_client_pid":111}' &
+  "$relay" arm-test --tmux-socket "$fake_tmux_socket" \
+    --json '{"v":2,"nonce":"ffffffffffff","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/1","local_client_pid":111}' &
+  wait
+)
+# Both files must exist (no last-wins) and have distinct seqs ordered by flock; also test restart monotonicity
+seq_e=$(python3 -c "import json; print(json.load(open(\"$tmp/xdg/termnav-$(id -u)/directives/$(echo -n "$fake_tmux_socket" | sha256sum | cut -c1-12)/eeeeeeeeeeee.json\"))['seq'])")
+seq_f=$(python3 -c "import json; print(json.load(open(\"$tmp/xdg/termnav-$(id -u)/directives/$(echo -n "$fake_tmux_socket" | sha256sum | cut -c1-12)/ffffffffffff.json\"))['seq'])")
+if [ "$seq_e" = "$seq_f" ]; then
+  echo "FAIL seq duplicate $seq_e"
+  exit 1
+fi
+# Do not assume E before F ordering (flock acquisition is nondeterministic); just verify distinct and both < next_seq
+# Restart monotonicity: must exceed both concurrent values (max), not just seq_f (fixes Codex v15 #2)
+next_seq=$("$relay" next-seq-test --tmux-socket "$fake_tmux_socket")
+max_seq=$([ "$seq_e" -gt "$seq_f" ] && echo "$seq_e" || echo "$seq_f")
+if [ "$next_seq" -le "$max_seq" ]; then
+  echo "FAIL next_seq not monotonic after restart $next_seq <= max($seq_e,$seq_f)=$max_seq"
+  exit 1
+fi
+# Expiry isolated on fresh socket so cccc/eeee/ffff do not mask the expired entry (fixes Codex v13 #3)
+fake_tmux_socket_exp="$tmp/fake-tmux-sock-exp"
+"$relay" arm-test --tmux-socket "$fake_tmux_socket_exp" \
+  --json '{"v":2,"nonce":"dddddddddddd","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket_exp"'","local_client_tty":"/dev/pts/1","local_client_pid":111,"seq":9,"expires_override":1}'
+_assert_eq "directive: expired directives cannot be claimed" "" \
+  "$("$relay" claim-test --tmux-socket "$fake_tmux_socket_exp")"
+unset XDG_RUNTIME_DIR
+
 _test_summary

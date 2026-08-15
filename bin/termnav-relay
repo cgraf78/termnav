@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -19,6 +21,8 @@ import time
 from pathlib import Path
 
 PANE_DIRECTIONS = {"left": "L", "down": "D", "up": "U", "right": "R"}
+COMMIT_KEY = b"\x1b[777009u"
+DIRECTIVE_TTL = 6
 WINDOW_DIRECTIONS = {"next": "next-window", "previous": "previous-window"}
 MOVE_DIRECTIONS = {"left": "-", "right": "+"}
 SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {"-bind_address", "-cipher", "-config", "-destination", "-escape_char", "-identity_file", "-jump", "-login_name", "-mac_spec", "-option", "-port", "-query_option", "-remote_forward", "-stdio_forward", "-tag", "-tunnel", "-w"}
@@ -27,6 +31,349 @@ SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {"-bind_address", "-cipher", 
 def die(message: str) -> "NoReturn":
     print(f"termnav-relay: {message}", file=sys.stderr)
     raise SystemExit(2)
+
+
+def runtime_dir() -> Path:
+    """Return the owner-only runtime dir, creating it with 0700."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    path = Path(base) / f"termnav-{os.getuid()}"
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        die(f"cannot create runtime dir {path}: {exc}")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        die(f"cannot stat runtime dir {path}: {exc}")
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        die(f"refusing to use unsafe runtime dir: {path}")
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    return path
+
+
+def directive_dir(tmux_socket: str) -> Path:
+    """Return the per-socket directive dir: $RUNTIME/directives/<hash>/ ."""
+    digest = hashlib.sha256(tmux_socket.encode()).hexdigest()[:12]
+    ddir = runtime_dir() / "directives" / digest
+    try:
+        ddir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        die(f"cannot create directive dir {ddir}: {exc}")
+    try:
+        os.chmod(ddir, 0o700)
+        os.chmod(ddir.parent, 0o700)
+    except OSError:
+        pass
+    return ddir
+
+
+def directive_path(tmux_socket: str, nonce: str) -> Path:
+    """Return the per-nonce directive file path."""
+    return directive_dir(tmux_socket) / f"{nonce}.json"
+
+
+def _is_valid_directive(d: dict) -> bool:
+    """Full schema validation before claim/exec: common + action-specific."""
+    try:
+        if not (
+            isinstance(d, dict)
+            and d.get("v") == 2
+            and re.fullmatch(r"[0-9a-f]{12}", d.get("nonce", ""))
+            and isinstance(d.get("seq"), int)
+            and d.get("action") in ("execute", "forward")
+            and isinstance(d.get("expires"), (int, float))
+            and isinstance(d.get("local_client_tty"), str)
+            and isinstance(d.get("local_client_pid"), int)
+            and isinstance(d.get("tmux_socket"), str)
+        ):
+            return False
+        if d["action"] == "execute":
+            valid_dirs = {
+                "pane": {"left", "down", "up", "right"},
+                "window": {"left", "right"},
+                "move": {"left", "right"},
+            }.get(d.get("scope"), set())
+            return (
+                isinstance(d.get("session"), str)
+                and isinstance(d.get("expected_pane"), str)
+                and isinstance(d.get("target_pane"), str)
+                and d.get("direction") in valid_dirs
+            )
+        else:  # forward
+            return isinstance(d.get("forward_pane"), str) and d.get(
+                "forward_pane"
+            ).startswith("%")
+    except Exception:
+        return False
+    return True
+
+
+def _load_directive(path: Path) -> dict | None:
+    """Load and claim a directive; must be called with .directives.lock held."""
+    claimed = path.with_name(path.name + f".claimed-{os.getpid()}")
+    try:
+        os.rename(path, claimed)
+    except OSError:
+        return None
+    try:
+        directive = json.loads(claimed.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        directive = None
+    try:
+        claimed.unlink()
+    except OSError:
+        pass
+    if not _is_valid_directive(directive):
+        return None
+    try:
+        if float(directive.get("expires", 0)) < time.time():
+            return None
+    except (TypeError, ValueError):
+        return None
+    return directive
+
+
+def _next_seq(tmux_socket: str) -> int:
+    """File-locked per-socket monotonic counter via .directives.lock."""
+    import fcntl
+
+    ddir = directive_dir(tmux_socket)
+    lock_path = ddir / ".directives.lock"
+    seq_path = ddir / ".seq"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            raw = seq_path.read_text(encoding="utf-8").strip()
+            cur = int(raw) if raw else 0
+        except (OSError, ValueError):
+            cur = 0
+        nxt = cur + 1
+        tmp = seq_path.with_name(seq_path.name + ".tmp")
+        try:
+            tmp.write_text(str(nxt), encoding="utf-8")
+            with open(tmp, "rb") as tf:
+                os.fsync(tf.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, seq_path)
+            try:
+                os.chmod(seq_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return nxt
+
+
+def arm_directive(directive: dict) -> None:
+    """Atomic publish under shared per-socket flock via temp+fsync+os.link."""
+    if not isinstance(directive, dict):
+        raise ValueError("directive must be a dict")
+    nonce = directive.get("nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        raise ValueError(f"invalid nonce: {nonce!r}")
+    seq = directive.get("seq")
+    if not isinstance(seq, int):
+        raise ValueError("missing or invalid seq")
+    ltty = directive.get("local_client_tty")
+    if not isinstance(ltty, str):
+        raise ValueError("missing local_client_tty")
+    lpid = directive.get("local_client_pid")
+    if not isinstance(lpid, int):
+        raise ValueError("missing local_client_pid")
+    tmux_socket = directive.get("tmux_socket")
+    if not isinstance(tmux_socket, str) or not tmux_socket:
+        raise ValueError("missing tmux_socket")
+    # expires handling: test hook expires_override verbatim, else now+TTL
+    if "expires_override" in directive:
+        try:
+            directive["expires"] = float(directive.pop("expires_override"))
+        except (TypeError, ValueError):
+            directive["expires"] = time.time() + DIRECTIVE_TTL
+    else:
+        directive["expires"] = time.time() + DIRECTIVE_TTL
+
+    import fcntl
+
+    ddir = directive_dir(tmux_socket)
+    lock_path = ddir / ".directives.lock"
+    final = directive_path(tmux_socket, nonce)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        # temp file in same dir
+        tmp = ddir / f".tmp-{nonce}-{os.getpid()}-{secrets.token_hex(4)}.json"
+        payload = json.dumps(directive, separators=(",", ":"), sort_keys=True)
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            with open(tmp, "rb") as tf:
+                os.fsync(tf.fileno())
+            os.chmod(tmp, 0o600)
+            try:
+                os.link(tmp, final)
+            except FileExistsError:
+                raise FileExistsError(f"directive already exists: {nonce}")
+            try:
+                os.chmod(final, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        try:
+            os.chmod(ddir, 0o700)
+        except OSError:
+            pass
+
+
+def mark_committed(tmux_socket: str, nonce: str) -> bool:
+    """Atomically extend expires to max(existing, now+2s) under .directives.lock."""
+    if not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        return False
+    import fcntl
+
+    ddir = directive_dir(tmux_socket)
+    lock_path = ddir / ".directives.lock"
+    path = directive_path(tmux_socket, nonce)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        try:
+            existing = float(data.get("expires", 0))
+        except (TypeError, ValueError):
+            existing = 0
+        new_expires = max(existing, time.time() + 2)
+        data["expires"] = new_expires
+        tmp = path.with_name(f".tmp-mark-{nonce}-{os.getpid()}.json")
+        payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            with open(tmp, "rb") as tf:
+                os.fsync(tf.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return True
+
+
+def claim_directive(tmux_socket: str) -> dict | None:
+    """Backward-compat no-client variant: seq-ordered across all clients (tests only)."""
+    import fcntl
+
+    lock_path = directive_dir(tmux_socket) / ".directives.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        ddir = directive_dir(tmux_socket)
+        try:
+            candidates = list(ddir.glob("*.json"))
+        except OSError:
+            return None
+        ordered = []
+        for p in candidates:
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                ordered.append((int(raw.get("seq", 1 << 60)), p))
+            except (OSError, ValueError):
+                ordered.append((1 << 60, p))
+        ordered.sort(key=lambda x: x[0])
+        for _, path in ordered:
+            d = _load_directive(path)
+            if d is not None:
+                return d
+        return None
+
+
+def claim_directive_nonce(tmux_socket: str, nonce: str) -> dict | None:
+    """Exact-nonce claim for error-path cleanup (validates nonce)."""
+    if not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        return None
+    import fcntl
+
+    lock_path = directive_dir(tmux_socket) / ".directives.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        return _load_directive(directive_path(tmux_socket, nonce))
+
+
+def claim_directive_for_client(
+    tmux_socket: str, client_tty: str, client_pid: int
+) -> dict | None:
+    """Per-client FIFO by seq; validates tty char device + list-clients."""
+    import fcntl
+    import stat as statmod
+
+    lock_path = directive_dir(tmux_socket) / ".directives.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
+        try:
+            st = os.stat(client_tty)
+            if not statmod.S_ISCHR(st.st_mode):
+                return None
+        except OSError:
+            return None
+    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
+        try:
+            listed = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
+            if listed.returncode != 0:
+                return None
+            valid = False
+            for line in listed.stdout.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == client_tty and parts[1] == str(client_pid):
+                    valid = True
+                    break
+            if not valid:
+                return None
+        except OSError:
+            return None
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        ddir = directive_dir(tmux_socket)
+        try:
+            candidates = list(ddir.glob("*.json"))
+        except OSError:
+            return None
+        filtered = []
+        for p in candidates:
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8"))
+                if raw.get("local_client_tty") == client_tty and int(
+                    raw.get("local_client_pid", -1)
+                ) == int(client_pid):
+                    filtered.append((int(raw.get("seq", 1 << 60)), p))
+            except (OSError, ValueError, TypeError):
+                continue
+        filtered.sort(key=lambda x: x[0])
+        for _, path in filtered:
+            d = _load_directive(path)
+            if d is not None:
+                if d.get("tmux_socket") != tmux_socket:
+                    continue
+                return d
+        return None
 
 
 def process_env(pid: int, name: str) -> str | None:
@@ -300,12 +647,7 @@ def ssh_command(arguments: list[str]) -> int:
     if request_tty == "no" or (request_tty == "auto" and not stdin_tty and not explicit_tty):
         return subprocess.run([binary, *arguments], check=False).returncode
 
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / f"termnav-{os.getuid()}"
-    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
-    runtime_info = runtime.lstat()
-    if not stat.S_ISDIR(runtime_info.st_mode) or runtime_info.st_uid != os.getuid():
-        return subprocess.run([binary, *arguments], check=False).returncode
-    os.chmod(runtime, 0o700)
+    runtime = runtime_dir()
     token = secrets.token_hex(12)
     local_socket = runtime / f"relay-{token}.sock"
     remote_socket = f"/tmp/termnav-relay-{token}.sock"
@@ -396,6 +738,24 @@ def main() -> int:
     server = subparsers.add_parser("serve")
     server.add_argument("--socket", required=True)
     subparsers.add_parser("sweep")
+    # test-only hidden subcommands for directive store
+    arm_test = subparsers.add_parser("arm-test")
+    arm_test.add_argument("--tmux-socket", required=True)
+    arm_test.add_argument("--json", required=True, dest="json_payload")
+    claim_test = subparsers.add_parser("claim-test")
+    claim_test.add_argument("--tmux-socket", required=True)
+    claim_nonce_test = subparsers.add_parser("claim-nonce-test")
+    claim_nonce_test.add_argument("--tmux-socket", required=True)
+    claim_nonce_test.add_argument("--nonce", required=True)
+    claim_client_test = subparsers.add_parser("claim-client-test")
+    claim_client_test.add_argument("--tmux-socket", required=True)
+    claim_client_test.add_argument("--client-tty", required=True)
+    claim_client_test.add_argument("--client-pid", required=True, type=int)
+    next_seq_test = subparsers.add_parser("next-seq-test")
+    next_seq_test.add_argument("--tmux-socket", required=True)
+    mark_committed_test = subparsers.add_parser("mark-committed-test")
+    mark_committed_test.add_argument("--tmux-socket", required=True)
+    mark_committed_test.add_argument("--nonce", required=True)
     args = parser.parse_args()
 
     if args.command == "send":
@@ -418,6 +778,56 @@ def main() -> int:
         return serve(args.socket)
     if args.command == "sweep":
         return sweep()
+    # test-only: directive store helpers
+    if args.command == "arm-test":
+        try:
+            directive = json.loads(args.json_payload)
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"termnav-relay: invalid json: {exc}", file=sys.stderr)
+            return 1
+        # auto-assign seq if missing via file-locked _next_seq
+        if "seq" not in directive:
+            try:
+                directive["seq"] = _next_seq(args.tmux_socket)
+            except OSError as exc:
+                print(f"termnav-relay: cannot assign seq: {exc}", file=sys.stderr)
+                return 1
+        # ensure tmux_socket matches the caller's socket if not provided
+        if "tmux_socket" not in directive:
+            directive["tmux_socket"] = args.tmux_socket
+        try:
+            arm_directive(directive)
+        except (ValueError, FileExistsError, OSError):
+            return 1
+        return 0
+    if args.command == "claim-test":
+        result = claim_directive(args.tmux_socket)
+        if result is not None:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        return 0
+    if args.command == "claim-nonce-test":
+        result = claim_directive_nonce(args.tmux_socket, args.nonce)
+        if result is not None:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        return 0
+    if args.command == "claim-client-test":
+        result = claim_directive_for_client(
+            args.tmux_socket, args.client_tty, int(args.client_pid)
+        )
+        if result is not None:
+            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        return 0
+    if args.command == "next-seq-test":
+        try:
+            nxt = _next_seq(args.tmux_socket)
+            print(nxt)
+        except OSError as exc:
+            print(f"termnav-relay: next-seq failed: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if args.command == "mark-committed-test":
+        ok = mark_committed(args.tmux_socket, args.nonce)
+        return 0 if ok else 1
     return 2
 
 
