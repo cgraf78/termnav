@@ -91,9 +91,9 @@ def route(scope: str, direction: str) -> bool:
     tmux_value = os.environ.get("TMUX", "")
     pane = os.environ.get("TMUX_PANE", "")
     session = os.environ.get("TERMNAV_TMUX_SESSION", "")
-    if tmux_value and pane:
+    if tmux_value and pane and session:
         tmux_socket = tmux_value.rsplit(",", 2)[0]
-        target_pane = f"{session}:.{pane}" if session else pane
+        target_pane = f"{session}:.{pane}"
         if scope == "pane":
             edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
             edge = tmux("-S", tmux_socket, "display-message", "-p", "-t", target_pane, f"#{{{edge_name}}}")
@@ -314,6 +314,7 @@ def ssh_command(arguments: list[str]) -> int:
     # environment (which is shared and last-attacher-wins).
     if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
         server_environment.pop("TERMNAV_TMUX_SESSION", None)
+        server_environment.pop("TERMNAV_PARENT_RELAY", None)
         clients = subprocess.run(
             ["tmux", "list-clients", "-F", "#{client_activity}\t#{client_pid}\t#{client_tty}\t#{pane_id}\t#{client_flags}\t#{session_id}"],
             text=True, capture_output=True, check=False,

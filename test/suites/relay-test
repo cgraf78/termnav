@@ -209,6 +209,32 @@ for boundary_pane in "$first_pane" "$last_pane"; do
 done
 _assert_eq "relay move: gapped first and last boundaries are no-ops" \
   $'first\nmiddle\nlast' "$(tmux -L "$tmux_socket_name" list-windows -t target -F '#{window_name}')"
+
+ambiguous_log="$tmp/ambiguous.log"
+ambiguous_parent_socket="$tmp/ambiguous-parent.sock"
+ambiguous_socket="$tmp/ambiguous.sock"
+TERMNAV_RELAY_TEST_LOG="$ambiguous_log" \
+  "$relay" serve --socket "$ambiguous_parent_socket" &
+ambiguous_parent_pid=$!
+for _ in {1..50}; do
+  [[ -S "$ambiguous_parent_socket" ]] && break
+  sleep 0.02
+done
+TMUX="$tmux_socket_path,0,0" TMUX_PANE="$middle_pane" \
+  TERMNAV_PARENT_RELAY="$ambiguous_parent_socket" \
+  "$relay" serve --socket "$ambiguous_socket" &
+ambiguous_pid=$!
+for _ in {1..50}; do
+  [[ -S "$ambiguous_socket" ]] && break
+  sleep 0.02
+done
+TERMNAV_PARENT_RELAY="$ambiguous_socket" "$relay" send move left
+_assert_eq "relay move: missing client session fails closed and forwards" \
+  "move left" "$(cat "$ambiguous_log")"
+_assert_eq "relay move: missing client session cannot mutate a linked pane" \
+  $'first\nmiddle\nlast' "$(tmux -L "$tmux_socket_name" list-windows -t target -F '#{window_name}')"
+kill "$ambiguous_pid" "$ambiguous_parent_pid"
+wait "$ambiguous_pid" "$ambiguous_parent_pid" 2>/dev/null || true
 tmux -L "$tmux_socket_name" kill-server
 
 echo
