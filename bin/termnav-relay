@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Carry navigation requests across arbitrarily nested interactive SSH hops."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+PANE_DIRECTIONS = {"left": "L", "down": "D", "up": "U", "right": "R"}
+WINDOW_DIRECTIONS = {"next": "next-window", "previous": "previous-window"}
+SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {"-bind_address", "-cipher", "-config", "-destination", "-escape_char", "-identity_file", "-jump", "-login_name", "-mac_spec", "-option", "-port", "-query_option", "-remote_forward", "-stdio_forward", "-tag", "-tunnel", "-w"}
+
+
+def die(message: str) -> "NoReturn":
+    print(f"termnav-relay: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def process_env(pid: int, name: str) -> str | None:
+    proc_readable = True
+    try:
+        data = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        proc_readable = False
+        data = b""
+    prefix = name.encode() + b"="
+    for entry in data.split(b"\0"):
+        if entry.startswith(prefix):
+            return entry[len(prefix) :].decode(errors="strict")
+    if proc_readable:
+        return None
+    try:
+        output = subprocess.run(["ps", "eww", "-p", str(pid), "-o", "command="], text=True, capture_output=True, check=False).stdout
+    except OSError:
+        return None
+    for entry in output.split():
+        if entry.startswith(f"{name}="):
+            return entry.split("=", 1)[1]
+    return None
+
+
+def valid_request(scope: str, direction: str) -> None:
+    if scope == "pane" and direction not in PANE_DIRECTIONS:
+        die(f"invalid pane direction: {direction}")
+    if scope == "window" and direction not in WINDOW_DIRECTIONS:
+        die(f"invalid window direction: {direction}")
+    if scope not in {"pane", "window"}:
+        die(f"invalid navigation scope: {scope}")
+
+
+def send_request(path: str, scope: str, direction: str) -> bool:
+    payload = json.dumps({"v": 1, "scope": scope, "direction": direction}, separators=(",", ":")) + "\n"
+    try:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2.0)
+            client.connect(path)
+            client.sendall(payload.encode())
+            return client.recv(1) == b"1"
+    except OSError:
+        return False
+
+
+def tmux(*args: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.pop("TMUX", None)
+    return subprocess.run(["tmux", *args], env=environment, text=True, capture_output=True, check=False)
+
+
+def route(scope: str, direction: str) -> bool:
+    test_log = os.environ.get("TERMNAV_RELAY_TEST_LOG")
+    if test_log:
+        with open(test_log, "a", encoding="utf-8") as output:
+            output.write(f"{scope} {direction}\n")
+        return True
+
+    tmux_value = os.environ.get("TMUX", "")
+    pane = os.environ.get("TMUX_PANE", "")
+    if tmux_value and pane:
+        tmux_socket = tmux_value.rsplit(",", 2)[0]
+        if scope == "pane":
+            edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
+            edge = tmux("-S", tmux_socket, "display-message", "-p", "-t", pane, f"#{{{edge_name}}}")
+            if edge.returncode == 0 and edge.stdout.strip() == "0":
+                selected = tmux("-S", tmux_socket, "select-pane", "-t", pane, f"-{PANE_DIRECTIONS[direction]}")
+                if selected.returncode == 0:
+                    return True
+        else:
+            fields = tmux("-S", tmux_socket, "display-message", "-p", "-t", pane, "#{session_id} #{session_windows}")
+            if fields.returncode == 0:
+                parts = fields.stdout.split()
+                if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) > 1:
+                    switched = tmux("-S", tmux_socket, WINDOW_DIRECTIONS[direction], "-t", parts[0])
+                    if switched.returncode == 0:
+                        return True
+
+    parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+    if parent:
+        return send_request(parent, scope, direction)
+    return False
+
+
+def serve(path: str) -> int:
+    socket_path = Path(path)
+    socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if socket_path.exists() or socket_path.is_socket():
+        try:
+            mode = socket_path.lstat().st_mode
+            if stat.S_ISSOCK(mode) and socket_path.parent.stat().st_uid == os.getuid():
+                socket_path.unlink()
+            else:
+                die(f"refusing to replace unsafe socket path: {path}")
+        except FileNotFoundError:
+            pass
+    server = socket.socket(socket.AF_UNIX)
+    old_umask = os.umask(0o177)
+    try:
+        server.bind(path)
+    finally:
+        os.umask(old_umask)
+    os.chmod(path, 0o600)
+    server.listen(8)
+    stopping = False
+
+    def stop(_signum: int, _frame: object) -> None:
+        nonlocal stopping
+        stopping = True
+        server.close()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    def handle(connection: socket.socket) -> None:
+        with connection:
+            connection.settimeout(0.25)
+            try:
+                raw = b""
+                while b"\n" not in raw and len(raw) <= 256:
+                    chunk = connection.recv(257 - len(raw))
+                    if not chunk:
+                        break
+                    raw += chunk
+                if len(raw) > 256 or not raw.endswith(b"\n"):
+                    return
+                request = json.loads(raw)
+                if set(request) != {"v", "scope", "direction"} or request["v"] != 1:
+                    return
+                valid_request(request["scope"], request["direction"])
+                handled = route(request["scope"], request["direction"])
+                connection.sendall(b"1" if handled else b"0")
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, SystemExit):
+                return
+
+    while not stopping:
+        try:
+            connection, _ = server.accept()
+        except OSError:
+            break
+        threading.Thread(target=handle, args=(connection,), daemon=True).start()
+    server.close()
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def sweep() -> int:
+    """Remove only old, owner-held relay sockets that no longer listen."""
+    now = time.time()
+    for entry in Path("/tmp").glob("termnav-relay-*.sock"):
+        try:
+            info = entry.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or now - info.st_mtime < 60:
+                continue
+            probe = socket.socket(socket.AF_UNIX)
+            probe.settimeout(0.1)
+            result = probe.connect_ex(str(entry))
+            probe.close()
+            if result != 0:
+                entry.unlink()
+        except OSError:
+            continue
+    return 0
+
+
+def ssh_destination_end(arguments: list[str]) -> tuple[int | None, int | None]:
+    destination = None
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--":
+            index += 1
+            destination = index if index < len(arguments) else None
+            break
+        if not value.startswith("-") or value == "-":
+            destination = index
+            break
+        option = value[:2]
+        if option in {"-V", "-v", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T", "-t", "-X", "-x", "-Y", "-y", "-4", "-6"}:
+            index += 1
+        elif len(value) > 2 and option in {f"-{letter}" for letter in SSH_VALUE_OPTIONS if len(letter) == 1}:
+            index += 1
+        elif option[1:] in SSH_VALUE_OPTIONS or value in SSH_VALUE_OPTIONS:
+            index += 2
+        else:
+            return None, None
+    if destination is None:
+        return None, None
+    return destination, destination + 1
+
+
+def ssh_command(arguments: list[str]) -> int:
+    binary = os.environ.get("TERMNAV_SSH_BINARY") or shutil.which("ssh")
+    if not binary:
+        die("ssh is not installed")
+    destination, command_start = ssh_destination_end(arguments)
+    control_modes = {"-G", "-N", "-T", "-W", "-O", "-f"}
+    no_value_flags = set("46AaCfGgKkMNnqTtVvXxYy")
+    has_control_mode = False
+    for value in arguments[:destination] if destination is not None else []:
+        if value in control_modes or value.startswith(("-W", "-O")):
+            has_control_mode = True
+        elif (
+            value.startswith("-")
+            and not value.startswith("--")
+            and set(value[1:]).issubset(no_value_flags)
+            and any(flag in value[1:] for flag in "GNTf")
+        ):
+            has_control_mode = True
+    explicit_tty = any(value.startswith("-t") for value in arguments)
+    stdin_tty = sys.stdin.isatty() or os.environ.get("TERMNAV_TEST_STDIN_TTY") == "1"
+    if destination is None or command_start != len(arguments) or has_control_mode or (not stdin_tty and not explicit_tty):
+        return subprocess.run([binary, *arguments], check=False).returncode
+
+    test_config = os.environ.get("TERMNAV_TEST_EFFECTIVE_CONFIG")
+    if test_config is None:
+        effective = subprocess.run(
+            [binary, "-G", *arguments],
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if effective.returncode != 0:
+            return subprocess.run([binary, *arguments], check=False).returncode
+        test_config = effective.stdout
+    settings = {}
+    for line in test_config.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator:
+            settings[key.lower()] = value.strip()
+    if settings.get("sessiontype", "default").lower() != "default":
+        return subprocess.run([binary, *arguments], check=False).returncode
+    request_tty = settings.get("requesttty", "auto").lower()
+    if request_tty == "no" or (request_tty == "auto" and not stdin_tty and not explicit_tty):
+        return subprocess.run([binary, *arguments], check=False).returncode
+
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir())) / f"termnav-{os.getuid()}"
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    runtime_info = runtime.lstat()
+    if not stat.S_ISDIR(runtime_info.st_mode) or runtime_info.st_uid != os.getuid():
+        return subprocess.run([binary, *arguments], check=False).returncode
+    os.chmod(runtime, 0o700)
+    token = secrets.token_hex(12)
+    local_socket = runtime / f"relay-{token}.sock"
+    remote_socket = f"/tmp/termnav-relay-{token}.sock"
+    server_environment = os.environ.copy()
+    # Existing tmux panes predate later SSH attachments. Resolve relay metadata
+    # from the client currently driving this pane, never tmux's session-global
+    # environment (which is shared and last-attacher-wins).
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+        clients = subprocess.run(
+            ["tmux", "list-clients", "-F", "#{client_activity}\t#{client_pid}\t#{client_tty}\t#{pane_id}\t#{client_flags}"],
+            text=True, capture_output=True, check=False,
+        )
+        candidates = []
+        for line in clients.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 5 or fields[3] != os.environ["TMUX_PANE"] or not fields[0].isdigit() or not fields[1].isdigit():
+                continue
+            relay = process_env(int(fields[1]), "TERMNAV_PARENT_RELAY")
+            candidates.append((int(fields[0]), "focused" in fields[4].split(","), relay))
+        if candidates:
+            newest = max(item[0] for item in candidates)
+            leaders = [item for item in candidates if item[0] == newest]
+            focused = [item for item in leaders if item[1]]
+            chosen = focused if len(focused) == 1 else leaders
+            if len(chosen) == 1 and chosen[0][2]:
+                server_environment["TERMNAV_PARENT_RELAY"] = chosen[0][2]
+            else:
+                server_environment.pop("TERMNAV_PARENT_RELAY", None)
+    server = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "serve", "--socket", str(local_socket)],
+        env=server_environment,
+    )
+    try:
+        for _ in range(100):
+            if local_socket.is_socket():
+                break
+            if server.poll() is not None:
+                return subprocess.run([binary, *arguments], check=False).returncode
+            time.sleep(0.01)
+        else:
+            return subprocess.run([binary, *arguments], check=False).returncode
+
+        extra = [
+            "-o", "StreamLocalBindUnlink=yes",
+            "-o", f"RemoteForward={remote_socket}:{local_socket}",
+            "-o", f"SetEnv=TERMNAV_PARENT_RELAY={remote_socket}",
+        ]
+        enhanced = [*arguments[:destination], *extra, arguments[destination]]
+        result = subprocess.run([binary, *enhanced], check=False).returncode
+        control_path = settings.get("controlpath", "none")
+        if control_path != "none":
+            subprocess.run(
+                [binary, "-S", control_path, "-O", "cancel", "-R", f"{remote_socket}:{local_socket}", arguments[destination]],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+        return result
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            server.kill()
+        try:
+            local_socket.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def main() -> int:
+    # SSH's option language is deliberately left to OpenSSH. Pull this mode
+    # out before argparse so flags such as -p and -J remain byte-for-byte input.
+    if len(sys.argv) >= 2 and sys.argv[1] == "ssh":
+        return ssh_command(sys.argv[2:])
+
+    parser = argparse.ArgumentParser(prog="termnav-relay")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    send = subparsers.add_parser("send")
+    send.add_argument("scope", choices=("pane", "window"))
+    send.add_argument("direction")
+    send.add_argument("--client-pid", type=int)
+    send.add_argument("--client-tty")
+    server = subparsers.add_parser("serve")
+    server.add_argument("--socket", required=True)
+    subparsers.add_parser("sweep")
+    args = parser.parse_args()
+
+    if args.command == "send":
+        valid_request(args.scope, args.direction)
+        if args.client_pid and args.client_tty:
+            try:
+                actual_tty = os.readlink(f"/proc/{args.client_pid}/fd/0")
+            except OSError:
+                actual_tty = subprocess.run(["ps", "-p", str(args.client_pid), "-o", "tty="], text=True, capture_output=True, check=False).stdout.strip()
+                if actual_tty and not actual_tty.startswith("/"):
+                    actual_tty = f"/dev/{actual_tty}"
+            try:
+                if actual_tty != args.client_tty:
+                    return 1
+            except UnboundLocalError:
+                return 1
+        parent = process_env(args.client_pid, "TERMNAV_PARENT_RELAY") if args.client_pid else os.environ.get("TERMNAV_PARENT_RELAY")
+        return 0 if parent and send_request(parent, args.scope, args.direction) else 1
+    if args.command == "serve":
+        return serve(args.socket)
+    if args.command == "sweep":
+        return sweep()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
