@@ -1297,7 +1297,8 @@ def ssh_command(arguments: list[str]) -> int:
             and any(flag in value[1:] for flag in "GNTf")
         ):
             has_control_mode = True
-    explicit_tty = any(value.startswith("-t") for value in arguments)
+    option_arguments = arguments[:destination] if destination is not None else arguments
+    explicit_tty = any(value.startswith("-t") for value in option_arguments)
     stdin_tty = sys.stdin.isatty() or os.environ.get("TERMNAV_TEST_STDIN_TTY") == "1"
     if destination is None or command_start != len(arguments) or has_control_mode or (not stdin_tty and not explicit_tty):
         return subprocess.run([binary, *arguments], check=False).returncode
@@ -1320,6 +1321,11 @@ def ssh_command(arguments: list[str]) -> int:
         if separator:
             settings[key.lower()] = value.strip()
     if settings.get("sessiontype", "default").lower() != "default":
+        return subprocess.run([binary, *arguments], check=False).returncode
+    # A configured RemoteCommand already owns the per-session command channel
+    # used by the relay bootstrap.  Combining both makes OpenSSH reject the
+    # session, so preserve that host's ordinary SSH behavior.
+    if settings.get("remotecommand", "none").lower() != "none":
         return subprocess.run([binary, *arguments], check=False).returncode
     request_tty = settings.get("requesttty", "auto").lower()
     if request_tty == "no" or (request_tty == "auto" and not stdin_tty and not explicit_tty):
@@ -1406,11 +1412,27 @@ def ssh_command(arguments: list[str]) -> int:
             return subprocess.run([binary, *arguments], check=False).returncode
 
         extra = [
+            "-tt" if request_tty == "force" else "-t",
             "-o", "StreamLocalBindUnlink=yes",
             "-o", f"RemoteForward={remote_socket}:{local_socket}",
             "-o", f"SetEnv=TERMNAV_PARENT_RELAY={remote_socket}",
         ]
-        enhanced = [*arguments[:destination], *extra, arguments[destination]]
+        # A multiplexed session inherits SetEnv policy from the long-lived
+        # master, so it may receive an earlier session's now-dead relay path.
+        # The mux protocol carries each session's command independently.  Use
+        # that channel to make this session's forward authoritative without a
+        # second SSH connection or authentication attempt.
+        # sshd always supplies SHELL.  Keep the outer command in the small
+        # syntax intersection shared by sh, fish, and csh-family login shells;
+        # env avoids shell-specific assignment/export forms.
+        bootstrap = f'exec env TERMNAV_PARENT_RELAY={remote_socket} "$SHELL" -l'
+        option_end = (
+            destination - 1
+            if destination > 0 and arguments[destination - 1] == "--"
+            else destination
+        )
+        separator = arguments[option_end:destination]
+        enhanced = [*arguments[:option_end], *extra, *separator, arguments[destination], bootstrap]
         result = subprocess.run([binary, *enhanced], check=False).returncode
         control_path = settings.get("controlpath", "none")
         if control_path != "none":
