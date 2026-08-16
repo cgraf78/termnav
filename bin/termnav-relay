@@ -199,6 +199,26 @@ def _next_seq(tmux_socket: str) -> int:
         return nxt
 
 
+def _publish_exclusive(path: Path, payload: str) -> None:
+    """Durably create an owner-only file without replacing an existing path."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise FileExistsError(f"directive already exists: {path.stem}") from None
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
     """Allocate seq and arm atomically under one .directives.lock.
 
@@ -260,31 +280,13 @@ def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
                 pass
         directive["seq"] = nxt
         # --- publish ---
-        tmp = ddir / f".tmp-{nonce}-{os.getpid()}-{secrets.token_hex(4)}.json"
         payload = json.dumps(directive, separators=(",", ":"), sort_keys=True)
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            with open(tmp, "rb") as tf:
-                os.fsync(tf.fileno())
-            os.chmod(tmp, 0o600)
-            try:
-                os.link(tmp, final)
-            except FileExistsError:
-                raise FileExistsError(f"directive already exists: {nonce}")
-            try:
-                os.chmod(final, 0o600)
-            except OSError:
-                pass
-        finally:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+        _publish_exclusive(final, payload)
         return nxt
 
 
 def arm_directive(directive: dict) -> None:
-    """Atomic publish under shared per-socket flock via temp+fsync+os.link."""
+    """Atomically publish a directive under the shared per-socket lock."""
     if not isinstance(directive, dict):
         raise ValueError("directive must be a dict")
     nonce = directive.get("nonce")
@@ -320,58 +322,7 @@ def arm_directive(directive: dict) -> None:
     with open(lock_path, "a+", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         payload = json.dumps(directive, separators=(",", ":"), sort_keys=True)
-        # Portable atomic create: O_CREAT|O_EXCL, fallback to os.link where available
-        try:
-            fd = os.open(final, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            raise FileExistsError(f"directive already exists: {nonce}")
-        except AttributeError:
-            # Termux may lack os.link but should have O_EXCL; if not, try link fallback
-            tmp = ddir / f".tmp-{nonce}-{os.getpid()}-{secrets.token_hex(4)}.json"
-            tmp.write_text(payload, encoding="utf-8")
-            with open(tmp, "rb") as tf:
-                os.fsync(tf.fileno())
-            os.chmod(tmp, 0o600)
-            try:
-                os.link(tmp, final)  # type: ignore[attr-defined]
-            except (FileExistsError, AttributeError, OSError) as exc:
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-                if isinstance(exc, FileExistsError):
-                    raise
-                # Fallback: exclusive create failed, try rename with existence check
-                raise FileExistsError(f"directive already exists: {nonce}") from exc
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            try:
-                os.chmod(final, 0o600)
-            except OSError:
-                pass
-            try:
-                os.chmod(ddir, 0o700)
-            except OSError:
-                pass
-            return
-        try:
-            os.write(fd, payload.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            os.chmod(final, 0o600)
-        except OSError:
-            pass
-        try:
-            os.chmod(ddir, 0o700)
-        except OSError:
-            pass
+        _publish_exclusive(final, payload)
 
 
 def mark_committed(tmux_socket: str, nonce: str) -> bool:

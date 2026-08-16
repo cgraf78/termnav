@@ -370,6 +370,42 @@ echo
 echo "=== directive store ==="
 export XDG_RUNTIME_DIR="$tmp/xdg"
 fake_tmux_socket="$tmp/fake-tmux-sock"
+# Termux's Python omits os.link. Exercise the production atomic sequence-plus-
+# publish path with that API removed so both arming entry points stay portable.
+RELAY_PATH="$relay" FAKE_TMUX_SOCKET="$fake_tmux_socket" python3 - <<'PY'
+import os
+import runpy
+
+relay = runpy.run_path(os.environ["RELAY_PATH"])
+link = os.link
+del os.link
+path = relay["directive_dir"](os.environ["FAKE_TMUX_SOCKET"]) / "permissions.json"
+old_umask = os.umask(0o777)
+try:
+    relay["_publish_exclusive"](path, "{}")
+    assert path.stat().st_mode & 0o777 == 0o600
+finally:
+    os.umask(old_umask)
+    path.unlink(missing_ok=True)
+try:
+    relay["_arm_directive_and_seq"](
+        os.environ["FAKE_TMUX_SOCKET"],
+        {
+            "v": 2,
+            "nonce": "121212121212",
+            "action": "forward",
+            "forward_pane": "%9",
+            "tmux_socket": os.environ["FAKE_TMUX_SOCKET"],
+            "local_client_tty": "/dev/pts/1",
+            "local_client_pid": 111,
+        },
+    )
+finally:
+    os.link = link
+PY
+portable_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
+_assert_contains "directive: atomic sequence publish works without os.link" \
+  '"nonce":"121212121212"' "$portable_claim"
 # Nonce validation: reject traversal/non-hex via arm-test
 _assert_eq "directive: reject bad nonce" "" "$(
   "$relay" arm-test --tmux-socket "$fake_tmux_socket" --json '{"v":2,"nonce":"../bad","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'"}' 2>&1 || true
