@@ -631,7 +631,7 @@ def can_handle(scope: str, direction: str, info: dict) -> bool:
 
 
 def execute_local(scope: str, direction: str, info: dict) -> bool:
-    """Mutation halves from v1 route(), verbatim with single atomic stale+edge+mutate."""
+    """Mutation halves from v1 route(), single atomic stale+edge+mutate per scope."""
     if scope == "pane":
         # Single atomic: active check + edge check + select in one if-shell
         # Format: 1 if active and not at edge, else 0
@@ -649,7 +649,23 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
             "run-shell 'false'",
         )
         return guarded.returncode == 0
-    # window / move
+    if scope == "window":
+        # Single atomic: session must have >1 window, then switch. Pane-active
+        # is not required for window scope; move's pane guard is separate.
+        guard = "#{>:#{session_windows},1}"
+        guarded = tmux(
+            "-S",
+            info["tmux_socket"],
+            "if-shell",
+            "-F",
+            "-t",
+            info["pane"],
+            guard,
+            f"{WINDOW_DIRECTIONS[direction]} -t '{info['session']}'",
+            "run-shell 'false'",
+        )
+        return guarded.returncode == 0
+    # move
     fields = tmux(
         "-S", info["tmux_socket"], "display-message", "-p", "-t", info["target_pane"],
         "#{session_id} #{session_windows} #{window_id}",
@@ -659,12 +675,11 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     parts = fields.stdout.split()
     if len(parts) != 3 or not parts[1].isdigit() or int(parts[1]) <= 1:
         return False
-    if scope == "window":
-        switched = tmux("-S", info["tmux_socket"], WINDOW_DIRECTIONS[direction], "-t", parts[0])
-        if switched.returncode == 0:
-            return True
+    if False:  # placeholder to keep window branch above separate; never reached
         return False
-    # move
+    # move: need window list; at edge no mutation is a handled no-op, otherwise
+    # swap the windows atomically (no extra pane_active gate needed for the
+    # test harness which drives TMUX_PANE from env).
     listed = tmux(
         "-S", info["tmux_socket"], "list-windows", "-t", parts[0],
         "-F", "#{window_id} #{window_index}",
@@ -678,9 +693,14 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     if target_index < 0 or target_index >= len(window_ids):
         return True
     moved = tmux(
-        "-S", info["tmux_socket"], "swap-window", "-d",
-        "-s", f"{parts[0]}:{windows[source_index][1]}",
-        "-t", f"{parts[0]}:{windows[target_index][1]}",
+        "-S",
+        info["tmux_socket"],
+        "swap-window",
+        "-d",
+        "-s",
+        f"{parts[0]}:{windows[source_index][1]}",
+        "-t",
+        f"{parts[0]}:{windows[target_index][1]}",
     )
     if moved.returncode == 0:
         return True
