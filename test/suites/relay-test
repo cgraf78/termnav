@@ -377,8 +377,9 @@ import os
 import runpy
 
 relay = runpy.run_path(os.environ["RELAY_PATH"])
-link = os.link
-del os.link
+link = getattr(os, "link", None)
+if link is not None:
+    del os.link
 path = relay["directive_dir"](os.environ["FAKE_TMUX_SOCKET"]) / "permissions.json"
 old_umask = os.umask(0o777)
 try:
@@ -401,7 +402,8 @@ try:
         },
     )
 finally:
-    os.link = link
+    if link is not None:
+        os.link = link
 PY
 portable_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
 _assert_contains "directive: atomic sequence publish works without os.link" \
