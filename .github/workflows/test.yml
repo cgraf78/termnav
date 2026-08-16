@@ -44,6 +44,21 @@ jobs:
       # single reviewed dependency decision.
       - uses: cgraf78/actions/.github/actions/verify-consumer-sync@2a6119d7886443929e1961a0e11b8dafa71c1978
 
+  relay-performance:
+    name: Relay startup / Ubuntu
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare relay hot paths with the PR base
+        env:
+          TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}
+        run: test/suites/relay-performance-test
+
   eza-current:
     name: Current eza compatibility / Arch
     runs-on: ubuntu-latest
@@ -66,17 +81,23 @@ jobs:
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, eza-current]
+    needs: [shell, eza-current, relay-performance]
     runs-on: ubuntu-24.04
     env:
       SHELL_RESULT: ${{ needs.shell.result }}
       EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}
+      RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}
     steps:
       - name: Require all Termnav compatibility checks
         shell: bash
         run: |-
           printf 'Shell CI: %s\n' "$SHELL_RESULT"
           printf 'Current eza: %s\n' "$EZA_CURRENT_RESULT"
+          printf 'Relay performance: %s\n' "$RELAY_PERFORMANCE_RESULT"
 
           test "$SHELL_RESULT" = success
           test "$EZA_CURRENT_RESULT" = success
+          case "$RELAY_PERFORMANCE_RESULT" in
+            success | skipped) ;;
+            *) exit 1 ;;
+          esac

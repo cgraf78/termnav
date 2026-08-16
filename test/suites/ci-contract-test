@@ -55,16 +55,38 @@ required_job=$(awk '
   in_required { print }
 ' "$workflow")
 
+performance_job=$(awk '
+  /^  relay-performance:$/ { in_performance = 1 }
+  in_performance && /^  [^ ]/ && $0 != "  relay-performance:" { exit }
+  in_performance { print }
+' "$workflow")
+
+# These are literal GitHub expressions in the workflow contract.
+# shellcheck disable=SC2016
+for contract in \
+  'name: Relay startup / Ubuntu' \
+  "if: \${{ github.event_name == 'pull_request' }}" \
+  'runs-on: ubuntu-24.04' \
+  'fetch-depth: 0' \
+  'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
+  'run: test/suites/relay-performance-test'; do
+  [[ "$performance_job" == *"$contract"* ]] ||
+    fail "Relay performance job is missing: $contract"
+done
+
 # These are literal GitHub and shell expressions in the workflow contract.
 # shellcheck disable=SC2016
 for contract in \
   'name: Required' \
   'if: ${{ always() }}' \
-  'needs: [shell, eza-current]' \
+  'needs: [shell, eza-current, relay-performance]' \
   'SHELL_RESULT: ${{ needs.shell.result }}' \
   'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
+  'RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}' \
   'test "$SHELL_RESULT" = success' \
-  'test "$EZA_CURRENT_RESULT" = success'; do
+  'test "$EZA_CURRENT_RESULT" = success' \
+  'success | skipped) ;;' \
+  '*) exit 1 ;;'; do
   [[ "$required_job" == *"$contract"* ]] ||
     fail "Required aggregate is missing: $contract"
 done

@@ -3,23 +3,9 @@
 
 from __future__ import annotations
 
-import argparse
-import base64
-import hashlib
 import json
 import os
-import re
-import secrets
-import shutil
-import signal
-import socket
-import stat
-import subprocess
 import sys
-import tempfile
-import threading
-import time
-from pathlib import Path
 
 PANE_DIRECTIONS = {"left": "L", "down": "D", "up": "U", "right": "R"}
 COMMIT_KEY = b"\x1b[777009u"
@@ -28,8 +14,39 @@ WINDOW_DIRECTIONS = {"next": "next-window", "previous": "previous-window"}
 MOVE_DIRECTIONS = {"left": "-", "right": "+"}
 SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {"-bind_address", "-cipher", "-config", "-destination", "-escape_char", "-identity_file", "-jump", "-login_name", "-mac_spec", "-option", "-port", "-query_option", "-remote_forward", "-stdio_forward", "-tag", "-tunnel", "-w"}
 
-HANDLE_LOCK = threading.Lock()
+HANDLE_LOCK = None
 _HANDLE_BUSY = False
+
+
+def load_commit_runtime() -> None:
+    """Load modules used only after a directive reaches its commit process."""
+    global hashlib, re, stat, subprocess, tempfile, time, Path
+
+    import hashlib
+    import re
+    import stat
+    import subprocess
+    import tempfile
+    import time
+    from pathlib import Path
+
+
+def load_server_runtime() -> None:
+    """Load long-lived server and SSH modules outside the per-chord client."""
+    global argparse, base64, shutil, signal, socket, threading, HANDLE_LOCK
+
+    load_commit_runtime()
+    import argparse
+    import base64
+    import shutil
+    import signal
+    import socket
+    import threading
+
+    # Initialize before serve() accepts clients so request threads never race
+    # while constructing the lock that protects two-phase admission.
+    if HANDLE_LOCK is None:
+        HANDLE_LOCK = threading.Lock()
 
 
 def die(message: str) -> "NoReturn":
@@ -60,6 +77,7 @@ def is_valid_request(scope: str, direction: str) -> bool:
 
 def runtime_dir() -> Path:
     """Return the owner-only runtime dir, creating it with 0700."""
+    load_commit_runtime()
     base = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
     path = Path(base) / f"termnav-{os.getuid()}"
     try:
@@ -81,6 +99,7 @@ def runtime_dir() -> Path:
 
 def directive_dir(tmux_socket: str) -> Path:
     """Return the per-socket directive dir: $RUNTIME/directives/<hash>/ ."""
+    load_commit_runtime()
     digest = hashlib.sha256(tmux_socket.encode()).hexdigest()[:12]
     ddir = runtime_dir() / "directives" / digest
     try:
@@ -469,6 +488,8 @@ def claim_directive_for_client(
 
 def parse_ps_environment(output: str, name: str) -> str | None:
     """Extract NAME's value from `ps eww` output preserving spaces."""
+    import re
+
     match = re.search(rf" {re.escape(name)}=(.*?)(?= \w+=|$)", output)
     if match:
         return match.group(1)
@@ -478,7 +499,8 @@ def parse_ps_environment(output: str, name: str) -> str | None:
 def process_env(pid: int, name: str) -> str | None:
     proc_readable = True
     try:
-        data = Path(f"/proc/{pid}/environ").read_bytes()
+        with open(f"/proc/{pid}/environ", "rb") as environment:
+            data = environment.read()
     except OSError:
         proc_readable = False
         data = b""
@@ -489,6 +511,8 @@ def process_env(pid: int, name: str) -> str | None:
     if proc_readable:
         return None
     try:
+        import subprocess
+
         output = subprocess.run(["ps", "eww", "-p", str(pid), "-o", "command="], text=True, capture_output=True, check=False).stdout
     except OSError:
         return None
@@ -506,7 +530,70 @@ def valid_request(scope: str, direction: str) -> None:
         die(f"invalid navigation scope: {scope}")
 
 
+def send_command(
+    scope: str,
+    direction: str,
+    client_pid: int | None = None,
+    client_tty: str | None = None,
+) -> int:
+    """Send one navigation request while preserving tri-state fallback rules."""
+    valid_request(scope, direction)
+    # Parent relay is authoritative from the client's environment if a pid is
+    # given (SSH chain), otherwise from the current process. Check both so
+    # tests that set TERMNAV_PARENT_RELAY in the caller's env still work.
+    parent = None
+    if client_pid:
+        parent = process_env(client_pid, "TERMNAV_PARENT_RELAY")
+    if not parent:
+        parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+    if client_pid and client_tty:
+        try:
+            actual_tty = os.readlink(f"/proc/{client_pid}/fd/0")
+        except OSError:
+            try:
+                import subprocess
+
+                actual_tty = subprocess.run(
+                    ["ps", "-p", str(client_pid), "-o", "tty="],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                ).stdout.strip()
+                if actual_tty and not actual_tty.startswith("/"):
+                    actual_tty = f"/dev/{actual_tty}"
+            except OSError:
+                actual_tty = ""
+        if actual_tty != client_tty:
+            # PID-reuse mismatch: fail closed (1) if a parent relay exists
+            # (would be handling the wrong client), otherwise declined (3)
+            # to allow local fallback (e.g., tab-switch's /dev/null dummy).
+            return 1 if parent else 3
+    if not parent:
+        return 3
+    import secrets
+
+    nonce = secrets.token_hex(6)
+    reply = send_message(
+        parent,
+        {
+            "v": 2,
+            "op": "navigate",
+            "scope": scope,
+            "direction": direction,
+            "nonce": nonce,
+        },
+    )
+    result = reply.get("result")
+    if result == "armed":
+        return 0
+    if result == "declined":
+        return 3
+    return 1
+
+
 def send_message(path: str, message: dict, timeout: float = 2.0) -> dict:
+    import socket
+
     payload = json.dumps(message, separators=(",", ":")) + "\n"
     try:
         with socket.socket(socket.AF_UNIX) as client:
@@ -528,6 +615,8 @@ def send_message(path: str, message: dict, timeout: float = 2.0) -> dict:
 
 
 def send_request(path: str, scope: str, direction: str) -> bool:
+    import socket
+
     payload = json.dumps({"v": 1, "scope": scope, "direction": direction}, separators=(",", ":")) + "\n"
     try:
         with socket.socket(socket.AF_UNIX) as client:
@@ -583,6 +672,7 @@ def can_handle(scope: str, direction: str, info: dict) -> bool:
 
 def execute_local(scope: str, direction: str, info: dict) -> bool:
     """Mutation halves from v1 route(), single atomic stale+edge+mutate per scope."""
+    load_commit_runtime()
     expected_guard = f"#{{==:#{{pane_id}},{info['pane']}}}"
     if scope == "pane":
         # The session target makes pane_id the pane the user currently owns.
@@ -662,6 +752,7 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
 
 
 def commit_command(tmux_socket: str, client_tty: str, client_pid: int) -> int:
+    load_commit_runtime()
     if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
         if not re.fullmatch(r"[0-9]+", str(client_pid)) or int(client_pid) <= 0:
             return 0
@@ -1019,6 +1110,7 @@ def route(scope: str, direction: str) -> bool:
 
 
 def serve(path: str) -> int:
+    load_server_runtime()
     socket_path = Path(path)
     socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if socket_path.exists() or socket_path.is_socket():
@@ -1137,6 +1229,9 @@ def serve(path: str) -> int:
 
 def sweep() -> int:
     """Remove only old, owner-held relay sockets that no longer listen."""
+    load_commit_runtime()
+    import socket
+
     now = time.time()
     roots = {Path("/tmp"), Path(tempfile.gettempdir())}
     for entry in (entry for root in roots for entry in root.glob("termnav-relay-*.sock")):
@@ -1182,6 +1277,9 @@ def ssh_destination_end(arguments: list[str]) -> tuple[int | None, int | None]:
 
 
 def ssh_command(arguments: list[str]) -> int:
+    load_server_runtime()
+    import secrets
+
     binary = os.environ.get("TERMNAV_SSH_BINARY") or shutil.which("ssh")
     if not binary:
         die("ssh is not installed")
@@ -1337,8 +1435,46 @@ def main() -> int:
     # SSH's option language is deliberately left to OpenSSH. Pull this mode
     # out before argparse so flags such as -p and -J remain byte-for-byte input.
     if len(sys.argv) >= 2 and sys.argv[1] == "ssh":
+        load_server_runtime()
         return ssh_command(sys.argv[2:])
 
+    # tmux emits these exact forms for every relayed chord. Keep argparse as
+    # the authoritative parser for help, unusual ordering, invalid values, and
+    # every maintenance command, but avoid importing/building it twice per
+    # successful navigation (send plus the foreground commit).
+    arguments = sys.argv[1:]
+    if (
+        len(arguments) == 3
+        and arguments[0] == "send"
+        and arguments[1] in {"pane", "window", "move"}
+    ):
+        return send_command(arguments[1], arguments[2])
+    if (
+        len(arguments) == 7
+        and arguments[0] == "send"
+        and arguments[1] in {"pane", "window", "move"}
+        and arguments[3] == "--client-pid"
+        and arguments[4].isdigit()
+        and arguments[5] == "--client-tty"
+        and arguments[6].startswith("/")
+    ):
+        return send_command(
+            arguments[1], arguments[2], int(arguments[4]), arguments[6]
+        )
+    if (
+        len(arguments) == 7
+        and arguments[0] == "commit"
+        and arguments[1] == "--tmux-socket"
+        and arguments[2].startswith("/")
+        and arguments[3] == "--client-tty"
+        and arguments[4].startswith("/")
+        and arguments[5] == "--client-pid"
+        and arguments[6].isdigit()
+    ):
+        load_commit_runtime()
+        return commit_command(arguments[2], arguments[4], int(arguments[6]))
+
+    load_server_runtime()
     parser = argparse.ArgumentParser(prog="termnav-relay")
     subparsers = parser.add_subparsers(dest="command", required=True)
     send = subparsers.add_parser("send")
@@ -1377,40 +1513,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "send":
-        valid_request(args.scope, args.direction)
-        # Parent relay is authoritative from the client's environment if a pid is
-        # given (SSH chain), otherwise from the current process. Check both so
-        # tests that set TERMNAV_PARENT_RELAY in the caller's env still work.
-        parent = None
-        if args.client_pid:
-            parent = process_env(args.client_pid, "TERMNAV_PARENT_RELAY")
-        if not parent:
-            parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
-        if args.client_pid and args.client_tty:
-            try:
-                actual_tty = os.readlink(f"/proc/{args.client_pid}/fd/0")
-            except OSError:
-                actual_tty = subprocess.run(["ps", "-p", str(args.client_pid), "-o", "tty="], text=True, capture_output=True, check=False).stdout.strip()
-                if actual_tty and not actual_tty.startswith("/"):
-                    actual_tty = f"/dev/{actual_tty}"
-            try:
-                if actual_tty != args.client_tty:
-                    # PID-reuse mismatch: fail closed (1) if a parent relay exists
-                    # (would be handling the wrong client), otherwise declined (3)
-                    # to allow local fallback (e.g., tab-switch's /dev/null dummy).
-                    return 1 if parent else 3
-            except UnboundLocalError:
-                return 1 if parent else 3
-        if not parent:
-            return 3
-        nonce = secrets.token_hex(6)
-        reply = send_message(parent, {"v": 2, "op": "navigate", "scope": args.scope, "direction": args.direction, "nonce": nonce})
-        result = reply.get("result")
-        if result == "armed":
-            return 0
-        if result == "declined":
-            return 3
-        return 1
+        return send_command(
+            args.scope, args.direction, args.client_pid, args.client_tty
+        )
     if args.command == "serve":
         return serve(args.socket)
     if args.command == "commit":
