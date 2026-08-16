@@ -603,34 +603,22 @@ def can_handle(scope: str, direction: str, info: dict) -> bool:
 
 
 def execute_local(scope: str, direction: str, info: dict) -> bool:
-    """Mutation halves from v1 route(), verbatim with stale-pane guard."""
-    # Stale directive check: for pane, expected pane must still be active; for window/move, pane must still exist
+    """Mutation halves from v1 route(), verbatim with single atomic stale+edge+mutate."""
     if scope == "pane":
-        try:
-            active = tmux("-S", info["tmux_socket"], "display-message", "-p", "-t", info["session"], "#{pane_id}")
-        except Exception:
-            return False
-        if active.returncode != 0 or active.stdout.strip() != info["pane"]:
-            return False
-    else:
-        try:
-            exists = tmux("-S", info["tmux_socket"], "display-message", "-p", "-t", info["pane"], "#{pane_id}")
-        except Exception:
-            return False
-        if exists.returncode != 0 or exists.stdout.strip() != info["pane"]:
-            return False
-    if scope == "pane":
-        edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
+        # Single atomic: active check + edge check + select in one if-shell
+        # Format: 1 if active and not at edge, else 0
+        edge_var = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
+        active_edge_fmt = f"#{{&&:#{{pane_active}},#{{!=:#{{{edge_var}}},1}}}}"
         guarded = tmux(
             "-S",
             info["tmux_socket"],
             "if-shell",
             "-F",
             "-t",
-            info["target_pane"],
-            f"#{{{edge_name}}}",
-            "",
+            info["pane"],
+            active_edge_fmt,
             f"select-pane -t '{info['target_pane']}' -{PANE_DIRECTIONS[direction]}",
+            "run-shell 'false'",
         )
         return guarded.returncode == 0
     # window / move
