@@ -900,86 +900,81 @@ def serve(path: str) -> int:
 
     def handle(connection: socket.socket) -> None:
         global _HANDLE_BUSY
-        # Non-blocking try-lock for busy admission
-        acquired = HANDLE_LOCK.acquire(blocking=False)
-        if not acquired:
+        # Read request before acquiring lock so stalled connections don't block
+        # the BUSY admission window (fragmented/concurrent tests)
+        with connection:
+            connection.settimeout(0.25)
+            acquired = False
             try:
-                connection.sendall(json.dumps({"v": 2, "result": "error", "reason": "busy"}, separators=(",", ":")).encode() + b"\n")
-            except OSError:
-                pass
-            try:
-                connection.close()
-            except OSError:
-                pass
-            return
-        _HANDLE_BUSY = True
-        try:
-            with connection:
-                connection.settimeout(0.25)
-                try:
-                    raw = b""
-                    while b"\n" not in raw and len(raw) <= 512:
-                        chunk = connection.recv(513 - len(raw))
-                        if not chunk:
-                            break
-                        raw += chunk
-                    if len(raw) > 512 or not raw.endswith(b"\n"):
-                        return
-                    # Handle both v1 and v2 for back-compat during transition
+                raw = b""
+                while b"\n" not in raw and len(raw) <= 512:
+                    chunk = connection.recv(513 - len(raw))
+                    if not chunk:
+                        break
+                    raw += chunk
+                if len(raw) > 512 or not raw.endswith(b"\n"):
+                    return
+                # Non-blocking try-lock for busy admission (dispatch only)
+                acquired = HANDLE_LOCK.acquire(blocking=False)
+                if not acquired:
                     try:
-                        request = json.loads(raw)
-                    except (ValueError, json.JSONDecodeError):
-                        return
-                    if not isinstance(request, dict):
-                        return
-                    # v2 dispatch
-                    if request.get("v") == 2 and "op" in request:
-                        op = request.get("op")
-                        if op == "navigate":
-                            if not all(k in request for k in ("scope", "direction", "nonce")):
-                                reply = {"v": 2, "result": "error"}
-                            else:
-                                reply = handle_navigate(request)
-                                debug(f"begin {request.get('nonce')} navigate")
-                                debug(f"end {request.get('nonce')} navigate")
-                        elif op == "commit-path":
-                            if "nonce" not in request:
-                                reply = {"v": 2, "result": "error"}
-                            else:
-                                reply = handle_commit_path(request)
-                                debug(f"begin {request.get('nonce')} commit")
-                                debug(f"end {request.get('nonce')} commit")
-                        else:
+                        connection.sendall(json.dumps({"v": 2, "result": "error", "reason": "busy"}, separators=(",", ":")).encode() + b"\n")
+                    except OSError:
+                        pass
+                    return
+                _HANDLE_BUSY = True
+                try:
+                    request = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    return
+                if not isinstance(request, dict):
+                    return
+                # v2 dispatch
+                if request.get("v") == 2 and "op" in request:
+                    op = request.get("op")
+                    if op == "navigate":
+                        if not all(k in request for k in ("scope", "direction", "nonce")):
                             reply = {"v": 2, "result": "error"}
-                        try:
-                            connection.sendall((json.dumps(reply, separators=(",", ":")) + "\n").encode())
-                        except OSError:
-                            pass
-                        return
-                    # v1 fallback (legacy tests): map to armed/declined via route
-                    if request.get("v") == 1 and set(request) == {"v", "scope", "direction"}:
-                        try:
-                            valid_request(request["scope"], request["direction"])
-                        except SystemExit:
-                            return
-                        # With DIRECT knob, legacy real-tmux tests expect direct execute
-                        # Use handle_navigate-style direct path when DIRECT=1
-                        handled = route(request["scope"], request["direction"])
-                        try:
-                            connection.sendall(b"1" if handled else b"0")
-                        except OSError:
-                            pass
-                        return
-                    # Unknown
+                        else:
+                            reply = handle_navigate(request)
+                            debug(f"begin {request.get('nonce')} navigate")
+                            debug(f"end {request.get('nonce')} navigate")
+                    elif op == "commit-path":
+                        if "nonce" not in request:
+                            reply = {"v": 2, "result": "error"}
+                        else:
+                            reply = handle_commit_path(request)
+                            debug(f"begin {request.get('nonce')} commit")
+                            debug(f"end {request.get('nonce')} commit")
+                    else:
+                        reply = {"v": 2, "result": "error"}
+                    try:
+                        connection.sendall((json.dumps(reply, separators=(",", ":")) + "\n").encode())
+                    except OSError:
+                        pass
                     return
-                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, SystemExit):
+                # v1 fallback (legacy tests): map to armed/declined via route
+                if request.get("v") == 1 and set(request) == {"v", "scope", "direction"}:
+                    try:
+                        valid_request(request["scope"], request["direction"])
+                    except SystemExit:
+                        return
+                    handled = route(request["scope"], request["direction"])
+                    try:
+                        connection.sendall(b"1" if handled else b"0")
+                    except OSError:
+                        pass
                     return
-        finally:
-            _HANDLE_BUSY = False
-            try:
-                HANDLE_LOCK.release()
-            except RuntimeError:
-                pass
+                return
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, SystemExit):
+                return
+            finally:
+                if acquired:
+                    _HANDLE_BUSY = False
+                    try:
+                        HANDLE_LOCK.release()
+                    except RuntimeError:
+                        pass
 
     while not stopping:
         try:
