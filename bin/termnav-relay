@@ -319,27 +319,55 @@ def arm_directive(directive: dict) -> None:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
-        # temp file in same dir
-        tmp = ddir / f".tmp-{nonce}-{os.getpid()}-{secrets.token_hex(4)}.json"
         payload = json.dumps(directive, separators=(",", ":"), sort_keys=True)
+        # Portable atomic create: O_CREAT|O_EXCL, fallback to os.link where available
         try:
+            fd = os.open(final, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            raise FileExistsError(f"directive already exists: {nonce}")
+        except AttributeError:
+            # Termux may lack os.link but should have O_EXCL; if not, try link fallback
+            tmp = ddir / f".tmp-{nonce}-{os.getpid()}-{secrets.token_hex(4)}.json"
             tmp.write_text(payload, encoding="utf-8")
             with open(tmp, "rb") as tf:
                 os.fsync(tf.fileno())
             os.chmod(tmp, 0o600)
             try:
-                os.link(tmp, final)
-            except FileExistsError:
-                raise FileExistsError(f"directive already exists: {nonce}")
-            try:
-                os.chmod(final, 0o600)
-            except OSError:
-                pass
-        finally:
+                os.link(tmp, final)  # type: ignore[attr-defined]
+            except (FileExistsError, AttributeError, OSError) as exc:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                if isinstance(exc, FileExistsError):
+                    raise
+                # Fallback: exclusive create failed, try rename with existence check
+                raise FileExistsError(f"directive already exists: {nonce}") from exc
             try:
                 tmp.unlink()
             except OSError:
                 pass
+            try:
+                os.chmod(final, 0o600)
+            except OSError:
+                pass
+            try:
+                os.chmod(ddir, 0o700)
+            except OSError:
+                pass
+            return
+        try:
+            os.write(fd, payload.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.chmod(final, 0o600)
+        except OSError:
+            pass
         try:
             os.chmod(ddir, 0o700)
         except OSError:
