@@ -401,6 +401,14 @@ def claim_directive_for_client(
         return None
 
 
+def parse_ps_environment(output: str, name: str) -> str | None:
+    """Extract NAME's value from `ps eww` output preserving spaces."""
+    match = re.search(rf" {re.escape(name)}=(.*?)(?= \w+=|$)", output)
+    if match:
+        return match.group(1)
+    return None
+
+
 def process_env(pid: int, name: str) -> str | None:
     proc_readable = True
     try:
@@ -418,10 +426,7 @@ def process_env(pid: int, name: str) -> str | None:
         output = subprocess.run(["ps", "eww", "-p", str(pid), "-o", "command="], text=True, capture_output=True, check=False).stdout
     except OSError:
         return None
-    for entry in output.split():
-        if entry.startswith(f"{name}="):
-            return entry.split("=", 1)[1]
-    return None
+    return parse_ps_environment(output, name)
 
 
 def valid_request(scope: str, direction: str) -> None:
@@ -1264,6 +1269,9 @@ def main() -> int:
     mark_committed_test = subparsers.add_parser("mark-committed-test")
     mark_committed_test.add_argument("--tmux-socket", required=True)
     mark_committed_test.add_argument("--nonce", required=True)
+    # hidden test helper for ps fallback parsing
+    parse_ps_env_test = subparsers.add_parser("parse-ps-env-test")
+    parse_ps_env_test.add_argument("name")
     args = parser.parse_args()
 
     if args.command == "send":
@@ -1347,6 +1355,12 @@ def main() -> int:
     if args.command == "mark-committed-test":
         ok = mark_committed(args.tmux_socket, args.nonce)
         return 0 if ok else 1
+    if args.command == "parse-ps-env-test":
+        output = sys.stdin.read()
+        value = parse_ps_environment(output, args.name)
+        if value is not None:
+            sys.stdout.write(value)
+        return 0
     return 2
 
 
