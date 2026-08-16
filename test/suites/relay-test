@@ -630,6 +630,64 @@ fi
 # Busy test note: the concurrent block above already covers serialization;
 # the busy JSON path is verified by grep above.
 
+echo "=== commit consumption ==="
+# Detached tmux has no real client_tty; use narrow test hook so claim/commit skip S_ISCHR/list-clients (test-only, fixes Codex v13 #5)
+export TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION=1
+# Isolate FIFO: A5's fail-closed check leaves one 6s directive alive; sweep so A6 does not consume stale (fixes Codex v13 #4)
+# Use the shared .directives.lock sweep (or rm the hash dir) before reusing the socket
+# shellcheck disable=SC2012
+hash_dir_a5=$(ls -d "$tmp/xdg2/termnav-$(id -u)/directives"/*/ 2>/dev/null | head -1)
+if [ -n "$hash_dir_a5" ]; then rm -f "${hash_dir_a5}"*.json; fi
+# Ensure stale arm_sock directives are cleared (head -1 may miss the arm_sock hash when multiple hashes exist)
+arm_hash=$(echo -n "$arm_sock" | sha256sum | cut -c1-12)
+rm -f "$tmp/xdg2/termnav-$(id -u)/directives/$arm_hash"/*.json 2>/dev/null || true
+# Reuse A5's $arm_tmux server, $arm_sock, $arm_sess, $left_pane, $emit_tty (now empty FIFO).
+# Stable identity: reuse $client_tty/$client_pid captured once in A5, not transient display-message recapture (fixes #5)
+right_pane=$(tmux -L "$arm_tmux" list-panes -t armsess -F '#{pane_id} #{pane_at_right}' |
+  awk '$2==1{print $1; exit}')
+tmux -L "$arm_tmux" select-pane -t "$left_pane"
+
+# execute: arm via a fresh navigate send (emission captured by $emit_tty), then commit.
+# Reuse stable client identity captured once in A5 (TERMNAV_RELAY_CLIENT_TTY/PID, not transient command client; fixes Codex v13 #5)
+# For detached tmux servers, validation is skipped via TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION=1 hook (narrow, test-only)
+TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send pane right
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
+_assert_eq "commit: an execute directive switches the pane in-band" "$right_pane" \
+  "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+# No watchdog: directive is consumed, no delayed switch
+sleep 0.8
+_assert_eq "commit: no watchdog — pane stays after consumed directive" "$right_pane" \
+  "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
+# execute mismatch: arm from the left pane, move the user elsewhere, commit must no-op.
+tmux -L "$arm_tmux" select-pane -t "$left_pane"
+TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send pane right
+tmux -L "$arm_tmux" select-pane -t "$right_pane"
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
+_assert_eq "commit: a stale execute directive never switches away from the user" \
+  "$right_pane" "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
+# forward: the commit key is re-emitted byte-for-byte into the explicit target pane.
+tmux -L "$arm_tmux" new-window -d -n keysink \
+  'stty raw -echo; cat > '"$tmp"'/keys.log'
+sink_pane=$(tmux -L "$arm_tmux" display-message -p -t armsess:keysink '#{pane_id}')
+sleep 0.2
+# Valid 12-hex nonce and required client/seq fields (fixes #6)
+"$relay" arm-test --tmux-socket "$arm_sock" \
+  --json '{"v":2,"nonce":"aaaaaaaaaaaa","action":"forward","forward_pane":"'"$sink_pane"'","tmux_socket":"'"$arm_sock"'","local_client_tty":"'"$client_tty"'","local_client_pid":'"$client_pid"',"seq":99}'
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
+sleep 0.2
+_assert_eq "commit: a forward directive re-emits the exact key into the target pane" \
+  "1b5b37373730303975" "$(xxd -p "$tmp/keys.log" | tr -d '\n')"
+
+# stray: a commit with no directive is a silent successful no-op.
+before_pane=$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')
+stray_output=$("$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid" 2>&1)
+_assert_exit "commit: a stray commit key exits 0" 0 "$?"
+_assert_eq "commit: a stray commit key emits nothing" "" "$stray_output"
+_assert_eq "commit: a stray commit key mutates nothing" "$before_pane" \
+  "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
 kill "$arm_pid" 2>/dev/null
 wait "$arm_pid" 2>/dev/null || true
 tmux -L "$arm_tmux" kill-server 2>/dev/null || true

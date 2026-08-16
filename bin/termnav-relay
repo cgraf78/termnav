@@ -509,15 +509,19 @@ def can_handle(scope: str, direction: str, info: dict) -> bool:
 def execute_local(scope: str, direction: str, info: dict) -> bool:
     """Mutation halves from v1 route(), verbatim."""
     if scope == "pane":
-        # Re-check edge then select; mirrors v1 but split: can_handle already checked,
-        # but execute still guards via tmux result.
         edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
-        edge = tmux("-S", info["tmux_socket"], "display-message", "-p", "-t", info["target_pane"], f"#{{{edge_name}}}")
-        if edge.returncode == 0 and edge.stdout.strip() == "0":
-            selected = tmux("-S", info["tmux_socket"], "select-pane", "-t", info["target_pane"], f"-{PANE_DIRECTIONS[direction]}")
-            if selected.returncode == 0:
-                return True
-        return False
+        guarded = tmux(
+            "-S",
+            info["tmux_socket"],
+            "if-shell",
+            "-F",
+            "-t",
+            info["target_pane"],
+            f"#{{{edge_name}}}",
+            "",
+            f"select-pane -t '{info['target_pane']}' -{PANE_DIRECTIONS[direction]}",
+        )
+        return guarded.returncode == 0
     # window / move
     fields = tmux(
         "-S", info["tmux_socket"], "display-message", "-p", "-t", info["target_pane"],
@@ -554,6 +558,40 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     if moved.returncode == 0:
         return True
     return False
+
+
+def commit_command(tmux_socket: str, client_tty: str, client_pid: int) -> int:
+    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
+        if not re.fullmatch(r"[0-9]+", str(client_pid)) or int(client_pid) <= 0:
+            return 0
+        try:
+            st = os.stat(client_tty)
+            if not stat.S_ISCHR(st.st_mode):
+                return 0
+        except OSError:
+            return 0
+        listed = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
+        if listed.returncode != 0:
+            return 0
+        if not any(line.split() == [client_tty, str(client_pid)] for line in listed.stdout.splitlines() if len(line.split()) == 2):
+            return 0
+    directive = claim_directive_for_client(tmux_socket, client_tty, int(client_pid))
+    if not directive:
+        return 0
+    if directive.get("tmux_socket") != tmux_socket:
+        return 0
+    if directive.get("local_client_tty") != client_tty or int(directive.get("local_client_pid", -1)) != int(client_pid):
+        return 0
+    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
+        listed2 = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
+        if listed2.returncode != 0 or not any(line.split() == [client_tty, str(client_pid)] for line in listed2.stdout.splitlines() if len(line.split()) == 2):
+            return 0
+    if directive["action"] == "forward":
+        tmux("-S", tmux_socket, "send-keys", "-t", directive["forward_pane"], "-H", *[f"{byte:02x}" for byte in COMMIT_KEY])
+        return 0
+    info = {"tmux_socket": tmux_socket, "pane": directive["expected_pane"], "session": directive["session"], "target_pane": directive["target_pane"]}
+    execute_local(directive["scope"], directive["direction"], info)
+    return 0
 
 
 def capture_local_client(info: dict) -> tuple[str | None, int | None]:
@@ -1203,6 +1241,10 @@ def main() -> int:
     send.add_argument("--client-tty")
     server = subparsers.add_parser("serve")
     server.add_argument("--socket", required=True)
+    commit = subparsers.add_parser("commit")
+    commit.add_argument("--tmux-socket", required=True)
+    commit.add_argument("--client-tty", required=True)
+    commit.add_argument("--client-pid", required=True, type=int)
     subparsers.add_parser("sweep")
     # test-only hidden subcommands for directive store
     arm_test = subparsers.add_parser("arm-test")
@@ -1251,6 +1293,8 @@ def main() -> int:
         return 1
     if args.command == "serve":
         return serve(args.socket)
+    if args.command == "commit":
+        return commit_command(args.tmux_socket, args.client_tty, int(args.client_pid))
     if args.command == "sweep":
         return sweep()
     # test-only: directive store helpers
