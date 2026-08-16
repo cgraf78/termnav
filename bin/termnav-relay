@@ -118,7 +118,7 @@ def _is_valid_directive(d: dict) -> bool:
         if d["action"] == "execute":
             valid_dirs = {
                 "pane": {"left", "down", "up", "right"},
-                "window": {"left", "right"},
+                "window": {"next", "previous"},
                 "move": {"left", "right"},
             }.get(d.get("scope"), set())
             return (
@@ -128,9 +128,12 @@ def _is_valid_directive(d: dict) -> bool:
                 and d.get("direction") in valid_dirs
             )
         else:  # forward
-            return isinstance(d.get("forward_pane"), str) and d.get(
-                "forward_pane"
-            ).startswith("%")
+            if not (isinstance(d.get("forward_pane"), str) and d.get("forward_pane").startswith("%")):
+                return False
+            # session now persisted on forward; require it when present, allow legacy fake without for tests
+            if "session" in d and not isinstance(d.get("session"), str):
+                return False
+            return True
     except Exception:
         return False
     return True
@@ -186,6 +189,90 @@ def _next_seq(tmux_socket: str) -> int:
             os.replace(tmp, seq_path)
             try:
                 os.chmod(seq_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return nxt
+
+
+def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
+    """Allocate seq and arm atomically under one .directives.lock.
+
+    Holds the per-socket lock for both the monotonic counter bump and the
+    durable publish, so two processes sharing one tmux socket cannot expose
+    seq 2 before seq 1 (out-of-order claim window). Returns the allocated seq.
+    """
+    import fcntl
+
+    if not isinstance(directive, dict):
+        raise ValueError("directive must be a dict")
+    nonce = directive.get("nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        raise ValueError(f"invalid nonce: {nonce!r}")
+    ltty = directive.get("local_client_tty")
+    if not isinstance(ltty, str):
+        raise ValueError("missing local_client_tty")
+    lpid = directive.get("local_client_pid")
+    if not isinstance(lpid, int):
+        raise ValueError("missing local_client_pid")
+    if directive.get("tmux_socket") != tmux_socket:
+        raise ValueError("tmux_socket mismatch")
+    if "expires_override" in directive:
+        try:
+            directive["expires"] = float(directive.pop("expires_override"))
+        except (TypeError, ValueError):
+            directive["expires"] = time.time() + DIRECTIVE_TTL
+    else:
+        directive["expires"] = time.time() + DIRECTIVE_TTL
+    ddir = directive_dir(tmux_socket)
+    lock_path = ddir / ".directives.lock"
+    seq_path = ddir / ".seq"
+    final = directive_path(tmux_socket, nonce)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        # --- seq bump ---
+        try:
+            raw = seq_path.read_text(encoding="utf-8").strip()
+            cur = int(raw) if raw else 0
+        except (OSError, ValueError):
+            cur = 0
+        nxt = cur + 1
+        tmp_seq = seq_path.with_name(seq_path.name + ".tmp")
+        try:
+            tmp_seq.write_text(str(nxt), encoding="utf-8")
+            with open(tmp_seq, "rb") as tf:
+                os.fsync(tf.fileno())
+            os.chmod(tmp_seq, 0o600)
+            os.replace(tmp_seq, seq_path)
+            try:
+                os.chmod(seq_path, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp_seq.unlink()
+            except OSError:
+                pass
+        directive["seq"] = nxt
+        # --- publish ---
+        tmp = ddir / f".tmp-{nonce}-{os.getpid()}-{secrets.token_hex(4)}.json"
+        payload = json.dumps(directive, separators=(",", ":"), sort_keys=True)
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            with open(tmp, "rb") as tf:
+                os.fsync(tf.fileno())
+            os.chmod(tmp, 0o600)
+            try:
+                os.link(tmp, final)
+            except FileExistsError:
+                raise FileExistsError(f"directive already exists: {nonce}")
+            try:
+                os.chmod(final, 0o600)
             except OSError:
                 pass
         finally:
@@ -476,7 +563,11 @@ def send_request(path: str, scope: str, direction: str) -> bool:
 def tmux(*args: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.pop("TMUX", None)
-    return subprocess.run(["tmux", *args], env=environment, text=True, capture_output=True, check=False)
+    try:
+        return subprocess.run(["tmux", *args], env=environment, text=True, capture_output=True, check=False, timeout=2)
+    except subprocess.TimeoutExpired:
+        # Fail closed on timeout (e.g., stale-pane guard during concurrent server)
+        return subprocess.CompletedProcess(args=["tmux", *args], returncode=1, stdout="", stderr="timeout")
 
 
 def local_scope() -> dict | None:
@@ -512,7 +603,22 @@ def can_handle(scope: str, direction: str, info: dict) -> bool:
 
 
 def execute_local(scope: str, direction: str, info: dict) -> bool:
-    """Mutation halves from v1 route(), verbatim."""
+    """Mutation halves from v1 route(), verbatim with stale-pane guard."""
+    # Stale directive check: for pane, expected pane must still be active; for window/move, pane must still exist
+    if scope == "pane":
+        try:
+            active = tmux("-S", info["tmux_socket"], "display-message", "-p", "-t", info["session"], "#{pane_id}")
+        except Exception:
+            return False
+        if active.returncode != 0 or active.stdout.strip() != info["pane"]:
+            return False
+    else:
+        try:
+            exists = tmux("-S", info["tmux_socket"], "display-message", "-p", "-t", info["pane"], "#{pane_id}")
+        except Exception:
+            return False
+        if exists.returncode != 0 or exists.stdout.strip() != info["pane"]:
+            return False
     if scope == "pane":
         edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
         guarded = tmux(
@@ -588,7 +694,12 @@ def commit_command(tmux_socket: str, client_tty: str, client_pid: int) -> int:
     if directive.get("local_client_tty") != client_tty or int(directive.get("local_client_pid", -1)) != int(client_pid):
         return 0
     if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
-        listed2 = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
+        # Session-scoped validation: tty/pid must remain attached to the directive's session
+        sess = directive.get("session")
+        if not isinstance(sess, str):
+            # Forward directives now carry session; reject if missing
+            return 0
+        listed2 = tmux("-S", tmux_socket, "list-clients", "-t", sess, "-F", "#{client_tty} #{client_pid}")
         if listed2.returncode != 0 or not any(line.split() == [client_tty, str(client_pid)] for line in listed2.stdout.splitlines() if len(line.split()) == 2):
             return 0
     if directive["action"] == "forward":
@@ -723,15 +834,9 @@ def handle_navigate(request: dict) -> dict:
             else:
                 return {"v": 2, "result": "error"}
         tmux_socket = info["tmux_socket"]  # type: ignore[index]
-        # Allocate seq and arm execute directive
-        try:
-            seq = _next_seq(tmux_socket)
-        except OSError:
-            return {"v": 2, "result": "error"}
         directive = {
             "v": 2,
             "nonce": nonce,
-            "seq": seq,
             "action": "execute",
             "tmux_socket": tmux_socket,
             "session": info["session"],  # type: ignore[index]
@@ -743,7 +848,7 @@ def handle_navigate(request: dict) -> dict:
             "local_client_pid": local_pid,
         }
         try:
-            arm_directive(directive)
+            _arm_directive_and_seq(tmux_socket, directive)
         except (ValueError, FileExistsError, OSError):
             return {"v": 2, "result": "error"}
         parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
@@ -819,24 +924,18 @@ def handle_commit_path(request: dict) -> dict:
                 local_tty = None
         if local_tty is not None:
             tmux_socket = info["tmux_socket"]
-            # Check test hook for commit-path: if TERMNAV_RELAY_TEST_RESULT set, still arm?
-            # Arm forward directive
-            try:
-                seq = _next_seq(tmux_socket)
-            except OSError:
-                return {"v": 2, "result": "error"}
             directive = {
                 "v": 2,
                 "nonce": nonce,
-                "seq": seq,
                 "action": "forward",
                 "tmux_socket": tmux_socket,
+                "session": info["session"],
                 "forward_pane": info["pane"],
                 "local_client_tty": local_tty,
                 "local_client_pid": local_pid,
             }
             try:
-                arm_directive(directive)
+                _arm_directive_and_seq(tmux_socket, directive)
             except (ValueError, FileExistsError, OSError):
                 return {"v": 2, "result": "error"}
             parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
@@ -996,15 +1095,10 @@ def serve(path: str) -> int:
                     except OSError:
                         pass
                     return
-                # v1 fallback (legacy tests): map to armed/declined via route
-                if request.get("v") == 1 and set(request) == {"v", "scope", "direction"}:
+                # v1 is rejected per v18 — do not route, fail closed
+                if request.get("v") == 1:
                     try:
-                        valid_request(request["scope"], request["direction"])
-                    except SystemExit:
-                        return
-                    handled = route(request["scope"], request["direction"])
-                    try:
-                        connection.sendall(b"1" if handled else b"0")
+                        connection.sendall((json.dumps({"v": 2, "result": "error"}, separators=(",", ":")) + "\n").encode())
                     except OSError:
                         pass
                     return

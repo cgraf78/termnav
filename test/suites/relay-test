@@ -117,7 +117,8 @@ fragmented.connect(sys.argv[1])
 payload = json.dumps({"v": 1, "scope": "pane", "direction": "left"}, separators=(",", ":")).encode() + b"\n"
 for byte in payload:
     fragmented.send(bytes([byte]))
-assert fragmented.recv(1) == b"1"
+# v1 is rejected per v18 — must not return b"1" via legacy route()
+assert fragmented.recv(1) != b"1"
 fragmented.close()
 stalled.close()
 PY
@@ -127,7 +128,7 @@ for _ in {1..12}; do
   sleep 0.02
 done
 _assert_eq "relay: stalled and concurrent clients cannot block valid fragmented requests" \
-  13 "$(wc -l <"$concurrent_log" | tr -d ' ')"
+  12 "$(wc -l <"$concurrent_log" | tr -d ' ')" # v1 is now rejected (not counted) per v18 #1
 set +e
 TERMNAV_PARENT_RELAY="$concurrent_socket" "$relay" send pane left \
   --client-pid "$$" --client-tty /dev/definitely-not-this-tty >/dev/null 2>&1
