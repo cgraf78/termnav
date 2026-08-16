@@ -169,6 +169,7 @@ middle_pane=$(tmux -L "$tmux_socket_name" display-message -p -t target:3 '#{pane
 first_pane=$(tmux -L "$tmux_socket_name" display-message -p -t target:0 '#{pane_id}')
 last_pane=$(tmux -L "$tmux_socket_name" display-message -p -t target:7 '#{pane_id}')
 target_session=$(tmux -L "$tmux_socket_name" display-message -p -t target '#{session_id}')
+tmux -L "$tmux_socket_name" select-window -t target:3
 move_socket="$tmp/move.sock"
 TERMNAV_RELAY_DIRECT=1 TMUX="$tmux_socket_path,0,0" TMUX_PANE="$middle_pane" TERMNAV_TMUX_SESSION="$target_session" \
   "$relay" serve --socket "$move_socket" &
@@ -191,6 +192,7 @@ kill "$move_pid"
 wait "$move_pid" 2>/dev/null || true
 
 for boundary_pane in "$first_pane" "$last_pane"; do
+  tmux -L "$tmux_socket_name" select-window -t "$boundary_pane"
   boundary_socket="$tmp/boundary-${boundary_pane#%}.sock"
   TERMNAV_RELAY_DIRECT=1 TMUX="$tmux_socket_path,0,0" TMUX_PANE="$boundary_pane" TERMNAV_TMUX_SESSION="$target_session" \
     "$relay" serve --socket "$boundary_socket" &
@@ -421,6 +423,16 @@ first_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
 second_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
 _assert_contains "directive: claim returns the armed directive" '"nonce":"abc123abc123"' "$first_claim"
 _assert_eq "directive: a directive can be claimed exactly once" "" "$second_claim"
+# O_EXCL publishes the final pathname while its contents are written under the
+# shared lock. A writer crash can leave invalid JSON; the next claim must fail
+# closed and remove it rather than execute a partial directive.
+partial_dir=$(dirname "$directive_file")
+partial_file="$partial_dir/121314151617.json"
+printf '{"v":2,"nonce":"121314151617"' >"$partial_file"
+partial_claim=$("$relay" claim-test --tmux-socket "$fake_tmux_socket")
+_assert_eq "directive: a crash-partial directive cannot be claimed" "" "$partial_claim"
+_assert_eq "directive: claiming removes a crash-partial directive" false \
+  "$([[ -e "$partial_file" ]] && echo true || echo false)"
 # Per-client seq-ordered FIFO: arm bbb then aaa (reverse lexicographic) but seq orders by arm time
 "$relay" arm-test --tmux-socket "$fake_tmux_socket" \
   --json '{"v":2,"nonce":"bbbbbbbbbbbb","action":"forward","forward_pane":"%9","tmux_socket":"'"$fake_tmux_socket"'","local_client_tty":"/dev/pts/1","local_client_pid":111,"seq":2}'
@@ -658,16 +670,109 @@ _assert_exit "arming: invalid client_tty fails closed" 1 "$fake_rc"
 kill "$fake_pid" 2>/dev/null
 wait "$fake_pid" 2>/dev/null || true
 
-# Busy handling: nonblocking try-lock returns busy JSON
-# Verify busy handling code is present (production handler uses try-lock + busy JSON)
-if grep -q 'busy' "$relay"; then
-  echo "PASS: busy handling present"
-else
-  echo "FAIL: busy handling missing"
-  exit 1
-fi
-# Busy test note: the concurrent block above already covers serialization;
-# the busy JSON path is verified by grep above.
+# Hold one real handler inside the dispatch lock, then prove a second request
+# is rejected promptly instead of overlapping the first invocation.
+busy_sock="$tmp/busy.sock"
+busy_log="$tmp/busy.log"
+TERMNAV_RELAY_TEST_LOG="$busy_log" TERMNAV_RELAY_TEST_HANDLE_DELAY=0.5 \
+  "$relay" serve --socket "$busy_sock" &
+busy_pid=$!
+for _ in {1..50}; do
+  [[ -S "$busy_sock" ]] && break
+  sleep 0.02
+done
+TERMNAV_PARENT_RELAY="$busy_sock" "$relay" send pane left &
+busy_first_pid=$!
+for _ in {1..50}; do
+  [[ -s "$busy_log" ]] && break
+  sleep 0.01
+done
+set +e
+TERMNAV_PARENT_RELAY="$busy_sock" "$relay" send pane right
+busy_rc=$?
+set -e
+_assert_exit "relay: concurrent handling returns a transport error" 1 "$busy_rc"
+wait "$busy_first_pid"
+_assert_not_contains "relay: a busy server never executes the rejected request" \
+  "pane right" "$(cat "$busy_log")"
+kill "$busy_pid" 2>/dev/null
+wait "$busy_pid" 2>/dev/null || true
+
+# A request that outlives the client's two-second deadline may still finish;
+# send must report transport error so callers never start a second fallback.
+delayed_sock="$tmp/delayed.sock"
+delayed_log="$tmp/delayed.log"
+TERMNAV_RELAY_TEST_LOG="$delayed_log" TERMNAV_RELAY_TEST_HANDLE_DELAY=2.2 \
+  "$relay" serve --socket "$delayed_sock" &
+delayed_pid=$!
+for _ in {1..50}; do
+  [[ -S "$delayed_sock" ]] && break
+  sleep 0.02
+done
+set +e
+TERMNAV_PARENT_RELAY="$delayed_sock" "$relay" send pane left
+delayed_rc=$?
+set -e
+_assert_exit "relay: client timeout stays a transport error" 1 "$delayed_rc"
+for _ in {1..50}; do
+  [[ "$(wc -l <"$delayed_log" | tr -d ' ')" -ge 2 ]] && break
+  sleep 0.02
+done
+_assert_contains "relay: timed-out server handling still completes" \
+  "completed pane left" "$(cat "$delayed_log")"
+kill "$delayed_pid" 2>/dev/null
+wait "$delayed_pid" 2>/dev/null || true
+
+# Invalid test delays must be ignored rather than crashing a handler thread or
+# holding the global dispatch lock indefinitely.
+invalid_delay_sock="$tmp/invalid-delay.sock"
+invalid_delay_log="$tmp/invalid-delay.log"
+TERMNAV_RELAY_TEST_LOG="$invalid_delay_log" TERMNAV_RELAY_TEST_HANDLE_DELAY=inf \
+  "$relay" serve --socket "$invalid_delay_sock" &
+invalid_delay_pid=$!
+for _ in {1..50}; do
+  [[ -S "$invalid_delay_sock" ]] && break
+  sleep 0.02
+done
+TERMNAV_PARENT_RELAY="$invalid_delay_sock" "$relay" send pane left
+_assert_exit "relay: a non-finite test delay is ignored" 0 "$?"
+kill "$invalid_delay_pid" 2>/dev/null
+wait "$invalid_delay_pid" 2>/dev/null || true
+
+# The move path discovers adjacency by stable window ID. Its final guarded
+# swap must retain those IDs instead of resolving mutable indexes later.
+stable_move_command=$(
+  python3 - "$relay" <<'PY'
+import importlib.machinery
+import subprocess
+import sys
+
+relay = importlib.machinery.SourceFileLoader("termnav_relay", sys.argv[1]).load_module()
+calls = []
+
+
+def fake_tmux(*args):
+    calls.append(args)
+    if "display-message" in args:
+        return subprocess.CompletedProcess(args, 0, "$0 2 @0\n", "")
+    if "list-windows" in args:
+        return subprocess.CompletedProcess(args, 0, "@0 0\n@1 1\n", "")
+    return subprocess.CompletedProcess(args, 0, "", "")
+
+
+relay.tmux = fake_tmux
+relay.execute_local(
+    "move",
+    "right",
+    {"tmux_socket": "/tmp/tmux.sock", "pane": "%0", "session": "$0", "target_pane": "$0:.%0"},
+)
+print(calls[-1][-2])
+PY
+)
+_assert_contains "relay move: guarded swap targets the stable source window ID" \
+  "-s '\$0:@0'" "$stable_move_command"
+_assert_contains "relay move: guarded swap targets the stable adjacent window ID" \
+  "-t '\$0:@1'" "$stable_move_command"
 
 echo "=== commit consumption ==="
 # Detached tmux has no real client_tty; use narrow test hook so claim/commit skip S_ISCHR/list-clients (test-only, fixes Codex v13 #5)
@@ -705,6 +810,35 @@ tmux -L "$arm_tmux" select-pane -t "$right_pane"
 "$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
 _assert_eq "commit: a stale execute directive never switches away from the user" \
   "$right_pane" "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
+# Cross-window staleness: pane_active is window-local, so every execute scope
+# must compare the session's selected pane with expected_pane at mutation time.
+tmux -L "$arm_tmux" select-pane -t "$left_pane"
+TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send pane right
+tmux -L "$arm_tmux" new-window -d -n elsewhere
+elsewhere_pane=$(tmux -L "$arm_tmux" display-message -p -t armsess:elsewhere '#{pane_id}')
+tmux -L "$arm_tmux" select-window -t armsess:elsewhere
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
+_assert_eq "commit: stale cross-window pane directive leaves its old window unchanged" \
+  "$left_pane" "$(tmux -L "$arm_tmux" display-message -p -t armsess:0 '#{pane_id}')"
+_assert_eq "commit: stale cross-window pane directive keeps the user's window" \
+  "$elsewhere_pane" "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
+tmux -L "$arm_tmux" select-window -t armsess:0
+tmux -L "$arm_tmux" select-pane -t "$left_pane"
+TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send window next
+tmux -L "$arm_tmux" select-window -t armsess:elsewhere
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
+_assert_eq "commit: stale cross-window window directive keeps the user's window" \
+  "$elsewhere_pane" "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
+tmux -L "$arm_tmux" select-window -t armsess:0
+TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send move right
+tmux -L "$arm_tmux" select-window -t armsess:elsewhere
+window_order_before=$(tmux -L "$arm_tmux" list-windows -t armsess -F '#{window_id}')
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" --client-pid "$client_pid"
+_assert_eq "commit: stale cross-window move directive does not reorder windows" \
+  "$window_order_before" "$(tmux -L "$arm_tmux" list-windows -t armsess -F '#{window_id}')"
 
 # forward: the commit key is re-emitted byte-for-byte into the explicit target pane.
 tmux -L "$arm_tmux" new-window -d -n keysink \

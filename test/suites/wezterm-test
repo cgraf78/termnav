@@ -452,10 +452,13 @@ for test_shell in bash zsh; do
       "${test_shell_command[@]}" -c '
         SECONDS=100
         source "$SHELL_INTEGRATION" >/dev/null
+        printf "loaded=%s\n" "${TERMNAV_SHELL_LOADED:-}"
         printf "queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
         printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
       '
   )
+  _assert_contains "shell integration: $test_shell loads the real provider" \
+    "loaded=1" "$startup_publish_output"
   _assert_contains "shell integration: $test_shell startup shares one tmux context query" \
     "queries=1" "$startup_publish_output"
   _assert_contains "shell integration: $test_shell shared startup query publishes global remote host" \

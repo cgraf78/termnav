@@ -583,18 +583,20 @@ def can_handle(scope: str, direction: str, info: dict) -> bool:
 
 def execute_local(scope: str, direction: str, info: dict) -> bool:
     """Mutation halves from v1 route(), single atomic stale+edge+mutate per scope."""
+    expected_guard = f"#{{==:#{{pane_id}},{info['pane']}}}"
     if scope == "pane":
-        # Single atomic: active check + edge check + select in one if-shell
-        # Format: 1 if active and not at edge, else 0
+        # The session target makes pane_id the pane the user currently owns.
+        # Combine that stale check with the edge check and mutation in one tmux
+        # command so another client cannot redirect a delayed commit.
         edge_var = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
-        active_edge_fmt = f"#{{&&:#{{pane_active}},#{{!=:#{{{edge_var}}},1}}}}"
+        active_edge_fmt = f"#{{&&:{expected_guard},#{{!=:#{{{edge_var}}},1}}}}"
         guarded = tmux(
             "-S",
             info["tmux_socket"],
             "if-shell",
             "-F",
             "-t",
-            info["pane"],
+            info["session"],
             active_edge_fmt,
             f"select-pane -t '{info['target_pane']}' -{PANE_DIRECTIONS[direction]}",
             "run-shell 'false'",
@@ -603,14 +605,14 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     if scope == "window":
         # Single atomic: pane must be active and session must have >1 window,
         # then switch — all in one if-shell for stale+edge+mutate.
-        guard = "#{&&:#{pane_active},#{!=:#{session_windows},1}}"
+        guard = f"#{{&&:{expected_guard},#{{!=:#{{session_windows}},1}}}}"
         guarded = tmux(
             "-S",
             info["tmux_socket"],
             "if-shell",
             "-F",
             "-t",
-            info["pane"],
+            info["session"],
             guard,
             f"{WINDOW_DIRECTIONS[direction]} -t '{info['session']}'",
             "run-shell 'false'",
@@ -626,11 +628,8 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     parts = fields.stdout.split()
     if len(parts) != 3 or not parts[1].isdigit() or int(parts[1]) <= 1:
         return False
-    if False:  # placeholder to keep window branch above separate; never reached
-        return False
-    # move: need window list; at edge no mutation is a handled no-op, otherwise
-    # swap the windows atomically (no extra pane_active gate needed for the
-    # test harness which drives TMUX_PANE from env).
+    # Move retains the existing stable window-ID adjacency lookup, while the
+    # final stale-focus check and swap execute as one tmux command.
     listed = tmux(
         "-S", info["tmux_socket"], "list-windows", "-t", parts[0],
         "-F", "#{window_id} #{window_index}",
@@ -643,17 +642,21 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     target_index = source_index + (-1 if direction == "left" else 1)
     if target_index < 0 or target_index >= len(window_ids):
         return True
-    moved = tmux(
+    guarded = tmux(
         "-S",
         info["tmux_socket"],
-        "swap-window",
-        "-d",
-        "-s",
-        f"{parts[0]}:{windows[source_index][1]}",
+        "if-shell",
+        "-F",
         "-t",
-        f"{parts[0]}:{windows[target_index][1]}",
+        info["session"],
+        expected_guard,
+        (
+            f"swap-window -d -s '{parts[0]}:{windows[source_index][0]}' "
+            f"-t '{parts[0]}:{windows[target_index][0]}'"
+        ),
+        "run-shell 'false'",
     )
-    if moved.returncode == 0:
+    if guarded.returncode == 0:
         return True
     return False
 
@@ -775,6 +778,24 @@ def handle_navigate(request: dict) -> dict:
                 output.write(f"{request.get('scope')} {request.get('direction')}\n")
         except OSError:
             pass
+        delay = os.environ.get("TERMNAV_RELAY_TEST_HANDLE_DELAY")
+        if delay is not None:
+            try:
+                delay_seconds = float(delay)
+            except ValueError:
+                delay_seconds = -1
+            # This hook deliberately holds the serialized handler lock. Keep it
+            # narrow enough to exercise the two-second client timeout without
+            # allowing stale test environments to stall a server indefinitely.
+            if 0 <= delay_seconds <= 3:
+                time.sleep(delay_seconds)
+            try:
+                with open(test_log, "a", encoding="utf-8") as output:
+                    output.write(
+                        f"completed {request.get('scope')} {request.get('direction')}\n"
+                    )
+            except OSError:
+                pass
         result = os.environ.get("TERMNAV_RELAY_TEST_RESULT", "armed")
         if result in ("armed", "declined", "error", "emitted"):
             return {"v": 2, "result": result}

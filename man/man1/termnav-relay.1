@@ -55,9 +55,11 @@ Each directive has a 6 s TTL (\fBDIRECTIVE_TTL\fR). On successful arm the
 executing hop extends the chain's TTLs by marking committed (max of existing
 expiry and now+2 s). Expiry is enforced at claim time by validating
 \fBexpires\fR inside the per-socket \fB.directives.lock\fR file lock. File
-creation uses exclusive create (temp file + \fBos.link\fR) under the shared
-lock so concurrent navigations create separate per-nonce files without
-last-wins drops or partial exposure; claims are single-claim by
+creation uses \fBO_CREAT|O_EXCL\fR under the shared lock so concurrent
+navigations create separate per-nonce files without last-wins drops. Normal
+claimers cannot observe a write in progress because they take the same lock.
+If a writer crashes mid-write, a claimer rejects and removes the invalid JSON
+when it is examined, without acting (fail-closed). Claims are single-claim by
 \fBflock\fR + unlink.
 .PP
 There is no watchdog direct-execution fallback. If the OSC is ignored
@@ -70,6 +72,10 @@ or other error (fail-closed, do nothing), and \fB2\fR on usage error.
 \fBtermnav-relay commit\fR always exits \fB0\fR (silent, bounded runtime) —
 it is invoked from a foreground tmux \fBrun-shell\fR so client input pauses
 until the switch lands. Stray commits with no pending directive are no-ops.
+.PP
+An absent parent relay is an explicit decline so ordinary local and nested-tmux
+compatibility paths continue to work. Once a parent relay is present, its
+timeout or transport failure is an error and never permits fallback.
 .PP
 \fBsend\fR itself never mutates tmux; only \fBcommit\fR does.
 .SH ENVIRONMENT
