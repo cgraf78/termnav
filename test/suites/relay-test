@@ -43,7 +43,7 @@ missing_rc=$?
 set -e
 _assert_exit "relay: rejects invalid directions" 2 "$bad_rc"
 _assert_contains "relay: invalid direction is actionable" "invalid pane direction" "$bad_output"
-_assert_exit "relay: absent parent fails silently" 1 "$missing_rc"
+_assert_exit "relay: absent parent fails silently" 3 "$missing_rc"
 _assert_eq "relay: absent parent emits nothing" "" "$missing_output"
 
 echo

@@ -650,10 +650,9 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
         )
         return guarded.returncode == 0
     if scope == "window":
-        # Single atomic: session must have >1 window, then switch. Pane-active
-        # is not required for window scope; use !=1 for older tmux portability
-        # (tmux 3.0 lacks > comparator in some builds).
-        guard = "#{!=:#{session_windows},1}"
+        # Single atomic: pane must be active and session must have >1 window,
+        # then switch — all in one if-shell for stale+edge+mutate.
+        guard = "#{&&:#{pane_active},#{!=:#{session_windows},1}}"
         guarded = tmux(
             "-S",
             info["tmux_socket"],
@@ -1407,6 +1406,14 @@ def main() -> int:
 
     if args.command == "send":
         valid_request(args.scope, args.direction)
+        # Parent relay is authoritative from the client's environment if a pid is
+        # given (SSH chain), otherwise from the current process. Check both so
+        # tests that set TERMNAV_PARENT_RELAY in the caller's env still work.
+        parent = None
+        if args.client_pid:
+            parent = process_env(args.client_pid, "TERMNAV_PARENT_RELAY")
+        if not parent:
+            parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
         if args.client_pid and args.client_tty:
             try:
                 actual_tty = os.readlink(f"/proc/{args.client_pid}/fd/0")
@@ -1416,12 +1423,14 @@ def main() -> int:
                     actual_tty = f"/dev/{actual_tty}"
             try:
                 if actual_tty != args.client_tty:
-                    return 1
+                    # PID-reuse mismatch: fail closed (1) if a parent relay exists
+                    # (would be handling the wrong client), otherwise declined (3)
+                    # to allow local fallback (e.g., tab-switch's /dev/null dummy).
+                    return 1 if parent else 3
             except UnboundLocalError:
-                return 1
-        parent = process_env(args.client_pid, "TERMNAV_PARENT_RELAY") if args.client_pid else os.environ.get("TERMNAV_PARENT_RELAY")
+                return 1 if parent else 3
         if not parent:
-            return 1
+            return 3
         nonce = secrets.token_hex(6)
         reply = send_message(parent, {"v": 2, "op": "navigate", "scope": args.scope, "direction": args.direction, "nonce": nonce})
         result = reply.get("result")
