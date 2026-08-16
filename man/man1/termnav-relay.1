@@ -27,10 +27,21 @@ fixed pane and window navigation operations.
 Install \fBshare/termnav/sshd_config\fR as an sshd_config.d fragment on any
 host that should participate, validate with \fBsshd -t\fR, and reload sshd.
 .PP
-Explicit SSH remote commands and non-session modes are passed to OpenSSH
-unchanged. Participating SSH servers accept only TERMNAV_PARENT_RELAY from the
-client environment. Failure to receive it makes navigation a silent no-op and
-does not create another SSH connection or authentication attempt.
+Explicit and configured SSH remote commands and non-session modes are passed
+to OpenSSH unchanged. For an interactive login, Termnav carries the current
+relay path in the session's fixed bootstrap command before immediately
+executing the remote login shell. This remains correct when OpenSSH reuses a
+ControlMaster whose original environment predates the relay session.
+Participating SSH servers also accept only TERMNAV_PARENT_RELAY from the client
+environment for compatibility with non-multiplexed clients. Failure to receive
+usable metadata makes navigation a silent no-op and does not create another SSH
+connection or authentication attempt.
+.PP
+Because the bootstrap occupies SSH's command channel, sshd exposes it as
+\fBSSH_ORIGINAL_COMMAND\fR to a configured \fBForceCommand\fR. Such a policy
+can choose to reject the enhanced login; Termnav then fails closed. Use ordinary
+\fBssh\fR for hosts whose policy requires an empty command, or configure a
+\fBRemoteCommand\fR that the policy explicitly permits.
 .SH TWO-PHASE COMMIT TRANSPORT
 Navigation uses a two-phase commit. The originating \fBsend\fR arms a per-nonce
 per-client directive file under \fB$XDG_RUNTIME_DIR/termnav-$UID/directives/<hash>/\fR
