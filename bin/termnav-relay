@@ -651,8 +651,9 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
         return guarded.returncode == 0
     if scope == "window":
         # Single atomic: session must have >1 window, then switch. Pane-active
-        # is not required for window scope; move's pane guard is separate.
-        guard = "#{>:#{session_windows},1}"
+        # is not required for window scope; use !=1 for older tmux portability
+        # (tmux 3.0 lacks > comparator in some builds).
+        guard = "#{!=:#{session_windows},1}"
         guarded = tmux(
             "-S",
             info["tmux_socket"],
