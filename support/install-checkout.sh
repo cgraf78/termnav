@@ -17,6 +17,7 @@ commands=(
   nvim-link-host
   nvim-ssh-control-open
   nvim-tmux-open
+  termnav-relay
   termnav-switch-tab
   tmux-follow-click
   vscode-nvim-focus

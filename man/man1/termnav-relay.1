@@ -1,0 +1,111 @@
+.TH TERMNAV-RELAY 1
+.SH NAME
+termnav-relay \- route navigation through nested SSH and tmux scopes
+.SH SYNOPSIS
+.B termnav-relay send
+.I pane direction
+[\fB--client-pid\fR \fIPID\fR]
+.br
+.B termnav-relay send
+.I window next|previous
+[\fB--client-pid\fR \fIPID\fR]
+.br
+.B termnav-relay send
+.I move left|right
+[\fB--client-pid\fR \fIPID\fR]
+.br
+.B termnav-relay commit --tmux-socket \fIsocket\fR --client-tty \fItty\fR --client-pid \fIpid\fR
+.br
+.B termnav-relay ssh
+[\fIssh arguments\fR]
+.SH DESCRIPTION
+Termnav establishes one owner-only Unix socket forwarding channel on each
+interactive SSH connection. Navigation requests are handled by the nearest
+tmux scope and otherwise forwarded to its parent. The protocol contains only
+fixed pane and window navigation operations.
+.PP
+Install \fBshare/termnav/sshd_config\fR as an sshd_config.d fragment on any
+host that should participate, validate with \fBsshd -t\fR, and reload sshd.
+.PP
+Explicit SSH remote commands and non-session modes are passed to OpenSSH
+unchanged. Participating SSH servers accept only TERMNAV_PARENT_RELAY from the
+client environment. Failure to receive it makes navigation a silent no-op and
+does not create another SSH connection or authentication attempt.
+.SH TWO-PHASE COMMIT TRANSPORT
+Navigation uses a two-phase commit. The originating \fBsend\fR arms a per-nonce
+per-client directive file under \fB$XDG_RUNTIME_DIR/termnav-$UID/directives/<hash>/\fR
+on each hop that can handle the request; the executing hop then emits an
+in-band commit key (\fBESC [777009u\fR, \fBuser-keys[8]\fR) via \fBOSC 1337 SetUserVar=DOT_RELAY_COMMIT\fR
+into the originating pane. The pane's tmux binding for User8 runs
+\fBtermnav-relay commit\fR, which claims the oldest pending directive for that
+client (FIFO by sequence number) and performs the pane/window switch. Window
+and move scopes use stable-ID swap logic; pane scope uses a single guarded
+\fBif-shell\fR (edge check and \fBselect-pane\fR atomically) to avoid TOCTOU.
+.PP
+Directives carry the hop-local initiating client identity (\fBclient_tty\fR,
+\fBclient_pid\fR) captured from the relay server's retained environment at
+\fBssh_command\fR spawn time (authoritative \fBlist-clients\fR newest
+\fBclient_activity\fR then \fBfocused\fR flag filtered to \fBTMUX_PANE\fR, or
+\fB/dev/tty\fR for tmux-less hops). No origin client fields are forwarded on
+the wire between hops. Commit validates the client tty is a character device
+and that the tty/pid pair is still present in \fBlist-clients\fR before and
+immediately before acting (fail-closed).
+.PP
+Each directive has a 6 s TTL (\fBDIRECTIVE_TTL\fR). On successful arm the
+executing hop extends the chain's TTLs by marking committed (max of existing
+expiry and now+2 s). Expiry is enforced at claim time by validating
+\fBexpires\fR inside the per-socket \fB.directives.lock\fR file lock. File
+creation uses \fBO_CREAT|O_EXCL\fR under the shared lock so concurrent
+navigations create separate per-nonce files without last-wins drops. Normal
+claimers cannot observe a write in progress because they take the same lock.
+If a writer crashes mid-write, a claimer rejects and removes the invalid JSON
+when it is examined, without acting (fail-closed). Claims are single-claim by
+\fBflock\fR + unlink.
+.PP
+There is no watchdog direct-execution fallback. If the OSC is ignored
+(non-WezTerm) or emit validation fails, the armed directive simply expires and
+navigation is a silent no-op. The scope is WezTerm-only for v2.
+.SH EXIT STATUS
+\fBtermnav-relay send\fR exits \fB0\fR when armed (handled), \fB3\fR when
+declined (caller may fall back to local \fBwezterm-*\fR), \fB1\fR on transport
+or other error (fail-closed, do nothing), and \fB2\fR on usage error.
+\fBtermnav-relay commit\fR always exits \fB0\fR (silent, bounded runtime) —
+it is invoked from a foreground tmux \fBrun-shell\fR so client input pauses
+until the switch lands. Stray commits with no pending directive are no-ops.
+.PP
+An absent parent relay is an explicit decline so ordinary local and nested-tmux
+compatibility paths continue to work. Once a parent relay is present, its
+timeout or transport failure is an error and never permits fallback.
+.PP
+\fBsend\fR itself never mutates tmux; only \fBcommit\fR does.
+.SH ENVIRONMENT
+.TP
+.B TERMNAV_RELAY_DIRECT
+When set to \fB1\fR, a handleable \fBsend\fR that has no parent relay executes
+directly without arming (used by legacy real-tmux regression tests).
+.TP
+.B TERMNAV_RELAY_LOG
+When set, the relay server appends debug lines (\fBbegin\fR/\fBend\fR per
+nonce) to the given path.
+.TP
+.B TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION
+Test-only hook to bypass \fBS_ISCHR\fR and \fBlist-clients\fR validation for
+detached tmux servers.
+.SH RESIDUAL RISKS
+Replies the terminal emits \fIafter\fR the commit key for queries from the
+departing pane, and post-switch handshakes from the departing subtree, can
+still misroute — the same exposure the pre-relay design had (never observed in
+practice). Fixing those requires reply routing inside tmux itself. Concurrent
+navigations have separate per-nonce, per-client files (no last-wins drop, no
+cross-client consumption); the remaining edge is per-client FIFO
+misattribution if a commit is lost — the next key from the same client
+executes its oldest pending directive (bounded, expires in 6 s, mitigated by
+\fBexpected_pane\fR check for \fBexecute\fR). Encoding the nonce into the
+commit byte stream would eliminate this; deferred. Remote \fB/tmp/termnav-relay-<token>.sock\fR
+forward path portability (Termux/no-/tmp) is a deferred known limitation —
+local artifacts already use \fB$XDG_RUNTIME_DIR\fR, remote \fBRemoteForward\fR
+stays \fB/tmp\fR for v2. \fBps eww\fR fallback remains best-effort and
+fail-closed (not a robust parser). TTL 6 s may expire on deep/slow chains —
+safe no-op but \fBsend\fR may have returned armed; bound is roughly 4 hops at
+6 s TTL with 2 s per-hop timeout, revisitable with a pending→committed
+lifecycle.
