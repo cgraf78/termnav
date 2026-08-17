@@ -255,6 +255,13 @@ ControlMaster connection. The helper fails closed when the variable is unset
 or the target host is not listed, so reusable installs do not inherit private
 host policy from this repo.
 
+`termnav-relay ssh` sends each relay path through OpenSSH's per-session
+environment channel, including sessions carried by an existing ControlMaster.
+It leaves SSH's remote command channel and login-shell selection untouched, so
+non-POSIX targets such as native Windows OpenSSH hosts still receive an
+ordinary interactive shell. Strict `ExitOnForwardFailure=yes` configurations
+are delegated unchanged rather than making Termnav's optional relay mandatory.
+
 Run tests with:
 
 ```bash

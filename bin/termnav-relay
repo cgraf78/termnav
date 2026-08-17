@@ -1322,10 +1322,14 @@ def ssh_command(arguments: list[str]) -> int:
             settings[key.lower()] = value.strip()
     if settings.get("sessiontype", "default").lower() != "default":
         return subprocess.run([binary, *arguments], check=False).returncode
-    # A configured RemoteCommand already owns the per-session command channel
-    # used by the relay bootstrap.  Combining both makes OpenSSH reject the
-    # session, so preserve that host's ordinary SSH behavior.
+    # A configured RemoteCommand is not an ordinary login shell. Preserve that
+    # session byte-for-byte rather than attaching relay state to a command
+    # Termnav does not own.
     if settings.get("remotecommand", "none").lower() != "none":
+        return subprocess.run([binary, *arguments], check=False).returncode
+    # The relay is optional. Do not make an otherwise ordinary login inherit a
+    # new fatal-forwarding requirement from the user's SSH configuration.
+    if settings.get("exitonforwardfailure", "no").lower() == "yes":
         return subprocess.run([binary, *arguments], check=False).returncode
     request_tty = settings.get("requesttty", "auto").lower()
     if request_tty == "no" or (request_tty == "auto" and not stdin_tty and not explicit_tty):
@@ -1412,28 +1416,24 @@ def ssh_command(arguments: list[str]) -> int:
             return subprocess.run([binary, *arguments], check=False).returncode
 
         extra = [
-            "-tt" if request_tty == "force" else "-t",
             "-o", "StreamLocalBindUnlink=yes",
             "-o", f"RemoteForward={remote_socket}:{local_socket}",
-            "-o", f"SetEnv=TERMNAV_PARENT_RELAY={remote_socket}",
+            "-o", "SendEnv=TERMNAV_PARENT_RELAY",
         ]
-        # A multiplexed session inherits SetEnv policy from the long-lived
-        # master, so it may receive an earlier session's now-dead relay path.
-        # The mux protocol carries each session's command independently.  Use
-        # that channel to make this session's forward authoritative without a
-        # second SSH connection or authentication attempt.
-        # sshd always supplies SHELL.  Keep the outer command in the small
-        # syntax intersection shared by sh, fish, and csh-family login shells;
-        # env avoids shell-specific assignment/export forms.
-        bootstrap = f'exec env TERMNAV_PARENT_RELAY={remote_socket} "$SHELL" -l'
+        # A multiplexed session retains SetEnv from the long-lived master, but
+        # SendEnv values come from each mux client process. Carry the current
+        # relay path in this invocation's environment so concurrent sessions
+        # keep distinct sockets without occupying the remote command channel.
+        ssh_environment = os.environ.copy()
+        ssh_environment["TERMNAV_PARENT_RELAY"] = remote_socket
         option_end = (
             destination - 1
             if destination > 0 and arguments[destination - 1] == "--"
             else destination
         )
         separator = arguments[option_end:destination]
-        enhanced = [*arguments[:option_end], *extra, *separator, arguments[destination], bootstrap]
-        result = subprocess.run([binary, *enhanced], check=False).returncode
+        enhanced = [*arguments[:option_end], *extra, *separator, arguments[destination]]
+        result = subprocess.run([binary, *enhanced], env=ssh_environment, check=False).returncode
         control_path = settings.get("controlpath", "none")
         if control_path != "none":
             subprocess.run(

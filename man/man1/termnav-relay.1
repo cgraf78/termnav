@@ -28,20 +28,20 @@ Install \fBshare/termnav/sshd_config\fR as an sshd_config.d fragment on any
 host that should participate, validate with \fBsshd -t\fR, and reload sshd.
 .PP
 Explicit and configured SSH remote commands and non-session modes are passed
-to OpenSSH unchanged. For an interactive login, Termnav carries the current
-relay path in the session's fixed bootstrap command before immediately
-executing the remote login shell. This remains correct when OpenSSH reuses a
-ControlMaster whose original environment predates the relay session.
-Participating SSH servers also accept only TERMNAV_PARENT_RELAY from the client
-environment for compatibility with non-multiplexed clients. Failure to receive
-usable metadata makes navigation a silent no-op and does not create another SSH
-connection or authentication attempt.
+to OpenSSH unchanged. For an interactive login, Termnav exports the current
+relay path in the invoking client process and requests
+\fBSendEnv=TERMNAV_PARENT_RELAY\fR. OpenSSH carries that value per session even
+when it reuses a ControlMaster, so concurrent sessions retain distinct relay
+sockets without a second connection or authentication attempt.
 .PP
-Because the bootstrap occupies SSH's command channel, sshd exposes it as
-\fBSSH_ORIGINAL_COMMAND\fR to a configured \fBForceCommand\fR. Such a policy
-can choose to reject the enhanced login; Termnav then fails closed. Use ordinary
-\fBssh\fR for hosts whose policy requires an empty command, or configure a
-\fBRemoteCommand\fR that the policy explicitly permits.
+The remote command channel remains empty and OpenSSH retains its normal login
+shell selection. Native Windows and other non-POSIX targets therefore continue
+to receive their ordinary interactive shell even when they cannot create the
+remote Unix-socket forward. An effective \fBExitOnForwardFailure=yes\fR policy
+is delegated unchanged without adding the optional relay. On other unsupported
+servers OpenSSH may report a nonfatal remote-forward warning; the login itself
+continues normally. Failure to receive usable relay metadata makes navigation
+a silent no-op.
 .SH TWO-PHASE COMMIT TRANSPORT
 Navigation uses a two-phase commit. The originating \fBsend\fR arms a per-nonce
 per-client directive file under \fB$XDG_RUNTIME_DIR/termnav-$UID/directives/<hash>/\fR

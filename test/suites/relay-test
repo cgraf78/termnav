@@ -295,10 +295,12 @@ for destination in arbitrary.example alice@host-with-alias '[2001:db8::7]'; do
   ssh_args=$(cat "$ssh_log")
   _assert_contains "ssh relay: preserves arbitrary destination $destination" "<$destination>" "$ssh_args"
   _assert_contains "ssh relay: uses the original SSH process for forwarding" "<RemoteForward=" "$ssh_args"
-  _assert_contains "ssh relay: passes only narrow relay metadata" "<SetEnv=TERMNAV_PARENT_RELAY=" "$ssh_args"
-  _assert_contains "ssh relay: carries current metadata in the multiplexed session" \
-    "<exec env TERMNAV_PARENT_RELAY=" "$ssh_args"
-  _assert_not_contains "ssh relay: never replaces the configured remote command" "<termnav-relay shell" "$ssh_args"
+  _assert_contains "ssh relay: requests per-session environment forwarding" \
+    "<SendEnv=TERMNAV_PARENT_RELAY>" "$ssh_args"
+  _assert_not_contains "ssh relay: does not pin metadata in ControlMaster configuration" \
+    "<SetEnv=TERMNAV_PARENT_RELAY=" "$ssh_args"
+  _assert_eq "ssh relay: leaves the remote command channel empty for $destination" \
+    "<$destination>" "$(tail -n 1 "$ssh_log")"
 done
 
 ssh_log="$tmp/option-separator.log"
@@ -306,9 +308,9 @@ TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default' \
   TERMNAV_TEST_STDIN_TTY=1 TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
   "$relay" ssh -- option-like.example
 separator_line=$(grep -n '^<-->$' "$ssh_log" | cut -d: -f1)
-tty_line=$(grep -n '^<-t>$' "$ssh_log" | cut -d: -f1)
+forward_line=$(grep -n '^<RemoteForward=' "$ssh_log" | cut -d: -f1)
 _assert_eq "ssh relay: generated options stay before the option separator" \
-  true "$([[ $tty_line -lt $separator_line ]] && echo true || echo false)"
+  true "$([[ $forward_line -lt $separator_line ]] && echo true || echo false)"
 _assert_contains "ssh relay: option separator preserves its destination" \
   '<option-like.example>' "$(cat "$ssh_log")"
 
@@ -352,7 +354,7 @@ TERMNAV_TEST_STDIN_TTY=1 \
   "$relay" ssh -oRequestTTY=force attached-option.example
 _assert_contains "ssh relay: attached option values are not mistaken for flag clusters" \
   "RemoteForward=" "$(cat "$ssh_log")"
-_assert_contains "ssh relay: configured forced tty remains forced" \
+_assert_not_contains "ssh relay: configured TTY policy needs no synthetic flag" \
   '<-tt>' "$(cat "$ssh_log")"
 
 for remote_command in 'tmux attach' 'exec dashboard'; do
@@ -366,6 +368,14 @@ remotecommand $remote_command" \
   _assert_eq "ssh relay: configured RemoteCommand remains ordinary SSH" \
     $'<-oRemoteCommand='"$remote_command"$'>\n<configured-command.example>' "$(cat "$ssh_log")"
 done
+
+ssh_log="$tmp/strict-forward-failure.log"
+TERMNAV_TEST_STDIN_TTY=1 \
+  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\nexitonforwardfailure yes' \
+  TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay" ssh strict.example
+_assert_eq "ssh relay: strict forwarding policy remains ordinary SSH" \
+  '<strict.example>' "$(cat "$ssh_log")"
 
 control_ssh="$fake_bin/ssh-control"
 cat >"$control_ssh" <<'EOF'
@@ -386,50 +396,36 @@ _assert_contains "ssh relay: cancels the exact remote forward through the existi
 _assert_contains "ssh relay: cancellation targets the resolved control socket" \
   '</tmp/TermNav-Control-Test>' "$(cat "$ssh_log")"
 
-stale_master_ssh="$fake_bin/ssh-stale-master"
-cat >"$stale_master_ssh" <<'EOF'
+session_env_ssh="$fake_bin/ssh-session-env"
+cat >"$session_env_ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 for argument in "$@"; do
   case "$argument" in
     RemoteForward=*) current=${argument#RemoteForward=} ; current=${current%%:*} ;;
-    SetEnv=TERMNAV_PARENT_RELAY=*) offered=${argument#SetEnv=TERMNAV_PARENT_RELAY=} ;;
+    SendEnv=TERMNAV_PARENT_RELAY) offered=1 ;;
     cancel) exit 0 ;;
   esac
 done
 
-if [[ ! -e $TERMNAV_TEST_MASTER_ENV ]]; then
-  printf '%s\n' "${offered:-}" >"$TERMNAV_TEST_MASTER_ENV"
-fi
-stale=$(cat "$TERMNAV_TEST_MASTER_ENV")
-TERMNAV_PARENT_RELAY=$stale SHELL="$TERMNAV_TEST_REMOTE_SHELL" \
-  "$TERMNAV_TEST_OUTER_SHELL" -c "${!#}"
+[[ ${offered:-0} == 1 ]] || exit 9
 printf '%s\n' "${current:-}" >>"$TERMNAV_TEST_EXPECTED_RELAYS"
+printf '%s\n' "${TERMNAV_PARENT_RELAY:-}" >>"$TERMNAV_TEST_ACTUAL_RELAYS"
 EOF
-chmod +x "$stale_master_ssh"
-cat >"$fake_bin/remote-shell" <<'EOF'
-#!/usr/bin/env sh
-printf '%s\n' "$TERMNAV_PARENT_RELAY" >>"$TERMNAV_TEST_ACTUAL_RELAYS"
-EOF
-chmod +x "$fake_bin/remote-shell"
-master_env="$tmp/master-env"
+chmod +x "$session_env_ssh"
 expected_relays="$tmp/expected-relays"
 actual_relays="$tmp/actual-relays"
-for outer_shell in sh bash zsh fish csh tcsh; do
-  outer_shell_path=$(command -v "$outer_shell" 2>/dev/null || true)
-  [[ -n $outer_shell_path ]] || continue
+for _ in first second; do
   TERMNAV_TEST_STDIN_TTY=1 \
     TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\ncontrolpath /tmp/TermNav-Control-Test' \
-    TERMNAV_SSH_BINARY="$stale_master_ssh" TERMNAV_TEST_MASTER_ENV="$master_env" \
-    TERMNAV_TEST_OUTER_SHELL="$outer_shell_path" \
-    TERMNAV_TEST_REMOTE_SHELL="$fake_bin/remote-shell" \
+    TERMNAV_SSH_BINARY="$session_env_ssh" \
     TERMNAV_TEST_EXPECTED_RELAYS="$expected_relays" TERMNAV_TEST_ACTUAL_RELAYS="$actual_relays" \
     "$relay" ssh multiplexed.example
 done
-_assert_eq "ssh relay: reused master receives each session's current relay" \
+_assert_eq "ssh relay: each session pairs its current SendEnv value with its forward" \
   "$(cat "$expected_relays")" "$(cat "$actual_relays")"
-_assert_eq "ssh relay: reused master regression exercises distinct relay paths" \
+_assert_eq "ssh relay: session environment regression exercises distinct relay paths" \
   "$(wc -l <"$actual_relays" | tr -d ' ')" "$(sort -u "$actual_relays" | wc -l | tr -d ' ')"
 
 for effective_config in 'sessiontype none' 'sessiontype subsystem' $'sessiontype default\nrequesttty no'; do
