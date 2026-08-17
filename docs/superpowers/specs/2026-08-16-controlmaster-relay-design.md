@@ -1,5 +1,9 @@
 # ControlMaster-safe relay transport
 
+> Superseded on 2026-08-17 by the per-session `SendEnv` transport. The shipped
+> implementation no longer occupies the remote command channel or launches a
+> replacement login shell; see `termnav-relay(1)` for the current contract.
+
 ## Problem
 
 `termnav-relay ssh` currently publishes a per-session remote relay socket with
