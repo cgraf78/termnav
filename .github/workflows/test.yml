@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@53b11877db22bac7c070abc200c03e8991408389
+    uses: cgraf78/actions/.github/workflows/shell-ci.yml@9b9c023fbe5f47be5f70f5a82bd8e2f298f6a1b1
     with:
       matrix-set: full
       profiles: base,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
@@ -42,7 +42,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@53b11877db22bac7c070abc200c03e8991408389
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@9b9c023fbe5f47be5f70f5a82bd8e2f298f6a1b1
 
   relay-performance:
     name: Relay startup / Ubuntu
