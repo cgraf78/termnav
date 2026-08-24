@@ -60,6 +60,8 @@ consumers must still select versioned VS Code payloads explicitly.
 - `bin/termnav-switch-tab`: switch the nearest outer tab scope from a
   one-window tmux session, walking locally nested tmux parents before choosing
   the originating VS Code or WezTerm client.
+- `bin/termnav-tmux-context`: publish tmux ownership to a newly attached
+  terminal client before a shell or editor redraws.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -193,6 +195,15 @@ releases its old claim and continues probing so pane return or reattach recovers
 without restarting the editor.
 
 ### Tab Scope Routing
+
+`termnav-tmux-context` is intended for tmux's `client-attached` hook.
+WezTerm user variables belong to a terminal pane rather than the long-lived
+tmux pane, so attaching a new client to an existing session does not inherit
+the shell or Neovim metadata previously emitted there. The attach publisher
+writes `TERMNAV_TMUX=true` synchronously to the exact client tty. Direct
+terminal clients receive raw OSC; an immediate tmux parent receives one
+passthrough wrapper, including when it advertises legacy `screen-*` terminfo.
+Control-mode clients are skipped without requiring terminal metadata.
 
 `termnav-switch-tab` receives the tmux client PID, TTY, and terminal type
 from the key binding that observed the chord. When that client was launched

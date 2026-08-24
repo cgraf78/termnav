@@ -4,6 +4,7 @@ program	bin/nvim-link-host
 program	bin/nvim-ssh-control-open
 program	bin/nvim-tmux-open
 program	bin/termnav-switch-tab
+program	bin/termnav-tmux-context
 program	bin/tmux-follow-click
 program	bin/vscode-nvim-focus
 program	bin/vscode-switch-tab

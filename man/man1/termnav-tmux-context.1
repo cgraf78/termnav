@@ -1,0 +1,60 @@
+.TH TERMNAV-TMUX-CONTEXT 1 "2026-08-24" "termnav" "User Commands"
+.SH NAME
+termnav-tmux-context \- publish tmux ownership to an attached terminal client
+.SH SYNOPSIS
+.B termnav-tmux-context
+.B --tty
+.I tty
+.B --client-termname
+.I term
+.RI [ --control-mode " 0" ]
+.br
+.B termnav-tmux-context
+.B --control-mode 1
+.SH DESCRIPTION
+.B termnav-tmux-context
+emits a WezTerm OSC 1337
+.B SetUserVar
+request that sets
+.B TERMNAV_TMUX=true
+for a newly attached tmux client. This lets the terminal pass navigation keys
+to tmux before considering terminal-level tabs.
+.PP
+The command writes directly to the tmux client tty. When the client's terminal
+name starts with
+.B tmux
+or
+.BR screen ,
+the request receives one DCS passthrough wrapper for that immediate tmux
+parent. The
+.B screen
+prefix covers tmux clients using legacy screen terminfo; GNU Screen is not a
+supported parent. Control-mode clients are ignored so terminal escape
+sequences cannot enter the tmux control protocol.
+.SH OPTIONS
+.TP
+.BI --tty " tty"
+Write the request to the attached client's terminal device.
+.TP
+.BI --client-termname " term"
+Use the tmux client's terminal name to select raw or parent-tmux framing.
+.TP
+.BI --control-mode " 0|1"
+Exit without writing when the attaching client uses tmux control mode. The
+.B --tty
+and
+.B --client-termname
+options are not required in that mode.
+.TP
+.B -h, --help
+Show command help.
+.SH EXIT STATUS
+.TP
+.B 0
+The tmux ownership request was written, or a control-mode client was skipped.
+.TP
+.B 2
+Usage error.
+.SH SEE ALSO
+.BR tmux (1),
+.BR wezterm-switch-tab (1)

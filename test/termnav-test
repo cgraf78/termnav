@@ -13,6 +13,7 @@ runtime_shell_files=(
   "$root/bin/nvim-ssh-control-open"
   "$root/bin/nvim-tmux-open"
   "$root/bin/termnav-switch-tab"
+  "$root/bin/termnav-tmux-context"
   "$root/bin/tmux-follow-click"
   "$root/bin/vscode-nvim-focus"
   "$root/bin/vscode-switch-tab"

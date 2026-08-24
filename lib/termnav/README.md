@@ -12,6 +12,8 @@ installed commands.
 - `nvim/` owns Neovim-side Lua helpers.
 - `shell/` owns reusable shell helpers for terminal control protocols and the
   rich-versus-plain file-link decision for the active terminal or tmux client.
+- `termnav-tmux-context` publishes tmux ownership when a terminal client
+  attaches, before any shell or editor redraw can refresh terminal metadata.
 - `wezterm/` owns WezTerm link routing and public link rules.
 
 Keep terminal-specific behavior in the closest integration directory, but keep

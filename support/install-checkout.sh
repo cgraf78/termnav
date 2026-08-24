@@ -19,6 +19,7 @@ commands=(
   nvim-tmux-open
   termnav-relay
   termnav-switch-tab
+  termnav-tmux-context
   tmux-follow-click
   vscode-nvim-focus
   vscode-switch-tab
