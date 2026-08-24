@@ -20,6 +20,7 @@ ssh_control_open="$TERMNAV_ROOT/bin/nvim-ssh-control-open"
 wezterm_switch_tab="$TERMNAV_ROOT/bin/wezterm-switch-tab"
 wezterm_move_tab="$TERMNAV_ROOT/bin/wezterm-move-tab"
 wezterm_select_pane="$TERMNAV_ROOT/bin/wezterm-select-pane"
+tmux_context="$TERMNAV_ROOT/bin/termnav-tmux-context"
 public_link_rules="$TERMNAV_ROOT/lib/termnav/wezterm/public-link-rules.lua"
 nvim_setup="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua"
 wezterm_routes="$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua"
@@ -50,6 +51,7 @@ ln -s "$ssh_control_open" "$symlink_bin/nvim-ssh-control-open"
 ln -s "$wezterm_switch_tab" "$symlink_bin/wezterm-switch-tab"
 ln -s "$wezterm_move_tab" "$symlink_bin/wezterm-move-tab"
 ln -s "$wezterm_select_pane" "$symlink_bin/wezterm-select-pane"
+ln -s "$tmux_context" "$symlink_bin/termnav-tmux-context"
 cat >"$mock_bin/eza" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${EZA_MOCK_LEGACY:-0}" = 1 && "$*" == "--hyperlink=always --version" ]]; then
@@ -169,10 +171,68 @@ _assert_exit "wezterm-select-pane symlink: help exits successfully" 0 "$symlink_
 _assert_contains "wezterm-select-pane symlink: resolves dependency libraries" \
   "usage: wezterm-select-pane" "$symlink_pane_usage"
 
+set +e
+symlink_tmux_context_usage=$("$symlink_bin/termnav-tmux-context" --help 2>&1)
+symlink_tmux_context_rc=$?
+_assert_exit "termnav-tmux-context symlink: help exits successfully" 0 \
+  "$symlink_tmux_context_rc"
+_assert_contains "termnav-tmux-context symlink: resolves dependency libraries" \
+  "usage: termnav-tmux-context" "$symlink_tmux_context_usage"
+
 echo
 echo "=== WezTerm tab user-var helpers ==="
 
 tab_tty=$(_tmpdir)/tab-tty
+: >"$tab_tty"
+
+"$tmux_context" --tty "$tab_tty" --client-termname xterm-256color \
+  --control-mode 0
+direct_tmux_context=$(cat "$tab_tty")
+_assert_eq "termnav-tmux-context direct: publishes tmux ownership" \
+  $'\033]1337;SetUserVar=TERMNAV_TMUX=dHJ1ZQ==\007' "$direct_tmux_context"
+
+: >"$tab_tty"
+"$tmux_context" --tty "$tab_tty" --client-termname tmux-256color \
+  --control-mode 0
+nested_tmux_context=$(cat "$tab_tty")
+_assert_eq "termnav-tmux-context nested: escapes one parent tmux" \
+  $'\033Ptmux;\033\033]1337;SetUserVar=TERMNAV_TMUX=dHJ1ZQ==\007\033\\' \
+  "$nested_tmux_context"
+
+: >"$tab_tty"
+"$tmux_context" --tty "$tab_tty" --client-termname screen-256color \
+  --control-mode 0
+legacy_tmux_context=$(cat "$tab_tty")
+_assert_eq "termnav-tmux-context nested: accepts tmux screen terminfo" \
+  "$nested_tmux_context" "$legacy_tmux_context"
+
+: >"$tab_tty"
+"$tmux_context" --tty "$tab_tty" --client-termname xterm-256color \
+  --control-mode 1
+_assert_eq "termnav-tmux-context: skips tmux control-mode clients" \
+  "" "$(cat "$tab_tty")"
+
+"$tmux_context" --control-mode 1
+_assert_exit "termnav-tmux-context: control mode needs no terminal metadata" 0 "$?"
+
+missing_tmux_context_tty_rc=0
+"$tmux_context" --client-termname xterm-256color >/dev/null 2>&1 ||
+  missing_tmux_context_tty_rc=$?
+_assert_exit "termnav-tmux-context: requires the target client tty" 2 \
+  "$missing_tmux_context_tty_rc"
+
+missing_tmux_context_term_rc=0
+"$tmux_context" --tty "$tab_tty" >/dev/null 2>&1 ||
+  missing_tmux_context_term_rc=$?
+_assert_exit "termnav-tmux-context: requires the client terminal name" 2 \
+  "$missing_tmux_context_term_rc"
+
+invalid_tmux_control_mode_rc=0
+"$tmux_context" --tty "$tab_tty" --client-termname xterm-256color \
+  --control-mode invalid >/dev/null 2>&1 || invalid_tmux_control_mode_rc=$?
+_assert_exit "termnav-tmux-context: rejects invalid control mode" 2 \
+  "$invalid_tmux_control_mode_rc"
+
 : >"$tab_tty"
 "$wezterm_switch_tab" next "$tab_tty"
 direct_switch=$(cat "$tab_tty")
