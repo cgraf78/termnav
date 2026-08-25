@@ -143,6 +143,11 @@ if command -v tmux >/dev/null 2>&1; then
     "termnav-switch-tab" "$_tmux_keys"
   _assert_contains "examples: tmux config wires Ctrl-click" \
     "tmux-follow-click" "$_tmux_keys"
+  _tmux_focus_hooks=$(tmux -L "$_socket" show-hooks -g client-focus-in)
+  _assert_contains "examples: tmux config publishes nested focus" \
+    "termnav-tmux-focus watch" "$_tmux_focus_hooks"
+  _assert_contains "examples: tmux focus excludes control clients" \
+    '#{==:#{client_control_mode},0}' "$_tmux_focus_hooks"
   tmux -L "$_socket" kill-server
 else
   echo "  SKIP: tmux config example requires tmux"

@@ -42,6 +42,7 @@ program	test/suites/relay-performance-test
 program	test/suites/relay-terminal-test
 program	test/suites/shell-test
 program	test/suites/tab-switch-test
+program	test/suites/tmux-focus-test
 program	test/suites/tmux-test
 program	test/suites/vscode-focus-test
 program	test/suites/vscode-test

@@ -49,6 +49,22 @@ def load_server_runtime() -> None:
         HANDLE_LOCK = threading.Lock()
 
 
+def load_focus_runtime() -> None:
+    """Load the shared tmux focus owner only for focus protocol requests."""
+    global focus_claim, focus_release, focus_start_expirer
+    global focus_valid_lease, focus_valid_token
+
+    root = Path(__file__).resolve().parent.parent
+    library = str(root / "lib" / "termnav")
+    if library not in sys.path:
+        sys.path.insert(0, library)
+    from tmux_focus import claim as focus_claim
+    from tmux_focus import release as focus_release
+    from tmux_focus import start_expirer as focus_start_expirer
+    from tmux_focus import valid_lease as focus_valid_lease
+    from tmux_focus import valid_token as focus_valid_token
+
+
 def die(message: str) -> "NoReturn":
     print(f"termnav-relay: {message}", file=sys.stderr)
     raise SystemExit(2)
@@ -1127,6 +1143,50 @@ def handle_commit_path(request: dict) -> dict:
     return {"v": 2, "result": "error"}
 
 
+def handle_focus(request: dict) -> dict:
+    """Apply or forward one leased claim to the immediate parent tmux pane."""
+    load_focus_runtime()
+    state = request.get("state")
+    token = request.get("token")
+    lease_ms = request.get("lease_ms")
+    if (
+        state not in {"claim", "release"}
+        or not isinstance(token, str)
+        or not focus_valid_token(token)
+        or (state == "claim" and not focus_valid_lease(lease_ms))
+    ):
+        return {"v": 2, "result": "error"}
+
+    info = local_scope()
+    if info is None:
+        parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+        if not parent:
+            return {"v": 2, "result": "declined"}
+        reply = send_message(parent, request)
+        if reply.get("result") in {"claimed", "released", "declined", "error"}:
+            return reply
+        return {"v": 2, "result": "error"}
+
+    if state == "release":
+        released = focus_release(info["tmux_socket"], info["pane"], token)
+        return {"v": 2, "result": "released" if released else "error"}
+
+    published = focus_claim(info["tmux_socket"], info["pane"], token, lease_ms)
+    if published is None:
+        return {"v": 2, "result": "error"}
+    # The expiry helper is deliberately independent from this relay server.
+    # If an SSH process or relay is killed, the parent pane still sheds the
+    # abandoned claim after the bounded lease.
+    if published.start_expirer:
+        focus_command = Path(__file__).resolve().with_name("termnav-tmux-focus")
+        if not focus_start_expirer(
+            focus_command, info["tmux_socket"], info["pane"]
+        ):
+            focus_release(info["tmux_socket"], info["pane"], token)
+            return {"v": 2, "result": "error"}
+    return {"v": 2, "result": "claimed"}
+
+
 def route(scope: str, direction: str) -> bool:
     # Backward-compat shim: uses split helpers
     test_log = os.environ.get("TERMNAV_RELAY_TEST_LOG")
@@ -1190,6 +1250,25 @@ def serve(path: str) -> int:
                     raw += chunk
                 if len(raw) > 512 or not raw.endswith(b"\n"):
                     return
+                try:
+                    request = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    return
+                if not isinstance(request, dict):
+                    return
+                # Focus heartbeats are independent, idempotent pane-option
+                # updates. Do not serialize them behind the navigation commit
+                # barrier: a slow filesystem or tmux server here must not make
+                # an unrelated key chord fail its nonblocking admission check.
+                if request.get("v") == 2 and request.get("op") == "focus":
+                    reply = handle_focus(request)
+                    try:
+                        connection.sendall(
+                            (json.dumps(reply, separators=(",", ":")) + "\n").encode()
+                        )
+                    except OSError:
+                        pass
+                    return
                 # Non-blocking try-lock for busy admission (dispatch only)
                 acquired = HANDLE_LOCK.acquire(blocking=False)
                 if not acquired:
@@ -1199,12 +1278,6 @@ def serve(path: str) -> int:
                         pass
                     return
                 _HANDLE_BUSY = True
-                try:
-                    request = json.loads(raw)
-                except (ValueError, json.JSONDecodeError):
-                    return
-                if not isinstance(request, dict):
-                    return
                 # v2 dispatch
                 if request.get("v") == 2 and "op" in request:
                     op = request.get("op")
