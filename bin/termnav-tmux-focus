@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Publish leased focus ownership between immediately nested tmux layers."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+EXECUTABLE = Path(__file__).resolve()
+sys.path.insert(0, str(ROOT / "lib" / "termnav"))
+
+from tmux_focus import (  # noqa: E402
+    INTERVAL_MAX_MS,
+    LEASE_MAX_MS,
+    LEASE_MIN_MS,
+    claim,
+    expire,
+    release,
+    start_expirer,
+    stop_watch,
+    valid_interval,
+    valid_lease,
+    valid_token,
+    watch,
+)
+
+
+def positive_lease(value: str) -> int:
+    """Parse a short positive lease without accepting unbounded sleeps."""
+    try:
+        lease_ms = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("lease must be an integer") from error
+    if not valid_lease(lease_ms):
+        raise argparse.ArgumentTypeError(
+            f"lease must be between {LEASE_MIN_MS} and {LEASE_MAX_MS} ms"
+        )
+    return lease_ms
+
+
+def token_value(value: str) -> str:
+    """Restrict claim tokens so they remain safe inside tmux formats."""
+    if not valid_token(value):
+        raise argparse.ArgumentTypeError("token must be 24 lowercase hex characters")
+    return value
+
+
+def positive_interval(value: str) -> int:
+    """Parse a bounded heartbeat interval."""
+    interval_ms = positive_lease(value)
+    if not valid_interval(interval_ms):
+        raise argparse.ArgumentTypeError(
+            f"interval must not exceed {INTERVAL_MAX_MS} ms"
+        )
+    return interval_ms
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="termnav-tmux-focus")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    claim_parser = subparsers.add_parser("claim")
+    claim_parser.add_argument("--parent-tmux", required=True)
+    claim_parser.add_argument("--parent-pane", required=True)
+    claim_parser.add_argument("--token", required=True, type=token_value)
+    claim_parser.add_argument("--lease-ms", required=True, type=positive_lease)
+
+    release_parser = subparsers.add_parser("release")
+    release_parser.add_argument("--parent-tmux", required=True)
+    release_parser.add_argument("--parent-pane", required=True)
+    release_parser.add_argument("--token", required=True, type=token_value)
+
+    expire_parser = subparsers.add_parser("expire", help=argparse.SUPPRESS)
+    expire_parser.add_argument("--parent-tmux", required=True)
+    expire_parser.add_argument("--parent-pane", required=True)
+
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("--tmux-socket", required=True)
+    watch_parser.add_argument("--client-pid", required=True, type=int)
+    watch_parser.add_argument("--client-tty", required=True)
+    watch_parser.add_argument("--lease-ms", type=positive_lease, default=3500)
+    watch_parser.add_argument("--interval-ms", type=positive_interval, default=1000)
+
+    stop_parser = subparsers.add_parser("stop")
+    stop_parser.add_argument("--tmux-socket", required=True)
+    stop_parser.add_argument("--client-pid", required=True, type=int)
+    stop_parser.add_argument("--client-tty", required=True)
+
+    arguments = parser.parse_args()
+    if arguments.command == "release":
+        return 0 if release(arguments.parent_tmux, arguments.parent_pane, arguments.token) else 1
+    if arguments.command == "expire":
+        expire(arguments.parent_tmux, arguments.parent_pane)
+        return 0
+
+    if arguments.command == "watch":
+        return watch(
+            EXECUTABLE,
+            arguments.tmux_socket,
+            arguments.client_pid,
+            arguments.client_tty,
+            arguments.lease_ms,
+            arguments.interval_ms,
+        )
+    if arguments.command == "stop":
+        return stop_watch(
+            EXECUTABLE,
+            arguments.tmux_socket,
+            arguments.client_pid,
+            arguments.client_tty,
+        )
+
+    published = claim(
+        arguments.parent_tmux,
+        arguments.parent_pane,
+        arguments.token,
+        arguments.lease_ms,
+    )
+    if published is None:
+        return 1
+    if published.start_expirer and not start_expirer(
+        EXECUTABLE, arguments.parent_tmux, arguments.parent_pane
+    ):
+        release(arguments.parent_tmux, arguments.parent_pane, arguments.token)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

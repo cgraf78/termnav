@@ -68,6 +68,11 @@ consumers must still select versioned VS Code payloads explicitly.
   DECRQM themselves.
 - `bin/termnav-tmux-context`: publish tmux ownership to a newly attached
   terminal client before a shell or editor redraws.
+- `bin/termnav-tmux-focus`: publish leased, pane-scoped focus ownership from a
+  nested tmux client to its immediate parent. Local parents are discovered
+  from the exact client process; remote parents use the existing SSH relay.
+  One-hop claims compose to arbitrary nesting depth without naming hosts,
+  sessions, commands, or a maximum depth.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
@@ -212,6 +217,31 @@ writes `TERMNAV_TMUX=true` synchronously to the exact client tty. Direct
 terminal clients receive raw OSC; an immediate tmux parent receives one
 passthrough wrapper, including when it advertises legacy `screen-*` terminfo.
 Control-mode clients are skipped without requiring terminal metadata.
+
+### Nested tmux leaf focus
+
+`termnav-tmux-focus` lets a tmux configuration distinguish the single focused
+leaf pane from active container panes higher in a nested tmux tree. A focused
+nested client publishes a short lease on the exact parent pane that hosts it.
+Local nesting is resolved from that client's process environment; nesting over
+SSH uses the same per-session relay established by `termnav-relay ssh`.
+
+The publisher is intentionally one-hop. Every tmux layer runs the same hooks,
+so a chain of any depth converges without a root coordinator or topology
+configuration. Separate clients attached to the same inner session publish to
+their own parent panes independently. A killed publisher, broken SSH session,
+or missed detach event fails closed when its lease expires.
+
+The rendering path remains entirely inside tmux. Consumers combine
+`pane_active`, the current client's `focused` flag, and the absence of the
+pane-local `@termnav_child_focus` option. No subprocess runs during a redraw.
+See `examples/tmux.conf` for the hooks and reusable predicate.
+
+As with every full-screen application in a tmux pane, the pane grid itself is
+shared if the exact same outer pane is viewed by multiple outer clients. tmux
+can render its own borders per client, but the nested application's already
+rendered cell backgrounds cannot differ between those viewers. Distinct outer
+panes attaching distinct clients to one inner session remain independent.
 
 `termnav-switch-tab` receives the tmux client PID, TTY, and terminal type
 from the key binding that observed the chord. When that client was launched
