@@ -719,7 +719,16 @@ def stop_watch(
     # The style reconciliation performs tmux round trips. Close the widened
     # focus-bounce window before consulting a stale watcher PID.
     if client_focused(socket_path, client_pid, client_tty):
-        return 0
+        # The client may have regained focus while the first reconciliation
+        # was deciding whether to apply its pane-local dim override. Reconcile
+        # once more in the new authoritative state before discarding this
+        # delayed focus-out event.
+        refocused_synced = sync_client_style(
+            socket_path,
+            client_pid,
+            client_tty,
+        )
+        return 0 if style_synced and refocused_synced else 1
     path = lock_path("watch", socket_path, str(client_pid), client_tty)
     try:
         raw_pid = path.read_text(encoding="ascii").strip()
