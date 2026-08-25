@@ -275,9 +275,94 @@ for clock_shell in bash zsh; do
 done
 
 echo
-echo "=== shell tmux context publication ==="
+echo "=== inherited SSH interposition ==="
 
 shell_integration="$TERMNAV_ROOT/share/termnav/shell.sh"
+ssh_shim="$TERMNAV_ROOT/share/termnav/shims/ssh"
+ssh_probe=$(_tmpdir)
+ssh_probe_bin="$ssh_probe/bin"
+mkdir -p "$ssh_probe_bin"
+cat >"$ssh_probe_bin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '<%s>\n' "$@" >"$TERMNAV_TEST_SSH_LOG"
+SH
+chmod +x "$ssh_probe_bin/ssh"
+
+_assert_file_exists "ssh shim: provider-owned executable exists" "$ssh_shim"
+_assert_eq "ssh shim: provider-owned command is executable" true \
+  "$([[ -x "$ssh_shim" ]] && printf true || printf false)"
+
+for test_shell in bash zsh; do
+  if [[ "$test_shell" == zsh ]] && ! command -v zsh >/dev/null 2>&1; then
+    echo "  - skipping inherited SSH interposition in zsh (zsh unavailable)"
+    continue
+  fi
+  if [[ "$test_shell" == bash ]]; then
+    test_shell_path="$BASH"
+    test_shell_args=(--noprofile --norc)
+  else
+    test_shell_path=$(command -v zsh)
+    test_shell_args=(-f)
+  fi
+
+  ssh_tty_log="$ssh_probe/$test_shell-tty.log"
+  ssh_plain_log="$ssh_probe/$test_shell-plain.log"
+  : >"$ssh_tty_log"
+  : >"$ssh_plain_log"
+  # The selected child shell owns all expansions inside this fixture. Keeping
+  # it literal verifies both Bash and zsh rather than the test runner's shell.
+  # Termux implements conventional /usr/bin shebang paths through termux-exec;
+  # preserve only its LD_PRELOAD hook across env isolation so the fixture has
+  # the same executable semantics as a real Termux login shell.
+  # shellcheck disable=SC2016
+  ssh_probe_output=$(
+    env -i \
+      HOME="$HOME" \
+      LD_PRELOAD="${LD_PRELOAD:-}" \
+      PATH="$TERMNAV_ROOT/bin:$ssh_probe_bin:/usr/bin:/bin" \
+      CHILD_BASH="$BASH" \
+      SHELL_INTEGRATION="$shell_integration" \
+      SSH_PLAIN_LOG="$ssh_plain_log" \
+      SSH_TTY_LOG="$ssh_tty_log" \
+      TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
+      "$test_shell_path" "${test_shell_args[@]}" -c '
+        source "$SHELL_INTEGRATION"
+        source "$SHELL_INTEGRATION"
+        printf "ssh=%s\n" "$(command -v ssh)"
+        count=$(printf "%s\n" "$PATH" | awk -v RS=: \
+          -v shim="${SHELL_INTEGRATION%/shell.sh}/shims" \
+          "\$0 == shim { count++ } END { print count + 0 }")
+        printf "shim-count=%s\n" "$count"
+        if typeset -f ssh >/dev/null 2>&1; then
+          printf "function=present\n"
+        else
+          printf "function=absent\n"
+        fi
+        TERMNAV_TEST_SSH_LOG="$SSH_TTY_LOG" \
+          "$CHILD_BASH" --noprofile --norc -c \
+          '"'"'exec ssh -t child.example printf hello'"'"'
+        TERMNAV_TEST_SSH_LOG="$SSH_PLAIN_LOG" \
+          "$CHILD_BASH" --noprofile --norc -c \
+          '"'"'exec ssh child.example printf hello </dev/null'"'"'
+      '
+  )
+  _assert_contains "ssh shim: $test_shell resolves the provider-owned shim" \
+    "ssh=$ssh_shim" "$ssh_probe_output"
+  _assert_contains "ssh shim: $test_shell activation is idempotent" \
+    "shim-count=1" "$ssh_probe_output"
+  _assert_contains "ssh shim: $test_shell defines no ssh function" \
+    "function=absent" "$ssh_probe_output"
+  _assert_contains "ssh shim: $test_shell child preserves the remote command" \
+    $'<child.example>\n<printf>\n<hello>' "$(tail -n 3 "$ssh_tty_log")"
+  _assert_contains "ssh shim: $test_shell child receives relay forwarding" \
+    "RemoteForward=" "$(cat "$ssh_tty_log")"
+  _assert_eq "ssh shim: $test_shell non-tty child remains ordinary SSH" \
+    $'<child.example>\n<printf>\n<hello>' "$(cat "$ssh_plain_log")"
+done
+
+echo
+echo "=== shell tmux context publication ==="
+
 shell_tmux_bin=$(_tmpdir)
 cat >"$shell_tmux_bin/tmux" <<'SH'
 #!/usr/bin/env bash

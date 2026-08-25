@@ -60,6 +60,12 @@ consumers must still select versioned VS Code payloads explicitly.
 - `bin/termnav-switch-tab`: switch the nearest outer tab scope from a
   one-window tmux session, walking locally nested tmux parents before choosing
   the originating VS Code or WezTerm client.
+- `bin/termnav-relay`: carry pane, window, and window-move requests across
+  nested SSH/tmux boundaries. Its outer commit barrier uses the standard,
+  read-only DECRQM reply path supported by WezTerm and xterm.js; intermediate
+  tmux layers continue to forward the private `User8` commit key. Unmatched
+  replies pass back to applications on tmux versions that do not virtualize
+  DECRQM themselves.
 - `bin/termnav-tmux-context`: publish tmux ownership to a newly attached
   terminal client before a shell or editor redraws.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
@@ -98,8 +104,10 @@ consumers must still select versioned VS Code payloads explicitly.
   owns and publishes each window's tab-switch socket and capability. New
   integrations use the latest versioned directory declared by the consuming
   dotfiles.
-- `share/termnav/shell.sh`: sourceable interactive shell loader for WezTerm
-  pane context publishing and file-link mode classification.
+- `share/termnav/shell.sh`: sourceable interactive shell loader for inherited
+  SSH relay interposition, WezTerm pane context publishing, and file-link mode
+  classification. It prepends a private Termnav shim directory rather than
+  defining an `ssh()` shell function, so child processes use the same route.
 
 Source non-binary assets through shdeps so install locations stay under the
 dependency manager's contract:
@@ -268,10 +276,14 @@ host policy from this repo.
 
 `termnav-relay ssh` sends each relay path through OpenSSH's per-session
 environment channel, including sessions carried by an existing ControlMaster.
-It leaves SSH's remote command channel and login-shell selection untouched, so
-non-POSIX targets such as native Windows OpenSSH hosts still receive an
-ordinary interactive shell. Strict `ExitOnForwardFailure=yes` configurations
-are delegated unchanged rather than making Termnav's optional relay mandatory.
+It never changes SSH's destination, remote-command arguments, or login-shell
+selection. Explicit commands are enhanced only when their command line requests
+a TTY, while non-TTY commands and control modes pass through unchanged. The
+sourceable shell integration exposes this behavior to descendants through a
+private `ssh` PATH shim, so scripts and tools need no Termnav-specific
+integration.
+Strict `ExitOnForwardFailure=yes` configurations are delegated unchanged rather
+than making Termnav's optional relay mandatory.
 
 Run tests with:
 

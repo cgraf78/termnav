@@ -351,8 +351,19 @@ done
 ssh_log="$tmp/explicit.log"
 TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
   "$relay" ssh other.example printf hello
-_assert_eq "ssh relay: explicit commands remain byte-for-byte ordinary SSH" \
+_assert_eq "ssh relay: explicit commands without a tty remain ordinary SSH" \
   $'<other.example>\n<printf>\n<hello>' "$(cat "$ssh_log")"
+
+ssh_log="$tmp/explicit-tty.log"
+TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
+  TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay" ssh -t other.example printf hello
+_assert_contains "ssh relay: explicit tty commands receive the relay forward" \
+  "RemoteForward=" "$(cat "$ssh_log")"
+_assert_contains "ssh relay: explicit tty commands request relay environment forwarding" \
+  "<SendEnv=TERMNAV_PARENT_RELAY>" "$(cat "$ssh_log")"
+_assert_eq "ssh relay: explicit tty commands preserve the explicit command arguments" \
+  $'<other.example>\n<printf>\n<hello>' "$(tail -n 3 "$ssh_log")"
 
 for mode in '-N mode.example' '-Nf background.example' '-TN no-session.example' '-G config.example' '-O check control.example' '-W target:22 jump.example' '-T no-tty.example' '-f background-only.example'; do
   ssh_log="$tmp/mode-${mode//[^a-zA-Z0-9]/_}.log"
@@ -616,8 +627,9 @@ TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send pane right
 send_rc=$?
 set -e
 _assert_exit "arming: a handleable top-hop request reports armed" 0 "$send_rc"
-_assert_contains "arming: the top hop emits the commit user-var" \
-  $'\x1b]1337;SetUserVar=DOT_RELAY_COMMIT=' "$(cat "$emit_tty")"
+emit_hex=$(python3 -c "import pathlib; print(pathlib.Path('$emit_tty').read_bytes().hex())")
+_assert_eq "arming: the top hop emits a read-only terminal commit barrier" \
+  "1b5b3f323030342470" "$emit_hex"
 # Correct glob: per-socket hash dir (fixes #6)
 # shellcheck disable=SC2012
 hash_dir=$(ls -d "$tmp/xdg2/termnav-$(id -u)/directives"/*/ 2>/dev/null | head -1)
@@ -944,6 +956,21 @@ _assert_exit "commit: a stray commit key exits 0" 0 "$?"
 _assert_eq "commit: a stray commit key emits nothing" "" "$stray_output"
 _assert_eq "commit: a stray commit key mutates nothing" "$before_pane" \
   "$(tmux -L "$arm_tmux" display-message -p -t armsess '#{pane_id}')"
+
+# A DECRQM response that has no pending Termnav directive belongs to the pane
+# application on older tmux releases, which forward the query to their client.
+tmux -L "$arm_tmux" respawn-pane -k -t "$sink_pane" \
+  'stty raw -echo; cat > '"$tmp"'/decrqm-keys.log'
+sleep 0.6
+"$relay" commit --tmux-socket "$arm_sock" --client-tty "$client_tty" \
+  --client-pid "$client_pid" --passthrough-decrqm 2 --pane "$sink_pane"
+for _ in {1..10}; do
+  decrqm_hex=$(python3 -c "import pathlib; p=pathlib.Path('$tmp/decrqm-keys.log'); print(p.read_bytes().hex() if p.exists() else '')" 2>/dev/null | tr -d '\n')
+  if [ "$decrqm_hex" = "1b5b3f323030343b322479" ]; then break; fi
+  sleep 0.1
+done
+_assert_eq "commit: unmatched DECRQM replies return to the originating pane" \
+  "1b5b3f323030343b322479" "$decrqm_hex"
 
 kill "$arm_pid" 2>/dev/null
 wait "$arm_pid" 2>/dev/null || true

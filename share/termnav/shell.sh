@@ -8,40 +8,6 @@
 # shellcheck disable=SC2034 # public marker for callers that verify the loader ran.
 TERMNAV_SHELL_LOADED=1
 
-# Enhance only ordinary interactive SSH logins. Explicit remote commands pass
-# through unchanged, and the wrapper performs exactly one SSH invocation, so
-# authentication and hardware-token prompts are never duplicated.
-ssh() {
-  command termnav-relay ssh "$@"
-}
-
-# OpenSSH leaves the pathname of a closed remote StreamLocal forward behind.
-# Remove only old, owner-held sockets that no longer have a listener; active
-# connections, young bind races, symlinks, and unrelated files are untouched.
-command termnav-relay sweep >/dev/null 2>&1 || true
-
-# Prompt hooks share this cache in the current shell. Re-sourcing the integration
-# intentionally refreshes it, matching the low-level tmux-client cache.
-_termnav_wezterm_remote_link_host_cache_set=0
-_termnav_wezterm_remote_link_host_cache_tmux=""
-_termnav_wezterm_remote_link_host_cache_ssh=""
-_termnav_wezterm_remote_link_host_cache_at=0
-_termnav_wezterm_remote_link_host_cache_value=""
-_termnav_wezterm_remote_link_host_result=""
-
-# ---------------------------------------------------------------------------
-# Public API - stable shell integration surface
-# ---------------------------------------------------------------------------
-# _termnav_wezterm_publish_link_context
-#   Publish the current pane cwd and remote-host context for terminal links.
-# _termnav_wezterm_preexec <command>
-#   Prompt hook callback that marks nvim/vim commands before they start.
-# _termnav_wezterm_precmd
-#   Prompt hook callback that marks the pane as no longer inside nvim/vim.
-# termnav_file_links_need_plain_output
-#   Return success when command output should use plain paths instead of OSC-8
-#   file links for the current terminal or attached tmux client.
-
 _termnav_shell_script_parent() {
   case "$1" in
     */*) printf '%s\n' "${1%/*}" ;;
@@ -68,6 +34,47 @@ elif [[ -n "${BASH_SOURCE[0]:-}" ]]; then
 fi
 _termnav_shell_dir=$(_termnav_shell_script_dir "$_termnav_shell_source_path") || return 1
 _termnav_root="${_termnav_shell_dir%/share/termnav}"
+_termnav_ssh_shim_dir="$_termnav_root/share/termnav/shims"
+
+# A shell function affects only commands parsed by that shell. PATH is the
+# process-level interface, so unrelated descendant launchers inherit the same
+# SSH route without knowing about Termnav. Keep activation idempotent because
+# dotfiles and other consumers may reload this file in place.
+case ":${PATH:-}:" in
+  *":$_termnav_ssh_shim_dir:"*) ;;
+  *) PATH="$_termnav_ssh_shim_dir${PATH:+:$PATH}" ;;
+esac
+export PATH
+
+# OpenSSH leaves the pathname of a closed remote StreamLocal forward behind.
+# Remove only old, owner-held sockets that no longer have a listener; active
+# connections, young bind races, symlinks, and unrelated files are untouched.
+# Use the provider beside this sourced asset so a development checkout cannot
+# accidentally invoke a different installed Termnav version during activation.
+"$_termnav_root/bin/termnav-relay" sweep >/dev/null 2>&1 || true
+
+# Prompt hooks share this cache in the current shell. Re-sourcing the integration
+# intentionally refreshes it, matching the low-level tmux-client cache.
+_termnav_wezterm_remote_link_host_cache_set=0
+_termnav_wezterm_remote_link_host_cache_tmux=""
+_termnav_wezterm_remote_link_host_cache_ssh=""
+_termnav_wezterm_remote_link_host_cache_at=0
+_termnav_wezterm_remote_link_host_cache_value=""
+_termnav_wezterm_remote_link_host_result=""
+
+# ---------------------------------------------------------------------------
+# Public API - stable shell integration surface
+# ---------------------------------------------------------------------------
+# _termnav_wezterm_publish_link_context
+#   Publish the current pane cwd and remote-host context for terminal links.
+# _termnav_wezterm_preexec <command>
+#   Prompt hook callback that marks nvim/vim commands before they start.
+# _termnav_wezterm_precmd
+#   Prompt hook callback that marks the pane as no longer inside nvim/vim.
+# termnav_file_links_need_plain_output
+#   Return success when command output should use plain paths instead of OSC-8
+#   file links for the current terminal or attached tmux client.
+
 # shellcheck source=../../lib/termnav/shell/wezterm-vars.sh
 . "$_termnav_root/lib/termnav/shell/wezterm-vars.sh" || return 1
 # shellcheck source=../../lib/termnav/shell/file-links.sh
