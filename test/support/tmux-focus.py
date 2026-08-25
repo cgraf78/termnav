@@ -454,7 +454,11 @@ class FocusLibraryTest(unittest.TestCase):
                 "client_focused",
                 side_effect=(False, True),
             ),
-            mock.patch.object(self.module, "sync_client_style", return_value=True),
+            mock.patch.object(
+                self.module,
+                "sync_client_style",
+                return_value=True,
+            ) as sync_client_style,
             mock.patch.object(self.module, "lock_path") as lock_path,
         ):
             status = self.module.stop_watch(
@@ -464,6 +468,7 @@ class FocusLibraryTest(unittest.TestCase):
                 "/dev/pts/1",
             )
         self.assertEqual(0, status)
+        self.assertEqual(2, sync_client_style.call_count)
         lock_path.assert_not_called()
 
 
