@@ -228,14 +228,25 @@ SSH uses the same per-session relay established by `termnav-relay ssh`.
 
 The publisher is intentionally one-hop. Every tmux layer runs the same hooks,
 so a chain of any depth converges without a root coordinator or topology
-configuration. Separate clients attached to the same inner session publish to
-their own parent panes independently. A killed publisher, broken SSH session,
-or missed detach event fails closed when its lease expires.
+configuration. The hooks also reconcile the active pane when a client gains or
+loses terminal focus, preventing an unfocused nested tmux from retaining its
+own active background. Separate clients attached to the same inner session
+publish to their own parent panes independently. A killed publisher, broken
+SSH session, or missed detach event fails closed when its lease expires.
 
-The rendering path remains entirely inside tmux. Consumers combine
-`pane_active`, the current client's `focused` flag, and the absence of the
-pane-local `@termnav_child_focus` option. No subprocess runs during a redraw.
-See `examples/tmux.conf` for the hooks and reusable predicate.
+The rendering path remains entirely inside tmux. Border and label formats can
+combine `pane_active`, the current client's `focused` flag, and the absence of
+the pane-local `@termnav_child_focus` option. Pane content styles are different:
+tmux compiles them without client context and does not reevaluate them when a
+user option changes. A configuration that gives the active pane a different
+background should therefore keep `window-active-style` literal and publish its
+inactive/container style through `@termnav_inactive_style`.
+Termnav applies that value as a pane-local active-style override while either a
+focused child owns the pane or no terminal client focuses it. It restores any
+preexisting override once the pane is again the focused leaf. No subprocess
+runs during a redraw, and the uncommon selection repair hook is skipped unless
+a stale unfocused marker is present. See `examples/tmux.conf` for the complete
+pattern.
 
 As with every full-screen application in a tmux pane, the pane grid itself is
 shared if the exact same outer pane is viewed by multiple outer clients. tmux

@@ -148,6 +148,14 @@ if command -v tmux >/dev/null 2>&1; then
     "termnav-tmux-focus watch" "$_tmux_focus_hooks"
   _assert_contains "examples: tmux focus excludes control clients" \
     '#{==:#{client_control_mode},0}' "$_tmux_focus_hooks"
+  _tmux_focus_sync_hook=$(tmux -L "$_socket" show-hooks -g after-select-pane)
+  _assert_contains "examples: stale pane dimming is repaired on selection" \
+    'termnav-tmux-focus sync' "$_tmux_focus_sync_hook"
+  _assert_contains "examples: ordinary pane selection remains process-free" \
+    '#{!=:#{@termnav_client_unfocused},}' "$_tmux_focus_sync_hook"
+  _assert_eq "examples: tmux focus publishes its inactive pane style" \
+    'bg=default' \
+    "$(tmux -L "$_socket" show-options -gqv @termnav_inactive_style)"
   tmux -L "$_socket" kill-server
 else
   echo "  SKIP: tmux config example requires tmux"

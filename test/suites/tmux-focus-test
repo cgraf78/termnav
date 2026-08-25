@@ -20,6 +20,22 @@ printf '%s\n' "$output"
 _assert_exit "tmux focus: real tmux integration passes" 0 "$rc"
 _assert_contains "tmux focus: a bounded claim expires" \
   "test_claim_expires_without_a_release" "$output"
+_assert_contains "tmux focus: a claim applies and restores pane styling" \
+  "test_claim_applies_parent_style_and_release_restores_inheritance" "$output"
+_assert_contains "tmux focus: deployments without style policy remain compatible" \
+  "test_claim_without_inactive_style_keeps_existing_behavior" "$output"
+_assert_contains "tmux focus: invalid styles preserve core focus ownership" \
+  "test_invalid_inactive_style_preserves_the_core_focus_claim" "$output"
+_assert_contains "tmux focus: invalid styles restore pane-local overrides" \
+  "test_invalid_inactive_style_restores_an_existing_override" "$output"
+_assert_contains "tmux focus: malformed restore markers preserve pane styling" \
+  "test_malformed_restore_marker_preserves_the_current_pane_style" "$output"
+_assert_contains "tmux focus: bad saved styles cannot trap expired claims" \
+  "test_invalid_saved_style_cannot_trap_an_expired_claim" "$output"
+_assert_contains "tmux focus: concurrent replacement restores the original style" \
+  "test_concurrent_replacement_restores_the_original_pane_style" "$output"
+_assert_contains "tmux focus: a preexisting pane style is restored" \
+  "test_release_restores_an_existing_pane_active_style" "$output"
 _assert_contains "tmux focus: a renewed claim keeps its lease" \
   "test_renewal_extends_the_same_claim" "$output"
 _assert_contains "tmux focus: stale cleanup cannot clear a replacement" \
@@ -38,6 +54,8 @@ _assert_contains "tmux focus: Boolean leases cannot mutate tmux" \
   "test_boolean_lease_is_rejected_before_any_tmux_mutation" "$output"
 _assert_contains "tmux focus: invalid heartbeat timing has no side effects" \
   "test_invalid_watch_timing_is_rejected_before_parent_discovery" "$output"
+_assert_contains "tmux focus: a refocus during style sync is never stopped" \
+  "test_refocus_during_style_sync_cannot_stop_the_current_watcher" "$output"
 _assert_contains "tmux focus: SSH relay claims only the immediate parent pane" \
   "test_relay_claim_is_scoped_to_its_immediate_parent_pane" "$output"
 _assert_contains "tmux focus: tmuxless hops forward to the nearest parent" \
@@ -50,6 +68,10 @@ _assert_contains "tmux focus: heartbeats do not block navigation admission" \
   "test_focus_heartbeat_does_not_block_navigation_admission" "$output"
 _assert_contains "tmux focus: a nested client owns only its exact parent pane" \
   "test_local_nested_client_claims_and_releases_its_exact_parent_pane" "$output"
+_assert_contains "tmux focus: direct client focus repaints its own leaf" \
+  "test_direct_client_focus_changes_repaint_its_active_leaf" "$output"
+_assert_contains "tmux focus: selection repairs stale pane dimming" \
+  "test_selecting_a_stale_dimmed_pane_repairs_its_style" "$output"
 _assert_contains "tmux focus: real client processes expose their exact parent route" \
   "test_nested_client_process_exposes_its_exact_parent_route" "$output"
 _assert_contains "tmux focus: arbitrary depth retains one highlighted leaf" \

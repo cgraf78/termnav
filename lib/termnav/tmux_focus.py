@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import signal
 import socket
 import stat
@@ -17,8 +18,13 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 FOCUS_OPTION = "@termnav_child_focus"
+CLIENT_UNFOCUSED_OPTION = "@termnav_client_unfocused"
+INACTIVE_STYLE_OPTION = "@termnav_inactive_style"
+STYLE_RESTORE_OPTION = "@termnav_child_focus_restore_active_style"
+WINDOW_ACTIVE_STYLE_OPTION = "window-active-style"
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{24}")
 CLAIM_PATTERN = re.compile(r"([0-9a-f]{24}):([0-9]+)")
 LEASE_MIN_MS = 50
@@ -101,35 +107,225 @@ def current_claim(socket_path: str, pane: str) -> str | None:
     return value if CLAIM_PATTERN.fullmatch(value) else None
 
 
-def claim(socket_path: str, pane: str, token: str, lease_ms: int) -> Claim | None:
-    """Publish one versioned child-focus lease on its immediate parent pane."""
-    if not valid_token(token) or not valid_pane(pane) or not valid_lease(lease_ms):
+def mutation_lock(socket_path: str, pane: str) -> IO[str]:
+    """Serialize the small group of pane-option updates for one parent."""
+    lock = lock_path("state", socket_path, pane).open("a+")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def option_value(
+    socket_path: str,
+    pane: str,
+    option: str,
+    *,
+    pane_local: bool,
+) -> str | None:
+    """Read an option while distinguishing an unset pane override from empty."""
+    scope = ["-p", "-t", pane] if pane_local else ["-g"]
+    shown = run_tmux(socket_path, "show-options", *scope, "-q", option)
+    if shown.returncode != 0 or not shown.stdout:
         return None
-    previous = current_claim(socket_path, pane)
-    deadline_ns = time.monotonic_ns() + lease_ms * 1_000_000
-    claim_value = f"{token}:{deadline_ns}"
-    result = run_tmux(
+    value = run_tmux(socket_path, "show-options", *scope, "-qv", option)
+    if value.returncode != 0:
+        return None
+    return value.stdout.removesuffix("\n")
+
+
+def style_restore_value(socket_path: str, pane: str) -> str:
+    """Encode the pane-local active style that a child claim must restore."""
+    existing = option_value(
         socket_path,
+        pane,
+        WINDOW_ACTIVE_STYLE_OPTION,
+        pane_local=True,
+    )
+    return json.dumps(
+        {"had_override": existing is not None, "value": existing or ""},
+        separators=(",", ":"),
+    )
+
+
+def inactive_style_setup(
+    socket_path: str,
+    pane: str,
+) -> tuple[list[str], str | None, bool]:
+    """Build the first pane-local dim override, if this server opts into it."""
+    inactive_style = option_value(
+        socket_path,
+        pane,
+        INACTIVE_STYLE_OPTION,
+        pane_local=False,
+    )
+    if not inactive_style:
+        return [], None, False
+    if option_value(socket_path, pane, STYLE_RESTORE_OPTION, pane_local=True) is not None:
+        return [], None, True
+    restore = style_restore_value(socket_path, pane)
+    return (
+        [
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            WINDOW_ACTIVE_STYLE_OPTION,
+            inactive_style,
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            STYLE_RESTORE_OPTION,
+            restore,
+        ],
+        restore,
+        True,
+    )
+
+
+def style_restore_arguments(pane: str, encoded: str) -> list[str] | None:
+    """Decode one trusted restore marker into a direct tmux argument vector."""
+    try:
+        state = json.loads(encoded)
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or not isinstance(state.get("had_override"), bool):
+        return None
+    value = state.get("value")
+    if not isinstance(value, str):
+        return None
+    if state["had_override"]:
+        return [
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            WINDOW_ACTIVE_STYLE_OPTION,
+            value,
+        ]
+    return [
         "set-option",
-        "-p",
+        "-pu",
         "-t",
         pane,
-        FOCUS_OPTION,
-        claim_value,
-    )
-    if result.returncode != 0:
+        WINDOW_ACTIVE_STYLE_OPTION,
+    ]
+
+
+def restore_style_commands(socket_path: str, pane: str) -> list[str] | None:
+    """Build commands that restore a Termnav-owned pane style override."""
+    encoded = option_value(socket_path, pane, STYLE_RESTORE_OPTION, pane_local=True)
+    if encoded is None:
         return None
-    # One independent expirer follows all renewals for a publisher token. A
-    # replacement token attempts to start another; the pane lock makes that a
-    # cheap no-op while the original expirer is still alive.
-    previous_token = previous.partition(":")[0] if previous else None
-    return Claim(claim_value, previous_token != token)
+    arguments = style_restore_arguments(pane, encoded)
+    return [] if arguments is None else [shlex.join(arguments)]
 
 
-def clear_exact(socket_path: str, pane: str, claim_value: str) -> bool:
-    """Clear exactly one observed lease generation."""
-    if not CLAIM_PATTERN.fullmatch(claim_value) or not valid_pane(pane):
+def rollback_claim_setup(
+    socket_path: str,
+    pane: str,
+    restore: str,
+    previous: str | None,
+) -> None:
+    """Return every pane option to its pre-claim state after setup fails."""
+    arguments = style_restore_arguments(pane, restore)
+    if arguments is None:
+        return
+    arguments.extend((";", "set-option", "-pu", "-t", pane, STYLE_RESTORE_OPTION, ";"))
+    if previous is None:
+        arguments.extend(("set-option", "-pu", "-t", pane, FOCUS_OPTION))
+    else:
+        arguments.extend(("set-option", "-p", "-t", pane, FOCUS_OPTION, previous))
+    run_tmux(socket_path, *arguments)
+
+
+def set_client_unfocused(socket_path: str, pane: str) -> bool:
+    """Dim one client-visible pane while preserving its prior active style."""
+    with mutation_lock(socket_path, pane):
+        style_arguments, restore, enabled = inactive_style_setup(socket_path, pane)
+        if not enabled:
+            return True
+        blur_arguments = [
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            CLIENT_UNFOCUSED_OPTION,
+            "1",
+        ]
+        arguments = [*style_arguments, ";", *blur_arguments] if style_arguments else blur_arguments
+        result = run_tmux(socket_path, *arguments)
+        if result.returncode == 0:
+            return True
+        if restore is not None:
+            rollback = style_restore_arguments(pane, restore)
+            if rollback is not None:
+                rollback.extend(
+                    (
+                        ";",
+                        "set-option",
+                        "-pu",
+                        "-t",
+                        pane,
+                        STYLE_RESTORE_OPTION,
+                        ";",
+                        "set-option",
+                        "-pu",
+                        "-t",
+                        pane,
+                        CLIENT_UNFOCUSED_OPTION,
+                    )
+                )
+                run_tmux(socket_path, *rollback)
         return False
+
+
+def clear_client_unfocused(socket_path: str, pane: str) -> bool:
+    """Restore a focused pane unless a nested child still owns the highlight."""
+    with mutation_lock(socket_path, pane):
+        arguments = ["set-option", "-pu", "-t", pane, CLIENT_UNFOCUSED_OPTION]
+        if current_claim(socket_path, pane) is None:
+            encoded = option_value(
+                socket_path,
+                pane,
+                STYLE_RESTORE_OPTION,
+                pane_local=True,
+            )
+            if encoded is not None:
+                restore = style_restore_arguments(pane, encoded)
+                arguments.extend((";", "set-option", "-pu", "-t", pane, STYLE_RESTORE_OPTION))
+                if restore is not None:
+                    arguments.extend((";", *restore))
+        result = run_tmux(socket_path, *arguments)
+        if result.returncode == 0:
+            return True
+        # A corrupt, syntactically valid marker may describe a style tmux
+        # cannot apply. Prefer the inherited global style to a permanent dim
+        # override after the ownership markers have already been cleared.
+        run_tmux(
+            socket_path,
+            "set-option",
+            "-pu",
+            "-t",
+            pane,
+            WINDOW_ACTIVE_STYLE_OPTION,
+        )
+        return False
+
+
+def _clear_exact(socket_path: str, pane: str, claim_value: str) -> bool:
+    """Clear one current claim and restore any style it temporarily owned."""
+    restore_commands = restore_style_commands(socket_path, pane)
+    # Remove ownership before attempting a saved style. A manually corrupted
+    # but valid-looking restore marker can make tmux reject that final command;
+    # clearing the lease first prevents the expirer from retrying in a hot loop.
+    commands = [shlex.join(("set-option", "-pu", "-t", pane, FOCUS_OPTION))]
+    blurred = option_value(socket_path, pane, CLIENT_UNFOCUSED_OPTION, pane_local=True)
+    if restore_commands is not None and blurred is None:
+        commands.append(shlex.join(("set-option", "-pu", "-t", pane, STYLE_RESTORE_OPTION)))
+        # A malformed marker cannot safely reconstruct the old style. Leave
+        # the current pane style untouched; a valid marker restores it last.
+        commands.extend(restore_commands)
     condition = f"#{{==:#{{{FOCUS_OPTION}}},{claim_value}}}"
     result = run_tmux(
         socket_path,
@@ -138,22 +334,93 @@ def clear_exact(socket_path: str, pane: str, claim_value: str) -> bool:
         "-t",
         pane,
         condition,
-        f"set-option -p -u -t {pane} {FOCUS_OPTION}",
+        " ; ".join(commands),
         "",
     )
+    if result.returncode != 0 and restore_commands:
+        # The claim and marker were intentionally cleared before restoration.
+        # If a corrupt saved style is rejected, fall back to inheritance rather
+        # than leaving the pane permanently painted as an inactive container.
+        run_tmux(
+            socket_path,
+            "set-option",
+            "-pu",
+            "-t",
+            pane,
+            WINDOW_ACTIVE_STYLE_OPTION,
+        )
     return result.returncode == 0
+
+
+def claim(socket_path: str, pane: str, token: str, lease_ms: int) -> Claim | None:
+    """Publish one versioned child-focus lease on its immediate parent pane."""
+    if not valid_token(token) or not valid_pane(pane) or not valid_lease(lease_ms):
+        return None
+    with mutation_lock(socket_path, pane):
+        previous = current_claim(socket_path, pane)
+        deadline_ns = time.monotonic_ns() + lease_ms * 1_000_000
+        claim_value = f"{token}:{deadline_ns}"
+        arguments = ["set-option", "-p", "-t", pane, FOCUS_OPTION, claim_value]
+        previous_token = previous.partition(":")[0] if previous else None
+
+        # Heartbeats for the current publisher only extend the lease. Avoid
+        # rereading or resetting style options on this steady-state hot path.
+        if previous_token == token:
+            result = run_tmux(socket_path, *arguments)
+            return Claim(claim_value, False) if result.returncode == 0 else None
+
+        # Pane content styles are compiled when set, not reevaluated on every
+        # draw. An outer tmux may opt into correct container painting by
+        # publishing its inactive style. Apply it once for the claim lifetime;
+        # the heartbeat still performs only the original single option write.
+        style_arguments, restore, _ = inactive_style_setup(socket_path, pane)
+        if style_arguments:
+            arguments = [*style_arguments, ";", *arguments]
+        result = run_tmux(socket_path, *arguments)
+        if result.returncode != 0:
+            if restore is not None:
+                # tmux may create a pane-local style artifact before reporting
+                # an invalid style. Restore the visual state, then publish the
+                # ownership lease separately so optional theming cannot break
+                # the core focused-leaf protocol.
+                rollback_claim_setup(socket_path, pane, restore, previous)
+                result = run_tmux(
+                    socket_path,
+                    "set-option",
+                    "-p",
+                    "-t",
+                    pane,
+                    FOCUS_OPTION,
+                    claim_value,
+                )
+            if result.returncode != 0:
+                return None
+        # One independent expirer follows all renewals for a publisher token. A
+        # replacement token attempts to start another; the pane lock makes that
+        # a cheap no-op while the original expirer is still alive.
+        return Claim(claim_value, previous_token != token)
+
+
+def clear_exact(socket_path: str, pane: str, claim_value: str) -> bool:
+    """Clear exactly one observed lease generation."""
+    if not CLAIM_PATTERN.fullmatch(claim_value) or not valid_pane(pane):
+        return False
+    with mutation_lock(socket_path, pane):
+        return _clear_exact(socket_path, pane, claim_value)
 
 
 def release(socket_path: str, pane: str, token: str) -> bool:
     """Clear a claim only if it is still owned by the releasing publisher."""
     if not valid_token(token) or not valid_pane(pane):
         return False
-    claim_value = current_claim(socket_path, pane)
-    if claim_value is None or claim_value.partition(":")[0] != token:
-        return True
-    # The compare and unset are one tmux command. A concurrent renewal with the
-    # same token, or a replacement publisher, cannot be erased after this read.
-    return clear_exact(socket_path, pane, claim_value)
+    with mutation_lock(socket_path, pane):
+        claim_value = current_claim(socket_path, pane)
+        if claim_value is None or claim_value.partition(":")[0] != token:
+            return True
+        # The compare, style restoration, and unset are one tmux command queue.
+        # A concurrent renewal or replacement cannot interleave because every
+        # Termnav mutation of this pane holds the same short-lived lock.
+        return _clear_exact(socket_path, pane, claim_value)
 
 
 def runtime_dir() -> Path:
@@ -272,6 +539,55 @@ def client_focused(socket_path: str, client_pid: int, client_tty: str) -> bool |
     return None
 
 
+def client_pane(socket_path: str, client_pid: int, client_tty: str) -> str | None:
+    """Return the active pane selected by one exact attached client."""
+    result = run_tmux(
+        socket_path,
+        "list-clients",
+        "-F",
+        "#{client_pid} #{client_tty} #{pane_id}",
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3 or fields[0] != str(client_pid) or fields[1] != client_tty:
+            continue
+        return fields[2] if valid_pane(fields[2]) else None
+    return None
+
+
+def pane_has_focused_client(socket_path: str, pane: str) -> bool:
+    """Return whether a non-control client currently focuses this exact pane."""
+    result = run_tmux(
+        socket_path,
+        "list-clients",
+        "-F",
+        "#{pane_id} #{m:*focused*,#{client_flags}} #{client_control_mode}",
+    )
+    if result.returncode != 0:
+        return False
+    return any(
+        fields == [pane, "1", "0"]
+        for line in result.stdout.splitlines()
+        if len(fields := line.split()) == 3
+    )
+
+
+def sync_client_style(
+    socket_path: str,
+    client_pid: int,
+    client_tty: str,
+) -> bool:
+    """Reconcile one client's active pane with authoritative tmux focus."""
+    pane = client_pane(socket_path, client_pid, client_tty)
+    if pane is None:
+        return True
+    if pane_has_focused_client(socket_path, pane):
+        return clear_client_unfocused(socket_path, pane)
+    return set_client_unfocused(socket_path, pane)
+
+
 def send_relay(path: str, state: str, token: str, lease_ms: int) -> bool:
     """Send one bounded focus update through the nearest SSH relay."""
     message: dict[str, object] = {
@@ -383,11 +699,25 @@ def process_is_watcher(
     )
 
 
-def stop_watch(executable: Path, socket_path: str, client_pid: int, client_tty: str) -> int:
+def stop_watch(
+    executable: Path,
+    socket_path: str,
+    client_pid: int,
+    client_tty: str,
+) -> int:
     """Stop an unfocused publisher while rejecting a delayed focus-out hook."""
     # Background hooks can complete out of order during a rapid focus bounce.
     # Re-read authoritative client state before signaling so an old focus-out
     # cannot kill the publisher created by the newer focus-in event.
+    if client_focused(socket_path, client_pid, client_tty):
+        return 0
+    style_synced = sync_client_style(
+        socket_path,
+        client_pid,
+        client_tty,
+    )
+    # The style reconciliation performs tmux round trips. Close the widened
+    # focus-bounce window before consulting a stale watcher PID.
     if client_focused(socket_path, client_pid, client_tty):
         return 0
     path = lock_path("watch", socket_path, str(client_pid), client_tty)
@@ -395,14 +725,14 @@ def stop_watch(executable: Path, socket_path: str, client_pid: int, client_tty: 
         raw_pid = path.read_text(encoding="ascii").strip()
         watcher_pid = int(raw_pid)
     except (OSError, ValueError):
-        return 0
+        return 0 if style_synced else 1
     if not process_is_watcher(executable, watcher_pid, socket_path, client_pid, client_tty):
-        return 0
+        return 0 if style_synced else 1
     try:
         os.kill(watcher_pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    return 0
+    return 0 if style_synced else 1
 
 
 def watch(
@@ -416,6 +746,11 @@ def watch(
     """Renew one focused nested client's immediate-parent claim."""
     if not valid_lease(lease_ms) or not valid_interval(interval_ms) or lease_ms < interval_ms * 2:
         return 2
+    if client_focused(socket_path, client_pid, client_tty) is not True:
+        return 0
+    # Styling is optional policy. A bad style must not suppress the child claim
+    # that borders, labels, and ancestor focus ownership depend on.
+    sync_client_style(socket_path, client_pid, client_tty)
     parent = parent_for_client(client_pid, socket_path)
     if parent is None:
         # Direct terminal clients have no parent to claim. Exiting immediately
@@ -442,9 +777,14 @@ def watch(
         lock.flush()
         claimed = False
         try:
-            while not stopping:
+            while True:
                 focused = client_focused(socket_path, client_pid, client_tty)
-                if not focused:
+                if stopping and focused:
+                    # A focus-in can race the old focus-out process after it
+                    # signals us but before we leave the loop. Keep ownership
+                    # when tmux says this exact client is focused again.
+                    stopping = False
+                if stopping or not focused:
                     break
                 result = update_parent(parent, "claim", token, lease_ms)
                 if isinstance(result, Claim):
