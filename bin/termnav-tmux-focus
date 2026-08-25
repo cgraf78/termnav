@@ -18,6 +18,7 @@ from tmux_focus import (  # noqa: E402
     claim,
     expire,
     release,
+    sync_client_style,
     start_expirer,
     stop_watch,
     valid_interval,
@@ -88,6 +89,14 @@ def main() -> int:
     stop_parser.add_argument("--client-pid", required=True, type=int)
     stop_parser.add_argument("--client-tty", required=True)
 
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="reconcile the active pane after a client selection change",
+    )
+    sync_parser.add_argument("--tmux-socket", required=True)
+    sync_parser.add_argument("--client-pid", required=True, type=int)
+    sync_parser.add_argument("--client-tty", required=True)
+
     arguments = parser.parse_args()
     if arguments.command == "release":
         return 0 if release(arguments.parent_tmux, arguments.parent_pane, arguments.token) else 1
@@ -111,6 +120,12 @@ def main() -> int:
             arguments.client_pid,
             arguments.client_tty,
         )
+    if arguments.command == "sync":
+        return 0 if sync_client_style(
+            arguments.tmux_socket,
+            arguments.client_pid,
+            arguments.client_tty,
+        ) else 1
 
     published = claim(
         arguments.parent_tmux,

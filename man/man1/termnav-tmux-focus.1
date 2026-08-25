@@ -19,6 +19,14 @@ termnav-tmux-focus \- publish focus ownership between nested tmux layers
 .I pid
 .B --client-tty
 .I tty
+.br
+.B termnav-tmux-focus sync
+.B --tmux-socket
+.I socket
+.B --client-pid
+.I pid
+.B --client-tty
+.I tty
 .SH DESCRIPTION
 .B termnav-tmux-focus
 lets a tmux configuration highlight only the focused leaf pane across nested
@@ -36,10 +44,15 @@ inner session retain independent parent claims.
 .PP
 The publisher renews only while its client is focused. A matching
 .B stop
-request releases immediately. Every claim also has a bounded lease, so a
-killed process, broken SSH connection, or missed hook eventually fails closed.
-Publisher and expiry workers are deduplicated with owner-only runtime locks.
-No helper is retained for a direct terminal client with no parent route.
+request reconciles that client's active pane when it is still attached and
+releases its parent immediately.
+The
+.B watch
+command restores the client's own pane on focus-in before publishing upward.
+Every claim also has a bounded lease, so a killed process, broken SSH
+connection, or missed hook eventually fails closed. Publisher and expiry
+workers are deduplicated with owner-only runtime locks. No helper is retained
+for a direct terminal client with no parent route.
 .SH TMUX INTEGRATION
 Start
 .B watch
@@ -53,6 +66,14 @@ from
 .B client-focus-out
 and
 .B client-detached.
+Invoke the lightweight
+.B sync
+command after pane, window, or session selection only when the target pane has
+a stale
+.B @termnav_client_unfocused
+marker. This repairs the uncommon case where another attachment changed the
+selection while a client was unfocused without adding a process to ordinary
+navigation.
 Pass
 .BR socket_path ,
 .BR client_pid ,
@@ -66,10 +87,20 @@ A focused-leaf predicate can be defined as:
 #{&&:#{pane_active},#{&&:#{m:*focused*,#{client_flags}},#{==:#{@termnav_child_focus},}}}
 .fi
 .PP
-Use that format in pane background, active-border, and border-label styles.
-Because the predicate is evaluated by tmux in each client context, rendering
-does not spawn subprocesses and simultaneous clients do not overwrite shared
-style options.
+Use that format in active-border and border-label formats. Those formats have
+the client context needed to evaluate the focused flag independently for each
+attachment.
+.PP
+Pane content styles are compiled by tmux without client context and are not
+reevaluated when a pane user option changes. Keep
+.B window-active-style
+literal. If active and inactive pane backgrounds differ, set
+.B @termnav_inactive_style
+to the inactive style. While a child claim is live or the pane's client is
+unfocused, Termnav applies that value as a pane-local
+.B window-active-style
+override and restores any preexisting override once neither condition remains.
+This remains a redraw-time zero-process path.
 .SH OPTIONS
 .TP
 .BI --tmux-socket " socket"
@@ -94,7 +125,7 @@ The publisher completed normally, another publisher already owns the same
 client, or the client has no parent route.
 .TP
 .B 1
-A parent claim could not be published.
+A tmux focus or style update failed.
 .TP
 .B 2
 Usage error or an invalid lease relationship.

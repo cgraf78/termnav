@@ -56,7 +56,19 @@ class FocusClaimTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="termnav-focus-test-")
         self.socket = pathlib.Path(self.tempdir.name) / "tmux.sock"
-        self.run_tmux("new-session", "-d", "-s", "focus", "sleep", "30")
+        # A custom socket isolates server state, but tmux still reads the
+        # caller's default configuration unless told otherwise. Keep provider
+        # tests independent of the developer's colors, hooks, and plugins.
+        self.run_tmux(
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-s",
+            "focus",
+            "sleep",
+            "30",
+        )
         self.pane = self.tmux("display-message", "-p", "#{pane_id}")
 
     def tearDown(self) -> None:
@@ -85,7 +97,41 @@ class FocusClaimTest(unittest.TestCase):
     def pane_claim_owner(self) -> str:
         return self.pane_claim().partition(":")[0]
 
-    def focus_command(self, command: str, token: str, lease_ms: int | None = None) -> None:
+    def pane_active_style(self) -> str:
+        return self.tmux(
+            "show-options",
+            "-pqv",
+            "-t",
+            self.pane,
+            "window-active-style",
+        )
+
+    def pane_restore_style(self) -> str:
+        return self.tmux(
+            "show-options",
+            "-pqv",
+            "-t",
+            self.pane,
+            "@termnav_child_focus_restore_active_style",
+        )
+
+    def configure_inactive_style(self) -> None:
+        self.run_tmux(
+            "set-option",
+            "-g",
+            "@termnav_inactive_style",
+            "bg=#010d17",
+        )
+
+    def focus_result(
+        self,
+        command: str,
+        token: str,
+        lease_ms: int | None = None,
+        *,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the public focus CLI so tests share one exact invocation shape."""
         arguments = [
             str(self.focus),
             command,
@@ -98,13 +144,206 @@ class FocusClaimTest(unittest.TestCase):
         ]
         if lease_ms is not None:
             arguments.extend(("--lease-ms", str(lease_ms)))
-        subprocess.run(arguments, check=True)
+        return subprocess.run(
+            arguments,
+            text=True,
+            capture_output=True,
+            check=check,
+        )
+
+    def focus_command(self, command: str, token: str, lease_ms: int | None = None) -> None:
+        self.focus_result(command, token, lease_ms, check=True)
 
     def test_claim_expires_without_a_release(self) -> None:
+        self.configure_inactive_style()
         token = "aaaaaaaaaaaaaaaaaaaaaaaa"
         self.focus_command("claim", token, 250)
         self.assertEqual(token, self.pane_claim_owner())
-        wait_until(lambda: self.pane_claim() == "", "expired claim cleanup")
+        self.assertEqual("bg=#010d17", self.pane_active_style())
+        wait_until(
+            lambda: self.pane_claim() == "" and self.pane_active_style() == "",
+            "expired claim and pane-style cleanup",
+        )
+
+    def test_claim_applies_parent_style_and_release_restores_inheritance(self) -> None:
+        self.configure_inactive_style()
+        token = "444444444444444444444444"
+        self.assertEqual("", self.pane_active_style())
+        self.focus_command("claim", token, 500)
+        self.assertEqual("bg=#010d17", self.pane_active_style())
+        self.focus_command("release", token)
+        self.assertEqual("", self.pane_active_style())
+
+    def test_claim_without_inactive_style_keeps_existing_behavior(self) -> None:
+        token = "666666666666666666666666"
+        self.focus_command("claim", token, 500)
+        self.assertEqual(token, self.pane_claim_owner())
+        self.assertEqual("", self.pane_active_style())
+        self.assertEqual("", self.pane_restore_style())
+        self.focus_command("release", token)
+
+    def test_invalid_inactive_style_preserves_the_core_focus_claim(self) -> None:
+        self.run_tmux(
+            "set-option",
+            "-g",
+            "@termnav_inactive_style",
+            "not-a-tmux-style",
+        )
+        token = "777777777777777777777777"
+        result = self.focus_result("claim", token, 500, check=False)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(token, self.pane_claim_owner())
+        self.assertEqual("", self.pane_restore_style())
+        self.assertEqual("", self.pane_active_style())
+        self.focus_command("release", token)
+
+    def test_invalid_inactive_style_restores_an_existing_override(self) -> None:
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "window-active-style",
+            "bg=#123456",
+        )
+        self.run_tmux(
+            "set-option",
+            "-g",
+            "@termnav_inactive_style",
+            "not-a-tmux-style",
+        )
+        token = "888888888888888888888888"
+        result = self.focus_result("claim", token, 500, check=False)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(token, self.pane_claim_owner())
+        self.assertEqual("", self.pane_restore_style())
+        self.assertEqual("bg=#123456", self.pane_active_style())
+        self.focus_command("release", token)
+
+    def test_concurrent_replacement_restores_the_original_pane_style(self) -> None:
+        self.configure_inactive_style()
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "window-active-style",
+            "bg=#123456",
+        )
+        tokens = (
+            "bbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccc",
+        )
+        barrier = threading.Barrier(3)
+        results: list[subprocess.CompletedProcess[str]] = []
+
+        def publish(token: str) -> None:
+            barrier.wait()
+            results.append(self.focus_result("claim", token, 1000, check=False))
+
+        threads = [threading.Thread(target=publish, args=(token,)) for token in tokens]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertEqual(2, len(results))
+        self.assertTrue(all(result.returncode == 0 for result in results))
+        owner = self.pane_claim_owner()
+        self.assertIn(owner, tokens)
+        self.assertEqual("bg=#010d17", self.pane_active_style())
+        loser = next(token for token in tokens if token != owner)
+        self.focus_command("release", loser)
+        self.assertEqual(owner, self.pane_claim_owner())
+        self.assertEqual("bg=#010d17", self.pane_active_style())
+        self.focus_command("release", owner)
+        self.assertEqual("", self.pane_claim())
+        self.assertEqual("bg=#123456", self.pane_active_style())
+
+    def test_malformed_restore_marker_preserves_the_current_pane_style(self) -> None:
+        token = "999999999999999999999999"
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "window-active-style",
+            "bg=#abcdef",
+        )
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "@termnav_child_focus_restore_active_style",
+            "not-json",
+        )
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "@termnav_child_focus",
+            f"{token}:9999999999999999",
+        )
+        self.focus_command("release", token)
+        self.assertEqual("", self.pane_claim())
+        self.assertEqual("", self.pane_restore_style())
+        self.assertEqual("bg=#abcdef", self.pane_active_style())
+
+    def test_invalid_saved_style_cannot_trap_an_expired_claim(self) -> None:
+        token = "dddddddddddddddddddddddd"
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "@termnav_child_focus_restore_active_style",
+            '{"had_override":true,"value":"not-a-tmux-style"}',
+        )
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "@termnav_child_focus",
+            f"{token}:1",
+        )
+        result = subprocess.run(
+            [
+                str(self.focus),
+                "expire",
+                "--parent-tmux",
+                str(self.socket),
+                "--parent-pane",
+                self.pane,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("", self.pane_claim())
+        self.assertEqual("", self.pane_restore_style())
+        self.assertEqual("", self.pane_active_style())
+
+    def test_release_restores_an_existing_pane_active_style(self) -> None:
+        self.configure_inactive_style()
+        self.run_tmux(
+            "set-option",
+            "-p",
+            "-t",
+            self.pane,
+            "window-active-style",
+            "bg=#123456,italics",
+        )
+        token = "555555555555555555555555"
+        self.focus_command("claim", token, 500)
+        self.assertEqual("bg=#010d17", self.pane_active_style())
+        self.focus_command("release", token)
+        self.assertEqual("bg=#123456,italics", self.pane_active_style())
 
     def test_renewal_extends_the_same_claim(self) -> None:
         token = "111111111111111111111111"
@@ -116,14 +355,17 @@ class FocusClaimTest(unittest.TestCase):
         wait_until(lambda: self.pane_claim() == "", "renewed claim cleanup")
 
     def test_stale_release_cannot_clear_a_replacement(self) -> None:
+        self.configure_inactive_style()
         old_token = "222222222222222222222222"
         new_token = "333333333333333333333333"
         self.focus_command("claim", old_token, 500)
         self.focus_command("claim", new_token, 500)
         self.focus_command("release", old_token)
         self.assertEqual(new_token, self.pane_claim_owner())
+        self.assertEqual("bg=#010d17", self.pane_active_style())
         self.focus_command("release", new_token)
         self.assertEqual("", self.pane_claim())
+        self.assertEqual("", self.pane_active_style())
 
 
 class FocusLibraryTest(unittest.TestCase):
@@ -204,6 +446,25 @@ class FocusLibraryTest(unittest.TestCase):
             )
         self.assertEqual(2, status)
         parent.assert_not_called()
+
+    def test_refocus_during_style_sync_cannot_stop_the_current_watcher(self) -> None:
+        with (
+            mock.patch.object(
+                self.module,
+                "client_focused",
+                side_effect=(False, True),
+            ),
+            mock.patch.object(self.module, "sync_client_style", return_value=True),
+            mock.patch.object(self.module, "lock_path") as lock_path,
+        ):
+            status = self.module.stop_watch(
+                pathlib.Path("/tmp/termnav-tmux-focus"),
+                "/tmp/tmux.sock",
+                123,
+                "/dev/pts/1",
+            )
+        self.assertEqual(0, status)
+        lock_path.assert_not_called()
 
 
 class RelayFocusTest(unittest.TestCase):
@@ -516,14 +777,24 @@ class NestedFocusTest(unittest.TestCase):
             "--tmux-socket #{q:socket_path} --client-pid #{client_pid} "
             "--client-tty #{q:client_tty}"
         )
+        sync_command = (
+            f"{shlex.quote(str(self.focus))} sync "
+            "--tmux-socket #{q:socket_path} --client-pid #{client_pid} "
+            "--client-tty #{q:client_tty}"
+        )
         self.config = self.root / "tmux.conf"
         self.config.write_text(
             "set -g focus-events on\n"
             "set -g status off\n"
+            "set -g window-active-style 'bg=#111111'\n"
+            "set -g @termnav_inactive_style 'bg=#222222'\n"
             f"set-hook -g client-attached[110] {{ run-shell -b '{command}' }}\n"
             f"set-hook -g client-focus-in[110] {{ run-shell -b '{command}' }}\n"
             f"set-hook -g client-focus-out[110] {{ run-shell -b '{stop_command}' }}\n"
-            f"set-hook -g client-detached[110] {{ run-shell -b '{stop_command}' }}\n",
+            f"set-hook -g client-detached[110] {{ run-shell -b '{stop_command}' }}\n"
+            f"set-hook -g after-select-pane[110] {{ run-shell -b '{sync_command}' }}\n"
+            f"set-hook -g after-select-window[110] {{ run-shell -b '{sync_command}' }}\n"
+            f"set-hook -g client-session-changed[110] {{ run-shell -b '{sync_command}' }}\n",
             encoding="utf-8",
         )
         self.sockets: list[pathlib.Path] = []
@@ -573,6 +844,27 @@ class NestedFocusTest(unittest.TestCase):
             "-t",
             pane,
             "@termnav_child_focus",
+        )
+
+    def pane_active_style(self, socket_path: pathlib.Path, pane: str) -> str:
+        """Return only a pane-local active-style override, not inheritance."""
+        return self.tmux(
+            socket_path,
+            "show-options",
+            "-pqv",
+            "-t",
+            pane,
+            "window-active-style",
+        )
+
+    def pane_blurred(self, socket_path: pathlib.Path, pane: str) -> str:
+        return self.tmux(
+            socket_path,
+            "show-options",
+            "-pqv",
+            "-t",
+            pane,
+            "@termnav_client_unfocused",
         )
 
     def client_tty(self, socket_path: pathlib.Path) -> str:
@@ -727,6 +1019,7 @@ class NestedFocusTest(unittest.TestCase):
 
     def test_local_nested_client_claims_and_releases_its_exact_parent_pane(self) -> None:
         inner = self.new_server("inner", "sleep 30")
+        inner_active = self.tmux(inner, "display-message", "-p", "#{pane_id}")
         self.tmux(inner, "split-window", "-d", "sleep 30")
         outer = self.new_server(
             "outer",
@@ -756,6 +1049,98 @@ class NestedFocusTest(unittest.TestCase):
         wait_until(
             lambda: self.pane_claim(outer, nested_pane) == "",
             "child release after parent pane loses focus",
+        )
+        wait_until(
+            lambda: self.pane_active_style(inner, inner_active) == "bg=#222222",
+            "nested leaf dimming after its client loses focus",
+        )
+
+        self.tmux(outer, "select-pane", "-t", nested_pane)
+        wait_until(
+            lambda: (
+                bool(self.pane_claim(outer, nested_pane))
+                and self.pane_active_style(inner, inner_active) == ""
+            ),
+            "nested leaf restoring when its client regains focus",
+        )
+
+    def test_direct_client_focus_changes_repaint_its_active_leaf(self) -> None:
+        direct = self.new_server("direct", "sleep 30")
+        pane = self.tmux(direct, "display-message", "-p", "#{pane_id}")
+        client = PtyClient(direct, self.environment)
+        self.clients.append(client)
+        client.focus()
+        wait_until(
+            lambda: self.pane_active_style(direct, pane) == "",
+            "focused direct leaf style",
+        )
+
+        client.blur()
+        wait_until(
+            lambda: (
+                self.pane_blurred(direct, pane) == "1"
+                and self.pane_active_style(direct, pane) == "bg=#222222"
+            ),
+            "unfocused direct leaf style",
+        )
+
+        client.focus()
+        wait_until(
+            lambda: (
+                self.pane_blurred(direct, pane) == "" and self.pane_active_style(direct, pane) == ""
+            ),
+            "refocused direct leaf style",
+        )
+
+    def test_selecting_a_stale_dimmed_pane_repairs_its_style(self) -> None:
+        direct = self.new_server("selection-repair", "sleep 30")
+        stale = self.tmux(
+            direct,
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sleep 30",
+        )
+        client = PtyClient(direct, self.environment)
+        self.clients.append(client)
+        client.focus()
+        self.tmux(
+            direct,
+            "set-option",
+            "-p",
+            "-t",
+            stale,
+            "window-active-style",
+            "bg=#222222",
+        )
+        self.tmux(
+            direct,
+            "set-option",
+            "-p",
+            "-t",
+            stale,
+            "@termnav_child_focus_restore_active_style",
+            '{"had_override":false,"value":""}',
+        )
+        self.tmux(
+            direct,
+            "set-option",
+            "-p",
+            "-t",
+            stale,
+            "@termnav_client_unfocused",
+            "1",
+        )
+
+        self.tmux(direct, "select-pane", "-t", stale)
+        wait_until(
+            lambda: (
+                self.pane_blurred(direct, stale) == ""
+                and self.pane_active_style(direct, stale) == ""
+            ),
+            "selection hook repairing a stale dim override",
         )
 
     def test_nested_client_process_exposes_its_exact_parent_route(self) -> None:
@@ -829,6 +1214,8 @@ class NestedFocusTest(unittest.TestCase):
             ),
             "claims through three focused tmux levels",
         )
+        self.assertEqual("bg=#222222", self.pane_active_style(outer, outer_nested))
+        self.assertEqual("bg=#222222", self.pane_active_style(middle, middle_nested))
         self.assertEqual(
             1,
             self.visual_leaf_count(outer, middle, deepest),
@@ -847,6 +1234,12 @@ class NestedFocusTest(unittest.TestCase):
             lambda: self.pane_claim(middle, middle_nested) == "",
             "deep child release while its parent remains focused",
         )
+        wait_until(
+            lambda: self.pane_active_style(deepest, deepest_other) == "bg=#222222",
+            "deepest leaf dimming when its client loses focus",
+        )
+        self.assertEqual("", self.pane_active_style(middle, middle_nested))
+        self.assertEqual("bg=#222222", self.pane_active_style(outer, outer_nested))
         self.assertTrue(self.pane_claim(outer, outer_nested))
         self.assertEqual(1, self.visual_leaf_count(outer, middle, deepest))
 
@@ -857,6 +1250,11 @@ class NestedFocusTest(unittest.TestCase):
             lambda: self.pane_claim(outer, outer_nested) == "",
             "middle child release after leaving the nested outer pane",
         )
+        wait_until(
+            lambda: self.pane_active_style(middle, middle_leaf) == "bg=#222222",
+            "middle leaf dimming when its client loses focus",
+        )
+        self.assertEqual("", self.pane_active_style(outer, outer_nested))
         self.assertEqual(1, self.visual_leaf_count(outer, middle, deepest))
 
         client.blur()
@@ -886,6 +1284,8 @@ class NestedFocusTest(unittest.TestCase):
             ),
             "independent claims from two clients of one inner session",
         )
+        self.assertEqual("bg=#222222", self.pane_active_style(outer_one, pane_one))
+        self.assertEqual("bg=#222222", self.pane_active_style(outer_two, pane_two))
         inner_flags = self.tmux(inner, "list-clients", "-F", "#{client_flags}")
         focused_clients = sum("focused" in flags.split(",") for flags in inner_flags.splitlines())
         self.assertEqual(2, focused_clients)
@@ -895,9 +1295,14 @@ class NestedFocusTest(unittest.TestCase):
             lambda: (
                 self.pane_claim(outer_one, pane_one) == ""
                 and bool(self.pane_claim(outer_two, pane_two))
+                and self.pane_active_style(outer_one, pane_one) == "bg=#222222"
             ),
-            "one attachment releasing without disturbing the other",
+            "one attachment becoming inactive without disturbing the other",
         )
+        inner_pane = self.tmux(inner, "display-message", "-p", "#{pane_id}")
+        self.assertEqual("", self.pane_blurred(inner, inner_pane))
+        self.assertEqual("", self.pane_active_style(inner, inner_pane))
+        self.assertEqual("bg=#222222", self.pane_active_style(outer_two, pane_two))
         inner_flags = self.tmux(inner, "list-clients", "-F", "#{client_flags}")
         focused_clients = sum("focused" in flags.split(",") for flags in inner_flags.splitlines())
         self.assertEqual(1, focused_clients)
@@ -933,8 +1338,11 @@ class NestedFocusTest(unittest.TestCase):
         publishers = self.helper_lock_holders("watch", inner)
         os.kill(publishers[0], signal.SIGKILL)
         wait_until(
-            lambda: self.pane_claim(outer, nested_pane) == "",
-            "lease cleanup after a killed publisher",
+            lambda: (
+                self.pane_claim(outer, nested_pane) == ""
+                and self.pane_active_style(outer, nested_pane) == ""
+            ),
+            "lease and pane-style cleanup after a killed publisher",
             timeout=2,
         )
 
@@ -944,6 +1352,7 @@ class NestedFocusTest(unittest.TestCase):
             lambda: bool(self.pane_claim(outer, nested_pane)),
             "fresh focus event restarts a publisher",
         )
+        self.assertEqual("bg=#222222", self.pane_active_style(outer, nested_pane))
 
     def test_delayed_focus_out_cannot_stop_a_refocused_client(self) -> None:
         inner = self.new_server("bounce-inner", "sleep 30")
@@ -984,6 +1393,19 @@ class NestedFocusTest(unittest.TestCase):
             check=True,
         )
         self.assertTrue(self.pane_claim(outer, nested_pane))
+        self.assertEqual([publisher], self.helper_lock_holders("watch", inner))
+
+        # Also exercise the narrower race where the old stop already resolved
+        # the watcher PID before focus returned and its signal arrives late.
+        previous_claim = self.pane_claim(outer, nested_pane)
+        os.kill(publisher, signal.SIGTERM)
+        wait_until(
+            lambda: (
+                self.pane_claim(outer, nested_pane) != previous_claim
+                and bool(self.pane_claim(outer, nested_pane))
+            ),
+            "renewal after a stale stop signal",
+        )
         self.assertEqual([publisher], self.helper_lock_holders("watch", inner))
 
     def test_renewals_keep_one_expirer_and_direct_clients_keep_no_watcher(self) -> None:
