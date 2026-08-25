@@ -9,6 +9,7 @@ import sys
 
 PANE_DIRECTIONS = {"left": "L", "down": "D", "up": "U", "right": "R"}
 COMMIT_KEY = b"\x1b[777009u"
+COMMIT_QUERY = b"\x1b[?2004$p"
 DIRECTIVE_TTL = 6
 WINDOW_DIRECTIONS = {"next": "next-window", "previous": "previous-window"}
 MOVE_DIRECTIONS = {"left": "-", "right": "+"}
@@ -33,11 +34,10 @@ def load_commit_runtime() -> None:
 
 def load_server_runtime() -> None:
     """Load long-lived server and SSH modules outside the per-chord client."""
-    global argparse, base64, shutil, signal, socket, threading, HANDLE_LOCK
+    global argparse, shutil, signal, socket, threading, HANDLE_LOCK
 
     load_commit_runtime()
     import argparse
-    import base64
     import shutil
     import signal
     import socket
@@ -751,25 +751,51 @@ def execute_local(scope: str, direction: str, info: dict) -> bool:
     return False
 
 
-def commit_command(tmux_socket: str, client_tty: str, client_pid: int) -> int:
+def commit_command(
+    tmux_socket: str,
+    client_tty: str,
+    client_pid: int,
+    passthrough_state: int | None = None,
+    passthrough_pane: str | None = None,
+) -> int:
     load_commit_runtime()
+
+    def unmatched() -> int:
+        if (
+            passthrough_state is not None
+            and 0 <= passthrough_state <= 4
+            and passthrough_pane is not None
+            and re.fullmatch(r"%[0-9]+", passthrough_pane)
+        ):
+            response = f"\x1b[?2004;{passthrough_state}$y".encode()
+            tmux(
+                "-S",
+                tmux_socket,
+                "send-keys",
+                "-t",
+                passthrough_pane,
+                "-H",
+                *[f"{byte:02x}" for byte in response],
+            )
+        return 0
+
     if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
         if not re.fullmatch(r"[0-9]+", str(client_pid)) or int(client_pid) <= 0:
-            return 0
+            return unmatched()
         try:
             st = os.stat(client_tty)
             if not stat.S_ISCHR(st.st_mode):
-                return 0
+                return unmatched()
         except OSError:
-            return 0
+            return unmatched()
         listed = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
         if listed.returncode != 0:
-            return 0
+            return unmatched()
         if not any(line.split() == [client_tty, str(client_pid)] for line in listed.stdout.splitlines() if len(line.split()) == 2):
-            return 0
+            return unmatched()
     directive = claim_directive_for_client(tmux_socket, client_tty, int(client_pid))
     if not directive:
-        return 0
+        return unmatched()
     if directive.get("tmux_socket") != tmux_socket:
         return 0
     if directive.get("local_client_tty") != client_tty or int(directive.get("local_client_pid", -1)) != int(client_pid):
@@ -843,16 +869,20 @@ def emit_commit(local_client_tty: str | None, local_client_pid: int | None, nonc
         else:
             tty_path = resolve_client_tty(info, local_client_tty, local_client_pid)
     if not tty_path:
+        debug("terminal commit has no validated client tty")
         return False
-    osc = b"\x1b]1337;SetUserVar=DOT_RELAY_COMMIT=" + base64.b64encode(nonce.encode()) + b"\x07"
     try:
         fd = os.open(tty_path, os.O_WRONLY | os.O_NOCTTY | os.O_APPEND)
         try:
-            os.write(fd, osc)
+            # DECRQM is a read-only terminal query. Its reply is an in-band
+            # barrier after earlier terminal output, while remaining usable by
+            # both WezTerm and xterm.js without an editor extension.
+            os.write(fd, COMMIT_QUERY)
         finally:
             os.close(fd)
         return True
-    except OSError:
+    except OSError as exc:
+        debug(f"cannot emit terminal commit to {tty_path}: {exc!r}")
         return False
 
 
@@ -948,7 +978,8 @@ def handle_navigate(request: dict) -> dict:
         }
         try:
             _arm_directive_and_seq(tmux_socket, directive)
-        except (ValueError, FileExistsError, OSError):
+        except (ValueError, FileExistsError, OSError) as exc:
+            debug(f"cannot arm execute directive: {exc!r}")
             return {"v": 2, "result": "error"}
         parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
         if parent:
@@ -961,6 +992,7 @@ def handle_navigate(request: dict) -> dict:
                 except OSError:
                     pass
                 return {"v": 2, "result": "armed"}
+            debug(f"parent commit path did not emit: {reply!r}")
             # Non-emitted: exact cleanup
             try:
                 claim_directive_nonce(tmux_socket, nonce)
@@ -980,6 +1012,7 @@ def handle_navigate(request: dict) -> dict:
             claim_directive_nonce(tmux_socket, nonce)
         except Exception:
             pass
+        debug("terminal commit emission failed")
         return {"v": 2, "result": "error"}
     # Cannot handle here
     parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
@@ -1035,7 +1068,8 @@ def handle_commit_path(request: dict) -> dict:
             }
             try:
                 _arm_directive_and_seq(tmux_socket, directive)
-            except (ValueError, FileExistsError, OSError):
+            except (ValueError, FileExistsError, OSError) as exc:
+                debug(f"cannot arm forward directive: {exc!r}")
                 return {"v": 2, "result": "error"}
             parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
             if parent:
@@ -1280,7 +1314,23 @@ def ssh_command(arguments: list[str]) -> int:
     load_server_runtime()
     import secrets
 
-    binary = os.environ.get("TERMNAV_SSH_BINARY") or shutil.which("ssh")
+    binary = os.environ.get("TERMNAV_SSH_BINARY")
+    if not binary:
+        # The sourceable integration prepends a private `ssh` shim so child
+        # processes inherit Termnav. Resolve the next SSH executable after that
+        # directory, preserving any pre-existing wrapper later in PATH.
+        shim_dir = os.path.realpath(
+            str(Path(__file__).resolve().parent.parent / "share/termnav/shims")
+        )
+        search_entries = [
+            entry
+            for entry in os.get_exec_path()
+            if os.path.realpath(entry or os.curdir) != shim_dir
+        ]
+        # An empty search path means no underlying client exists; do not let
+        # shutil.which reinterpret it as the current working directory.
+        if search_entries:
+            binary = shutil.which("ssh", path=os.pathsep.join(search_entries))
     if not binary:
         die("ssh is not installed")
     destination, command_start = ssh_destination_end(arguments)
@@ -1300,7 +1350,16 @@ def ssh_command(arguments: list[str]) -> int:
     option_arguments = arguments[:destination] if destination is not None else arguments
     explicit_tty = any(value.startswith("-t") for value in option_arguments)
     stdin_tty = sys.stdin.isatty() or os.environ.get("TERMNAV_TEST_STDIN_TTY") == "1"
-    if destination is None or command_start != len(arguments) or has_control_mode or (not stdin_tty and not explicit_tty):
+    has_remote_command = command_start != len(arguments) if command_start is not None else False
+    # A remote command is not inherently interactive. Continue only when the
+    # caller explicitly requested a tty or when OpenSSH's resolved configuration
+    # proves this is an interactive login. This keeps inherited PATH
+    # interposition transparent for Git, automation, and ordinary scripts.
+    if (
+        destination is None
+        or has_control_mode
+        or (not stdin_tty and not explicit_tty)
+    ):
         return subprocess.run([binary, *arguments], check=False).returncode
 
     test_config = os.environ.get("TERMNAV_TEST_EFFECTIVE_CONFIG")
@@ -1332,7 +1391,14 @@ def ssh_command(arguments: list[str]) -> int:
     if settings.get("exitonforwardfailure", "no").lower() == "yes":
         return subprocess.run([binary, *arguments], check=False).returncode
     request_tty = settings.get("requesttty", "auto").lower()
-    if request_tty == "no" or (request_tty == "auto" and not stdin_tty and not explicit_tty):
+    tty_session = explicit_tty or request_tty in {"yes", "force"}
+    # `RequestTTY auto` allocates a tty for a login only. OpenSSH does not do so
+    # for an explicit remote command unless the caller supplied -t, so mirror
+    # that distinction instead of turning every inherited child call into a
+    # relayed interactive session.
+    if not has_remote_command and request_tty == "auto" and stdin_tty:
+        tty_session = True
+    if request_tty == "no" or not tty_session:
         return subprocess.run([binary, *arguments], check=False).returncode
 
     runtime = runtime_dir()
@@ -1432,7 +1498,7 @@ def ssh_command(arguments: list[str]) -> int:
             else destination
         )
         separator = arguments[option_end:destination]
-        enhanced = [*arguments[:option_end], *extra, *separator, arguments[destination]]
+        enhanced = [*arguments[:option_end], *extra, *separator, *arguments[destination:]]
         result = subprocess.run([binary, *enhanced], env=ssh_environment, check=False).returncode
         control_path = settings.get("controlpath", "none")
         if control_path != "none":
@@ -1495,6 +1561,29 @@ def main() -> int:
     ):
         load_commit_runtime()
         return commit_command(arguments[2], arguments[4], int(arguments[6]))
+    if (
+        len(arguments) == 11
+        and arguments[0] == "commit"
+        and arguments[1] == "--tmux-socket"
+        and arguments[2].startswith("/")
+        and arguments[3] == "--client-tty"
+        and arguments[4].startswith("/")
+        and arguments[5] == "--client-pid"
+        and arguments[6].isdigit()
+        and arguments[7] == "--passthrough-decrqm"
+        and arguments[8] in {"0", "1", "2", "3", "4"}
+        and arguments[9] == "--pane"
+        and arguments[10].startswith("%")
+        and arguments[10][1:].isdigit()
+    ):
+        load_commit_runtime()
+        return commit_command(
+            arguments[2],
+            arguments[4],
+            int(arguments[6]),
+            int(arguments[8]),
+            arguments[10],
+        )
 
     load_server_runtime()
     parser = argparse.ArgumentParser(prog="termnav-relay")
@@ -1510,6 +1599,8 @@ def main() -> int:
     commit.add_argument("--tmux-socket", required=True)
     commit.add_argument("--client-tty", required=True)
     commit.add_argument("--client-pid", required=True, type=int)
+    commit.add_argument("--passthrough-decrqm", type=int, choices=range(5))
+    commit.add_argument("--pane")
     subparsers.add_parser("sweep")
     # test-only hidden subcommands for directive store
     arm_test = subparsers.add_parser("arm-test")
@@ -1541,7 +1632,13 @@ def main() -> int:
     if args.command == "serve":
         return serve(args.socket)
     if args.command == "commit":
-        return commit_command(args.tmux_socket, args.client_tty, int(args.client_pid))
+        return commit_command(
+            args.tmux_socket,
+            args.client_tty,
+            int(args.client_pid),
+            args.passthrough_decrqm,
+            args.pane,
+        )
     if args.command == "sweep":
         return sweep()
     # test-only: directive store helpers

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# relay-terminal-test - real tmux and PTY coverage for the terminal commit barrier.
+
+set -euo pipefail
+export NO_COLOR=1
+
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+root="${test_dir%/test}"
+# shellcheck source=../helpers.sh
+. "$test_dir/helpers.sh"
+
+echo "=== terminal-independent relay commit ==="
+set +e
+output=$(python3 "$test_dir/support/relay-terminal.py" \
+  --relay "$root/bin/termnav-relay" 2>&1)
+rc=$?
+set -e
+printf '%s\n' "$output"
+_assert_exit "relay terminal: real tmux/PTY integration passes" 0 "$rc"
+_assert_contains "relay terminal: all five DECRQM states are exercised" \
+  "test_all_decrqm_states_commit_pane_navigation" "$output"
+_assert_contains "relay terminal: nested tmux handoff and parent bubble are exercised" \
+  "test_nested_commit_and_parent_bubble_use_one_terminal_barrier" "$output"
+_assert_contains "relay terminal: pane, window, and move scopes are exercised" \
+  "test_window_move_commits_after_terminal_response" "$output"
+_assert_contains "relay terminal: pane DECRQM remains application-safe" \
+  "test_application_decrqm_response_is_preserved" "$output"
+
+_test_summary

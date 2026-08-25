@@ -33,6 +33,7 @@ runtime_shell_files=(
   "$root/lib/termnav/shell/file-links.sh"
   "$root/lib/termnav/shell/wezterm-vars.sh"
   "$root/share/termnav/shell.sh"
+  "$root/share/termnav/shims/ssh"
 )
 
 example_shell_files=(

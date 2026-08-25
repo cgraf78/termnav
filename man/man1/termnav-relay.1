@@ -27,31 +27,44 @@ fixed pane and window navigation operations.
 Install \fBshare/termnav/sshd_config\fR as an sshd_config.d fragment on any
 host that should participate, validate with \fBsshd -t\fR, and reload sshd.
 .PP
-Explicit and configured SSH remote commands and non-session modes are passed
-to OpenSSH unchanged. For an interactive login, Termnav exports the current
-relay path in the invoking client process and requests
+Explicit SSH remote commands are eligible when their command line requests a
+TTY. Termnav preserves the destination and remote command as their original
+OpenSSH arguments. Commands without that explicit TTY request, configured
+remote commands, and non-session control modes remain ordinary SSH.
+.PP
+For an eligible interactive login or commanded TTY, Termnav exports
+the current relay path in the invoking client process and requests
 \fBSendEnv=TERMNAV_PARENT_RELAY\fR. OpenSSH carries that value per session even
 when it reuses a ControlMaster, so concurrent sessions retain distinct relay
 sockets without a second connection or authentication attempt.
 .PP
-The remote command channel remains empty and OpenSSH retains its normal login
-shell selection. Native Windows and other non-POSIX targets therefore continue
-to receive their ordinary interactive shell even when they cannot create the
-remote Unix-socket forward. An effective \fBExitOnForwardFailure=yes\fR policy
-is delegated unchanged without adding the optional relay. On other unsupported
-servers OpenSSH may report a nonfatal remote-forward warning; the login itself
-continues normally. Failure to receive usable relay metadata makes navigation
-a silent no-op.
+Termnav never changes the remote command channel or OpenSSH's normal login-shell
+selection. Native Windows and other non-POSIX targets therefore continue to
+receive the original command or interactive shell even when they cannot create
+the remote Unix-socket forward. An effective \fBExitOnForwardFailure=yes\fR
+policy is delegated unchanged without adding the optional relay. On other
+unsupported servers OpenSSH may report a nonfatal remote-forward warning; the
+session itself continues normally. Failure to receive usable relay metadata
+makes navigation a silent no-op.
 .SH TWO-PHASE COMMIT TRANSPORT
 Navigation uses a two-phase commit. The originating \fBsend\fR arms a per-nonce
 per-client directive file under \fB$XDG_RUNTIME_DIR/termnav-$UID/directives/<hash>/\fR
-on each hop that can handle the request; the executing hop then emits an
-in-band commit key (\fBESC [777009u\fR, \fBuser-keys[8]\fR) via \fBOSC 1337 SetUserVar=DOT_RELAY_COMMIT\fR
-into the originating pane. The pane's tmux binding for User8 runs
-\fBtermnav-relay commit\fR, which claims the oldest pending directive for that
-client (FIFO by sequence number) and performs the pane/window switch. Window
-and move scopes use stable-ID swap logic; pane scope uses a single guarded
-\fBif-shell\fR (edge check and \fBselect-pane\fR atomically) to avoid TOCTOU.
+on each hop that can handle the request. The outer hop writes the read-only
+DECRQM query \fBESC [ ? 2004 $ p\fR to the originating terminal. Its ordered
+reply is one of \fBESC [ ? 2004 ; 0..4 $ y\fR; tmux \fBuser-keys[9]\fR through
+\fBuser-keys[13]\fR bind all five legal states to \fBtermnav-relay commit\fR.
+No terminal extension or terminal-specific OSC handler is required.
+When no Termnav directive is pending, the binding passes the response back to
+the originating pane for compatibility with tmux versions that do not answer
+application DECRQM queries themselves.
+.PP
+When another tmux layer lies between the terminal and the executing hop, its
+commit forwards the private in-band key \fBESC [777009u\fR
+(\fBuser-keys[8]\fR) into the nested client. Each commit claims the oldest
+pending directive for that client (FIFO by sequence number) and either forwards
+again or performs the pane/window action. Window and move scopes use stable-ID
+swap logic; pane scope uses a single guarded \fBif-shell\fR (edge check and
+\fBselect-pane\fR atomically) to avoid TOCTOU.
 .PP
 Directives carry the hop-local initiating client identity (\fBclient_tty\fR,
 \fBclient_pid\fR) captured from the relay server's retained environment at
@@ -73,9 +86,9 @@ If a writer crashes mid-write, a claimer rejects and removes the invalid JSON
 when it is examined, without acting (fail-closed). Claims are single-claim by
 \fBflock\fR + unlink.
 .PP
-There is no watchdog direct-execution fallback. If the OSC is ignored
-(non-WezTerm) or emit validation fails, the armed directive simply expires and
-navigation is a silent no-op. The scope is WezTerm-only for v2.
+There is no watchdog direct-execution fallback. If the terminal does not answer
+DECRQM or emit validation fails, the armed directive simply expires and
+navigation is a silent no-op.
 .SH EXIT STATUS
 \fBtermnav-relay send\fR exits \fB0\fR when armed (handled), \fB3\fR when
 declined (caller may fall back to local \fBwezterm-*\fR), \fB1\fR on transport
@@ -103,7 +116,7 @@ nonce) to the given path.
 Test-only hook to bypass \fBS_ISCHR\fR and \fBlist-clients\fR validation for
 detached tmux servers.
 .SH RESIDUAL RISKS
-Replies the terminal emits \fIafter\fR the commit key for queries from the
+Replies the terminal emits \fIafter\fR the commit barrier for queries from the
 departing pane, and post-switch handshakes from the departing subtree, can
 still misroute — the same exposure the pre-relay design had (never observed in
 practice). Fixing those requires reply routing inside tmux itself. Concurrent

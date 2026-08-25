@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# Keep SSH interposition inherited by child processes without installing a
+# global command named ssh. The shell integration adds only this private
+# directory to PATH; termnav-relay skips it when resolving the real client.
+
+case "$0" in
+  */*) script_path=$0 ;;
+  *)
+    # POSIX shells normally expose the resolved path for a shebang script, but
+    # command lookup is a safe fallback for launchers that retain argv[0].
+    script_path=$(command -v -- "$0") || exit 127
+    ;;
+esac
+script_dir=${script_path%/*}
+termnav_root=$(
+  unset CDPATH
+  cd -P -- "$script_dir/../../.." && pwd
+) || exit 127
+exec "$termnav_root/bin/termnav-relay" ssh "$@"
