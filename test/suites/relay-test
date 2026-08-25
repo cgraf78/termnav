@@ -14,13 +14,68 @@ tmp=$(_tmpdir)
 log="$tmp/route.log"
 socket="$tmp/parent.sock"
 
+echo "=== relay listener readiness ==="
+bound_socket="$tmp/bound-only.sock"
+bound_marker="$tmp/bound-only.ready"
+python3 - "$bound_socket" "$bound_marker" <<'PY' &
+import pathlib
+import socket
+import sys
+import time
+
+server = socket.socket(socket.AF_UNIX)
+server.bind(sys.argv[1])
+pathlib.Path(sys.argv[2]).touch()
+time.sleep(2)
+PY
+bound_pid=$!
+for _ in {1..50}; do
+  [[ -f "$bound_marker" ]] && break
+  sleep 0.02
+done
+_assert_file_exists "relay readiness: bound-only fixture starts" "$bound_marker"
+set +e
+_wait_for_unix_listener "$bound_socket" 0.1 2>/dev/null
+bound_wait_rc=$?
+set -e
+_assert_exit "relay readiness: a bound-only socket is not ready" 1 "$bound_wait_rc"
+kill "$bound_pid" 2>/dev/null || true
+wait "$bound_pid" 2>/dev/null || true
+
+listening_socket="$tmp/listening.sock"
+listening_marker="$tmp/listening.ready"
+python3 - "$listening_socket" "$listening_marker" <<'PY' &
+import pathlib
+import signal
+import socket
+import sys
+
+server = socket.socket(socket.AF_UNIX)
+server.bind(sys.argv[1])
+server.listen(1)
+pathlib.Path(sys.argv[2]).touch()
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+connection, _ = server.accept()
+connection.close()
+PY
+listening_pid=$!
+for _ in {1..50}; do
+  [[ -f "$listening_marker" ]] && break
+  sleep 0.02
+done
+_assert_file_exists "relay readiness: listening fixture starts" "$listening_marker"
+set +e
+_wait_for_unix_listener "$listening_socket" 1 2>/dev/null
+listening_wait_rc=$?
+set -e
+_assert_exit "relay readiness: a listening socket is ready" 0 "$listening_wait_rc"
+kill "$listening_pid" 2>/dev/null || true
+wait "$listening_pid" 2>/dev/null || true
+
 echo "=== relay protocol ==="
 TERMNAV_RELAY_TEST_LOG="$log" "$relay" serve --socket "$socket" &
 server_pid=$!
-for _ in {1..50}; do
-  [[ -S "$socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$socket"
 TERMNAV_PARENT_RELAY="$socket" "$relay" send pane left
 TERMNAV_PARENT_RELAY="$socket" "$relay" send pane down
 TERMNAV_PARENT_RELAY="$socket" "$relay" send window next
@@ -54,17 +109,11 @@ chain_log="$tmp/chain.log"
 env -u TMUX -u TMUX_PANE TERMNAV_RELAY_TEST_LOG="$chain_log" \
   "$relay" serve --socket "$outer_socket" &
 outer_pid=$!
-for _ in {1..50}; do
-  [[ -S "$outer_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$outer_socket"
 env -u TMUX -u TMUX_PANE TERMNAV_PARENT_RELAY="$outer_socket" \
   "$relay" serve --socket "$inner_socket" &
 inner_pid=$!
-for _ in {1..50}; do
-  [[ -S "$inner_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$inner_socket"
 TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send window previous
 TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send pane right
 TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send move left
@@ -77,10 +126,7 @@ malformed_socket="$tmp/malformed.sock"
 malformed_log="$tmp/malformed.log"
 TERMNAV_RELAY_TEST_LOG="$malformed_log" "$relay" serve --socket "$malformed_socket" &
 malformed_pid=$!
-for _ in {1..50}; do
-  [[ -S "$malformed_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$malformed_socket"
 python3 - "$malformed_socket" <<'PY'
 import socket
 import sys
@@ -99,10 +145,7 @@ concurrent_socket="$tmp/concurrent.sock"
 concurrent_log="$tmp/concurrent.log"
 TERMNAV_RELAY_TEST_LOG="$concurrent_log" "$relay" serve --socket "$concurrent_socket" &
 concurrent_pid=$!
-for _ in {1..50}; do
-  [[ -S "$concurrent_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$concurrent_socket"
 python3 - "$concurrent_socket" <<'PY'
 import json
 import socket
@@ -142,10 +185,7 @@ negative_socket="$tmp/negative.sock"
 env -u TMUX -u TMUX_PANE -u TERMNAV_PARENT_RELAY \
   "$relay" serve --socket "$negative_socket" &
 negative_pid=$!
-for _ in {1..50}; do
-  [[ -S "$negative_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$negative_socket"
 set +e
 TERMNAV_PARENT_RELAY="$negative_socket" "$relay" send pane left >/dev/null 2>&1
 negative_rc=$?
@@ -174,10 +214,7 @@ move_socket="$tmp/move.sock"
 TERMNAV_RELAY_DIRECT=1 TMUX="$tmux_socket_path,0,0" TMUX_PANE="$middle_pane" TERMNAV_TMUX_SESSION="$target_session" \
   "$relay" serve --socket "$move_socket" &
 move_pid=$!
-for _ in {1..50}; do
-  [[ -S "$move_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$move_socket"
 TERMNAV_PARENT_RELAY="$move_socket" "$relay" send move left
 _assert_eq "relay move: left targets the captured pane's gapped-index session" \
   $'middle\nfirst\nlast' "$(tmux -L "$tmux_socket_name" list-windows -t target -F '#{window_name}')"
@@ -197,10 +234,7 @@ for boundary_pane in "$first_pane" "$last_pane"; do
   TERMNAV_RELAY_DIRECT=1 TMUX="$tmux_socket_path,0,0" TMUX_PANE="$boundary_pane" TERMNAV_TMUX_SESSION="$target_session" \
     "$relay" serve --socket "$boundary_socket" &
   boundary_pid=$!
-  for _ in {1..50}; do
-    [[ -S "$boundary_socket" ]] && break
-    sleep 0.02
-  done
+  _wait_for_unix_listener "$boundary_socket"
   boundary_direction=left
   [[ "$boundary_pane" == "$last_pane" ]] && boundary_direction=right
   TERMNAV_PARENT_RELAY="$boundary_socket" "$relay" send move "$boundary_direction"
@@ -216,18 +250,12 @@ ambiguous_socket="$tmp/ambiguous.sock"
 TERMNAV_RELAY_TEST_LOG="$ambiguous_log" \
   "$relay" serve --socket "$ambiguous_parent_socket" &
 ambiguous_parent_pid=$!
-for _ in {1..50}; do
-  [[ -S "$ambiguous_parent_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$ambiguous_parent_socket"
 TMUX="$tmux_socket_path,0,0" TMUX_PANE="$middle_pane" \
   TERMNAV_PARENT_RELAY="$ambiguous_parent_socket" \
   "$relay" serve --socket "$ambiguous_socket" &
 ambiguous_pid=$!
-for _ in {1..50}; do
-  [[ -S "$ambiguous_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$ambiguous_socket"
 TERMNAV_PARENT_RELAY="$ambiguous_socket" "$relay" send move left
 _assert_eq "relay move: missing client session fails closed and forwards" \
   "move left" "$(cat "$ambiguous_log")"
@@ -258,10 +286,7 @@ PY
 ln -s "$unrelated_file" "$symlink_path"
 TERMNAV_RELAY_TEST_LOG="$tmp/sweep.log" "$relay" serve --socket "$active_socket" &
 active_pid=$!
-for _ in {1..50}; do
-  [[ -S "$active_socket" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$active_socket"
 python3 - "$active_socket" <<'PY'
 import os
 import sys
@@ -585,10 +610,7 @@ TERMNAV_RELAY_CLIENT_TTY="$client_tty" TERMNAV_RELAY_CLIENT_PID="$client_pid" \
   TERMNAV_RELAY_EMIT_TTY="$emit_tty" \
   "$relay" serve --socket "$tmp/arm.sock" &
 arm_pid=$!
-for _ in {1..50}; do
-  [[ -S "$tmp/arm.sock" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$tmp/arm.sock"
 set +e
 TERMNAV_PARENT_RELAY="$tmp/arm.sock" "$relay" send pane right
 send_rc=$?
@@ -682,10 +704,7 @@ forward_parent_sock="$tmp/forward-parent.sock"
 env -u TMUX -u TMUX_PANE -u TERMNAV_TMUX_SESSION TERMNAV_PARENT_RELAY="$tmp/arm.sock" \
   "$relay" serve --socket "$forward_parent_sock" &
 fwd_pid=$!
-for _ in {1..50}; do
-  [[ -S "$forward_parent_sock" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$forward_parent_sock"
 # Capture count of execute directives before
 # shellcheck disable=SC2012,SC2034
 pre_count=$(ls "$hash_dir"/*.json 2>/dev/null | wc -l | tr -d ' ' || echo 0)
@@ -707,17 +726,11 @@ declined_sock1="$tmp/declined1.sock"
 declined_sock2="$tmp/declined2.sock"
 env -u TMUX -u TMUX_PANE -u TERMNAV_TMUX_SESSION "$relay" serve --socket "$declined_sock1" &
 dec1_pid=$!
-for _ in {1..50}; do
-  [[ -S "$declined_sock1" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$declined_sock1"
 env -u TMUX -u TMUX_PANE -u TERMNAV_TMUX_SESSION TERMNAV_PARENT_RELAY="$declined_sock1" \
   "$relay" serve --socket "$declined_sock2" &
 dec2_pid=$!
-for _ in {1..50}; do
-  [[ -S "$declined_sock2" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$declined_sock2"
 set +e
 TERMNAV_PARENT_RELAY="$declined_sock2" "$relay" send pane left
 dec_rc=$?
@@ -734,10 +747,7 @@ TERMNAV_RELAY_CLIENT_TTY="/tmp/nonexistent-tty" TERMNAV_RELAY_CLIENT_PID="12345"
   TERMNAV_RELAY_EMIT_TTY="" \
   "$relay" serve --socket "$tmp/fake-tty.sock" &
 fake_pid=$!
-for _ in {1..50}; do
-  [[ -S "$tmp/fake-tty.sock" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$tmp/fake-tty.sock"
 # Need to unset skip validation for this test so it actually validates
 set +e
 env -u TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION TERMNAV_PARENT_RELAY="$tmp/fake-tty.sock" "$relay" send pane right
@@ -755,10 +765,7 @@ busy_log="$tmp/busy.log"
 TERMNAV_RELAY_TEST_LOG="$busy_log" TERMNAV_RELAY_TEST_HANDLE_DELAY=0.5 \
   "$relay" serve --socket "$busy_sock" &
 busy_pid=$!
-for _ in {1..50}; do
-  [[ -S "$busy_sock" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$busy_sock"
 TERMNAV_PARENT_RELAY="$busy_sock" "$relay" send pane left &
 busy_first_pid=$!
 for _ in {1..50}; do
@@ -783,10 +790,7 @@ delayed_log="$tmp/delayed.log"
 TERMNAV_RELAY_TEST_LOG="$delayed_log" TERMNAV_RELAY_TEST_HANDLE_DELAY=2.2 \
   "$relay" serve --socket "$delayed_sock" &
 delayed_pid=$!
-for _ in {1..50}; do
-  [[ -S "$delayed_sock" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$delayed_sock"
 set +e
 TERMNAV_PARENT_RELAY="$delayed_sock" "$relay" send pane left
 delayed_rc=$?
@@ -808,10 +812,7 @@ invalid_delay_log="$tmp/invalid-delay.log"
 TERMNAV_RELAY_TEST_LOG="$invalid_delay_log" TERMNAV_RELAY_TEST_HANDLE_DELAY=inf \
   "$relay" serve --socket "$invalid_delay_sock" &
 invalid_delay_pid=$!
-for _ in {1..50}; do
-  [[ -S "$invalid_delay_sock" ]] && break
-  sleep 0.02
-done
+_wait_for_unix_listener "$invalid_delay_sock"
 TERMNAV_PARENT_RELAY="$invalid_delay_sock" "$relay" send pane left
 _assert_exit "relay: a non-finite test delay is ignored" 0 "$?"
 kill "$invalid_delay_pid" 2>/dev/null

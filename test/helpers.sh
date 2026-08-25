@@ -259,6 +259,38 @@ _with_timeout() {
   fi
 }
 
+# Wait until an AF_UNIX stream socket accepts connections. A socket path exists
+# as soon as bind() returns, which can precede listen() under scheduler load.
+_wait_for_unix_listener() {
+  local path="$1" timeout_seconds="${2:-2}"
+
+  python3 - "$path" "$timeout_seconds" <<'PY'
+import socket
+import sys
+import time
+
+path = sys.argv[1]
+deadline = time.monotonic() + float(sys.argv[2])
+last_error = "listener did not become ready"
+
+while True:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(path)
+        raise SystemExit(0)
+    except OSError as error:
+        last_error = str(error)
+
+    if time.monotonic() >= deadline:
+        print(
+            f"timed out waiting for Unix listener {path}: {last_error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    time.sleep(0.02)
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Platform checks
 # ---------------------------------------------------------------------------
