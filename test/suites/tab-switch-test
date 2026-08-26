@@ -543,6 +543,32 @@ _assert_contains "tab router: forwards the second VS Code window token" \
   "\"token\":\"$token_b\"" \
   "$(sed -n '2p' "$router_log")"
 
+# Preserve the exact-client contract before the router is generalized. The
+# caller's environment may contain state from another attached editor window;
+# only the tmux client that observed the chord is authoritative.
+: >"$router_log"
+TERMNAV_VSCODE_SOCKET=/tmp/stale-caller.sock \
+  TERMNAV_VSCODE_TOKEN=$(printf 'c%.0s' {1..64}) \
+  TERMNAV_ROUTER_CODE_LOG="$router_log" PATH="$router_bin:$PATH" \
+  "$router" next --client-pid "$client_a" --client-tty /dev/pts/100 \
+  --client-termtype 'xterm.js(5.3.0)'
+_assert_contains "tab router: exact client ignores inherited VS Code socket state" \
+  "socket=</tmp/termnav-window-a.sock>" "$(cat "$router_log")"
+_assert_not_contains "tab router: exact client never uses the caller's stale socket" \
+  "socket=</tmp/stale-caller.sock>" "$(cat "$router_log")"
+
+# A direct WezTerm client is likewise identified by the exact tty supplied by
+# tmux. This output path must remain targeted rather than being broadcast
+# through the application pane when the routing implementation is extracted.
+wezterm_direct_tty=$(_tmpdir)/wezterm-direct.tty
+: >"$wezterm_direct_tty"
+_spawn_client TERM_PROGRAM=WezTerm
+wezterm_direct_client=$REPLY
+"$router" previous --client-pid "$wezterm_direct_client" \
+  --client-tty "$wezterm_direct_tty" --client-termtype xterm-256color
+_assert_contains "tab router: direct WezTerm routing targets the supplied tty" \
+  "SetUserVar=DOT_SWITCH_TAB=" "$(cat "$wezterm_direct_tty")"
+
 _spawn_client VSCODE_IPC_HOOK_CLI=/tmp/not-a-window-identity TERM_PROGRAM=vscode
 client_without_socket=$REPLY
 : >"$router_log"
