@@ -134,11 +134,11 @@ result=$(_nvim_lua "
       close = function() end,
     }
   end
-  print(tostring(vars.set('DOT_PARENT_SWITCH_TAB', 'next:1')))
+  print(tostring(vars.set('TERMNAV_TMUX', 'true')))
   local esc = string.char(27)
   local bel = string.char(7)
   local bs = string.char(92)
-  local raw = esc .. ']1337;SetUserVar=DOT_PARENT_SWITCH_TAB=bmV4dDox' .. bel
+  local raw = esc .. ']1337;SetUserVar=TERMNAV_TMUX=dHJ1ZQ==' .. bel
   local single = esc .. 'Ptmux;' .. raw:gsub(esc, esc .. esc) .. esc .. bs
   local expected = esc .. 'Ptmux;' .. single:gsub(esc, esc .. esc) .. esc .. bs
   local _, passthrough_count = writes[1]:gsub(esc .. 'Ptmux;', '')

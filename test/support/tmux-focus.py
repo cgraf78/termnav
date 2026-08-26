@@ -372,21 +372,24 @@ class FocusLibraryTest(unittest.TestCase):
     """Cover portable parsing and owner-only runtime state boundaries."""
 
     module: object
+    process_info: object
 
-    def test_macos_process_environment_parser_preserves_values_with_spaces(self) -> None:
+    def test_macos_process_environment_parser_preserves_values_with_spaces(
+        self,
+    ) -> None:
         output = (
             "tmux attach TMUX=/tmp/outer.sock,123,0 TMUX_PANE=%42 "
             "LABEL=one value with spaces PATH=/usr/bin:/bin"
         )
         self.assertEqual(
             "/tmp/outer.sock,123,0",
-            self.module.parse_ps_environment(output, "TMUX"),
+            self.process_info.parse_environment(output, "TMUX"),
         )
         self.assertEqual(
             "one value with spaces",
-            self.module.parse_ps_environment(output, "LABEL"),
+            self.process_info.parse_environment(output, "LABEL"),
         )
-        self.assertIsNone(self.module.parse_ps_environment(output, "MUX"))
+        self.assertIsNone(self.process_info.parse_environment(output, "MUX"))
 
     def test_relative_runtime_directory_falls_back_to_private_tmp_state(self) -> None:
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "relative"}):
@@ -498,6 +501,49 @@ class RelayFocusTest(unittest.TestCase):
         self.pane = self.tmux("display-message", "-p", "#{pane_id}")
         self.session = self.tmux("display-message", "-p", "#{session_id}")
         self.processes: list[subprocess.Popen[bytes]] = []
+        environment = os.environ.copy()
+        environment.pop("TMUX", None)
+        environment.pop("TMUX_PANE", None)
+        # The devserver test runner itself uses TERM=dumb. A real tmux client
+        # exits immediately under that value, so give this synthetic terminal a
+        # stable capability set just as the other PTY integration harnesses do.
+        environment["TERM"] = "xterm-256color"
+        client = subprocess.Popen(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).with_name("tmux-client.py")),
+                "-S",
+                str(self.tmux_socket),
+                "attach-session",
+                "-t",
+                "focus",
+            ],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.processes.append(client)
+
+        def client_attached() -> bool:
+            listed = subprocess.run(
+                [
+                    "tmux",
+                    "-S",
+                    str(self.tmux_socket),
+                    "list-clients",
+                    "-F",
+                    "#{client_pid}",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return listed.returncode == 0 and bool(listed.stdout.strip())
+
+        wait_until(
+            client_attached,
+            "focus relay tmux client",
+        )
 
     def tearDown(self) -> None:
         for process in self.processes:
@@ -533,22 +579,31 @@ class RelayFocusTest(unittest.TestCase):
         parent: pathlib.Path | None = None,
         owns_tmux: bool = False,
         extra_environment: dict[str, str] | None = None,
+        navigation_log: pathlib.Path | None = None,
     ) -> None:
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TMUX_PANE", None)
-        environment.pop("TERMNAV_TMUX_SESSION", None)
         environment.pop("TERMNAV_PARENT_RELAY", None)
         if parent is not None:
             environment["TERMNAV_PARENT_RELAY"] = str(parent)
         if owns_tmux:
             environment["TMUX"] = f"{self.tmux_socket},1,0"
             environment["TMUX_PANE"] = self.pane
-            environment["TERMNAV_TMUX_SESSION"] = self.session
         if extra_environment is not None:
             environment.update(extra_environment)
+        command = [str(self.relay), "serve", "--socket", str(path)]
+        if navigation_log is not None:
+            command = [
+                sys.executable,
+                str(pathlib.Path(__file__).resolve().with_name("relay-server.py")),
+                "--socket",
+                str(path),
+                "--log",
+                str(navigation_log),
+            ]
         process = subprocess.Popen(
-            [str(self.relay), "serve", "--socket", str(path)],
+            command,
             env=environment,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -602,8 +657,8 @@ class RelayFocusTest(unittest.TestCase):
             owns_tmux=True,
             extra_environment={
                 "PATH": f"{mock_bin}:{os.environ['PATH']}",
-                "TERMNAV_RELAY_TEST_LOG": str(log),
             },
+            navigation_log=log,
         )
         focus_reply: list[dict[str, object]] = []
         request = {
@@ -815,6 +870,28 @@ class NestedFocusTest(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+
+        # tmux runs focus hooks in background processes. Killing the isolated
+        # servers requests shutdown, but deleting their runtime directory can
+        # race a final watcher/expirer write under load. Wait for the observable
+        # lifecycle boundary instead of guessing how long those children need.
+        def helpers_stopped() -> bool:
+            return all(
+                not self.helper_processes(command, socket_path)
+                for socket_path in self.sockets
+                for command in ("watch", "expire")
+            )
+
+        try:
+            wait_until(helpers_stopped, "all isolated focus helpers to exit")
+        except AssertionError as error:
+            remaining = {
+                f"{socket_path.name}:{command}": self.helper_process_details(command, socket_path)
+                for socket_path in self.sockets
+                for command in ("watch", "expire")
+                if self.helper_processes(command, socket_path)
+            }
+            raise AssertionError(f"{error}; remaining helpers: {remaining}") from error
         self.tempdir.cleanup()
 
     def tmux(self, socket_path: pathlib.Path, *arguments: str) -> str:
@@ -1022,7 +1099,9 @@ class NestedFocusTest(unittest.TestCase):
                     break
         return holders
 
-    def test_local_nested_client_claims_and_releases_its_exact_parent_pane(self) -> None:
+    def test_local_nested_client_claims_and_releases_its_exact_parent_pane(
+        self,
+    ) -> None:
         inner = self.new_server("inner", "sleep 30")
         inner_active = self.tmux(inner, "display-message", "-p", "#{pane_id}")
         self.tmux(inner, "split-window", "-d", "sleep 30")
@@ -1450,10 +1529,12 @@ def main() -> int:
     arguments, unittest_arguments = parser.parse_known_args()
     library = arguments.focus.parent.parent / "lib" / "termnav"
     sys.path.insert(0, str(library))
+    import process_info
     import tmux_focus
 
     FocusClaimTest.focus = arguments.focus
     FocusLibraryTest.module = tmux_focus
+    FocusLibraryTest.process_info = process_info
     RelayFocusTest.relay = arguments.relay
     NestedFocusTest.focus = arguments.focus
     NestedFocusTest.module = tmux_focus

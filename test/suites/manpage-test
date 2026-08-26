@@ -19,9 +19,10 @@ while IFS= read -r command; do
   _assert_contains "manpage NAME section: $command" ".SH NAME" "$content"
   _assert_contains "manpage names command: $command" "$command \\" "$content"
 done < <(
-  git -C "$TERMNAV_REPO_ROOT" ls-files -- 'bin/*' |
-    xargs -n 1 basename |
-    sort
+  for source in "$TERMNAV_REPO_ROOT"/bin/*; do
+    [[ -f "$source" && -x "$source" ]] || continue
+    basename "$source"
+  done | LC_ALL=C sort
 )
 
 _test_summary

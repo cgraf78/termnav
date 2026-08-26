@@ -284,6 +284,10 @@ ssh_probe_bin="$ssh_probe/bin"
 mkdir -p "$ssh_probe_bin"
 cat >"$ssh_probe_bin/ssh" <<'SH'
 #!/usr/bin/env bash
+if [[ ${1:-} == -G ]]; then
+  printf '%s\n' "$TERMNAV_TEST_EFFECTIVE_CONFIG"
+  exit 0
+fi
 printf '<%s>\n' "$@" >"$TERMNAV_TEST_SSH_LOG"
 SH
 chmod +x "$ssh_probe_bin/ssh"

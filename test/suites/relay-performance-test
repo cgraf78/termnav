@@ -32,9 +32,9 @@ else
   : >"$tmp/send-client.out"
   : >"$tmp/send-client.err"
 fi
-TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION=1 XDG_RUNTIME_DIR="$tmp/runtime" \
-  PYTHONPATH="$tmp/shadow" "$relay" commit \
+XDG_RUNTIME_DIR="$tmp/runtime" PYTHONPATH="$tmp/shadow" "$relay" commit \
   --tmux-socket "$tmp/tmux.sock" --client-tty /dev/null --client-pid 1 \
+  --client-created 1 \
   >"$tmp/commit.out" 2>"$tmp/commit.err"
 commit_rc=$?
 set -e

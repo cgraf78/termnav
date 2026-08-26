@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# nvim-navigation-test - fast-path and mapping contracts for the nvim adapter.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+if ! command -v nvim >/dev/null 2>&1; then
+  echo "  SKIP: termnav nvim navigation assertions (nvim unavailable)"
+  _test_summary
+fi
+
+output=$(
+  TERMNAV_NAVIGATION_MODULE="$TERMNAV_ROOT/lib/termnav/nvim/navigation.lua" \
+    TERMNAV_SETUP_MODULE="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua" \
+    nvim --headless --noplugin -u NONE -i NONE \
+    -l "$TERMNAV_ROOT/test/support/nvim-navigation.lua" 2>&1
+)
+status=$?
+
+_assert_exit "nvim navigation: headless behavior suite exits successfully" 0 "$status"
+_assert_contains "nvim navigation: all fast-path and mapping cases pass" \
+  "nvim-navigation: 14 passed" "$output"
+
+_test_summary

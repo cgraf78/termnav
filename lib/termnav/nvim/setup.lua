@@ -55,6 +55,10 @@ local function default_vscode_focus()
   return load_sibling("vscode-focus.lua").new()
 end
 
+local function default_navigation()
+  return load_sibling("navigation.lua").new()
+end
+
 local function option_list(options, name, default)
   local value = options[name]
   if value == nil then
@@ -69,6 +73,7 @@ function M.new(options)
   local ctx = {
     group_name = options.group_name or "termnav_nvim",
     opener = options.opener or default_opener(),
+    navigation = options.navigation or default_navigation(),
     wezterm_vars = options.wezterm_vars or default_wezterm_vars(),
     vscode_focus = options.vscode_focus or default_vscode_focus(),
     publish_delay_ms = options.publish_delay_ms or 100,
@@ -197,6 +202,7 @@ function M.new(options)
   function ctx.setup()
     local group = vim.api.nvim_create_augroup(ctx.group_name, { clear = true })
 
+    ctx.navigation.setup()
     ctx.opener.setup()
     ctx.claim_focus()
 

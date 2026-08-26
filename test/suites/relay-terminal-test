@@ -21,9 +21,17 @@ _assert_contains "relay terminal: all five DECRQM states are exercised" \
   "test_all_decrqm_states_commit_pane_navigation" "$output"
 _assert_contains "relay terminal: nested tmux handoff and parent bubble are exercised" \
   "test_nested_commit_and_parent_bubble_use_one_terminal_barrier" "$output"
+_assert_contains "relay terminal: three nested tmux levels share one barrier" \
+  "test_three_tmux_levels_prepare_before_one_terminal_barrier" "$output"
 _assert_contains "relay terminal: pane, window, and move scopes are exercised" \
   "test_window_move_commits_after_terminal_response" "$output"
 _assert_contains "relay terminal: pane DECRQM remains application-safe" \
   "test_application_decrqm_response_is_preserved" "$output"
+_assert_contains "relay terminal: a one-window SSH hop reaches the outer terminal" \
+  "test_one_window_tab_selection_reaches_the_outer_terminal" "$output"
+_assert_contains "relay terminal: remote bubbling reaches the VS Code window adapter" \
+  "test_one_window_tab_selection_reaches_the_vscode_window_adapter" "$output"
+_assert_contains "relay terminal: post-start focus changes select the live client" \
+  "test_relay_started_before_focus_switch_targets_the_live_client" "$output"
 
 _test_summary
