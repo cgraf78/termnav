@@ -74,6 +74,10 @@ consumers must still select versioned VS Code payloads explicitly.
   `add_public_link_rules(rules)`.
 - `lib/termnav/nvim/setup.lua`: reusable Neovim-side setup for publishing the
   current editor socket, cwd, and remote context to WezTerm.
+- `lib/termnav/nvim/navigation.lua`: Neovim pane and tab navigation. Directional
+  pane edges and tab boundaries delegate to the shared router, while
+  Ctrl-backslash preserves the local previous-split/previous-tmux-pane history
+  expected from vim-tmux-navigator without guessing at an ancestor's history.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
   `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
   setup module and advanced consumers.
