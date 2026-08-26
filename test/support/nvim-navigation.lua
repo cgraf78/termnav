@@ -226,6 +226,30 @@ test("previous split navigation remains local and process free", function()
   equal(#streams, 0, "previous split should not start the router")
 end)
 
+test("single nvim split delegates previous-pane history only to its immediate tmux", function()
+  vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
+  vim.env.TMUX_PANE = "%7"
+  local ctx, commands, streams = fake_context()
+
+  equal(ctx.previous(), true, "tmux should own previous-pane history")
+
+  equal(#commands, 1, "previous pane should use one guarded tmux command")
+  truthy(
+    table.concat(commands[1], " "):find("select%-pane %-t %%7 %-l") ~= nil,
+    "previous pane should target the immediate tmux pane"
+  )
+  equal(#streams, 0, "previous pane should not enter the boundary router")
+end)
+
+test("previous pane without a tmux scope is a local no-op", function()
+  local ctx, commands, streams = fake_context()
+
+  equal(ctx.previous(), true, "outermost previous pane should be consumed")
+
+  equal(#commands, 0, "outermost previous pane should not invoke tmux")
+  equal(#streams, 0, "outermost previous pane should not invent a terminal route")
+end)
+
 test("previous pane returns to tmux after crossing the nvim boundary", function()
   vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
   vim.env.TMUX_PANE = "%7"
@@ -295,8 +319,26 @@ test("setup installs direct mappings and netrw routing", function()
 
   ctx.setup()
 
-  equal(vim.fn.maparg("<C-h>", "n", false, true).desc, "Navigate left", "normal map")
+  -- Keep the complete vim-tmux-navigator migration surface explicit. A future
+  -- refactor must not preserve only the four directional mappings while
+  -- silently dropping the fifth previous-pane operation again.
+  for _, expected in ipairs({
+    { key = "<C-h>", desc = "Navigate left" },
+    { key = "<C-j>", desc = "Navigate down" },
+    { key = "<C-k>", desc = "Navigate up" },
+    { key = "<C-l>", desc = "Navigate right" },
+    { key = "<C-\\>", desc = "Navigate to previous pane" },
+  }) do
+    local mapping = vim.fn.maparg(expected.key, "n", false, true)
+    truthy(mapping.callback ~= nil, expected.key .. " should map a navigation callback")
+    equal(mapping.desc, expected.desc, expected.key .. " mapping description")
+  end
   equal(vim.fn.maparg("<C-j>", "t", false, true).expr, 1, "terminal pane map should be expr")
+  equal(
+    vim.fn.maparg("<C-\\>", "t"),
+    "",
+    "terminal Ctrl-backslash must remain available for the terminal-mode escape prefix"
+  )
   for _, mode in ipairs({ "n", "i", "t" }) do
     truthy(
       vim.fn.maparg("<C-Tab>", mode, false, true).callback ~= nil,
