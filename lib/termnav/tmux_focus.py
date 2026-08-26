@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from process_info import environment as process_env
+
 FOCUS_OPTION = "@termnav_child_focus"
 CLIENT_UNFOCUSED_OPTION = "@termnav_client_unfocused"
 INACTIVE_STYLE_OPTION = "@termnav_inactive_style"
@@ -468,40 +470,6 @@ def expire(socket_path: str, pane: str) -> None:
             # A heartbeat may land between our read and this command. Exact
             # comparison makes that race harmless; then re-read for replacement.
             clear_exact(socket_path, pane, value)
-
-
-def parse_ps_environment(output: str, name: str) -> str | None:
-    """Extract NAME from `ps eww` output without truncating spaces in values."""
-    pattern = rf"(?:^|\s){re.escape(name)}=(.*?)(?=\s[A-Za-z_][A-Za-z0-9_]*=|$)"
-    match = re.search(pattern, output)
-    return match.group(1) if match else None
-
-
-def process_env(pid: int, name: str) -> str | None:
-    """Read one client-process variable on Linux or the macOS ps fallback."""
-    proc_readable = True
-    try:
-        data = Path(f"/proc/{pid}/environ").read_bytes()
-    except OSError:
-        proc_readable = False
-        data = b""
-    prefix = name.encode() + b"="
-    for entry in data.split(b"\0"):
-        if entry.startswith(prefix):
-            return entry[len(prefix) :].decode(errors="strict")
-    if proc_readable:
-        return None
-    try:
-        output = subprocess.run(
-            ["ps", "eww", "-p", str(pid), "-o", "command="],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=2,
-        ).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return parse_ps_environment(output, name)
 
 
 def parent_for_client(client_pid: int, own_socket: str) -> Parent | None:

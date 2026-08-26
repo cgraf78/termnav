@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Navigate through application, tmux, relay, and terminal scopes."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib" / "termnav"))
+
+from navigation import Client, Navigator, Outcome, SystemBackend
+from navigation_protocol import validate_request
+
+
+def run_stream(navigator: Navigator) -> int:
+    """Route an ordered burst while following its selected tmux client."""
+
+    continuation_client = None
+    continuation_scope = None
+    for line in sys.stdin:
+        fields = line.split()
+        if len(fields) != 2:
+            print(1, flush=True)
+            return 1
+        action, direction = fields
+        try:
+            result = navigator.route(
+                action,
+                direction,
+                include_current=(
+                    continuation_client is None and continuation_scope is None
+                ),
+                continuing_client=continuation_client,
+                continuing_scope=continuation_scope,
+            )
+        except ValueError:
+            print(1, flush=True)
+            return 1
+        print(int(result.outcome), flush=True)
+        if result.outcome is Outcome.ERROR:
+            return 1
+        continuation_client = result.client
+        continuation_scope = result.scope
+    return 0
+
+
+def main() -> int:
+    """Parse the stable CLI and return Termnav's tri-state result."""
+
+    parser = argparse.ArgumentParser(prog="termnav-navigate")
+    parser.add_argument(
+        "action", nargs="?", choices=("pane-select", "tab-select", "tab-move")
+    )
+    parser.add_argument("direction", nargs="?")
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="read ordered ACTION DIRECTION requests from standard input",
+    )
+    parser.add_argument(
+        "--parent",
+        action="store_true",
+        help="start outside a tmux scope that has already declined the action",
+    )
+    parser.add_argument("--client-pid", type=int)
+    parser.add_argument("--client-tty")
+    parser.add_argument("--client-created", type=int)
+    parser.add_argument("--client-termtype")
+    parser.add_argument("--source-socket")
+    parser.add_argument("--source-pane")
+    parser.add_argument("--source-session")
+    arguments = parser.parse_args()
+
+    if arguments.stream:
+        if (
+            arguments.action is not None
+            or arguments.direction is not None
+            or arguments.parent
+        ):
+            parser.error("--stream does not accept an initial action or --parent")
+        backend = SystemBackend(ROOT / "bin")
+        return run_stream(
+            Navigator(backend, now=lambda: time.time_ns() // 1_000_000_000)
+        )
+
+    if arguments.action is None or arguments.direction is None:
+        parser.error("action and direction are required unless --stream is used")
+    try:
+        validate_request(arguments.action, arguments.direction)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    identity = (
+        arguments.client_pid,
+        arguments.client_tty,
+        arguments.client_created,
+        arguments.client_termtype,
+        arguments.source_socket,
+        arguments.source_pane,
+    )
+    if arguments.parent and any(value is None for value in identity):
+        parser.error(
+            "--client-pid, --client-tty, --client-created, --client-termtype, "
+            "--source-socket, and --source-pane are required with --parent"
+        )
+
+    exact_client = None
+    if arguments.parent:
+        exact_client = Client(
+            activity=0,
+            pid=arguments.client_pid,
+            tty=arguments.client_tty,
+            termtype=arguments.client_termtype,
+            session=arguments.source_session or "",
+            pane=arguments.source_pane,
+            socket=arguments.source_socket,
+            exact=True,
+            created=arguments.client_created,
+        )
+
+    backend = SystemBackend(ROOT / "bin")
+    return int(
+        Navigator(backend, now=lambda: time.time_ns() // 1_000_000_000).navigate(
+            arguments.action,
+            arguments.direction,
+            include_current=not arguments.parent,
+            exact_client=exact_client,
+        )
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

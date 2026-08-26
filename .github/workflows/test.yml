@@ -62,7 +62,9 @@ jobs:
   eza-current:
     name: Current eza compatibility / Arch
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    # The job intentionally tracks Arch's rolling userland to catch current eza
+    # compatibility. A digest would turn that policy into a stale snapshot.
+    container: archlinux:latest # zizmor: ignore[unpinned-images]
     steps:
       - name: Install test dependencies
         run: |
@@ -76,7 +78,7 @@ jobs:
 
       - name: Exercise current eza CLI
         shell: bash
-        run: test/suites/wezterm-test
+        run: test/suites/wezterm-integration-test
 
   required:
     name: Required

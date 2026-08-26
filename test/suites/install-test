@@ -23,16 +23,12 @@ commands=(
   nvim-link-host
   nvim-ssh-control-open
   nvim-tmux-open
+  termnav-navigate
   termnav-relay
-  termnav-switch-tab
   termnav-tmux-context
   termnav-tmux-focus
   tmux-follow-click
   vscode-nvim-focus
-  vscode-switch-tab
-  wezterm-move-tab
-  wezterm-select-pane
-  wezterm-switch-tab
 )
 
 expected=$(printf '%s\n' "${commands[@]}" | LC_ALL=C sort)
@@ -198,6 +194,21 @@ _assert_eq "installer: retargets a command symlink" \
 _assert_eq "installer: retargets a manpage symlink" \
   "$root/man/man1/eza-nvim-links.1" "$(readlink "$retarget/share/man/man1/eza-nvim-links.1")"
 
+retired=$(_tmpdir)/retired
+mkdir -p "$retired/bin" "$retired/share/man/man1"
+ln -s "$root/bin/removed-command" "$retired/bin/removed-command"
+ln -s "$root/man/man1/removed-command.1" \
+  "$retired/share/man/man1/removed-command.1"
+ln -s /another/provider/removed-command "$retired/bin/provider-owned-elsewhere"
+PREFIX="$retired" "$installer_delegate" >/dev/null
+_assert_eq "installer: removes a dangling provider command" false \
+  "$([[ -e "$retired/bin/removed-command" || -L "$retired/bin/removed-command" ]] && echo true || echo false)"
+_assert_eq "installer: removes a dangling provider manpage" false \
+  "$([[ -e "$retired/share/man/man1/removed-command.1" || -L "$retired/share/man/man1/removed-command.1" ]] && echo true || echo false)"
+_assert_eq "installer: preserves symlinks owned by another provider" \
+  /another/provider/removed-command \
+  "$(readlink "$retired/bin/provider-owned-elsewhere")"
+
 # Publication is transactional even after preflight succeeds. Fail the final
 # manpage link through PATH so real earlier links have been changed, then prove
 # rollback removes every new link and restores a symlink that was retargeted.
@@ -282,7 +293,7 @@ _assert_contains "installer: rollback failure is actionable" \
 
 blocked_bin=$(_tmpdir)/blocked-bin
 mkdir -p "$blocked_bin/bin"
-printf 'user command\n' >"$blocked_bin/bin/wezterm-switch-tab"
+printf 'user command\n' >"$blocked_bin/bin/termnav-navigate"
 set +e
 PREFIX="$blocked_bin" "$installer_delegate" \
   >"$blocked_bin.out" 2>"$blocked_bin.err"
@@ -290,7 +301,7 @@ status=$?
 set -e
 _assert_exit "installer: refuses a regular command" 1 "$status"
 _assert_file_content "installer: preserves a regular command" \
-  "user command" "$blocked_bin/bin/wezterm-switch-tab"
+  "user command" "$blocked_bin/bin/termnav-navigate"
 if [[ ! -e "$blocked_bin/bin/eza-nvim-links" && ! -L "$blocked_bin/bin/eza-nvim-links" ]]; then
   _pass "installer: command collision causes no partial install"
 else
@@ -301,7 +312,7 @@ _assert_contains "installer: command collision is actionable" \
 
 blocked_man=$(_tmpdir)/blocked-man
 mkdir -p "$blocked_man/share/man/man1"
-printf 'user manpage\n' >"$blocked_man/share/man/man1/wezterm-switch-tab.1"
+printf 'user manpage\n' >"$blocked_man/share/man/man1/termnav-navigate.1"
 set +e
 PREFIX="$blocked_man" "$installer_delegate" \
   >"$blocked_man.out" 2>"$blocked_man.err"
@@ -309,7 +320,7 @@ status=$?
 set -e
 _assert_exit "installer: refuses a regular manpage" 1 "$status"
 _assert_file_content "installer: preserves a regular manpage" \
-  "user manpage" "$blocked_man/share/man/man1/wezterm-switch-tab.1"
+  "user manpage" "$blocked_man/share/man/man1/termnav-navigate.1"
 if [[ ! -e "$blocked_man/bin/eza-nvim-links" && ! -L "$blocked_man/bin/eza-nvim-links" ]]; then
   _pass "installer: manpage collision causes no partial install"
 else

@@ -6,17 +6,76 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import NoReturn
 
-PANE_DIRECTIONS = {"left": "L", "down": "D", "up": "U", "right": "R"}
+_LIBRARY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    "lib",
+    "termnav",
+)
+if _LIBRARY not in sys.path:
+    sys.path.insert(0, _LIBRARY)
+
+from navigation_protocol import ACTION_FROM_WIRE, valid_wire_request
+from process_info import environment as process_env
+
 COMMIT_KEY = b"\x1b[777009u"
 COMMIT_QUERY = b"\x1b[?2004$p"
-DIRECTIVE_TTL = 6
-WINDOW_DIRECTIONS = {"next": "next-window", "previous": "previous-window"}
-MOVE_DIRECTIONS = {"left": "-", "right": "+"}
-SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {"-bind_address", "-cipher", "-config", "-destination", "-escape_char", "-identity_file", "-jump", "-login_name", "-mac_spec", "-option", "-port", "-query_option", "-remote_forward", "-stdio_forward", "-tag", "-tunnel", "-w"}
+COMMIT_TIMEOUT = 6
+COMMIT_POLL_SECONDS = 0.01
+PREPARE_STALE_SECONDS = 30
+SSH_FLAG_OPTIONS = {
+    "-4",
+    "-6",
+    "-A",
+    "-C",
+    "-G",
+    "-K",
+    "-M",
+    "-N",
+    "-T",
+    "-V",
+    "-X",
+    "-Y",
+    "-a",
+    "-f",
+    "-g",
+    "-k",
+    "-n",
+    "-q",
+    "-s",
+    "-t",
+    "-v",
+    "-x",
+    "-y",
+}
+SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOopQRSWw") | {
+    "-bind_address",
+    "-cipher",
+    "-config",
+    "-destination",
+    "-escape_char",
+    "-identity_file",
+    "-jump",
+    "-login_name",
+    "-mac_spec",
+    "-option",
+    "-port",
+    "-query_option",
+    "-remote_forward",
+    "-stdio_forward",
+    "-tag",
+    "-tunnel",
+    "-w",
+}
+SSH_ATTACHED_VALUE_OPTIONS = {
+    f"-{option}" for option in SSH_VALUE_OPTIONS if len(option) == 1
+}
 
-HANDLE_LOCK = None
-_HANDLE_BUSY = False
+NAVIGATION_CONDITION = None
+NAVIGATION_NEXT = 0
+NAVIGATION_SERVING = 0
+_NAVIGATION_LOADED = False
 
 
 def load_commit_runtime() -> None:
@@ -34,7 +93,7 @@ def load_commit_runtime() -> None:
 
 def load_server_runtime() -> None:
     """Load long-lived server and SSH modules outside the per-chord client."""
-    global argparse, shutil, signal, socket, threading, HANDLE_LOCK
+    global argparse, shutil, signal, socket, threading, NAVIGATION_CONDITION
 
     load_commit_runtime()
     import argparse
@@ -43,10 +102,10 @@ def load_server_runtime() -> None:
     import socket
     import threading
 
-    # Initialize before serve() accepts clients so request threads never race
-    # while constructing the lock that protects two-phase admission.
-    if HANDLE_LOCK is None:
-        HANDLE_LOCK = threading.Lock()
+    # Allocate tickets before accepting connections. Navigation requests wait
+    # in arrival order, while independent focus heartbeats remain concurrent.
+    if NAVIGATION_CONDITION is None:
+        NAVIGATION_CONDITION = threading.Condition()
 
 
 def load_focus_runtime() -> None:
@@ -65,7 +124,31 @@ def load_focus_runtime() -> None:
     from tmux_focus import valid_token as focus_valid_token
 
 
-def die(message: str) -> "NoReturn":
+def load_navigation_runtime() -> None:
+    """Load the one owner of tmux navigation semantics for relay use."""
+    global navigation_actions, navigation_backend, navigation_outcome
+    global navigation_client, navigation_scope, _NAVIGATION_LOADED
+
+    if _NAVIGATION_LOADED:
+        return
+
+    from pathlib import Path as LocalPath
+
+    root = LocalPath(__file__).resolve().parent.parent
+    library = str(root / "lib" / "termnav")
+    if library not in sys.path:
+        sys.path.insert(0, library)
+    from navigation import Client, Outcome, Scope, SystemBackend
+
+    navigation_actions = ACTION_FROM_WIRE
+    navigation_backend = SystemBackend(root / "bin")
+    navigation_client = Client
+    navigation_outcome = Outcome
+    navigation_scope = Scope
+    _NAVIGATION_LOADED = True
+
+
+def die(message: str) -> NoReturn:
     print(f"termnav-relay: {message}", file=sys.stderr)
     raise SystemExit(2)
 
@@ -82,13 +165,7 @@ def debug(message: str) -> None:
 
 
 def is_valid_request(scope: str, direction: str) -> bool:
-    if scope == "pane" and direction in PANE_DIRECTIONS:
-        return True
-    if scope == "window" and direction in WINDOW_DIRECTIONS:
-        return True
-    if scope == "move" and direction in MOVE_DIRECTIONS:
-        return True
-    return False
+    return valid_wire_request(scope, direction)
 
 
 def runtime_dir() -> Path:
@@ -135,103 +212,97 @@ def directive_path(tmux_socket: str, nonce: str) -> Path:
     return directive_dir(tmux_socket) / f"{nonce}.json"
 
 
+def result_path(tmux_socket: str, nonce: str) -> Path:
+    """Return the completion receipt path for one directive."""
+
+    return directive_dir(tmux_socket) / f"{nonce}.result"
+
+
 def _is_valid_directive(d: dict) -> bool:
     """Full schema validation before claim/exec: common + action-specific."""
-    try:
-        if not (
-            isinstance(d, dict)
-            and d.get("v") == 2
-            and re.fullmatch(r"[0-9a-f]{12}", d.get("nonce", ""))
-            and isinstance(d.get("seq"), int)
-            and d.get("action") in ("execute", "forward")
-            and isinstance(d.get("expires"), (int, float))
-            and isinstance(d.get("local_client_tty"), str)
-            and isinstance(d.get("local_client_pid"), int)
-            and isinstance(d.get("tmux_socket"), str)
-        ):
-            return False
-        if d["action"] == "execute":
-            valid_dirs = {
-                "pane": {"left", "down", "up", "right"},
-                "window": {"next", "previous"},
-                "move": {"left", "right"},
-            }.get(d.get("scope"), set())
-            return (
-                isinstance(d.get("session"), str)
-                and isinstance(d.get("expected_pane"), str)
-                and isinstance(d.get("target_pane"), str)
-                and d.get("direction") in valid_dirs
-            )
-        else:  # forward
-            if not (isinstance(d.get("forward_pane"), str) and d.get("forward_pane").startswith("%")):
-                return False
-            # session now persisted on forward; require it when present, allow legacy fake without for tests
-            if "session" in d and not isinstance(d.get("session"), str):
-                return False
-            return True
-    except Exception:
+    if not (
+        isinstance(d, dict)
+        and d.get("v") == 2
+        and isinstance(d.get("nonce"), str)
+        and re.fullmatch(r"[0-9a-f]{12}", d["nonce"])
+        and isinstance(d.get("seq"), int)
+        and d.get("action") in ("execute", "forward")
+        and isinstance(d.get("ready"), bool)
+        and isinstance(d.get("claimed"), bool)
+        and isinstance(d.get("prepared_at"), (int, float))
+        and isinstance(d.get("local_client_tty"), str)
+        and isinstance(d.get("local_client_pid"), int)
+        and isinstance(d.get("local_client_created"), int)
+        and isinstance(d.get("started_at"), int)
+        and isinstance(d.get("owner_pid"), int)
+        and isinstance(d.get("tmux_socket"), str)
+    ):
         return False
-    return True
+    if d["action"] == "execute":
+        valid_dirs = {
+            "pane": {"left", "down", "up", "right"},
+            "window": {"next", "previous"},
+            "move": {"left", "right"},
+        }.get(d.get("scope"), set())
+        return (
+            isinstance(d.get("session"), str)
+            and isinstance(d.get("expected_pane"), str)
+            and isinstance(d.get("target_pane"), str)
+            and d.get("direction") in valid_dirs
+        )
+    forward_pane = d.get("forward_pane")
+    return (
+        isinstance(d.get("session"), str)
+        and isinstance(forward_pane, str)
+        and forward_pane.startswith("%")
+    )
 
 
 def _load_directive(path: Path) -> dict | None:
     """Load and claim a directive; must be called with .directives.lock held."""
-    claimed = path.with_name(path.name + f".claimed-{os.getpid()}")
     try:
-        os.rename(path, claimed)
-    except OSError:
-        return None
-    try:
-        directive = json.loads(claimed.read_text(encoding="utf-8"))
+        directive = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         directive = None
-    try:
-        claimed.unlink()
-    except OSError:
-        pass
     if not _is_valid_directive(directive):
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return None
     try:
-        if float(directive.get("expires", 0)) < time.time():
-            return None
-    except (TypeError, ValueError):
+        os.kill(directive["owner_pid"], 0)
+    except OSError:
+        # A ready record outlives its server only if commit died before it
+        # could publish a receipt. Remove and poison it while holding the same
+        # store lock used for claiming; a late nonce-less User8 can then never
+        # execute the abandoned action or a future replacement.
+        path.unlink(missing_ok=True)
+        if directive["ready"]:
+            _poison_client(directive["tmux_socket"], directive)
         return None
+    if not directive["ready"] or directive["claimed"]:
+        return None
+    # Keep the claimed directive present until its result receipt is durable.
+    # That closes the small cross-server window in which another request for
+    # the same nonced-less DECRQM response could otherwise become eligible.
+    directive["claimed"] = True
+    replacement = path.with_name(f".tmp-claim-{path.stem}-{os.getpid()}.json")
+    try:
+        replacement.write_text(
+            json.dumps(directive, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, path)
+    except OSError:
+        return None
+    finally:
+        try:
+            replacement.unlink()
+        except OSError:
+            pass
     return directive
-
-
-def _next_seq(tmux_socket: str) -> int:
-    """File-locked per-socket monotonic counter via .directives.lock."""
-    import fcntl
-
-    ddir = directive_dir(tmux_socket)
-    lock_path = ddir / ".directives.lock"
-    seq_path = ddir / ".seq"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            raw = seq_path.read_text(encoding="utf-8").strip()
-            cur = int(raw) if raw else 0
-        except (OSError, ValueError):
-            cur = 0
-        nxt = cur + 1
-        tmp = seq_path.with_name(seq_path.name + ".tmp")
-        try:
-            tmp.write_text(str(nxt), encoding="utf-8")
-            with open(tmp, "rb") as tf:
-                os.fsync(tf.fileno())
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, seq_path)
-            try:
-                os.chmod(seq_path, 0o600)
-            except OSError:
-                pass
-        finally:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-        return nxt
 
 
 def _publish_exclusive(path: Path, payload: str) -> None:
@@ -254,6 +325,57 @@ def _publish_exclusive(path: Path, payload: str) -> None:
         raise
 
 
+def _client_key(directive: dict) -> tuple[str, int, int]:
+    """Return the physical tmux attachment identity used by one directive."""
+
+    return (
+        directive["local_client_tty"],
+        directive["local_client_pid"],
+        directive["local_client_created"],
+    )
+
+
+def _poison_path(tmux_socket: str, directive: dict) -> Path:
+    """Name a failed commit stream by its stable tmux client identity."""
+
+    identity = "\0".join(str(value) for value in _client_key(directive))
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return directive_dir(tmux_socket) / f".poison-{digest}"
+
+
+def _matching_directive_exists(ddir: Path, directive: dict) -> bool:
+    """Clean abandoned preparation and detect an unsafe outstanding query."""
+
+    expected = _client_key(directive)
+    now = time.time()
+    for path in ddir.glob("*.json"):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if _is_valid_directive(current) and _client_key(current) == expected:
+                # Normal failures explicitly abort the prepared path. This
+                # bounded lease is only crash recovery for a caller that dies
+                # while the long-lived relay server itself remains healthy.
+                if (
+                    not current["ready"]
+                    and now - float(current["prepared_at"])
+                    > PREPARE_STALE_SECONDS
+                ):
+                    path.unlink(missing_ok=True)
+                    continue
+                try:
+                    os.kill(current["owner_pid"], 0)
+                except OSError:
+                    path.unlink(missing_ok=True)
+                    if current["ready"]:
+                        _poison_client(current["tmux_socket"], current)
+                        return True
+                    continue
+                return True
+        except (OSError, TypeError, ValueError):
+            continue
+    return False
+
+
 def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
     """Allocate seq and arm atomically under one .directives.lock.
 
@@ -264,25 +386,26 @@ def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
     import fcntl
 
     if not isinstance(directive, dict):
-        raise ValueError("directive must be a dict")
+        raise TypeError("directive must be a dict")
     nonce = directive.get("nonce")
     if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
         raise ValueError(f"invalid nonce: {nonce!r}")
     ltty = directive.get("local_client_tty")
     if not isinstance(ltty, str):
-        raise ValueError("missing local_client_tty")
+        raise TypeError("missing local_client_tty")
     lpid = directive.get("local_client_pid")
     if not isinstance(lpid, int):
-        raise ValueError("missing local_client_pid")
+        raise TypeError("missing local_client_pid")
+    if not isinstance(directive.get("local_client_created"), int):
+        raise TypeError("missing local_client_created")
+    if not isinstance(directive.get("started_at"), int):
+        raise TypeError("missing started_at")
     if directive.get("tmux_socket") != tmux_socket:
         raise ValueError("tmux_socket mismatch")
-    if "expires_override" in directive:
-        try:
-            directive["expires"] = float(directive.pop("expires_override"))
-        except (TypeError, ValueError):
-            directive["expires"] = time.time() + DIRECTIVE_TTL
-    else:
-        directive["expires"] = time.time() + DIRECTIVE_TTL
+    directive["ready"] = False
+    directive["claimed"] = False
+    directive["prepared_at"] = time.time()
+    directive["owner_pid"] = os.getpid()
     ddir = directive_dir(tmux_socket)
     lock_path = ddir / ".directives.lock"
     seq_path = ddir / ".seq"
@@ -290,6 +413,17 @@ def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
+        # DECRQM replies do not carry an application nonce. Exactly one query
+        # may therefore be outstanding for a physical tmux attachment across
+        # every relay server sharing this store. A poisoned attachment remains
+        # closed until that tmux client disconnects and is recreated; otherwise
+        # a very late reply could execute a later, unrelated navigation action.
+        if _poison_path(tmux_socket, directive).exists():
+            raise RuntimeError("client commit stream is poisoned")
+        if _matching_directive_exists(ddir, directive):
+            raise RuntimeError("client already has an outstanding directive")
+        if result_path(tmux_socket, nonce).exists():
+            raise FileExistsError(f"directive result already exists: {nonce}")
         # --- seq bump ---
         try:
             raw = seq_path.read_text(encoding="utf-8").strip()
@@ -320,48 +454,8 @@ def _arm_directive_and_seq(tmux_socket: str, directive: dict) -> int:
         return nxt
 
 
-def arm_directive(directive: dict) -> None:
-    """Atomically publish a directive under the shared per-socket lock."""
-    if not isinstance(directive, dict):
-        raise ValueError("directive must be a dict")
-    nonce = directive.get("nonce")
-    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
-        raise ValueError(f"invalid nonce: {nonce!r}")
-    seq = directive.get("seq")
-    if not isinstance(seq, int):
-        raise ValueError("missing or invalid seq")
-    ltty = directive.get("local_client_tty")
-    if not isinstance(ltty, str):
-        raise ValueError("missing local_client_tty")
-    lpid = directive.get("local_client_pid")
-    if not isinstance(lpid, int):
-        raise ValueError("missing local_client_pid")
-    tmux_socket = directive.get("tmux_socket")
-    if not isinstance(tmux_socket, str) or not tmux_socket:
-        raise ValueError("missing tmux_socket")
-    # expires handling: test hook expires_override verbatim, else now+TTL
-    if "expires_override" in directive:
-        try:
-            directive["expires"] = float(directive.pop("expires_override"))
-        except (TypeError, ValueError):
-            directive["expires"] = time.time() + DIRECTIVE_TTL
-    else:
-        directive["expires"] = time.time() + DIRECTIVE_TTL
-
-    import fcntl
-
-    ddir = directive_dir(tmux_socket)
-    lock_path = ddir / ".directives.lock"
-    final = directive_path(tmux_socket, nonce)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        payload = json.dumps(directive, separators=(",", ":"), sort_keys=True)
-        _publish_exclusive(final, payload)
-
-
 def mark_committed(tmux_socket: str, nonce: str) -> bool:
-    """Atomically extend expires to max(existing, now+2s) under .directives.lock."""
+    """Make one prepared directive visible to the terminal reply handler."""
     if not re.fullmatch(r"[0-9a-f]{12}", nonce):
         return False
     import fcntl
@@ -377,12 +471,7 @@ def mark_committed(tmux_socket: str, nonce: str) -> bool:
             data = json.loads(raw)
         except (OSError, ValueError, json.JSONDecodeError):
             return False
-        try:
-            existing = float(data.get("expires", 0))
-        except (TypeError, ValueError):
-            existing = 0
-        new_expires = max(existing, time.time() + 2)
-        data["expires"] = new_expires
+        data["ready"] = True
         tmp = path.with_name(f".tmp-mark-{nonce}-{os.getpid()}.json")
         payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
         try:
@@ -403,78 +492,161 @@ def mark_committed(tmux_socket: str, nonce: str) -> bool:
         return True
 
 
-def claim_directive(tmux_socket: str) -> dict | None:
-    """Backward-compat no-client variant: seq-ordered across all clients (tests only)."""
+def _remove_directive(tmux_socket: str, nonce: str) -> bool:
+    """Remove one exact directive regardless of its prepared state."""
+
+    if not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        return False
     import fcntl
 
     lock_path = directive_dir(tmux_socket) / ".directives.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        ddir = directive_dir(tmux_socket)
+    path = directive_path(tmux_socket, nonce)
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            candidates = list(ddir.glob("*.json"))
-        except OSError:
-            return None
-        ordered = []
-        for p in candidates:
-            try:
-                raw = json.loads(p.read_text(encoding="utf-8"))
-                ordered.append((int(raw.get("seq", 1 << 60)), p))
-            except (OSError, ValueError):
-                ordered.append((1 << 60, p))
-        ordered.sort(key=lambda x: x[0])
-        for _, path in ordered:
-            d = _load_directive(path)
-            if d is not None:
-                return d
-        return None
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
 
 
-def claim_directive_nonce(tmux_socket: str, nonce: str) -> dict | None:
-    """Exact-nonce claim for error-path cleanup (validates nonce)."""
+def record_result(tmux_socket: str, nonce: str, handled: bool) -> None:
+    """Publish the commit handler's definitive result for the waiting relay."""
+
+    path = result_path(tmux_socket, nonce)
+    try:
+        _publish_exclusive(path, "handled\n" if handled else "error\n")
+    except FileExistsError:
+        pass
+    _remove_directive(tmux_socket, nonce)
+
+
+def _read_directive(tmux_socket: str, nonce: str) -> dict | None:
+    """Read one exact prepared or pending directive without consuming it."""
+
     if not re.fullmatch(r"[0-9a-f]{12}", nonce):
         return None
     import fcntl
 
     lock_path = directive_dir(tmux_socket) / ".directives.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a+", encoding="utf-8") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        return _load_directive(directive_path(tmux_socket, nonce))
+    path = directive_path(tmux_socket, nonce)
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            directive = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return directive if _is_valid_directive(directive) else None
+
+
+def _poison_client(tmux_socket: str, directive: dict) -> None:
+    """Permanently fail closed for a live client whose reply was lost."""
+
+    path = _poison_path(tmux_socket, directive)
+    try:
+        _publish_exclusive(path, "lost terminal commit response\n")
+    except FileExistsError:
+        pass
+
+
+def wait_for_consumption(tmux_socket: str, nonce: str) -> bool:
+    """Wait until tmux claims a directive, then poison on a lost response."""
+
+    receipt = result_path(tmux_socket, nonce)
+
+    def completed() -> bool | None:
+        try:
+            result = receipt.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if result not in {"handled", "error"}:
+            return None
+        try:
+            receipt.unlink()
+        except OSError:
+            pass
+        return result == "handled"
+
+    result = completed()
+    if result is not None:
+        return result
+    directive = _read_directive(tmux_socket, nonce)
+    if directive is None:
+        return False
+    deadline = time.monotonic() + COMMIT_TIMEOUT
+    while time.monotonic() < deadline:
+        result = completed()
+        if result is not None:
+            return result
+        time.sleep(COMMIT_POLL_SECONDS)
+    # Remove the exact action before poisoning. Leaving it ready would let a
+    # later response execute after the caller has already observed failure.
+    _remove_directive(tmux_socket, nonce)
+    try:
+        receipt.unlink()
+    except OSError:
+        pass
+    _poison_client(tmux_socket, directive)
+    return False
+
+
+def discard_directive(tmux_socket: str, nonce: str) -> None:
+    """Best-effort removal after a commit path can no longer complete."""
+
+    try:
+        _remove_directive(tmux_socket, nonce)
+        try:
+            result_path(tmux_socket, nonce).unlink()
+        except OSError:
+            pass
+    except OSError as exc:
+        debug(f"cannot discard directive {nonce}: {exc!r}")
+
+
+def abort_parent(parent: str, nonce: str) -> None:
+    """Best-effort rollback of an outward path that never entered commit."""
+
+    if not parent:
+        return
+    reply = send_message(parent, {"v": 2, "op": "abort-path", "nonce": nonce})
+    if reply.get("result") != "aborted":
+        debug(f"parent commit path did not abort cleanly: {reply!r}")
 
 
 def claim_directive_for_client(
-    tmux_socket: str, client_tty: str, client_pid: int
+    tmux_socket: str,
+    client_tty: str,
+    client_pid: int,
+    client_created: int,
 ) -> dict | None:
-    """Per-client FIFO by seq; validates tty char device + list-clients."""
-    import fcntl
+    """Claim the sole directive for one exact character-device client."""
     import stat as statmod
+
+    try:
+        st = os.stat(client_tty)
+        if not statmod.S_ISCHR(st.st_mode):
+            return None
+    except OSError:
+        return None
+    return _claim_directive_for_identity(
+        tmux_socket,
+        client_tty,
+        client_pid,
+        client_created,
+    )
+
+
+def _claim_directive_for_identity(
+    tmux_socket: str,
+    client_tty: str,
+    client_pid: int,
+    client_created: int,
+) -> dict | None:
+    """Claim the oldest valid directive for one already-validated client."""
+    import fcntl
 
     lock_path = directive_dir(tmux_socket) / ".directives.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
-        try:
-            st = os.stat(client_tty)
-            if not statmod.S_ISCHR(st.st_mode):
-                return None
-        except OSError:
-            return None
-    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
-        try:
-            listed = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
-            if listed.returncode != 0:
-                return None
-            valid = False
-            for line in listed.stdout.splitlines():
-                parts = line.split()
-                if len(parts) == 2 and parts[0] == client_tty and parts[1] == str(client_pid):
-                    valid = True
-                    break
-            if not valid:
-                return None
-        except OSError:
-            return None
     with open(lock_path, "a+", encoding="utf-8") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         ddir = directive_dir(tmux_socket)
@@ -488,10 +660,15 @@ def claim_directive_for_client(
                 raw = json.loads(p.read_text(encoding="utf-8"))
                 if raw.get("local_client_tty") == client_tty and int(
                     raw.get("local_client_pid", -1)
-                ) == int(client_pid):
+                ) == int(client_pid) and int(
+                    raw.get("local_client_created", -1)
+                ) == int(client_created):
                     filtered.append((int(raw.get("seq", 1 << 60)), p))
             except (OSError, ValueError, TypeError):
-                continue
+                # A malformed publication can never belong to any client. Put
+                # it through the normal claim path so the invalid file is
+                # removed instead of accumulating forever.
+                filtered.append((1 << 60, p))
         filtered.sort(key=lambda x: x[0])
         for _, path in filtered:
             d = _load_directive(path)
@@ -502,47 +679,14 @@ def claim_directive_for_client(
         return None
 
 
-def parse_ps_environment(output: str, name: str) -> str | None:
-    """Extract NAME's value from `ps eww` output preserving spaces."""
-    import re
-
-    match = re.search(rf" {re.escape(name)}=(.*?)(?= \w+=|$)", output)
-    if match:
-        return match.group(1)
-    return None
-
-
-def process_env(pid: int, name: str) -> str | None:
-    proc_readable = True
-    try:
-        with open(f"/proc/{pid}/environ", "rb") as environment:
-            data = environment.read()
-    except OSError:
-        proc_readable = False
-        data = b""
-    prefix = name.encode() + b"="
-    for entry in data.split(b"\0"):
-        if entry.startswith(prefix):
-            return entry[len(prefix) :].decode(errors="strict")
-    if proc_readable:
-        return None
-    try:
-        import subprocess
-
-        output = subprocess.run(["ps", "eww", "-p", str(pid), "-o", "command="], text=True, capture_output=True, check=False).stdout
-    except OSError:
-        return None
-    return parse_ps_environment(output, name)
-
-
 def valid_request(scope: str, direction: str) -> None:
-    if scope == "pane" and direction not in PANE_DIRECTIONS:
+    if scope == "pane" and not valid_wire_request(scope, direction):
         die(f"invalid pane direction: {direction}")
-    if scope == "window" and direction not in WINDOW_DIRECTIONS:
+    if scope == "window" and not valid_wire_request(scope, direction):
         die(f"invalid window direction: {direction}")
-    if scope == "move" and direction not in MOVE_DIRECTIONS:
+    if scope == "move" and not valid_wire_request(scope, direction):
         die(f"invalid move direction: {direction}")
-    if scope not in {"pane", "window", "move"}:
+    if scope not in ACTION_FROM_WIRE:
         die(f"invalid navigation scope: {scope}")
 
 
@@ -580,9 +724,9 @@ def send_command(
             except OSError:
                 actual_tty = ""
         if actual_tty != client_tty:
-            # PID-reuse mismatch: fail closed (1) if a parent relay exists
-            # (would be handling the wrong client), otherwise declined (3)
-            # to allow local fallback (e.g., tab-switch's /dev/null dummy).
+            # PID reuse must never redirect a request into another client. A
+            # missing parent means this transport does not own the request;
+            # an advertised parent makes the mismatch a hard routing error.
             return 1 if parent else 3
     if not parent:
         return 3
@@ -607,7 +751,7 @@ def send_command(
     return 1
 
 
-def send_message(path: str, message: dict, timeout: float = 2.0) -> dict:
+def send_message(path: str, message: dict, timeout: float = COMMIT_TIMEOUT + 2) -> dict:
     import socket
 
     payload = json.dumps(message, separators=(",", ":")) + "\n"
@@ -630,147 +774,100 @@ def send_message(path: str, message: dict, timeout: float = 2.0) -> dict:
     return {"result": "error"}
 
 
-def send_request(path: str, scope: str, direction: str) -> bool:
-    import socket
-
-    payload = json.dumps({"v": 1, "scope": scope, "direction": direction}, separators=(",", ":")) + "\n"
-    try:
-        with socket.socket(socket.AF_UNIX) as client:
-            client.settimeout(2.0)
-            client.connect(path)
-            client.sendall(payload.encode())
-            return client.recv(1) == b"1"
-    except OSError:
-        return False
-
-
 def tmux(*args: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.pop("TMUX", None)
     try:
-        return subprocess.run(["tmux", *args], env=environment, text=True, capture_output=True, check=False, timeout=2)
+        return subprocess.run(
+            ["tmux", *args],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
     except subprocess.TimeoutExpired:
         # Fail closed on timeout (e.g., stale-pane guard during concurrent server)
-        return subprocess.CompletedProcess(args=["tmux", *args], returncode=1, stdout="", stderr="timeout")
+        return subprocess.CompletedProcess(
+            args=["tmux", *args], returncode=1, stdout="", stderr="timeout"
+        )
 
 
 def local_scope() -> dict | None:
-    """Return local tmux scope from env, or None if any piece missing."""
-    tmux_value = os.environ.get("TMUX", "")
-    pane = os.environ.get("TMUX_PANE", "")
-    session = os.environ.get("TERMNAV_TMUX_SESSION", "")
-    if not tmux_value or not pane or not session:
+    """Resolve the live tmux client that currently owns this SSH pane.
+
+    This differs intentionally from an application-local action, which can
+    mutate a logical tmux scope before choosing a terminal. Relay execution is
+    deferred until a nonce-less User8 returns through the exact terminal and
+    tmux client path, so even a locally executable action needs unambiguous
+    physical provenance. A multiply viewed nested path therefore fails closed;
+    ordinary direct tmux navigation remains logical-scope-first in Navigator.
+    """
+
+    load_navigation_runtime()
+    current = navigation_backend.current_scope()
+    if current is None:
         return None
-    tmux_socket = tmux_value.rsplit(",", 2)[0]
-    target_pane = f"{session}:.{pane}"
-    return {"tmux_socket": tmux_socket, "pane": pane, "session": session, "target_pane": target_pane}
+    started_at = int(time.time())
+    client = navigation_backend.resolve_client(current, started_at)
+    if client is None:
+        return None
+    return {
+        "tmux_socket": current.socket,
+        "pane": current.pane,
+        "session": client.session,
+        "target_pane": f"{client.session}:.{current.pane}",
+        "client": client,
+        "started_at": started_at,
+    }
+
+
+def parent_relay(info: dict | None) -> str:
+    """Return the parent relay advertised by the currently selected client."""
+
+    if info is not None:
+        client = info.get("client")
+        if client is not None:
+            return process_env(client.pid, "TERMNAV_PARENT_RELAY") or ""
+    return os.environ.get("TERMNAV_PARENT_RELAY", "")
 
 
 def can_handle(scope: str, direction: str, info: dict) -> bool:
-    """Read-only checks from v1 route() without mutating."""
-    if scope == "pane":
-        edge_name = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
-        edge = tmux("-S", info["tmux_socket"], "display-message", "-p", "-t", info["target_pane"], f"#{{{edge_name}}}")
-        if edge.returncode == 0 and edge.stdout.strip() == "0":
-            return True
+    """Ask the shared navigation policy whether this relay hop owns a request."""
+    load_navigation_runtime()
+    action = navigation_actions.get(scope)
+    if action is None:
         return False
-    # window / move: check session has more than one window
-    fields = tmux(
-        "-S", info["tmux_socket"], "display-message", "-p", "-t", info["target_pane"],
-        "#{session_id} #{session_windows} #{window_id}",
+    current = navigation_scope(
+        socket=info["tmux_socket"],
+        pane=info["pane"],
+        session=info["session"],
     )
-    if fields.returncode == 0:
-        parts = fields.stdout.split()
-        if len(parts) == 3 and parts[1].isdigit() and int(parts[1]) > 1:
-            return True
-    return False
+    return navigation_backend.can_execute(current, action, direction)
 
 
 def execute_local(scope: str, direction: str, info: dict) -> bool:
-    """Mutation halves from v1 route(), single atomic stale+edge+mutate per scope."""
-    load_commit_runtime()
-    expected_guard = f"#{{==:#{{pane_id}},{info['pane']}}}"
-    if scope == "pane":
-        # The session target makes pane_id the pane the user currently owns.
-        # Combine that stale check with the edge check and mutation in one tmux
-        # command so another client cannot redirect a delayed commit.
-        edge_var = {"left": "pane_at_left", "down": "pane_at_bottom", "up": "pane_at_top", "right": "pane_at_right"}[direction]
-        active_edge_fmt = f"#{{&&:{expected_guard},#{{!=:#{{{edge_var}}},1}}}}"
-        guarded = tmux(
-            "-S",
-            info["tmux_socket"],
-            "if-shell",
-            "-F",
-            "-t",
-            info["session"],
-            active_edge_fmt,
-            f"select-pane -t '{info['target_pane']}' -{PANE_DIRECTIONS[direction]}",
-            "run-shell 'false'",
-        )
-        return guarded.returncode == 0
-    if scope == "window":
-        # Single atomic: pane must be active and session must have >1 window,
-        # then switch — all in one if-shell for stale+edge+mutate.
-        guard = f"#{{&&:{expected_guard},#{{!=:#{{session_windows}},1}}}}"
-        guarded = tmux(
-            "-S",
-            info["tmux_socket"],
-            "if-shell",
-            "-F",
-            "-t",
-            info["session"],
-            guard,
-            f"{WINDOW_DIRECTIONS[direction]} -t '{info['session']}'",
-            "run-shell 'false'",
-        )
-        return guarded.returncode == 0
-    # move
-    fields = tmux(
-        "-S", info["tmux_socket"], "display-message", "-p", "-t", info["target_pane"],
-        "#{session_id} #{session_windows} #{window_id}",
-    )
-    if fields.returncode != 0:
+    """Execute one prepared relay request through the shared tmux backend."""
+    load_navigation_runtime()
+    action = navigation_actions.get(scope)
+    if action is None:
         return False
-    parts = fields.stdout.split()
-    if len(parts) != 3 or not parts[1].isdigit() or int(parts[1]) <= 1:
-        return False
-    # Move retains the existing stable window-ID adjacency lookup, while the
-    # final stale-focus check and swap execute as one tmux command.
-    listed = tmux(
-        "-S", info["tmux_socket"], "list-windows", "-t", parts[0],
-        "-F", "#{window_id} #{window_index}",
+    current = navigation_scope(
+        socket=info["tmux_socket"],
+        pane=info["pane"],
+        session=info["session"],
     )
-    windows = [line.split() for line in listed.stdout.splitlines()]
-    window_ids = [item[0] for item in windows if len(item) == 2]
-    if listed.returncode != 0 or parts[2] not in window_ids:
-        return False
-    source_index = window_ids.index(parts[2])
-    target_index = source_index + (-1 if direction == "left" else 1)
-    if target_index < 0 or target_index >= len(window_ids):
-        return True
-    guarded = tmux(
-        "-S",
-        info["tmux_socket"],
-        "if-shell",
-        "-F",
-        "-t",
-        info["session"],
-        expected_guard,
-        (
-            f"swap-window -d -s '{parts[0]}:{windows[source_index][0]}' "
-            f"-t '{parts[0]}:{windows[target_index][0]}'"
-        ),
-        "run-shell 'false'",
+    return (
+        navigation_backend.execute(current, action, direction)
+        is navigation_outcome.HANDLED
     )
-    if guarded.returncode == 0:
-        return True
-    return False
 
 
 def commit_command(
     tmux_socket: str,
     client_tty: str,
     client_pid: int,
+    client_created: int,
     passthrough_state: int | None = None,
     passthrough_pane: str | None = None,
 ) -> int:
@@ -795,95 +892,128 @@ def commit_command(
             )
         return 0
 
-    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
-        if not re.fullmatch(r"[0-9]+", str(client_pid)) or int(client_pid) <= 0:
+    if not re.fullmatch(r"[0-9]+", str(client_pid)) or int(client_pid) <= 0:
+        return unmatched()
+    try:
+        st = os.stat(client_tty)
+        if not stat.S_ISCHR(st.st_mode):
             return unmatched()
-        try:
-            st = os.stat(client_tty)
-            if not stat.S_ISCHR(st.st_mode):
-                return unmatched()
-        except OSError:
-            return unmatched()
-        listed = tmux("-S", tmux_socket, "list-clients", "-F", "#{client_tty} #{client_pid}")
-        if listed.returncode != 0:
-            return unmatched()
-        if not any(line.split() == [client_tty, str(client_pid)] for line in listed.stdout.splitlines() if len(line.split()) == 2):
-            return unmatched()
-    directive = claim_directive_for_client(tmux_socket, client_tty, int(client_pid))
+    except OSError:
+        return unmatched()
+    listed = tmux(
+        "-S",
+        tmux_socket,
+        "list-clients",
+        "-F",
+        "#{client_tty} #{client_pid} #{client_created}",
+    )
+    if listed.returncode != 0:
+        return unmatched()
+    if not any(
+        line.split() == [client_tty, str(client_pid), str(client_created)]
+        for line in listed.stdout.splitlines()
+        if len(line.split()) == 3
+    ):
+        return unmatched()
+    directive = claim_directive_for_client(
+        tmux_socket,
+        client_tty,
+        int(client_pid),
+        int(client_created),
+    )
     if not directive:
         return unmatched()
     if directive.get("tmux_socket") != tmux_socket:
+        record_result(tmux_socket, directive["nonce"], False)
         return 0
-    if directive.get("local_client_tty") != client_tty or int(directive.get("local_client_pid", -1)) != int(client_pid):
+    if directive.get("local_client_tty") != client_tty or int(
+        directive.get("local_client_pid", -1)
+    ) != int(client_pid):
+        record_result(tmux_socket, directive["nonce"], False)
         return 0
-    if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") != "1":
-        # Session-scoped validation: tty/pid must remain attached to the directive's session
-        sess = directive.get("session")
-        if not isinstance(sess, str):
-            # Forward directives now carry session; reject if missing
-            return 0
-        listed2 = tmux("-S", tmux_socket, "list-clients", "-t", sess, "-F", "#{client_tty} #{client_pid}")
-        if listed2.returncode != 0 or not any(line.split() == [client_tty, str(client_pid)] for line in listed2.stdout.splitlines() if len(line.split()) == 2):
-            return 0
+    # Selection was inferred when the action was armed. Re-run that same
+    # conservative policy at the irreversible boundary so a focus, pane, or
+    # linked-session handoff cannot redirect the terminal response.
+    if not validate_directive_client(directive):
+        record_result(tmux_socket, directive["nonce"], False)
+        return 0
     if directive["action"] == "forward":
-        tmux("-S", tmux_socket, "send-keys", "-t", directive["forward_pane"], "-H", *[f"{byte:02x}" for byte in COMMIT_KEY])
+        forwarded = tmux(
+            "-S",
+            tmux_socket,
+            "send-keys",
+            "-t",
+            directive["forward_pane"],
+            "-H",
+            *[f"{byte:02x}" for byte in COMMIT_KEY],
+        )
+        record_result(tmux_socket, directive["nonce"], forwarded.returncode == 0)
         return 0
-    info = {"tmux_socket": tmux_socket, "pane": directive["expected_pane"], "session": directive["session"], "target_pane": directive["target_pane"]}
-    execute_local(directive["scope"], directive["direction"], info)
+    info = {
+        "tmux_socket": tmux_socket,
+        "pane": directive["expected_pane"],
+        "session": directive["session"],
+        "target_pane": directive["target_pane"],
+    }
+    handled = execute_local(directive["scope"], directive["direction"], info)
+    record_result(tmux_socket, directive["nonce"], handled)
     return 0
 
 
-def capture_local_client(info: dict) -> tuple[str | None, int | None]:
-    # Hop-local identity is authoritative from the relay server's retained env
-    # captured at ssh_command spawn time — no re-query at navigate time
-    tty = os.environ.get("TERMNAV_RELAY_CLIENT_TTY")
-    pid_s = os.environ.get("TERMNAV_RELAY_CLIENT_PID")
-    if not tty:
-        return None, None
-    try:
-        return tty, int(pid_s) if pid_s else None
-    except ValueError:
-        return tty, None
+def directive_client(directive: dict) -> object:
+    """Rebuild the inferred client whose route was selected during prepare."""
+
+    load_navigation_runtime()
+    pane = directive.get("expected_pane") or directive.get("forward_pane")
+    return navigation_client(
+        activity=0,
+        pid=directive["local_client_pid"],
+        tty=directive["local_client_tty"],
+        termtype="",
+        session=directive["session"],
+        pane=pane,
+        socket=directive["tmux_socket"],
+        created=directive["local_client_created"],
+    )
 
 
-def resolve_client_tty(info: dict, expected_tty: str | None, expected_pid: int | None) -> str | None:
-    if not expected_tty:
-        return None
-    listed = tmux("-S", info["tmux_socket"], "list-clients", "-t", info["session"],
-                  "-F", "#{client_tty} #{client_pid}")
-    if listed.returncode != 0:
-        return None
-    for line in listed.stdout.splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
-        tty, pid_str = parts
-        if tty != expected_tty:
-            continue
+def validate_directive_client(directive: dict) -> bool:
+    """Reapply the full inferred-client selection rule at commit time."""
+
+    load_navigation_runtime()
+    return navigation_backend.validate_client(
+        directive_client(directive), directive["started_at"]
+    )
+
+
+def make_directive(info: dict, nonce: str, action: str, **fields: object) -> dict:
+    """Create one pending directive from a single live-client snapshot."""
+
+    client = info["client"]
+    return {
+        "v": 2,
+        "nonce": nonce,
+        "action": action,
+        "tmux_socket": info["tmux_socket"],
+        "session": info["session"],
+        "local_client_tty": client.tty,
+        "local_client_pid": client.pid,
+        "local_client_created": client.created,
+        "started_at": info["started_at"],
+        **fields,
+    }
+
+
+def emit_commit(client_tty: str | None, *, direct_terminal: bool = False) -> bool:
+    """Write the single terminal barrier after route validation is complete."""
+
+    tty_path = client_tty
+    if direct_terminal:
         try:
-            if expected_pid is not None and int(pid_str) != expected_pid:
-                continue
-            # Reduce PID-reuse risk: check pid still alive
-            if expected_pid is not None:
-                os.kill(expected_pid, 0)
-        except (ValueError, OSError):
-            continue
-        return tty
-    return None
-
-
-def emit_commit(local_client_tty: str | None, local_client_pid: int | None, nonce: str, info: dict | None) -> bool:
-    # Validate hop-local client tty/pid (not origin-forwarded)
-    tty_path = os.environ.get("TERMNAV_RELAY_EMIT_TTY")
-    if not tty_path:
-        if info is None:
-            try:
-                if local_client_tty and os.path.samefile(local_client_tty, "/dev/tty"):
-                    tty_path = local_client_tty
-            except OSError:
+            if not tty_path or not os.path.samefile(tty_path, "/dev/tty"):
                 tty_path = None
-        else:
-            tty_path = resolve_client_tty(info, local_client_tty, local_client_pid)
+        except OSError:
+            tty_path = None
     if not tty_path:
         debug("terminal commit has no validated client tty")
         return False
@@ -902,41 +1032,58 @@ def emit_commit(local_client_tty: str | None, local_client_pid: int | None, nonc
         return False
 
 
+def terminal_client() -> object | None:
+    """Describe a direct terminal-owned SSH process outside tmux."""
+
+    load_navigation_runtime()
+    tty = os.environ.get("TERMNAV_RELAY_CLIENT_TTY", "")
+    pid_text = os.environ.get("TERMNAV_RELAY_CLIENT_PID", "")
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+    if not tty or pid <= 0:
+        return None
+    return navigation_client(
+        activity=0,
+        pid=pid,
+        tty=tty,
+        termtype=os.environ.get("TERM", ""),
+        session="",
+        pane="",
+        socket="",
+        exact=True,
+    )
+
+
+def dispatch_terminal(info: dict | None, scope: str, direction: str) -> str:
+    """Continue a top relay hop through Termnav's shared terminal backend."""
+
+    load_navigation_runtime()
+    action = navigation_actions.get(scope)
+    if action is None:
+        return "error"
+    client = info.get("client") if info is not None else terminal_client()
+    if info is None and client is None:
+        return "declined"
+    if client is not None and not navigation_backend.validate_client(
+        client, int(time.time())
+    ):
+        return "error"
+    outcome = navigation_backend.terminal(client, action, direction)
+    if outcome is navigation_outcome.HANDLED:
+        return "armed"
+    if outcome is navigation_outcome.DECLINED:
+        return "declined"
+    return "error"
+
+
 def handle_navigate(request: dict) -> dict:
-    # Validate nonce
+    """Route one action and commit a local tmux mutation through the terminal."""
+
     nonce = request.get("nonce")
     if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
         return {"v": 2, "result": "error"}
-    # Test hooks
-    test_log = os.environ.get("TERMNAV_RELAY_TEST_LOG")
-    if test_log is not None:
-        try:
-            with open(test_log, "a", encoding="utf-8") as output:
-                output.write(f"{request.get('scope')} {request.get('direction')}\n")
-        except OSError:
-            pass
-        delay = os.environ.get("TERMNAV_RELAY_TEST_HANDLE_DELAY")
-        if delay is not None:
-            try:
-                delay_seconds = float(delay)
-            except ValueError:
-                delay_seconds = -1
-            # This hook deliberately holds the serialized handler lock. Keep it
-            # narrow enough to exercise the two-second client timeout without
-            # allowing stale test environments to stall a server indefinitely.
-            if 0 <= delay_seconds <= 3:
-                time.sleep(delay_seconds)
-            try:
-                with open(test_log, "a", encoding="utf-8") as output:
-                    output.write(
-                        f"completed {request.get('scope')} {request.get('direction')}\n"
-                    )
-            except OSError:
-                pass
-        result = os.environ.get("TERMNAV_RELAY_TEST_RESULT", "armed")
-        if result in ("armed", "declined", "error", "emitted"):
-            return {"v": 2, "result": result}
-        return {"v": 2, "result": "armed"}
     scope = request.get("scope")
     direction = request.get("direction")
     if not isinstance(scope, str) or not isinstance(direction, str):
@@ -944,200 +1091,193 @@ def handle_navigate(request: dict) -> dict:
     if not is_valid_request(scope, direction):
         return {"v": 2, "result": "error"}
     info = local_scope()
-    # Determine if this hop can handle (read-only)
-    can = False
-    if info is not None:
-        try:
-            can = can_handle(scope, direction, info)
-        except Exception:
-            can = False
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE") and info is None:
+        return {"v": 2, "result": "error"}
+    can = info is not None and can_handle(scope, direction, info)
     if can:
-        # TERMNAV_RELAY_DIRECT=1 bypasses arming entirely (claim-free direct execute)
-        if os.environ.get("TERMNAV_RELAY_DIRECT") == "1":
-            try:
-                executed = execute_local(scope, direction, info)  # type: ignore[arg-type]
-            except Exception:
-                executed = False
-            if executed:
-                return {"v": 2, "result": "armed"}
-            return {"v": 2, "result": "error"}
-        # Capture hop-local client identity
-        local_tty, local_pid = capture_local_client(info)  # type: ignore[arg-type]
-        # For detached tmux, client_tty may be dummy; still need valid pid for directive
-        if local_pid is None:
-            # Try to get pid from env fallback
-            pid_s = os.environ.get("TERMNAV_RELAY_CLIENT_PID")
-            try:
-                local_pid = int(pid_s) if pid_s else 99999
-            except ValueError:
-                local_pid = 99999
-        if not local_tty:
-            # No client tty — fail closed (emit will fail); but still need directive for test hook?
-            # Use dummy if test hook active, else error
-            if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") == "1":
-                local_tty = "/dev/pts/99"
-            else:
-                return {"v": 2, "result": "error"}
         tmux_socket = info["tmux_socket"]  # type: ignore[index]
-        directive = {
-            "v": 2,
-            "nonce": nonce,
-            "action": "execute",
-            "tmux_socket": tmux_socket,
-            "session": info["session"],  # type: ignore[index]
-            "expected_pane": info["pane"],  # type: ignore[index]
-            "target_pane": info["target_pane"],  # type: ignore[index]
-            "scope": scope,
-            "direction": direction,
-            "local_client_tty": local_tty,
-            "local_client_pid": local_pid,
-        }
+        directive = make_directive(
+            info,  # type: ignore[arg-type]
+            nonce,
+            "execute",
+            expected_pane=info["pane"],  # type: ignore[index]
+            target_pane=info["target_pane"],  # type: ignore[index]
+            scope=scope,
+            direction=direction,
+        )
         try:
             _arm_directive_and_seq(tmux_socket, directive)
-        except (ValueError, FileExistsError, OSError) as exc:
+        except (ValueError, FileExistsError, RuntimeError, OSError) as exc:
             debug(f"cannot arm execute directive: {exc!r}")
             return {"v": 2, "result": "error"}
-        parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+        parent = parent_relay(info)
         if parent:
-            # Forward commit-path up
-            reply = send_message(parent, {"v": 2, "op": "commit-path", "nonce": nonce})
-            if reply.get("result") == "emitted":
-                # Extend TTL on success
-                try:
-                    mark_committed(tmux_socket, nonce)
-                except OSError:
-                    pass
-                return {"v": 2, "result": "armed"}
-            debug(f"parent commit path did not emit: {reply!r}")
-            # Non-emitted: exact cleanup
-            try:
-                claim_directive_nonce(tmux_socket, nonce)
-            except Exception:
-                pass
+            prepared = send_message(
+                parent, {"v": 2, "op": "prepare-path", "nonce": nonce}
+            )
+            if prepared.get("result") != "prepared":
+                debug(f"parent commit path did not prepare: {prepared!r}")
+                abort_parent(parent, nonce)
+                discard_directive(tmux_socket, nonce)
+                return {"v": 2, "result": "error"}
+        if not validate_directive_client(directive):
+            abort_parent(parent, nonce)
+            discard_directive(tmux_socket, nonce)
             return {"v": 2, "result": "error"}
-        # Top hop: emit
-        ok = emit_commit(local_tty, local_pid, nonce, info)
-        if ok:
-            try:
-                mark_committed(tmux_socket, nonce)
-            except OSError:
-                pass
+        if not mark_committed(tmux_socket, nonce):
+            abort_parent(parent, nonce)
+            discard_directive(tmux_socket, nonce)
+            return {"v": 2, "result": "error"}
+        if parent:
+            # The RPC reply is advisory once commit begins: the outer hop may
+            # have emitted the terminal query before its reply was lost. Only
+            # this exact directive's durable receipt can prove safe completion;
+            # otherwise wait_for_consumption removes it and poisons the client
+            # before a late User8 can be mistaken for a later action.
+            send_message(parent, {"v": 2, "op": "commit-path", "nonce": nonce})
+        else:
+            if not emit_commit(directive["local_client_tty"]):
+                discard_directive(tmux_socket, nonce)
+                debug("terminal commit emission failed")
+                return {"v": 2, "result": "error"}
+        if wait_for_consumption(tmux_socket, nonce):
             return {"v": 2, "result": "armed"}
-        # Emit failed: cleanup
-        try:
-            claim_directive_nonce(tmux_socket, nonce)
-        except Exception:
-            pass
-        debug("terminal commit emission failed")
+        debug("terminal commit response was not consumed")
         return {"v": 2, "result": "error"}
-    # Cannot handle here
-    parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+    parent = parent_relay(info)
     if parent:
-        reply = send_message(parent, {"v": 2, "op": "navigate", "scope": scope, "direction": direction, "nonce": nonce})
-        # Relay verbatim
-        if isinstance(reply, dict) and reply.get("v") == 2 and reply.get("result") in ("armed", "declined", "error", "emitted"):
+        reply = send_message(
+            parent,
+            {
+                "v": 2,
+                "op": "navigate",
+                "scope": scope,
+                "direction": direction,
+                "nonce": nonce,
+            },
+        )
+        if (
+            isinstance(reply, dict)
+            and reply.get("v") == 2
+            and reply.get("result") in ("armed", "declined", "error", "emitted")
+        ):
             return reply
         return {"v": 2, "result": "error"}
-    return {"v": 2, "result": "declined"}
+    return {"v": 2, "result": dispatch_terminal(info, scope, direction)}
 
 
-def handle_commit_path(request: dict) -> dict:
+def handle_prepare_path(request: dict) -> dict:
+    """Build every outward forwarding hop before any commit query is emitted."""
+
     nonce = request.get("nonce")
     if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
         return {"v": 2, "result": "error"}
-    test_log = os.environ.get("TERMNAV_RELAY_TEST_LOG")
-    if test_log is not None:
-        try:
-            with open(test_log, "a", encoding="utf-8") as output:
-                output.write(f"commit-path {nonce}\n")
-        except OSError:
-            pass
-        # Test hook result still goes through normal arming? For commit-path, just honor result if set
-        # But we still need to arm forward directive when handled; simplified: if no tmux scope skip arm
-        pass
     info = local_scope()
-    # If this hop has a tmux scope, arm forward directive
-    if info is not None:
-        local_tty, local_pid = capture_local_client(info)
-        if local_pid is None:
-            pid_s = os.environ.get("TERMNAV_RELAY_CLIENT_PID")
-            try:
-                local_pid = int(pid_s) if pid_s else 99999
-            except ValueError:
-                local_pid = 99999
-        if not local_tty:
-            if os.environ.get("TERMNAV_RELAY_TEST_SKIP_TTY_VALIDATION") == "1":
-                local_tty = "/dev/pts/99"
-            else:
-                local_tty = None
-        if local_tty is not None:
-            tmux_socket = info["tmux_socket"]
-            directive = {
-                "v": 2,
-                "nonce": nonce,
-                "action": "forward",
-                "tmux_socket": tmux_socket,
-                "session": info["session"],
-                "forward_pane": info["pane"],
-                "local_client_tty": local_tty,
-                "local_client_pid": local_pid,
-            }
-            try:
-                _arm_directive_and_seq(tmux_socket, directive)
-            except (ValueError, FileExistsError, OSError) as exc:
-                debug(f"cannot arm forward directive: {exc!r}")
-                return {"v": 2, "result": "error"}
-            parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
-            if parent:
-                reply = send_message(parent, {"v": 2, "op": "commit-path", "nonce": nonce})
-                if reply.get("result") == "emitted":
-                    try:
-                        mark_committed(tmux_socket, nonce)
-                    except OSError:
-                        pass
-                    return {"v": 2, "result": "emitted"}
-                # Non-emitted: exact cleanup of this hop's forward directive
-                try:
-                    claim_directive_nonce(tmux_socket, nonce)
-                except Exception:
-                    pass
-                # Relay non-emitted result verbatim? Spec: remove then relay error? For forward, on non-emitted remove and relay error
-                if isinstance(reply, dict) and reply.get("v") == 2 and reply.get("result") in ("armed", "declined", "error", "emitted"):
-                    # For navigate forward we relay verbatim, for commit-path forward we should relay emitted/error
-                    # If parent returned error/declined, relay it; but cleanup already done
-                    if reply.get("result") == "emitted":
-                        return reply
-                    return {"v": 2, "result": "error"}
-                return {"v": 2, "result": "error"}
-            # Top hop: emit
-            ok = emit_commit(local_tty, local_pid, nonce, info)
-            if ok:
-                try:
-                    mark_committed(tmux_socket, nonce)
-                except OSError:
-                    pass
-                return {"v": 2, "result": "emitted"}
-            try:
-                claim_directive_nonce(tmux_socket, nonce)
-            except Exception:
-                pass
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE") and info is None:
+        return {"v": 2, "result": "error"}
+    parent = parent_relay(info)
+    if info is None:
+        if not parent:
+            return {"v": 2, "result": "prepared"}
+        return send_message(parent, request)
+
+    tmux_socket = info["tmux_socket"]
+    directive = make_directive(
+        info,
+        nonce,
+        "forward",
+        forward_pane=info["pane"],
+    )
+    try:
+        _arm_directive_and_seq(tmux_socket, directive)
+    except (ValueError, FileExistsError, RuntimeError, OSError) as exc:
+        debug(f"cannot prepare forward directive: {exc!r}")
+        return {"v": 2, "result": "error"}
+    if not parent:
+        return {"v": 2, "result": "prepared"}
+    reply = send_message(parent, request)
+    if reply.get("result") == "prepared":
+        return reply
+    abort_parent(parent, nonce)
+    discard_directive(tmux_socket, nonce)
+    return {"v": 2, "result": "error"}
+
+
+def handle_abort_path(request: dict) -> dict:
+    """Remove every prepared outward hop after a failed prepare transaction."""
+
+    nonce = request.get("nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        return {"v": 2, "result": "error"}
+
+    load_navigation_runtime()
+    current = navigation_backend.current_scope()
+    if current is not None:
+        directive = _read_directive(current.socket, nonce)
+        if directive is not None:
+            client = directive_client(directive)
+            parent = process_env(client.pid, "TERMNAV_PARENT_RELAY") or ""
+            discard_directive(current.socket, nonce)
+        else:
+            # Repeated aborts are intentionally idempotent. Re-resolving the
+            # current hop is best effort; any unreachable prepared ancestor is
+            # still reclaimed by the crash-only preparation lease.
+            parent = parent_relay(local_scope())
+        abort_parent(parent, nonce)
+        return {"v": 2, "result": "aborted"}
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+        return {"v": 2, "result": "error"}
+
+    abort_parent(parent_relay(None), nonce)
+    return {"v": 2, "result": "aborted"}
+
+
+def handle_commit_path(request: dict) -> dict:
+    """Expose a prepared path from the outside inward, then await consumption."""
+
+    nonce = request.get("nonce")
+    if not isinstance(nonce, str) or not re.fullmatch(r"[0-9a-f]{12}", nonce):
+        return {"v": 2, "result": "error"}
+    load_navigation_runtime()
+    current = navigation_backend.current_scope()
+    if current is not None:
+        tmux_socket = current.socket
+        directive = _read_directive(tmux_socket, nonce)
+        if directive is None or directive.get("action") != "forward":
             return {"v": 2, "result": "error"}
-    # No tmux scope: arm nothing, just forward
-    parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+        if not validate_directive_client(directive):
+            discard_directive(tmux_socket, nonce)
+            return {"v": 2, "result": "error"}
+        if not mark_committed(tmux_socket, nonce):
+            discard_directive(tmux_socket, nonce)
+            return {"v": 2, "result": "error"}
+        client = directive_client(directive)
+        parent = process_env(client.pid, "TERMNAV_PARENT_RELAY") or ""
+        if parent:
+            send_message(parent, {"v": 2, "op": "commit-path", "nonce": nonce})
+        else:
+            if not emit_commit(client.tty):
+                discard_directive(tmux_socket, nonce)
+                return {"v": 2, "result": "error"}
+        if wait_for_consumption(tmux_socket, nonce):
+            return {"v": 2, "result": "emitted"}
+        return {"v": 2, "result": "error"}
+    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+        return {"v": 2, "result": "error"}
+    parent = parent_relay(None)
     if parent:
         reply = send_message(parent, {"v": 2, "op": "commit-path", "nonce": nonce})
-        if isinstance(reply, dict) and reply.get("v") == 2 and reply.get("result") in ("armed", "declined", "error", "emitted"):
+        if (
+            isinstance(reply, dict)
+            and reply.get("v") == 2
+            and reply.get("result") in ("armed", "declined", "error", "emitted")
+        ):
             return reply
         return {"v": 2, "result": "error"}
-    # Top hop without tmux: emit via /dev/tty fallback? But no info, try emit_commit with no info
-    # Try to capture client tty from env for tmux-less top hop
+    # A direct terminal-owned SSH process has no forwarding directive. Its
+    # launch-time tty still identifies the one terminal barrier.
     local_tty = os.environ.get("TERMNAV_RELAY_CLIENT_TTY")
-    local_pid_s = os.environ.get("TERMNAV_RELAY_CLIENT_PID")
-    try:
-        local_pid = int(local_pid_s) if local_pid_s else None
-    except ValueError:
-        local_pid = None
-    ok = emit_commit(local_tty, local_pid, nonce, None)
+    ok = emit_commit(local_tty, direct_terminal=True)
     if ok:
         return {"v": 2, "result": "emitted"}
     return {"v": 2, "result": "error"}
@@ -1159,7 +1299,9 @@ def handle_focus(request: dict) -> dict:
 
     info = local_scope()
     if info is None:
-        parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
+        if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
+            return {"v": 2, "result": "error"}
+        parent = parent_relay(info)
         if not parent:
             return {"v": 2, "result": "declined"}
         reply = send_message(parent, request)
@@ -1179,28 +1321,10 @@ def handle_focus(request: dict) -> dict:
     # abandoned claim after the bounded lease.
     if published.start_expirer:
         focus_command = Path(__file__).resolve().with_name("termnav-tmux-focus")
-        if not focus_start_expirer(
-            focus_command, info["tmux_socket"], info["pane"]
-        ):
+        if not focus_start_expirer(focus_command, info["tmux_socket"], info["pane"]):
             focus_release(info["tmux_socket"], info["pane"], token)
             return {"v": 2, "result": "error"}
     return {"v": 2, "result": "claimed"}
-
-
-def route(scope: str, direction: str) -> bool:
-    # Backward-compat shim: uses split helpers
-    test_log = os.environ.get("TERMNAV_RELAY_TEST_LOG")
-    if test_log:
-        with open(test_log, "a", encoding="utf-8") as output:
-            output.write(f"{scope} {direction}\n")
-        return True
-    info = local_scope()
-    if info is not None and can_handle(scope, direction, info):
-        return execute_local(scope, direction, info)
-    parent = os.environ.get("TERMNAV_PARENT_RELAY", "")
-    if parent:
-        return send_request(parent, scope, direction)
-    return False
 
 
 def serve(path: str) -> int:
@@ -1234,13 +1358,61 @@ def serve(path: str) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
+    def dispatch(request: dict) -> dict:
+        """Run one validated protocol operation."""
+
+        op = request.get("op")
+        if op == "navigate":
+            if not all(key in request for key in ("scope", "direction", "nonce")):
+                return {"v": 2, "result": "error"}
+            debug(f"begin {request.get('nonce')} navigate")
+            reply = handle_navigate(request)
+            debug(f"end {request.get('nonce')} navigate")
+            return reply
+        if op == "prepare-path":
+            if "nonce" not in request:
+                return {"v": 2, "result": "error"}
+            debug(f"begin {request.get('nonce')} prepare")
+            reply = handle_prepare_path(request)
+            debug(f"end {request.get('nonce')} prepare")
+            return reply
+        if op == "commit-path":
+            if "nonce" not in request:
+                return {"v": 2, "result": "error"}
+            debug(f"begin {request.get('nonce')} commit")
+            reply = handle_commit_path(request)
+            debug(f"end {request.get('nonce')} commit")
+            return reply
+        if op == "abort-path":
+            if "nonce" not in request:
+                return {"v": 2, "result": "error"}
+            debug(f"begin {request.get('nonce')} abort")
+            reply = handle_abort_path(request)
+            debug(f"end {request.get('nonce')} abort")
+            return reply
+        return {"v": 2, "result": "error"}
+
+    def dispatch_ordered(request: dict) -> dict:
+        """Serialize navigation and commit requests in accepted order."""
+
+        global NAVIGATION_NEXT, NAVIGATION_SERVING
+        with NAVIGATION_CONDITION:
+            ticket = NAVIGATION_NEXT
+            NAVIGATION_NEXT += 1
+            while ticket != NAVIGATION_SERVING:
+                NAVIGATION_CONDITION.wait()
+        try:
+            return dispatch(request)
+        finally:
+            with NAVIGATION_CONDITION:
+                NAVIGATION_SERVING += 1
+                NAVIGATION_CONDITION.notify_all()
+
     def handle(connection: socket.socket) -> None:
-        global _HANDLE_BUSY
-        # Read request before acquiring lock so stalled connections don't block
-        # the BUSY admission window (fragmented/concurrent tests)
+        # Read each bounded request before joining the ordered dispatcher, so a
+        # stalled or fragmented peer cannot reserve a navigation ticket.
         with connection:
             connection.settimeout(0.25)
-            acquired = False
             try:
                 raw = b""
                 while b"\n" not in raw and len(raw) <= 512:
@@ -1269,56 +1441,35 @@ def serve(path: str) -> int:
                     except OSError:
                         pass
                     return
-                # Non-blocking try-lock for busy admission (dispatch only)
-                acquired = HANDLE_LOCK.acquire(blocking=False)
-                if not acquired:
-                    try:
-                        connection.sendall(json.dumps({"v": 2, "result": "error", "reason": "busy"}, separators=(",", ":")).encode() + b"\n")
-                    except OSError:
-                        pass
-                    return
-                _HANDLE_BUSY = True
-                # v2 dispatch
                 if request.get("v") == 2 and "op" in request:
-                    op = request.get("op")
-                    if op == "navigate":
-                        if not all(k in request for k in ("scope", "direction", "nonce")):
-                            reply = {"v": 2, "result": "error"}
-                        else:
-                            reply = handle_navigate(request)
-                            debug(f"begin {request.get('nonce')} navigate")
-                            debug(f"end {request.get('nonce')} navigate")
-                    elif op == "commit-path":
-                        if "nonce" not in request:
-                            reply = {"v": 2, "result": "error"}
-                        else:
-                            reply = handle_commit_path(request)
-                            debug(f"begin {request.get('nonce')} commit")
-                            debug(f"end {request.get('nonce')} commit")
-                    else:
-                        reply = {"v": 2, "result": "error"}
+                    reply = dispatch_ordered(request)
                     try:
-                        connection.sendall((json.dumps(reply, separators=(",", ":")) + "\n").encode())
+                        connection.sendall(
+                            (json.dumps(reply, separators=(",", ":")) + "\n").encode()
+                        )
                     except OSError:
                         pass
                     return
-                # v1 is rejected per v18 — do not route, fail closed
-                if request.get("v") == 1:
-                    try:
-                        connection.sendall((json.dumps({"v": 2, "result": "error"}, separators=(",", ":")) + "\n").encode())
-                    except OSError:
-                        pass
-                    return
+                try:
+                    connection.sendall(
+                        (
+                            json.dumps(
+                                {"v": 2, "result": "error"}, separators=(",", ":")
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+                except OSError:
+                    pass
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                TypeError,
+                KeyError,
+                SystemExit,
+            ):
                 return
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, SystemExit):
-                return
-            finally:
-                if acquired:
-                    _HANDLE_BUSY = False
-                    try:
-                        HANDLE_LOCK.release()
-                    except RuntimeError:
-                        pass
 
     while not stopping:
         try:
@@ -1341,10 +1492,16 @@ def sweep() -> int:
 
     now = time.time()
     roots = {Path("/tmp"), Path(tempfile.gettempdir())}
-    for entry in (entry for root in roots for entry in root.glob("termnav-relay-*.sock")):
+    for entry in (
+        entry for root in roots for entry in root.glob("termnav-relay-*.sock")
+    ):
         try:
             info = entry.lstat()
-            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or now - info.st_mtime < 60:
+            if (
+                not stat.S_ISSOCK(info.st_mode)
+                or info.st_uid != os.getuid()
+                or now - info.st_mtime < 60
+            ):
                 continue
             probe = socket.socket(socket.AF_UNIX)
             probe.settimeout(0.1)
@@ -1370,9 +1527,9 @@ def ssh_destination_end(arguments: list[str]) -> tuple[int | None, int | None]:
             destination = index
             break
         option = value[:2]
-        if option in {"-V", "-v", "-A", "-a", "-C", "-f", "-G", "-g", "-K", "-k", "-M", "-N", "-n", "-q", "-s", "-T", "-t", "-X", "-x", "-Y", "-y", "-4", "-6"}:
-            index += 1
-        elif len(value) > 2 and option in {f"-{letter}" for letter in SSH_VALUE_OPTIONS if len(letter) == 1}:
+        if option in SSH_FLAG_OPTIONS or (
+            len(value) > 2 and option in SSH_ATTACHED_VALUE_OPTIONS
+        ):
             index += 1
         elif option[1:] in SSH_VALUE_OPTIONS or value in SSH_VALUE_OPTIONS:
             index += 2
@@ -1383,7 +1540,14 @@ def ssh_destination_end(arguments: list[str]) -> tuple[int | None, int | None]:
     return destination, destination + 1
 
 
-def ssh_command(arguments: list[str]) -> int:
+def ssh_command(arguments: list[str], *, stdin_tty: bool | None = None) -> int:
+    """Run SSH, enriching only an interactive session Termnav can own.
+
+    The optional tty observation keeps policy separate from process-global I/O
+    and lets tests exercise the planner without production-only environment
+    branches. Normal callers always use the real standard input descriptor.
+    """
+
     load_server_runtime()
     import secrets
 
@@ -1411,44 +1575,42 @@ def ssh_command(arguments: list[str]) -> int:
     no_value_flags = set("46AaCfGgKkMNnqTtVvXxYy")
     has_control_mode = False
     for value in arguments[:destination] if destination is not None else []:
-        if value in control_modes or value.startswith(("-W", "-O")):
-            has_control_mode = True
-        elif (
-            value.startswith("-")
-            and not value.startswith("--")
-            and set(value[1:]).issubset(no_value_flags)
-            and any(flag in value[1:] for flag in "GNTf")
+        if (
+            value in control_modes
+            or value.startswith(("-W", "-O"))
+            or (
+                value.startswith("-")
+                and not value.startswith("--")
+                and set(value[1:]).issubset(no_value_flags)
+                and any(flag in value[1:] for flag in "GNTf")
+            )
         ):
             has_control_mode = True
     option_arguments = arguments[:destination] if destination is not None else arguments
     explicit_tty = any(value.startswith("-t") for value in option_arguments)
-    stdin_tty = sys.stdin.isatty() or os.environ.get("TERMNAV_TEST_STDIN_TTY") == "1"
-    has_remote_command = command_start != len(arguments) if command_start is not None else False
+    if stdin_tty is None:
+        stdin_tty = sys.stdin.isatty()
+    has_remote_command = (
+        command_start != len(arguments) if command_start is not None else False
+    )
     # A remote command is not inherently interactive. Continue only when the
     # caller explicitly requested a tty or when OpenSSH's resolved configuration
     # proves this is an interactive login. This keeps inherited PATH
     # interposition transparent for Git, automation, and ordinary scripts.
-    if (
-        destination is None
-        or has_control_mode
-        or (not stdin_tty and not explicit_tty)
-    ):
+    if destination is None or has_control_mode or (not stdin_tty and not explicit_tty):
         return subprocess.run([binary, *arguments], check=False).returncode
 
-    test_config = os.environ.get("TERMNAV_TEST_EFFECTIVE_CONFIG")
-    if test_config is None:
-        effective = subprocess.run(
-            [binary, "-G", *arguments],
-            stdin=subprocess.DEVNULL,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if effective.returncode != 0:
-            return subprocess.run([binary, *arguments], check=False).returncode
-        test_config = effective.stdout
+    effective = subprocess.run(
+        [binary, "-G", *arguments],
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if effective.returncode != 0:
+        return subprocess.run([binary, *arguments], check=False).returncode
     settings = {}
-    for line in test_config.splitlines():
+    for line in effective.stdout.splitlines():
         key, separator, value = line.partition(" ")
         if separator:
             settings[key.lower()] = value.strip()
@@ -1479,54 +1641,11 @@ def ssh_command(arguments: list[str]) -> int:
     local_socket = runtime / f"relay-{token}.sock"
     remote_socket = f"/tmp/termnav-relay-{token}.sock"
     server_environment = os.environ.copy()
-    # Existing tmux panes predate later SSH attachments. Resolve relay metadata
-    # from the client currently driving this pane, never tmux's session-global
-    # environment (which is shared and last-attacher-wins).
-    if os.environ.get("TMUX") and os.environ.get("TMUX_PANE"):
-        server_environment.pop("TERMNAV_TMUX_SESSION", None)
-        server_environment.pop("TERMNAV_PARENT_RELAY", None)
-        clients = subprocess.run(
-            ["tmux", "list-clients", "-F", "#{client_activity}\t#{client_pid}\t#{client_tty}\t#{pane_id}\t#{client_flags}\t#{session_id}"],
-            text=True, capture_output=True, check=False,
-        )
-        candidates = []
-        for line in clients.stdout.splitlines():
-            fields = line.split("\t")
-            if len(fields) != 6 or fields[3] != os.environ["TMUX_PANE"] or not fields[0].isdigit() or not fields[1].isdigit():
-                continue
-            relay = process_env(int(fields[1]), "TERMNAV_PARENT_RELAY")
-            candidates.append((int(fields[0]), "focused" in fields[4].split(","), relay, fields[5], fields[2], fields[1]))
-        if candidates:
-            newest = max(item[0] for item in candidates)
-            leaders = [item for item in candidates if item[0] == newest]
-            focused = [item for item in leaders if item[1]]
-            chosen = focused if len(focused) == 1 else leaders
-            if len(chosen) == 1:
-                server_environment["TERMNAV_TMUX_SESSION"] = chosen[0][3]
-                server_environment["TERMNAV_RELAY_CLIENT_TTY"] = chosen[0][4]
-                server_environment["TERMNAV_RELAY_CLIENT_PID"] = chosen[0][5]
-                server_environment["TERMNAV_RELAY_CLIENT_SESSION"] = chosen[0][3]
-                server_environment["TERMNAV_RELAY_CLIENT_PANE"] = os.environ["TMUX_PANE"]
-                if chosen[0][2]:
-                    server_environment["TERMNAV_PARENT_RELAY"] = chosen[0][2]
-                else:
-                    server_environment.pop("TERMNAV_PARENT_RELAY", None)
-            else:
-                server_environment.pop("TERMNAV_PARENT_RELAY", None)
-        else:
-            # No client matched but we have a tty: capture /dev/tty for tmux-less top hop
-            try:
-                tty_path = os.readlink(f"/proc/{os.getpid()}/fd/0")
-            except OSError:
-                try:
-                    tty_path = os.ttyname(0)
-                except OSError:
-                    tty_path = None
-            if tty_path:
-                server_environment["TERMNAV_RELAY_CLIENT_TTY"] = tty_path
-                server_environment["TERMNAV_RELAY_CLIENT_PID"] = str(os.getpid())
-    else:
-        # No TMUX_PANE: try /dev/tty for tmux-less top hop emit
+    # tmux client identity is intentionally not captured here. A long-lived SSH
+    # connection can later be driven by another attached terminal; each request
+    # resolves and revalidates that live client. Outside tmux, this process and
+    # its tty remain the stable terminal identity for the lifetime of SSH.
+    if not (os.environ.get("TMUX") and os.environ.get("TMUX_PANE")):
         try:
             tty_path = os.readlink(f"/proc/{os.getpid()}/fd/0")
         except OSError:
@@ -1538,7 +1657,13 @@ def ssh_command(arguments: list[str]) -> int:
             server_environment["TERMNAV_RELAY_CLIENT_TTY"] = tty_path
             server_environment["TERMNAV_RELAY_CLIENT_PID"] = str(os.getpid())
     server = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "serve", "--socket", str(local_socket)],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "serve",
+            "--socket",
+            str(local_socket),
+        ],
         env=server_environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -1555,9 +1680,12 @@ def ssh_command(arguments: list[str]) -> int:
             return subprocess.run([binary, *arguments], check=False).returncode
 
         extra = [
-            "-o", "StreamLocalBindUnlink=yes",
-            "-o", f"RemoteForward={remote_socket}:{local_socket}",
-            "-o", "SendEnv=TERMNAV_PARENT_RELAY",
+            "-o",
+            "StreamLocalBindUnlink=yes",
+            "-o",
+            f"RemoteForward={remote_socket}:{local_socket}",
+            "-o",
+            "SendEnv=TERMNAV_PARENT_RELAY",
         ]
         # A multiplexed session retains SetEnv from the long-lived master, but
         # SendEnv values come from each mux client process. Carry the current
@@ -1571,13 +1699,32 @@ def ssh_command(arguments: list[str]) -> int:
             else destination
         )
         separator = arguments[option_end:destination]
-        enhanced = [*arguments[:option_end], *extra, *separator, *arguments[destination:]]
-        result = subprocess.run([binary, *enhanced], env=ssh_environment, check=False).returncode
+        enhanced = [
+            *arguments[:option_end],
+            *extra,
+            *separator,
+            *arguments[destination:],
+        ]
+        result = subprocess.run(
+            [binary, *enhanced], env=ssh_environment, check=False
+        ).returncode
         control_path = settings.get("controlpath", "none")
         if control_path != "none":
             subprocess.run(
-                [binary, "-S", control_path, "-O", "cancel", "-R", f"{remote_socket}:{local_socket}", arguments[destination]],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                [
+                    binary,
+                    "-S",
+                    control_path,
+                    "-O",
+                    "cancel",
+                    "-R",
+                    f"{remote_socket}:{local_socket}",
+                    arguments[destination],
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
             )
         return result
     finally:
@@ -1619,11 +1766,9 @@ def main() -> int:
         and arguments[5] == "--client-tty"
         and arguments[6].startswith("/")
     ):
-        return send_command(
-            arguments[1], arguments[2], int(arguments[4]), arguments[6]
-        )
+        return send_command(arguments[1], arguments[2], int(arguments[4]), arguments[6])
     if (
-        len(arguments) == 7
+        len(arguments) == 9
         and arguments[0] == "commit"
         and arguments[1] == "--tmux-socket"
         and arguments[2].startswith("/")
@@ -1631,11 +1776,15 @@ def main() -> int:
         and arguments[4].startswith("/")
         and arguments[5] == "--client-pid"
         and arguments[6].isdigit()
+        and arguments[7] == "--client-created"
+        and arguments[8].isdigit()
     ):
         load_commit_runtime()
-        return commit_command(arguments[2], arguments[4], int(arguments[6]))
+        return commit_command(
+            arguments[2], arguments[4], int(arguments[6]), int(arguments[8])
+        )
     if (
-        len(arguments) == 11
+        len(arguments) == 13
         and arguments[0] == "commit"
         and arguments[1] == "--tmux-socket"
         and arguments[2].startswith("/")
@@ -1643,11 +1792,13 @@ def main() -> int:
         and arguments[4].startswith("/")
         and arguments[5] == "--client-pid"
         and arguments[6].isdigit()
-        and arguments[7] == "--passthrough-decrqm"
-        and arguments[8] in {"0", "1", "2", "3", "4"}
-        and arguments[9] == "--pane"
-        and arguments[10].startswith("%")
-        and arguments[10][1:].isdigit()
+        and arguments[7] == "--client-created"
+        and arguments[8].isdigit()
+        and arguments[9] == "--passthrough-decrqm"
+        and arguments[10] in {"0", "1", "2", "3", "4"}
+        and arguments[11] == "--pane"
+        and arguments[12].startswith("%")
+        and arguments[12][1:].isdigit()
     ):
         load_commit_runtime()
         return commit_command(
@@ -1655,7 +1806,8 @@ def main() -> int:
             arguments[4],
             int(arguments[6]),
             int(arguments[8]),
-            arguments[10],
+            int(arguments[10]),
+            arguments[12],
         )
 
     load_server_runtime()
@@ -1672,30 +1824,10 @@ def main() -> int:
     commit.add_argument("--tmux-socket", required=True)
     commit.add_argument("--client-tty", required=True)
     commit.add_argument("--client-pid", required=True, type=int)
+    commit.add_argument("--client-created", required=True, type=int)
     commit.add_argument("--passthrough-decrqm", type=int, choices=range(5))
     commit.add_argument("--pane")
     subparsers.add_parser("sweep")
-    # test-only hidden subcommands for directive store
-    arm_test = subparsers.add_parser("arm-test")
-    arm_test.add_argument("--tmux-socket", required=True)
-    arm_test.add_argument("--json", required=True, dest="json_payload")
-    claim_test = subparsers.add_parser("claim-test")
-    claim_test.add_argument("--tmux-socket", required=True)
-    claim_nonce_test = subparsers.add_parser("claim-nonce-test")
-    claim_nonce_test.add_argument("--tmux-socket", required=True)
-    claim_nonce_test.add_argument("--nonce", required=True)
-    claim_client_test = subparsers.add_parser("claim-client-test")
-    claim_client_test.add_argument("--tmux-socket", required=True)
-    claim_client_test.add_argument("--client-tty", required=True)
-    claim_client_test.add_argument("--client-pid", required=True, type=int)
-    next_seq_test = subparsers.add_parser("next-seq-test")
-    next_seq_test.add_argument("--tmux-socket", required=True)
-    mark_committed_test = subparsers.add_parser("mark-committed-test")
-    mark_committed_test.add_argument("--tmux-socket", required=True)
-    mark_committed_test.add_argument("--nonce", required=True)
-    # hidden test helper for ps fallback parsing
-    parse_ps_env_test = subparsers.add_parser("parse-ps-env-test")
-    parse_ps_env_test.add_argument("name")
     args = parser.parse_args()
 
     if args.command == "send":
@@ -1709,67 +1841,12 @@ def main() -> int:
             args.tmux_socket,
             args.client_tty,
             int(args.client_pid),
+            int(args.client_created),
             args.passthrough_decrqm,
             args.pane,
         )
     if args.command == "sweep":
         return sweep()
-    # test-only: directive store helpers
-    if args.command == "arm-test":
-        try:
-            directive = json.loads(args.json_payload)
-        except (ValueError, json.JSONDecodeError) as exc:
-            print(f"termnav-relay: invalid json: {exc}", file=sys.stderr)
-            return 1
-        # auto-assign seq if missing via file-locked _next_seq
-        if "seq" not in directive:
-            try:
-                directive["seq"] = _next_seq(args.tmux_socket)
-            except OSError as exc:
-                print(f"termnav-relay: cannot assign seq: {exc}", file=sys.stderr)
-                return 1
-        # ensure tmux_socket matches the caller's socket if not provided
-        if "tmux_socket" not in directive:
-            directive["tmux_socket"] = args.tmux_socket
-        try:
-            arm_directive(directive)
-        except (ValueError, FileExistsError, OSError):
-            return 1
-        return 0
-    if args.command == "claim-test":
-        result = claim_directive(args.tmux_socket)
-        if result is not None:
-            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
-        return 0
-    if args.command == "claim-nonce-test":
-        result = claim_directive_nonce(args.tmux_socket, args.nonce)
-        if result is not None:
-            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
-        return 0
-    if args.command == "claim-client-test":
-        result = claim_directive_for_client(
-            args.tmux_socket, args.client_tty, int(args.client_pid)
-        )
-        if result is not None:
-            print(json.dumps(result, separators=(",", ":"), sort_keys=True))
-        return 0
-    if args.command == "next-seq-test":
-        try:
-            nxt = _next_seq(args.tmux_socket)
-            print(nxt)
-        except OSError as exc:
-            print(f"termnav-relay: next-seq failed: {exc}", file=sys.stderr)
-            return 1
-        return 0
-    if args.command == "mark-committed-test":
-        ok = mark_committed(args.tmux_socket, args.nonce)
-        return 0 if ok else 1
-    if args.command == "parse-ps-env-test":
-        output = sys.stdin.read()
-        value = parse_ps_environment(output, args.name)
-        if value is not None:
-            sys.stdout.write(value)
-        return 0
     return 2
 
 

@@ -17,16 +17,12 @@ commands=(
   nvim-link-host
   nvim-ssh-control-open
   nvim-tmux-open
+  termnav-navigate
   termnav-relay
-  termnav-switch-tab
   termnav-tmux-context
   termnav-tmux-focus
   tmux-follow-click
   vscode-nvim-focus
-  vscode-switch-tab
-  wezterm-move-tab
-  wezterm-select-pane
-  wezterm-switch-tab
 )
 
 die() {
@@ -64,6 +60,26 @@ for command in "${commands[@]}"; do
   link_targets+=("$BIN_DIR/$command" "$MAN_DIR/$command.1")
 done
 
+# A checkout-backed link is provider-owned only while its target remains under
+# this exact checkout. Retire any such dangling links generically, so deleting a
+# command is enough to delete its installed surface without preserving a
+# growing migration list in the installer. Files and links to other providers
+# remain user-owned.
+for target in "$BIN_DIR"/*; do
+  if [[ -L "$target" && $(readlink "$target") == "$ROOT/bin/"* &&
+  ! -e "$target" ]]; then
+    link_sources+=("")
+    link_targets+=("$target")
+  fi
+done
+for target in "$MAN_DIR"/*; do
+  if [[ -L "$target" && $(readlink "$target") == "$ROOT/man/man1/"* &&
+  ! -e "$target" ]]; then
+    link_sources+=("")
+    link_targets+=("$target")
+  fi
+done
+
 # Snapshot every destination before publishing any link. If a later link
 # fails, restoring this small journal prevents commands and documentation from
 # referring to different checkout revisions.
@@ -99,7 +115,14 @@ rollback_links() {
 
 mkdir -p "$BIN_DIR" "$MAN_DIR"
 for ((index = 0; index < ${#link_targets[@]}; index++)); do
-  if ln -sfn -- "${link_sources[$index]}" "${link_targets[$index]}"; then
+  if [[ -z "${link_sources[$index]}" ]]; then
+    if rm -f -- "${link_targets[$index]}"; then
+      continue
+    fi
+    status=$?
+    rollback_links "$((index + 1))"
+    exit "$status"
+  elif ln -sfn -- "${link_sources[$index]}" "${link_targets[$index]}"; then
     continue
   else
     status=$?

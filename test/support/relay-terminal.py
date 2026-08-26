@@ -160,6 +160,18 @@ class TerminalClient:
     def send(self, payload: bytes) -> None:
         os.write(self.master, payload)
 
+    def focus(self) -> None:
+        """Tell tmux this synthetic terminal is the focused attachment."""
+
+        self.send(b"\x1b[I")
+        self.drain()
+
+    def blur(self) -> None:
+        """Tell tmux this synthetic terminal is no longer focused."""
+
+        self.send(b"\x1b[O")
+        self.drain()
+
     def synchronize_input(self) -> None:
         """Prove all earlier client input was consumed using a bound sentinel."""
         self.harness.sentinel.unlink(missing_ok=True)
@@ -249,7 +261,8 @@ class RelayHarness:
         commit = (
             f"{shlex.quote(self.relay)} commit "
             "--tmux-socket #{q:socket_path} "
-            "--client-tty #{q:client_tty} --client-pid #{client_pid}"
+            "--client-tty #{q:client_tty} --client-pid #{client_pid} "
+            "--client-created #{client_created}"
         )
         self.tmux(tmux_socket, "set-option", "-s", "user-keys[8]", COMMIT_KEY.decode())
         self.tmux(
@@ -309,15 +322,29 @@ class RelayHarness:
         tty, pid = line.splitlines()[0].split()
         return tty, int(pid)
 
+    def focused_clients(self, tmux_socket: str) -> set[int]:
+        """Return client PIDs whose terminal-focus flag is current."""
+
+        listing = self.tmux(
+            tmux_socket,
+            "list-clients",
+            "-F",
+            "#{client_pid} #{client_flags}",
+            check=False,
+        ).stdout.splitlines()
+        return {
+            int(pid)
+            for line in listing
+            if len(fields := line.split(maxsplit=1)) == 2
+            for pid, flags in (fields,)
+            if pid.isdigit() and "focused" in flags.split(",")
+        }
+
     def start_relay(
         self,
         name: str,
         tmux_socket: str,
         pane: str,
-        session_id: str,
-        client_tty: str,
-        client_pid: int,
-        parent: str | None = None,
     ) -> str:
         relay_socket = str(self.root / f"{name}-relay.sock")
         environment = self.environment.copy()
@@ -327,16 +354,10 @@ class RelayHarness:
             {
                 "TMUX": f"{tmux_socket},0,0",
                 "TMUX_PANE": pane,
-                "TERMNAV_TMUX_SESSION": session_id,
-                "TERMNAV_RELAY_CLIENT_TTY": client_tty,
-                "TERMNAV_RELAY_CLIENT_PID": str(client_pid),
                 "TERMNAV_RELAY_LOG": str(relay_log),
             }
         )
-        if parent is not None:
-            environment["TERMNAV_PARENT_RELAY"] = parent
-        else:
-            environment.pop("TERMNAV_PARENT_RELAY", None)
+        environment.pop("TERMNAV_PARENT_RELAY", None)
         process = subprocess.Popen(
             [self.relay, "serve", "--socket", relay_socket],
             env=environment,
@@ -362,17 +383,24 @@ class RelayHarness:
         wait_for(listening, f"relay listener {name}")
         return relay_socket
 
-    def send(self, relay_socket: str, scope: str, direction: str) -> None:
+    def start_send(self, relay_socket: str, scope: str, direction: str) -> subprocess.Popen[str]:
+        """Start a request whose terminal response may be driven by the test."""
+
         environment = self.environment.copy()
         environment["TERMNAV_PARENT_RELAY"] = relay_socket
-        result = subprocess.run(
+        return subprocess.Popen(
             [self.relay, "send", scope, direction],
             env=environment,
             text=True,
-            capture_output=True,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        if result.returncode != 0:
+
+    def finish_send(self, process: subprocess.Popen[str], scope: str, direction: str) -> None:
+        """Require one asynchronous request to finish successfully."""
+
+        stdout, stderr = process.communicate(timeout=10)
+        if process.returncode != 0:
             diagnostics = []
             for relay_log in self.relay_logs:
                 if relay_log.exists():
@@ -380,9 +408,14 @@ class RelayHarness:
                         f"{relay_log.name}:\n{relay_log.read_text(encoding='utf-8')}"
                     )
             raise AssertionError(
-                f"relay send {scope} {direction} exited {result.returncode}: "
-                f"{result.stderr}\n{''.join(diagnostics)}"
+                f"relay send {scope} {direction} exited {process.returncode}: "
+                f"{stdout}{stderr}\n{''.join(diagnostics)}"
             )
+
+    def send(self, relay_socket: str, scope: str, direction: str) -> None:
+        """Run a request that completes without a test-driven terminal reply."""
+
+        self.finish_send(self.start_send(relay_socket, scope, direction), scope, direction)
 
     def active_pane(self, tmux_socket: str, session: str) -> str:
         """Return the pane carrying tmux's authoritative active flag."""
@@ -456,18 +489,12 @@ class RelayTerminalTest(unittest.TestCase):
         if current_window == 0:
             self.harness.tmux(tmux_socket, "select-pane", "-t", pane_ids[0])
             source_pane = pane_ids[0]
-        session_id = self.harness.tmux(
-            tmux_socket, "display-message", "-p", "-t", "top", "#{session_id}"
-        ).stdout.strip()
         self.harness.configure_commits(tmux_socket, terminal_replies=True)
         terminal = self.harness.attach(tmux_socket, "top")
         relay_socket = self.harness.start_relay(
             "top",
             tmux_socket,
             source_pane,
-            session_id,
-            terminal.tty,
-            terminal.pid,
         )
         return tmux_socket, source_pane, pane_ids, terminal, relay_socket
 
@@ -478,11 +505,12 @@ class RelayTerminalTest(unittest.TestCase):
             with self.subTest(state=state):
                 self.harness.tmux(tmux_socket, "select-pane", "-t", left)
                 terminal.drain()
-                self.harness.send(relay_socket, "pane", "right")
+                request = self.harness.start_send(relay_socket, "pane", "right")
                 terminal.read_until(COMMIT_QUERY)
                 active = self.harness.active_pane(tmux_socket, "top")
                 self.assertEqual(left, active, "navigation committed before the reply")
                 terminal.send(response)
+                self.harness.finish_send(request, "pane", "right")
                 wait_for(
                     lambda: self.harness.active_pane(tmux_socket, "top") == right,
                     f"pane commit for DECRQM state {state}",
@@ -493,7 +521,7 @@ class RelayTerminalTest(unittest.TestCase):
         before = self.harness.tmux(
             tmux_socket, "display-message", "-p", "-t", "top", "#{window_id}"
         ).stdout.strip()
-        self.harness.send(relay_socket, "window", "next")
+        request = self.harness.start_send(relay_socket, "window", "next")
         terminal.read_until(COMMIT_QUERY)
         self.assertEqual(
             before,
@@ -502,6 +530,7 @@ class RelayTerminalTest(unittest.TestCase):
             ).stdout.strip(),
         )
         terminal.send(DECRQM_RESPONSES[2])
+        self.harness.finish_send(request, "window", "next")
         wait_for(
             lambda: (
                 self.harness.tmux(
@@ -517,7 +546,7 @@ class RelayTerminalTest(unittest.TestCase):
         before = self.harness.tmux(
             tmux_socket, "list-windows", "-t", "top", "-F", "#{window_name}"
         ).stdout.splitlines()
-        self.harness.send(relay_socket, "move", "left")
+        request = self.harness.start_send(relay_socket, "move", "left")
         terminal.read_until(COMMIT_QUERY)
         self.assertEqual(
             before,
@@ -526,6 +555,7 @@ class RelayTerminalTest(unittest.TestCase):
             ).stdout.splitlines(),
         )
         terminal.send(DECRQM_RESPONSES[3])
+        self.harness.finish_send(request, "move", "left")
         expected = [before[1], before[0], before[2]]
         wait_for(
             lambda: (
@@ -537,10 +567,65 @@ class RelayTerminalTest(unittest.TestCase):
             "window move commit",
         )
 
+    def test_one_window_tab_selection_reaches_the_outer_terminal(self) -> None:
+        _, _, _, terminal, relay_socket = self.top_level()
+        terminal.drain()
+
+        self.harness.send(relay_socket, "window", "next")
+
+        payload = terminal.read_until(b"]1337;SetUserVar=DOT_SWITCH_TAB=")
+        self.assertIn(b"\x1b]1337;SetUserVar=DOT_SWITCH_TAB=", payload)
+
+    def test_relay_started_before_focus_switch_targets_the_live_client(self) -> None:
+        tmux_socket, _, _, first, relay_socket = self.top_level()
+        second = self.harness.attach(tmux_socket, "top")
+        first.blur()
+        second.focus()
+        wait_for(
+            lambda: self.harness.focused_clients(tmux_socket) == {second.pid},
+            "second terminal focus",
+        )
+        first.drain()
+        second.drain()
+
+        self.harness.send(relay_socket, "window", "next")
+
+        second.read_until(b"]1337;SetUserVar=DOT_SWITCH_TAB=")
+        self.assertNotIn(b"]1337;SetUserVar=DOT_SWITCH_TAB=", first.drain())
+
+    def test_one_window_tab_selection_reaches_the_vscode_window_adapter(self) -> None:
+        calls = self.harness.root / "vscode-calls"
+        curl = self.harness.root / "curl"
+        curl.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >"$TERMNAV_TEST_VSCODE_CALLS"\n',
+            encoding="utf-8",
+        )
+        curl.chmod(0o700)
+        token = "a" * 64
+        self.harness.environment.update(
+            {
+                "TERM_PROGRAM": "vscode",
+                "TERMNAV_VSCODE_SOCKET": str(self.harness.root / "vscode.sock"),
+                "TERMNAV_VSCODE_TOKEN": token,
+                "TERMNAV_VSCODE_CURL": str(curl),
+                "TERMNAV_TEST_VSCODE_CALLS": str(calls),
+            }
+        )
+        _, _, _, _, relay_socket = self.top_level()
+
+        self.harness.send(relay_socket, "window", "previous")
+
+        arguments = wait_for(
+            lambda: calls.read_text(encoding="utf-8") if calls.exists() else None,
+            "VS Code window adapter request",
+        )
+        self.assertIn(f"--unix-socket {self.harness.root / 'vscode.sock'}", arguments)
+        self.assertIn(f'{{"direction":"previous","token":"{token}"}}', arguments)
+
     def test_fragmented_response_waits_for_its_terminator(self) -> None:
         tmux_socket, left, panes, terminal, relay_socket = self.top_level(panes=2)
         right = panes[1]
-        self.harness.send(relay_socket, "pane", "right")
+        request = self.harness.start_send(relay_socket, "pane", "right")
         terminal.read_until(COMMIT_QUERY)
         terminal.send(b"\x1b[?2004;1")
         self.assertEqual(left, self.harness.active_pane(tmux_socket, "top"))
@@ -549,6 +634,7 @@ class RelayTerminalTest(unittest.TestCase):
             "the armed directive must remain pending until the reply terminates",
         )
         terminal.send(b"$y")
+        self.harness.finish_send(request, "pane", "right")
         wait_for(
             lambda: self.harness.active_pane(tmux_socket, "top") == right,
             "commit after the fragmented response terminator",
@@ -563,9 +649,10 @@ class RelayTerminalTest(unittest.TestCase):
             self.harness.active_pane(tmux_socket, "top"),
         )
 
-        self.harness.send(relay_socket, "pane", "right")
+        request = self.harness.start_send(relay_socket, "pane", "right")
         terminal.read_until(COMMIT_QUERY)
         terminal.send(DECRQM_RESPONSES[1] + DECRQM_RESPONSES[1])
+        self.harness.finish_send(request, "pane", "right")
         terminal.synchronize_input()
         self.assertEqual(
             panes[1],
@@ -628,14 +715,10 @@ class RelayTerminalTest(unittest.TestCase):
             "#{pane_id}",
             "cat",
         ).stdout.strip()
-        inner_session_id = self.harness.tmux(
-            inner_socket, "display-message", "-p", "-t", "inner", "#{session_id}"
-        ).stdout.strip()
         self.harness.tmux(inner_socket, "select-pane", "-t", inner_left)
         self.harness.configure_commits(inner_socket, terminal_replies=False)
 
-        nested_command = f"exec tmux -S {shlex.quote(inner_socket)} attach-session -t inner"
-        outer_socket = self.harness.new_server("outer", "outer", nested_command)
+        outer_socket = self.harness.new_server("outer", "outer", "cat")
         outer_nested = self.harness.tmux(
             outer_socket, "display-message", "-p", "-t", "outer", "#{pane_id}"
         ).stdout.strip()
@@ -651,37 +734,40 @@ class RelayTerminalTest(unittest.TestCase):
             "#{pane_id}",
             "cat",
         ).stdout.strip()
-        outer_session_id = self.harness.tmux(
-            outer_socket, "display-message", "-p", "-t", "outer", "#{session_id}"
-        ).stdout.strip()
         self.harness.tmux(outer_socket, "select-pane", "-t", outer_nested)
         self.harness.configure_commits(outer_socket, terminal_replies=True)
         terminal = self.harness.attach(outer_socket, "outer")
 
-        inner_tty, inner_pid = self.harness.client_identity(inner_socket)
         outer_relay = self.harness.start_relay(
             "outer",
             outer_socket,
             outer_nested,
-            outer_session_id,
-            terminal.tty,
-            terminal.pid,
         )
+        nested_command = (
+            f"exec env TERMNAV_PARENT_RELAY={shlex.quote(outer_relay)} "
+            f"tmux -S {shlex.quote(inner_socket)} attach-session -t inner"
+        )
+        self.harness.tmux(
+            outer_socket,
+            "respawn-pane",
+            "-k",
+            "-t",
+            outer_nested,
+            nested_command,
+        )
+        self.harness.client_identity(inner_socket)
         inner_relay = self.harness.start_relay(
             "inner",
             inner_socket,
             inner_left,
-            inner_session_id,
-            inner_tty,
-            inner_pid,
-            parent=outer_relay,
         )
 
         # The inner server can handle this request. The outer server therefore
         # consumes the terminal reply and forwards User8 into the nested client.
-        self.harness.send(inner_relay, "pane", "right")
+        request = self.harness.start_send(inner_relay, "pane", "right")
         terminal.read_until(COMMIT_QUERY)
         terminal.send(DECRQM_RESPONSES[4])
+        self.harness.finish_send(request, "pane", "right")
         wait_for(
             lambda: self.harness.active_pane(inner_socket, "inner") == inner_right,
             "nested User8 commit",
@@ -695,12 +781,83 @@ class RelayTerminalTest(unittest.TestCase):
         # committed directly by the nearest outer tmux scope.
         self.harness.tmux(inner_socket, "kill-pane", "-t", inner_right)
         terminal.drain()
-        self.harness.send(inner_relay, "pane", "right")
+        request = self.harness.start_send(inner_relay, "pane", "right")
         terminal.read_until(COMMIT_QUERY)
         terminal.send(DECRQM_RESPONSES[0])
+        self.harness.finish_send(request, "pane", "right")
         wait_for(
             lambda: self.harness.active_pane(outer_socket, "outer") == outer_right,
             "parent pane bubble",
+        )
+
+    def test_three_tmux_levels_prepare_before_one_terminal_barrier(self) -> None:
+        inner_socket = self.harness.new_server("deep-inner", "inner", "cat")
+        inner_left = self.harness.tmux(
+            inner_socket, "display-message", "-p", "-t", "inner", "#{pane_id}"
+        ).stdout.strip()
+        inner_right = self.harness.tmux(
+            inner_socket,
+            "split-window",
+            "-h",
+            "-d",
+            "-t",
+            "inner",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "cat",
+        ).stdout.strip()
+        self.harness.tmux(inner_socket, "select-pane", "-t", inner_left)
+        self.harness.configure_commits(inner_socket, terminal_replies=False)
+
+        middle_socket = self.harness.new_server("deep-middle", "middle", "cat")
+        middle_pane = self.harness.tmux(
+            middle_socket, "display-message", "-p", "-t", "middle", "#{pane_id}"
+        ).stdout.strip()
+        self.harness.configure_commits(middle_socket, terminal_replies=False)
+
+        outer_socket = self.harness.new_server("deep-outer", "outer", "cat")
+        outer_pane = self.harness.tmux(
+            outer_socket, "display-message", "-p", "-t", "outer", "#{pane_id}"
+        ).stdout.strip()
+        self.harness.configure_commits(outer_socket, terminal_replies=True)
+        terminal = self.harness.attach(outer_socket, "outer")
+
+        outer_relay = self.harness.start_relay("deep-outer", outer_socket, outer_pane)
+        self.harness.tmux(
+            outer_socket,
+            "respawn-pane",
+            "-k",
+            "-t",
+            outer_pane,
+            f"exec env TERMNAV_PARENT_RELAY={shlex.quote(outer_relay)} "
+            f"tmux -S {shlex.quote(middle_socket)} attach-session -t middle",
+        )
+        self.harness.client_identity(middle_socket)
+        middle_relay = self.harness.start_relay("deep-middle", middle_socket, middle_pane)
+        self.harness.tmux(
+            middle_socket,
+            "respawn-pane",
+            "-k",
+            "-t",
+            middle_pane,
+            f"exec env TERMNAV_PARENT_RELAY={shlex.quote(middle_relay)} "
+            f"tmux -S {shlex.quote(inner_socket)} attach-session -t inner",
+        )
+        self.harness.client_identity(inner_socket)
+        inner_relay = self.harness.start_relay("deep-inner", inner_socket, inner_left)
+
+        request = self.harness.start_send(inner_relay, "pane", "right")
+        terminal.read_until(COMMIT_QUERY)
+        self.assertEqual(inner_left, self.harness.active_pane(inner_socket, "inner"))
+        self.assertEqual(middle_pane, self.harness.active_pane(middle_socket, "middle"))
+        self.assertEqual(outer_pane, self.harness.active_pane(outer_socket, "outer"))
+        terminal.send(DECRQM_RESPONSES[1])
+        self.harness.finish_send(request, "pane", "right")
+
+        wait_for(
+            lambda: self.harness.active_pane(inner_socket, "inner") == inner_right,
+            "three-level nested commit",
         )
 
 

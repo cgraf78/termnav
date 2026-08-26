@@ -3,14 +3,9 @@ program	bin/eza-nvim-links
 program	bin/nvim-link-host
 program	bin/nvim-ssh-control-open
 program	bin/nvim-tmux-open
-program	bin/termnav-switch-tab
 program	bin/termnav-tmux-context
 program	bin/tmux-follow-click
 program	bin/vscode-nvim-focus
-program	bin/vscode-switch-tab
-program	bin/wezterm-move-tab
-program	bin/wezterm-select-pane
-program	bin/wezterm-switch-tab
 program	examples/tmux-follow/extensions.d/example-ticket.sh
 program	install.sh
 program	scripts/checkout-installer.conf
@@ -23,9 +18,6 @@ program	lib/termnav/nvim-open/link.sh
 program	lib/termnav/nvim-open/remote.sh
 program	lib/termnav/remote-command.sh
 program	lib/termnav/shell/file-links.sh
-program	lib/termnav/shell/vscode-backend-mcp.sh
-program	lib/termnav/shell/vscode-backend-socket.sh
-program	lib/termnav/shell/vscode-command.sh
 program	lib/termnav/shell/wezterm-vars.sh
 program	share/termnav/shell.sh
 program	share/termnav/shims/ssh
@@ -34,6 +26,9 @@ program	test/suites/ci-contract-test
 program	test/suites/examples-test
 program	test/suites/install-test
 program	test/suites/manpage-test
+program	test/suites/navigation-cli-test
+program	test/suites/navigation-test
+program	test/suites/nvim-navigation-test
 program	test/suites/nvim-launcher-test
 program	test/suites/nvim-test
 program	test/suites/remote-test
@@ -41,10 +36,8 @@ program	test/suites/relay-test
 program	test/suites/relay-performance-test
 program	test/suites/relay-terminal-test
 program	test/suites/shell-test
-program	test/suites/tab-switch-test
 program	test/suites/tmux-focus-test
 program	test/suites/tmux-test
 program	test/suites/vscode-focus-test
-program	test/suites/vscode-test
-program	test/suites/wezterm-test
+program	test/suites/wezterm-integration-test
 program	test/termnav-test

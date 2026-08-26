@@ -44,22 +44,13 @@ consumers must still select versioned VS Code payloads explicitly.
 - `bin/nvim-link-host`: print the host token for `rg --hostname-bin`.
 - `bin/nvim-ssh-control-open`: open a remote target through an existing
   SSH ControlMaster connection without starting a new authentication flow.
-- `bin/wezterm-switch-tab`: request WezTerm tab switching, including
-  parent-tmux bubbling for nested local or remote tmux sessions.
-- `bin/wezterm-move-tab`: request WezTerm tab movement, including parent-tmux
-  bubbling for nested local or remote tmux sessions.
-- `bin/wezterm-select-pane`: request directional pane selection in a parent
-  tmux through WezTerm's remote-safe terminal loopback.
-- `bin/vscode-switch-tab`: request a VS Code integrated-terminal tab switch
-  through the pluggable command-execution bridge. There is no matching
-  move/reorder command because VS Code exposes no command to reorder
-  terminal tabs (drag-only).
+- `bin/termnav-navigate`: route pane selection, tab selection, and tab movement
+  through arbitrary local tmux ancestry, SSH relays, and the originating
+  terminal. Neovim and tmux retain process-light local fast paths and invoke
+  this router only after their current scope declines.
 - `bin/vscode-nvim-focus`: publish ordered, leased Neovim focus ownership to
   the window-scoped VS Code adapter. Persistent tmux sessions resolve the
   currently focused client rather than trusting inherited window state.
-- `bin/termnav-switch-tab`: switch the nearest outer tab scope from a
-  one-window tmux session, walking locally nested tmux parents before choosing
-  the originating VS Code or WezTerm client.
 - `bin/termnav-relay`: carry pane, window, and window-move requests across
   nested SSH/tmux boundaries. Its outer commit barrier uses the standard,
   read-only DECRQM reply path supported by WezTerm and xterm.js; intermediate
@@ -97,14 +88,6 @@ consumers must still select versioned VS Code payloads explicitly.
 - `lib/termnav/shell/file-links.sh`: terminal and attached-tmux-client
   classification for choosing plain paths versus Termnav-routable OSC-8 links.
   `termnav_file_links_need_plain_output` returns success for plain output.
-- `lib/termnav/shell/vscode-command.sh`: dispatch seam for executing a VS
-  Code command by ID through a pluggable backend (`TERMNAV_VSCODE_BACKEND`,
-  automatically `socket` when the adapter is advertised, otherwise `mcp`).
-- `lib/termnav/shell/vscode-backend-socket.sh`: window-scoped backend that
-  posts an authenticated direction to the local adapter's owner-only Unix
-  socket.
-- `lib/termnav/shell/vscode-backend-mcp.sh`: legacy backend for direct callers
-  that use the `nabheet.vscode-ide-mcp` extension's local HTTP JSON-RPC API.
 - `share/termnav/vscode/termnav-0.3.0`: local VS Code extension that
   owns and publishes each window's tab-switch socket and capability. New
   integrations use the latest versioned directory declared by the consuming
@@ -153,8 +136,9 @@ through Shdeps.
   Unix-socket support. The adapter publishes a private, per-window socket into
   its terminals; VS Code, VS Code Insiders, Cursor, and compatible builds use
   the same transport without product-specific CLI discovery.
-- `nabheet.vscode-ide-mcp` is required only by direct legacy callers or when
-  `TERMNAV_VSCODE_BACKEND=mcp` is selected. Its auth token follows the dotfiles
+- `nabheet.vscode-ide-mcp` is required only when
+  `TERMNAV_VSCODE_FALLBACK_BACKEND=mcp` selects the devserver fallback. Its
+  auth token follows the dotfiles
   `vscode.sh` contract under an absolute
   `$XDG_STATE_HOME/dot` or the `$HOME/.local/state/dot` fallback.
 - `nvim-remote-pane-host` is an optional extension command for custom
@@ -254,15 +238,19 @@ can render its own borders per client, but the nested application's already
 rendered cell backgrounds cannot differ between those viewers. Distinct outer
 panes attaching distinct clients to one inner session remain independent.
 
-`termnav-switch-tab` receives the tmux client PID, TTY, and terminal type
-from the key binding that observed the chord. When that client was launched
-inside another local tmux, the helper follows its `TMUX` and `TMUX_PANE`
-environment to the parent server. Only clients whose active pane is the exact
-parent pane are eligible, which keeps linked sessions from stealing a request.
-The most recently active eligible client wins; a unique focused client breaks
-same-second ties, and unresolved ties fail closed. A parent session with
-multiple windows owns the switch immediately, while a one-window parent
-contributes its selected client and traversal continues outward.
+`termnav-navigate` receives the exact tmux client, creation stamp, and source
+scope from tmux bindings. Application-origin requests cannot carry that
+identity, so one client snapshot resolves both the logical tmux scope and any
+safe physical provenance. Local pane operations need no client, and local tab
+operations need only a session shared by the clients viewing that pane. A sole
+eligible client, unique focused client, or unique fresh client is retained when
+available so a buffered chord sequence keeps its original ancestry. Physical
+ambiguity fails closed only when the action must leave the local tmux scope.
+Every selected client is revalidated before traversal and again before terminal
+or relay dispatch, so detach, recreation, pane-switch, and session-switch races
+do not redirect a delayed chord. Linked windows use the selected client's
+session instead of whichever session happens to appear first in a server-wide
+query.
 
 At the terminal boundary, WezTerm keeps the OSC user-variable transport. Each
 VS Code window's `cgraf.termnav` adapter owns an owner-only Unix socket and
@@ -277,14 +265,11 @@ reload or restart the editor window so it discovers the adapter, then relaunch
 existing terminal or tmux clients to receive the value. The same terminal
 relaunch is required after an extension-host or editor-window restart.
 Without it the router fails closed; an MCP route is used only when
-`TERMNAV_VSCODE_FALLBACK_BACKEND=mcp` is explicitly set. Standalone
-`vscode-switch-tab` calls retain their legacy MCP default.
+`TERMNAV_VSCODE_FALLBACK_BACKEND=mcp` is explicitly set.
 
-When a remote nested tmux parent cannot be reached as a local server, the
-existing WezTerm `DOT_PARENT_SWITCH_TAB` loopback remains the fallback. An
-ordinary SSH or mosh hop cannot carry that output-side loopback into VS Code;
-a one-window remote tmux therefore fails closed there unless the caller
-provides a reverse bridge explicitly.
+There is no terminal-specific parent-tmux fallback. Local parents are followed
+through process ancestry and remote parents through the SSH relay; if neither
+route can identify the next scope, navigation is consumed without guessing.
 
 Neovim socket discovery state lives under
 an absolute `$XDG_STATE_HOME/nvim-tmux-open`, falling back to
