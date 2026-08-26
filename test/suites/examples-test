@@ -143,6 +143,8 @@ if command -v tmux >/dev/null 2>&1; then
     "termnav-navigate tab-select" "$_tmux_keys"
   _assert_contains "examples: tmux passes exact source identity" \
     "--source-socket" "$_tmux_keys"
+  _assert_contains "examples: tmux shell-quotes its dollar-prefixed session ID" \
+    '--source-session #{q:session_id}' "$_tmux_keys"
   _assert_not_contains "examples: boundary navigation preserves key order" \
     "run-shell -b" "$(grep 'termnav-navigate' "$TMUX_EXAMPLE")"
   _assert_contains "examples: tmux config wires Ctrl-click" \
