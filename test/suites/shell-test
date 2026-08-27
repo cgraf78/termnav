@@ -281,6 +281,7 @@ shell_integration="$TERMNAV_ROOT/share/termnav/shell.sh"
 ssh_shim="$TERMNAV_ROOT/share/termnav/shims/ssh"
 ssh_probe=$(_tmpdir)
 ssh_probe_bin="$ssh_probe/bin"
+python_path=$(command -v python3)
 mkdir -p "$ssh_probe_bin"
 cat >"$ssh_probe_bin/ssh" <<'SH'
 #!/usr/bin/env bash
@@ -318,6 +319,8 @@ for test_shell in bash zsh; do
   # Termux implements conventional /usr/bin shebang paths through termux-exec;
   # preserve only its LD_PRELOAD hook across env isolation so the fixture has
   # the same executable semantics as a real Termux login shell.
+  # The fixture intentionally strips the login PATH, so preserve the selected
+  # Python explicitly; native Termux does not expose it through /usr/bin.
   # shellcheck disable=SC2016
   ssh_probe_output=$(
     env -i \
@@ -329,6 +332,7 @@ for test_shell in bash zsh; do
       SHELL_INTEGRATION="$shell_integration" \
       SSH_PLAIN_LOG="$ssh_plain_log" \
       SSH_TTY_LOG="$ssh_tty_log" \
+      TERMNAV_PYTHON="$python_path" \
       TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
       "$test_shell_path" "${test_shell_args[@]}" -c '
         source "$SHELL_INTEGRATION"

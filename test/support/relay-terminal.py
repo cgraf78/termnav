@@ -511,6 +511,11 @@ class RelayTerminalTest(unittest.TestCase):
         for state, response in enumerate(DECRQM_RESPONSES):
             with self.subTest(state=state):
                 self.harness.tmux(tmux_socket, "select-pane", "-t", left)
+                # Each DECRQM reply enters through the synthetic client's
+                # input queue. Prove tmux consumed the previous reply before
+                # starting the next transaction; otherwise a fast CI worker
+                # can race client input processing and observe no next query.
+                terminal.synchronize_input()
                 terminal.drain()
                 request = self.harness.start_send(relay_socket, "pane", "right")
                 terminal.read_until(COMMIT_QUERY)
