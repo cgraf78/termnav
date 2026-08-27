@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# cli-contract-test - black-box contracts retained through the native rewrite.
+
+set -euo pipefail
+export NO_COLOR=1
+
+test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=${test_dir%/test}
+# shellcheck source=../helpers.sh
+. "$test_dir/helpers.sh"
+
+commands=(
+  eza-nvim-links
+  nvim-link-host
+  nvim-ssh-control-open
+  nvim-tmux-open
+  termnav-navigate
+  termnav-relay
+  termnav-tmux-context
+  termnav-tmux-focus
+  tmux-follow-click
+  vscode-nvim-focus
+)
+
+expected=$(printf '%s\n' "${commands[@]}" | LC_ALL=C sort)
+actual=$(
+  for path in "$root"/bin/*; do
+    [[ -f $path && -x $path ]] || continue
+    printf '%s\n' "${path##*/}"
+  done | LC_ALL=C sort
+)
+_assert_eq "CLI contract: executable inventory is explicit" "$expected" "$actual"
+
+navigate_help=$("$root/bin/termnav-navigate" --help 2>&1)
+_assert_contains "CLI contract: navigation exposes parent traversal" \
+  "--parent" "$navigate_help"
+_assert_contains "CLI contract: navigation exposes exact client identity" \
+  "--client-created" "$navigate_help"
+
+relay_help=$("$root/bin/termnav-relay" --help 2>&1)
+for command in send serve commit sweep navigate warm stop ssh; do
+  _assert_contains "CLI contract: relay exposes $command" "$command" "$relay_help"
+done
+
+focus_help=$("$root/bin/termnav-tmux-focus" --help 2>&1)
+for command in watch expire claim release stop sync; do
+  _assert_contains "CLI contract: focus exposes $command" "$command" "$focus_help"
+done
+
+set +e
+"$root/bin/termnav-navigate" pane-select diagonal >/dev/null 2>&1
+navigate_invalid_rc=$?
+"$root/bin/termnav-relay" send pane diagonal >/dev/null 2>&1
+relay_invalid_rc=$?
+"$root/bin/termnav-tmux-context" unexpected >/dev/null 2>&1
+context_invalid_rc=$?
+set -e
+_assert_exit "CLI contract: invalid navigation direction is usage error" \
+  2 "$navigate_invalid_rc"
+_assert_exit "CLI contract: invalid relay direction is usage error" \
+  2 "$relay_invalid_rc"
+_assert_exit "CLI contract: invalid context argument is usage error" \
+  2 "$context_invalid_rc"
+
+link_host=$(TERMNAV_REMOTE_LINK_HOST=contract.example.invalid \
+  "$root/bin/nvim-link-host")
+_assert_eq "CLI contract: ripgrep host helper remains zero-argument" \
+  "contract.example.invalid" "$link_host"
+
+_test_summary
