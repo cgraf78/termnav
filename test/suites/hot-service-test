@@ -24,14 +24,32 @@ provider_key_for "$root"
 hot_socket_name="hot-v1-$provider_key.sock"
 
 # Raw AF_UNIX fixtures need the same portable path discipline as the service.
-# Prefer /tmp, which is also the facade's fallback, but retain the platform's
-# configured temporary directory on systems such as Termux without /tmp.
-socket_test_base=${TMPDIR:-/tmp}
-if [[ -d /tmp && -w /tmp ]]; then
-  socket_test_base=/tmp
+# Prefer /tmp, but retain the first writable platform temporary directory on
+# systems such as native Termux where /tmp is unavailable.
+fallback_socket_base=/tmp
+if [[ ! -d $fallback_socket_base || ! -w $fallback_socket_base ]]; then
+  for candidate in "${TMPDIR:-}" "${TEMP:-}" "${TMP:-}"; do
+    case $candidate in
+      /*) ;;
+      *) continue ;;
+    esac
+    [[ -d $candidate && -w $candidate ]] || continue
+    fallback_socket_base=$candidate
+    break
+  done
 fi
-socket_test_root=$(mktemp -d "$socket_test_base/tnhs.XXXXXX")
+socket_test_root=$(mktemp -d "$fallback_socket_base/tnhs.XXXXXX")
 CLEANUP_DIRS+=("$socket_test_root")
+HOT_CLEANUP_FILES=()
+
+hot_cleanup() {
+  local path
+  for path in "${HOT_CLEANUP_FILES[@]+"${HOT_CLEANUP_FILES[@]}"}"; do
+    rm -f -- "$path"
+  done
+  _cleanup
+}
+trap hot_cleanup EXIT
 
 socket_for_runtime() {
   local runtime_root=$1 candidate key
@@ -49,8 +67,8 @@ socket_for_runtime() {
   # longer sockaddr_un limit.
   provider_key_for "$candidate"
   key=$provider_key
-  printf '/tmp/termnav-%s/hot-v1-%s.sock\n' \
-    "${UID:-$(id -u)}" "$key"
+  printf '%s/termnav-%s/hot-v1-%s.sock\n' \
+    "$fallback_socket_base" "${UID:-$(id -u)}" "$key"
 }
 
 wait_for_path() {
@@ -106,6 +124,7 @@ _assert_file_missing "hot service: ordinary repository tests start no daemon" \
 long_runtime=$(_tmpdir)/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 long_candidate="$long_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
 long_socket=$(socket_for_runtime "$long_runtime")
+HOT_CLEANUP_FILES+=("$long_socket" "${long_socket%.sock}.lock")
 XDG_RUNTIME_DIR="$long_runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=2 "$relay" warm
 if wait_for_path present "$long_socket"; then
   _pass "hot service: long runtime paths use an isolated short socket"
@@ -116,7 +135,7 @@ _assert_file_missing "hot service: long runtime paths are never bound directly" 
   "$long_candidate"
 XDG_RUNTIME_DIR="$long_runtime" "$relay" stop || true
 
-runtime=$(_tmpdir)/runtime
+runtime=$socket_test_root/a
 socket=$(socket_for_runtime "$runtime")
 XDG_RUNTIME_DIR="$runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
 if wait_for_path present "$socket"; then
@@ -238,8 +257,8 @@ else
   XDG_RUNTIME_DIR="$runtime" "$relay" stop || true
 fi
 
-sweep_runtime=$(_tmpdir)/runtime
-sweep_tmp=$socket_test_root/sweep
+sweep_runtime=$socket_test_root/b
+sweep_tmp=$socket_test_root/c
 mkdir -p "$sweep_tmp"
 sweep_socket=$(socket_for_runtime "$sweep_runtime")
 REPO_TEST=1 XDG_RUNTIME_DIR="$sweep_runtime" TMPDIR="$sweep_tmp" \
@@ -367,7 +386,7 @@ set -e
 _assert_exit "hot service: slow maintenance never blocks request admission" \
   0 "$slow_sweep_rc"
 
-stale_runtime=$(_tmpdir)/runtime
+stale_runtime=$socket_test_root/d
 stale_socket=$(socket_for_runtime "$stale_runtime")
 mkdir -p "${stale_socket%/*}"
 STALE_SOCKET="$stale_socket" python3 - <<'PY'
@@ -396,7 +415,7 @@ else
   _fail "hot service: explicit stop removes its socket"
 fi
 
-unsafe_runtime=$(_tmpdir)/runtime
+unsafe_runtime=$socket_test_root/e
 unsafe_socket=$(socket_for_runtime "$unsafe_runtime")
 mkdir -p "${unsafe_socket%/*}"
 printf 'not a socket\n' >"$unsafe_socket"
@@ -408,8 +427,8 @@ _assert_exit "hot service: unsafe runtime entries retain fallback semantics" 3 "
 _assert_file_content "hot service: unsafe runtime entries are never replaced" \
   "not a socket" "$unsafe_socket"
 
-symlink_runtime=$socket_test_root/symlink-runtime
-symlink_target=$socket_test_root/symlink-target
+symlink_runtime=$socket_test_root/f
+symlink_target=$socket_test_root/g
 mkdir -p "$symlink_runtime" "$symlink_target"
 ln -s "$symlink_target" "$symlink_runtime/termnav-${UID:-$(id -u)}"
 set +e
@@ -453,7 +472,7 @@ cat >"$unsupported_bin/curl" <<'SH'
 exit 2
 SH
 chmod 0755 "$unsupported_bin/curl"
-unsupported_runtime=$(_tmpdir)/runtime
+unsupported_runtime=$socket_test_root/h
 unsupported_socket=$(socket_for_runtime "$unsupported_runtime")
 XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" warm
 if ! wait_for_path present "$unsupported_socket"; then
@@ -468,7 +487,7 @@ _assert_exit "hot service: unsupported curl preserves the Python fallback" \
   3 "$unsupported_rc"
 XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" stop
 
-active_runtime=$(_tmpdir)/runtime
+active_runtime=$socket_test_root/i
 active_socket=$(socket_for_runtime "$active_runtime")
 REPO_TEST=1 XDG_RUNTIME_DIR="$active_runtime" \
   TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
@@ -560,7 +579,7 @@ set -e
 _assert_exit "hot service: old cleanup preserves a replacement socket" \
   0 "$identity_rc"
 
-drain_runtime=$(_tmpdir)/runtime
+drain_runtime=$socket_test_root/j
 drain_socket=$(socket_for_runtime "$drain_runtime")
 drain_ready=$(_tmpdir)/ready
 drain_release=$(_tmpdir)/release
@@ -648,7 +667,7 @@ SH
 chmod 0755 "$stale_bin/python3"
 touch -t 200001010000 "$drain_socket"
 set +e
-BASH_ENV="$stale_bash_env" PATH="$stale_bin:/usr/bin:/bin" \
+BASH_ENV="$stale_bash_env" PATH="$stale_bin:$PATH" \
   TERMNAV_PYTHON="$stale_bin/python3" \
   TERMNAV_TEST_FALLBACK_LOG="$stale_fallback_log" \
   XDG_RUNTIME_DIR="$drain_runtime" "$relay" send pane left
@@ -720,7 +739,7 @@ else
   _fail "hot service: graceful stop removes the drained service socket"
 fi
 
-concurrent_runtime=$(_tmpdir)/runtime
+concurrent_runtime=$socket_test_root/k
 concurrent_socket=$(socket_for_runtime "$concurrent_runtime")
 warm_pids=()
 for _ in 1 2 3 4 5 6 7 8; do

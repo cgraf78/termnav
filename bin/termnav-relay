@@ -76,10 +76,24 @@ socket_path_too_long() {
 
 if socket_path_too_long "$socket"; then
   # Preserve XDG/TMP runtime isolation even when the pathname itself must move
-  # to /tmp: hashing the complete preferred socket path distinguishes separate
-  # test sandboxes, login runtimes, and provider checkouts for the same user.
+  # to a shorter temporary root: hashing the complete preferred socket path
+  # distinguishes separate test sandboxes, login runtimes, and provider
+  # checkouts for the same user. Native Termux has no writable /tmp, so retain
+  # its platform TMPDIR instead of disabling the hot service there.
   provider_key_for "$socket"
-  runtime=/tmp/termnav-$uid
+  short_runtime_base=/tmp
+  if [[ ! -d $short_runtime_base || ! -w $short_runtime_base ]]; then
+    for candidate in "${TMPDIR:-}" "${TEMP:-}" "${TMP:-}"; do
+      case $candidate in
+        /*) ;;
+        *) continue ;;
+      esac
+      [[ -d $candidate && -w $candidate ]] || continue
+      short_runtime_base=$candidate
+      break
+    done
+  fi
+  runtime=$short_runtime_base/termnav-$uid
   socket=$runtime/hot-v1-$provider_key.sock
 fi
 
