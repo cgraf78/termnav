@@ -23,6 +23,36 @@ provider_key_for() {
 provider_key_for "$root"
 hot_socket_name="hot-v1-$provider_key.sock"
 
+# Raw AF_UNIX fixtures need the same portable path discipline as the service.
+# Prefer /tmp, which is also the facade's fallback, but retain the platform's
+# configured temporary directory on systems such as Termux without /tmp.
+socket_test_base=${TMPDIR:-/tmp}
+if [[ -d /tmp && -w /tmp ]]; then
+  socket_test_base=/tmp
+fi
+socket_test_root=$(mktemp -d "$socket_test_base/tnhs.XXXXXX")
+CLEANUP_DIRS+=("$socket_test_root")
+
+socket_for_runtime() {
+  local runtime_root=$1 candidate key
+  local LC_ALL=C
+
+  candidate="$runtime_root/termnav-${UID:-$(id -u)}/$hot_socket_name"
+  if ((${#candidate} <= 100)); then
+    printf '%s\n' "$candidate"
+    return
+  fi
+
+  # Match the public facade's portable macOS fallback. Test temporary roots
+  # are often much deeper than real login runtimes, so assertions must follow
+  # the endpoint the client actually selected rather than assuming Linux's
+  # longer sockaddr_un limit.
+  provider_key_for "$candidate"
+  key=$provider_key
+  printf '/tmp/termnav-%s/hot-v1-%s.sock\n' \
+    "${UID:-$(id -u)}" "$key"
+}
+
 wait_for_path() {
   local mode="$1" path="$2" attempt
   for ((attempt = 0; attempt < 200; attempt++)); do
@@ -67,7 +97,7 @@ set -e
 _assert_exit "hot service: ordinary repository tests retain parser semantics" \
   3 "$isolated_rc"
 _assert_file_missing "hot service: ordinary repository tests start no daemon" \
-  "$isolated_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+  "$(socket_for_runtime "$isolated_runtime")"
 
 # macOS limits pathname Unix sockets to 103 bytes, while deeply nested CI and
 # temporary directories routinely exceed that. The fallback name hashes the
@@ -75,8 +105,7 @@ _assert_file_missing "hot service: ordinary repository tests start no daemon" \
 # though their sockets share the short owner-only /tmp directory.
 long_runtime=$(_tmpdir)/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 long_candidate="$long_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
-provider_key_for "$long_candidate"
-long_socket="/tmp/termnav-${UID:-$(id -u)}/hot-v1-$provider_key.sock"
+long_socket=$(socket_for_runtime "$long_runtime")
 XDG_RUNTIME_DIR="$long_runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=2 "$relay" warm
 if wait_for_path present "$long_socket"; then
   _pass "hot service: long runtime paths use an isolated short socket"
@@ -88,7 +117,7 @@ _assert_file_missing "hot service: long runtime paths are never bound directly" 
 XDG_RUNTIME_DIR="$long_runtime" "$relay" stop || true
 
 runtime=$(_tmpdir)/runtime
-socket="$runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+socket=$(socket_for_runtime "$runtime")
 XDG_RUNTIME_DIR="$runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
 if wait_for_path present "$socket"; then
   _pass "hot service: warm starts the private dispatcher"
@@ -210,9 +239,9 @@ else
 fi
 
 sweep_runtime=$(_tmpdir)/runtime
-sweep_tmp=$(_tmpdir)/tmp
+sweep_tmp=$socket_test_root/sweep
 mkdir -p "$sweep_tmp"
-sweep_socket="$sweep_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+sweep_socket=$(socket_for_runtime "$sweep_runtime")
 REPO_TEST=1 XDG_RUNTIME_DIR="$sweep_runtime" TMPDIR="$sweep_tmp" \
   TERMNAV_TEST_HOT_IDLE_SECONDS=1 TERMNAV_TEST_HOT_SWEEP_SECONDS=0.05 \
   "$relay" warm
@@ -247,8 +276,9 @@ fi
 XDG_RUNTIME_DIR="$sweep_runtime" TMPDIR="$sweep_tmp" "$relay" stop || true
 
 set +e
-TERMNAV_TEST_ROOT="$root" TERMNAV_TEST_DIR="$(_tmpdir)" \
-TERMNAV_TEST_HOT_IDLE_SECONDS=2 TERMNAV_TEST_HOT_SWEEP_SECONDS=60 \
+TERMNAV_TEST_ROOT="$root" \
+  TERMNAV_TEST_SOCKET="$socket_test_root/slow-sweep.sock" \
+  TERMNAV_TEST_HOT_IDLE_SECONDS=2 TERMNAV_TEST_HOT_SWEEP_SECONDS=60 \
   python3 - <<'PY'
 import os
 import socket
@@ -261,7 +291,7 @@ root = Path(os.environ["TERMNAV_TEST_ROOT"])
 sys.path.insert(0, str(root / "lib" / "termnav"))
 from hot_service import PROVIDER_ROOT, serve_hot
 
-socket_path = Path(os.environ["TERMNAV_TEST_DIR"]) / "slow-sweep.sock"
+socket_path = Path(os.environ["TERMNAV_TEST_SOCKET"])
 sweep_started = threading.Event()
 sweep_release = threading.Event()
 
@@ -338,7 +368,7 @@ _assert_exit "hot service: slow maintenance never blocks request admission" \
   0 "$slow_sweep_rc"
 
 stale_runtime=$(_tmpdir)/runtime
-stale_socket="$stale_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+stale_socket=$(socket_for_runtime "$stale_runtime")
 mkdir -p "${stale_socket%/*}"
 STALE_SOCKET="$stale_socket" python3 - <<'PY'
 import os
@@ -367,7 +397,7 @@ else
 fi
 
 unsafe_runtime=$(_tmpdir)/runtime
-unsafe_socket="$unsafe_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+unsafe_socket=$(socket_for_runtime "$unsafe_runtime")
 mkdir -p "${unsafe_socket%/*}"
 printf 'not a socket\n' >"$unsafe_socket"
 set +e
@@ -378,8 +408,8 @@ _assert_exit "hot service: unsafe runtime entries retain fallback semantics" 3 "
 _assert_file_content "hot service: unsafe runtime entries are never replaced" \
   "not a socket" "$unsafe_socket"
 
-symlink_runtime=$(_tmpdir)/runtime
-symlink_target=$(_tmpdir)/target
+symlink_runtime=$socket_test_root/symlink-runtime
+symlink_target=$socket_test_root/symlink-target
 mkdir -p "$symlink_runtime" "$symlink_target"
 ln -s "$symlink_target" "$symlink_runtime/termnav-${UID:-$(id -u)}"
 set +e
@@ -424,7 +454,7 @@ exit 2
 SH
 chmod 0755 "$unsupported_bin/curl"
 unsupported_runtime=$(_tmpdir)/runtime
-unsupported_socket="$unsupported_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+unsupported_socket=$(socket_for_runtime "$unsupported_runtime")
 XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" warm
 if ! wait_for_path present "$unsupported_socket"; then
   _fail "hot service: unsupported-curl fixture starts the dispatcher"
@@ -439,7 +469,7 @@ _assert_exit "hot service: unsupported curl preserves the Python fallback" \
 XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" stop
 
 active_runtime=$(_tmpdir)/runtime
-active_socket="$active_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+active_socket=$(socket_for_runtime "$active_runtime")
 REPO_TEST=1 XDG_RUNTIME_DIR="$active_runtime" \
   TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
 if ! wait_for_path present "$active_socket"; then
@@ -492,9 +522,9 @@ _assert_exit "hot service: idle retirement preserves an active request" \
   0 "$active_rc"
 XDG_RUNTIME_DIR="$active_runtime" "$relay" stop || true
 
-identity_dir=$(_tmpdir)
 set +e
-TERMNAV_TEST_ROOT="$root" TERMNAV_TEST_IDENTITY_DIR="$identity_dir" python3 - <<'PY'
+TERMNAV_TEST_ROOT="$root" TERMNAV_TEST_IDENTITY_DIR="$socket_test_root" \
+  python3 - <<'PY'
 import os
 import socket
 import sys
@@ -531,7 +561,7 @@ _assert_exit "hot service: old cleanup preserves a replacement socket" \
   0 "$identity_rc"
 
 drain_runtime=$(_tmpdir)/runtime
-drain_socket="$drain_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+drain_socket=$(socket_for_runtime "$drain_runtime")
 drain_ready=$(_tmpdir)/ready
 drain_release=$(_tmpdir)/release
 REPO_TEST=1 XDG_RUNTIME_DIR="$drain_runtime" \
@@ -603,21 +633,23 @@ stale_bin=$(_tmpdir)/bin
 stale_fallback_log=$(_tmpdir)/fallback.log
 mkdir -p "$stale_bin"
 ln -s "$(command -v curl)" "$stale_bin/curl"
-cat >"$stale_bin/sleep" <<'SH'
-#!/usr/bin/env bash
-# Collapse the production ten-second shutdown budget while the fixture keeps
-# an accepted request pinned. The observable socket condition remains real.
-exit 0
+stale_bash_env=$(_tmpdir)/bash-env
+cat >"$stale_bash_env" <<'SH'
+# Collapse the production ten-second shutdown budget inside the relay shell.
+# Launching 1,000 fake sleep processes can itself exceed the server's request
+# deadline on busy or emulated CI workers and release the request being tested.
+sleep() { :; }
 SH
 cat >"$stale_bin/python3" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >"$TERMNAV_TEST_FALLBACK_LOG"
 exit 37
 SH
-chmod 0755 "$stale_bin/sleep" "$stale_bin/python3"
+chmod 0755 "$stale_bin/python3"
 touch -t 200001010000 "$drain_socket"
 set +e
-PATH="$stale_bin:/usr/bin:/bin" TERMNAV_PYTHON="$stale_bin/python3" \
+BASH_ENV="$stale_bash_env" PATH="$stale_bin:/usr/bin:/bin" \
+  TERMNAV_PYTHON="$stale_bin/python3" \
   TERMNAV_TEST_FALLBACK_LOG="$stale_fallback_log" \
   XDG_RUNTIME_DIR="$drain_runtime" "$relay" send pane left
 stale_busy_rc=$?
@@ -689,7 +721,7 @@ else
 fi
 
 concurrent_runtime=$(_tmpdir)/runtime
-concurrent_socket="$concurrent_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+concurrent_socket=$(socket_for_runtime "$concurrent_runtime")
 warm_pids=()
 for _ in 1 2 3 4 5 6 7 8; do
   XDG_RUNTIME_DIR="$concurrent_runtime" "$relay" warm &
