@@ -33,11 +33,45 @@ pub fn run(
         }
         "context" => context(&arguments[1..], stdout, stderr),
         "focus" => focus(&arguments[1..], stdout, stderr),
+        "follow-click" => follow_click(&arguments[1..], stderr),
         _ => usage(
             stderr,
             &format!("unknown or unimplemented tmux command: {command}"),
         ),
     }
+}
+
+fn follow_click(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32> {
+    let fields = if arguments.first().map(String::as_str) == Some("--stdin") {
+        let mut input = String::new();
+        io::Read::read_to_string(&mut io::stdin(), &mut input)?;
+        input
+            .lines()
+            .take(10)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        arguments.to_vec()
+    };
+    if fields.len() > 10 {
+        return usage(stderr, "follow-click accepts at most ten fields");
+    }
+    let field = |index: usize| fields.get(index).cloned().unwrap_or_default();
+    let number = |index: usize| fields.get(index).and_then(|value| value.parse().ok());
+    let input = crate::click::Input {
+        hyperlink: field(0),
+        word: field(1),
+        line: field(2),
+        x: number(3),
+        cwd: field(4),
+        client_tty: field(5),
+        pane: field(6),
+        y: number(7),
+        pane_top: number(8),
+        pane_left: number(9),
+    };
+    crate::click::follow(&input)?;
+    Ok(0)
 }
 
 fn focus(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -> io::Result<i32> {

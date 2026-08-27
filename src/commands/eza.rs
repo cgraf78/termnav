@@ -22,11 +22,14 @@ pub fn run(
             .map(process::status_code);
     };
 
-    let mut eza_arguments = vec![hyperlink];
+    // Remote-link rewriting captures eza's stdout before forwarding it. Force
+    // color at that internal pipe boundary so the wrapper does not make a real
+    // terminal look non-interactive; the caller's own pipe still receives the
+    // same colored stream as the established shell implementation.
+    let mut eza_arguments = vec![hyperlink, OsString::from("--color=always")];
     if io::stdout().is_terminal()
         || std::env::var("TERMNAV_EZA_NVIM_LINKS_FORCE_TTY").is_ok_and(|value| value == "1")
     {
-        eza_arguments.push(OsString::from("--color=always"));
         if let Some(width) = terminal_width() {
             eza_arguments.push(OsString::from("--width"));
             eza_arguments.push(OsString::from(width.to_string()));

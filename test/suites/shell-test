@@ -281,17 +281,12 @@ shell_integration="$TERMNAV_ROOT/share/termnav/shell.sh"
 ssh_shim="$TERMNAV_ROOT/share/termnav/shims/ssh"
 ssh_probe=$(_tmpdir)
 ssh_probe_bin="$ssh_probe/bin"
-python_path=$(command -v python3)
 mkdir -p "$ssh_probe_bin"
-cat >"$ssh_probe_bin/ssh" <<'SH'
+cat >"$ssh_probe_bin/termnav" <<'SH'
 #!/usr/bin/env bash
-if [[ ${1:-} == -G ]]; then
-  printf '%s\n' "$TERMNAV_TEST_EFFECTIVE_CONFIG"
-  exit 0
-fi
-printf '<%s>\n' "$@" >"$TERMNAV_TEST_SSH_LOG"
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
 SH
-chmod +x "$ssh_probe_bin/ssh"
+chmod +x "$ssh_probe_bin/termnav"
 
 _assert_file_exists "ssh shim: provider-owned executable exists" "$ssh_shim"
 _assert_eq "ssh shim: provider-owned command is executable" true \
@@ -310,30 +305,34 @@ for test_shell in bash zsh; do
     test_shell_args=(-f)
   fi
 
-  ssh_tty_log="$ssh_probe/$test_shell-tty.log"
-  ssh_plain_log="$ssh_probe/$test_shell-plain.log"
+  ssh_tty_log="$ssh_probe/$test_shell-tty-command.log"
+  ssh_plain_log="$ssh_probe/$test_shell-plain-command.log"
+  ssh_stderr_log="$ssh_probe/$test_shell-stderr.log"
   : >"$ssh_tty_log"
   : >"$ssh_plain_log"
+  : >"$ssh_stderr_log"
   # The selected child shell owns all expansions inside this fixture. Keeping
   # it literal verifies both Bash and zsh rather than the test runner's shell.
   # Termux implements conventional /usr/bin shebang paths through termux-exec;
   # preserve only its LD_PRELOAD hook across env isolation so the fixture has
   # the same executable semantics as a real Termux login shell.
-  # The fixture intentionally strips the login PATH, so preserve the selected
-  # Python explicitly; native Termux does not expose it through /usr/bin.
+  # Keep all three fixture descriptors non-terminal. This suite owns only PATH
+  # interposition and argument forwarding, so a fake Termnav records the exact
+  # adapter call without also starting the independently-tested relay
+  # supervisor. Relay-test and relay-terminal-test own enhanced SSH behavior
+  # and the real PTY contract. Separating those layers also keeps Android's adb
+  # transport PTY from coupling shell activation to relay lifecycle behavior.
   # shellcheck disable=SC2016
   ssh_probe_output=$(
-    env -i \
+    _with_timeout 20s env -i \
       HOME="$HOME" \
       LD_PRELOAD="${LD_PRELOAD:-}" \
-      PATH="$TERMNAV_ROOT/bin:$ssh_probe_bin:/usr/bin:/bin" \
+      PATH="$ssh_probe_bin:/usr/bin:/bin" \
       REPO_TEST=1 \
       CHILD_BASH="$BASH" \
       SHELL_INTEGRATION="$shell_integration" \
       SSH_PLAIN_LOG="$ssh_plain_log" \
       SSH_TTY_LOG="$ssh_tty_log" \
-      TERMNAV_PYTHON="$python_path" \
-      TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
       "$test_shell_path" "${test_shell_args[@]}" -c '
         source "$SHELL_INTEGRATION"
         source "$SHELL_INTEGRATION"
@@ -347,26 +346,28 @@ for test_shell in bash zsh; do
         else
           printf "function=absent\n"
         fi
-        TERMNAV_TEST_SSH_LOG="$SSH_TTY_LOG" \
+        TERMNAV_TEST_COMMAND_LOG="$SSH_TTY_LOG" \
           "$CHILD_BASH" --noprofile --norc -c \
           '"'"'exec ssh -t child.example printf hello'"'"'
-        TERMNAV_TEST_SSH_LOG="$SSH_PLAIN_LOG" \
+        TERMNAV_TEST_COMMAND_LOG="$SSH_PLAIN_LOG" \
           "$CHILD_BASH" --noprofile --norc -c \
           '"'"'exec ssh child.example printf hello </dev/null'"'"'
-      '
+      ' \
+      </dev/null 2>"$ssh_stderr_log"
   )
+  ssh_probe_rc=$?
+  _assert_eq "ssh shim: $test_shell fixture exits within its bound" \
+    "0" "$ssh_probe_rc"
   _assert_contains "ssh shim: $test_shell resolves the provider-owned shim" \
     "ssh=$ssh_shim" "$ssh_probe_output"
   _assert_contains "ssh shim: $test_shell activation is idempotent" \
     "shim-count=1" "$ssh_probe_output"
   _assert_contains "ssh shim: $test_shell defines no ssh function" \
     "function=absent" "$ssh_probe_output"
-  _assert_contains "ssh shim: $test_shell child preserves the remote command" \
-    $'<child.example>\n<printf>\n<hello>' "$(tail -n 3 "$ssh_tty_log")"
-  _assert_contains "ssh shim: $test_shell child receives relay forwarding" \
-    "RemoteForward=" "$(cat "$ssh_tty_log")"
-  _assert_eq "ssh shim: $test_shell non-tty child remains ordinary SSH" \
-    $'<child.example>\n<printf>\n<hello>' "$(cat "$ssh_plain_log")"
+  _assert_eq "ssh shim: $test_shell child delegates the exact tty command" \
+    $'<ssh>\n<-t>\n<child.example>\n<printf>\n<hello>' "$(cat "$ssh_tty_log")"
+  _assert_eq "ssh shim: $test_shell child delegates the exact non-tty command" \
+    $'<ssh>\n<child.example>\n<printf>\n<hello>' "$(cat "$ssh_plain_log")"
 done
 
 echo

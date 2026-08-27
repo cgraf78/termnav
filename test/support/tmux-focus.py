@@ -18,7 +18,6 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
 
 
 def wait_until(predicate, description: str, timeout: float = 3.0) -> None:
@@ -29,6 +28,16 @@ def wait_until(predicate, description: str, timeout: float = 3.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError(f"timed out waiting for {description}")
+
+
+def socket_temp_directory(prefix: str):
+    """Create a private fixture root short enough for every Unix socket ABI."""
+    # macOS allows only 103 pathname bytes in sockaddr_un, while its normal
+    # per-user TMPDIR is already long. Termux has no /tmp, so retain its
+    # application-private temporary directory there instead of assuming a
+    # conventional filesystem layout.
+    short_root = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else None
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=short_root)
 
 
 def send_message(path: pathlib.Path, message: dict[str, object]) -> dict[str, object]:
@@ -54,8 +63,10 @@ class FocusClaimTest(unittest.TestCase):
     focus: pathlib.Path
 
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="termnav-focus-test-")
-        self.socket = pathlib.Path(self.tempdir.name) / "tmux.sock"
+        self.tempdir = socket_temp_directory("tnfocus-")
+        # The quoted filename deliberately exercises the shell boundary used
+        # when tmux takes ownership of the expiry worker.
+        self.socket = pathlib.Path(self.tempdir.name) / "tmux #{session_name} focus's.sock"
         # A custom socket isolates server state, but tmux still reads the
         # caller's default configuration unless told otherwise. Keep provider
         # tests independent of the developer's colors, hooks, and plugins.
@@ -368,120 +379,13 @@ class FocusClaimTest(unittest.TestCase):
         self.assertEqual("", self.pane_active_style())
 
 
-class FocusLibraryTest(unittest.TestCase):
-    """Cover portable parsing and owner-only runtime state boundaries."""
-
-    module: object
-    process_info: object
-
-    def test_macos_process_environment_parser_preserves_values_with_spaces(
-        self,
-    ) -> None:
-        output = (
-            "tmux attach TMUX=/tmp/outer.sock,123,0 TMUX_PANE=%42 "
-            "LABEL=one value with spaces PATH=/usr/bin:/bin"
-        )
-        self.assertEqual(
-            "/tmp/outer.sock,123,0",
-            self.process_info.parse_environment(output, "TMUX"),
-        )
-        self.assertEqual(
-            "one value with spaces",
-            self.process_info.parse_environment(output, "LABEL"),
-        )
-        self.assertIsNone(self.process_info.parse_environment(output, "MUX"))
-
-    def test_relative_runtime_directory_falls_back_to_private_tmp_state(self) -> None:
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "relative"}):
-            path = self.module.runtime_dir()
-        self.assertEqual(pathlib.Path(tempfile.gettempdir()), path.parents[1])
-        self.assertEqual(0o700, path.stat().st_mode & 0o777)
-
-    def test_runtime_directory_rejects_a_symlinked_focus_leaf(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="termnav-focus-runtime-") as root:
-            base = pathlib.Path(root)
-            owner_root = base / f"termnav-{os.getuid()}"
-            owner_root.mkdir(mode=0o700)
-            target = base / "target"
-            target.mkdir(mode=0o700)
-            (owner_root / "focus").symlink_to(target, target_is_directory=True)
-            with (
-                mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(base)}),
-                self.assertRaises(OSError),
-            ):
-                self.module.runtime_dir()
-
-    def test_lock_names_hash_unbounded_socket_and_tty_values(self) -> None:
-        with (
-            tempfile.TemporaryDirectory(prefix="termnav-focus-lock-") as root,
-            mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": root}),
-        ):
-            path = self.module.lock_path("watch", "/" + "s" * 500, "/dev/pts/1")
-        self.assertRegex(path.name, r"^watch-[0-9a-f]{24}\.lock$")
-
-    def test_expirer_spawn_failure_is_reported_for_fail_closed_cleanup(self) -> None:
-        with mock.patch.object(self.module.subprocess, "Popen", side_effect=OSError):
-            started = self.module.start_expirer(
-                pathlib.Path("/tmp/termnav-tmux-focus"), "/tmp/tmux.sock", "%1"
-            )
-        self.assertFalse(started)
-
-    def test_boolean_lease_is_rejected_before_any_tmux_mutation(self) -> None:
-        with mock.patch.object(self.module, "run_tmux") as run_tmux:
-            published = self.module.claim(
-                "/tmp/tmux.sock",
-                "%1",
-                "999999999999999999999999",
-                True,
-            )
-        self.assertIsNone(published)
-        run_tmux.assert_not_called()
-
-    def test_invalid_watch_timing_is_rejected_before_parent_discovery(self) -> None:
-        with mock.patch.object(self.module, "parent_for_client") as parent:
-            status = self.module.watch(
-                pathlib.Path("/tmp/termnav-tmux-focus"),
-                "/tmp/tmux.sock",
-                123,
-                "/dev/pts/1",
-                100,
-                100,
-            )
-        self.assertEqual(2, status)
-        parent.assert_not_called()
-
-    def test_refocus_during_style_sync_cannot_stop_the_current_watcher(self) -> None:
-        with (
-            mock.patch.object(
-                self.module,
-                "client_focused",
-                side_effect=(False, True),
-            ),
-            mock.patch.object(
-                self.module,
-                "sync_client_style",
-                return_value=True,
-            ) as sync_client_style,
-            mock.patch.object(self.module, "lock_path") as lock_path,
-        ):
-            status = self.module.stop_watch(
-                pathlib.Path("/tmp/termnav-tmux-focus"),
-                "/tmp/tmux.sock",
-                123,
-                "/dev/pts/1",
-            )
-        self.assertEqual(0, status)
-        self.assertEqual(2, sync_client_style.call_count)
-        lock_path.assert_not_called()
-
-
 class RelayFocusTest(unittest.TestCase):
     """Validate one-hop focus transport without involving a real SSH host."""
 
     relay: pathlib.Path
 
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="termnav-focus-relay-")
+        self.tempdir = socket_temp_directory("tnfocus-relay-")
         self.root = pathlib.Path(self.tempdir.name)
         self.tmux_socket = self.root / "tmux.sock"
         subprocess.run(
@@ -817,7 +721,7 @@ class NestedFocusTest(unittest.TestCase):
     module: object
 
     def setUp(self) -> None:
-        self.tempdir = tempfile.TemporaryDirectory(prefix="termnav-focus-nested-")
+        self.tempdir = socket_temp_directory("tnfocus-nested-")
         self.root = pathlib.Path(self.tempdir.name)
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(mode=0o700)
@@ -1099,24 +1003,44 @@ class NestedFocusTest(unittest.TestCase):
         return details
 
     def helper_lock_holders(self, command: str, socket_path: pathlib.Path) -> list[int]:
-        """Count logical workers, ignoring an interpreter-launcher parent process."""
-        holders = []
-        for pid in self.helper_processes(command, socket_path):
+        """Return one owner PID for each distinct helper lock."""
+        processes = self.helper_processes(command, socket_path)
+        holders: dict[tuple[int, int], int] = {}
+        for pid in processes:
             descriptor_root = pathlib.Path("/proc") / str(pid) / "fd"
             if not descriptor_root.is_dir():
                 # macOS does not expose /proc. Its normal Python executable does
                 # not add the devserver's interpreter-launcher parent process.
-                holders.append(pid)
+                holders[(0, pid)] = pid
                 continue
             for descriptor in descriptor_root.iterdir():
                 try:
                     target = os.readlink(descriptor)
+                    identity = os.stat(descriptor)
                 except OSError:
                     continue
                 if f"/{command}-" in target and target.endswith(".lock"):
-                    holders.append(pid)
+                    owner = pid
+                    try:
+                        recorded = pathlib.Path(target).read_text(encoding="utf-8").strip()
+                        if recorded.isdigit():
+                            owner = int(recorded)
+                    except OSError:
+                        pass
+
+                    # A watcher periodically forks `tmux` to renew its claim.
+                    # Before exec, that transient child still has the parent's
+                    # command line and inherited lock descriptor; Android's
+                    # slower process startup makes the otherwise tiny window
+                    # observable. Likewise, a concurrently launched watcher
+                    # briefly opens the same file before its nonblocking flock
+                    # is rejected. Neither is a second logical worker. Group by
+                    # the lock inode and report the PID written by its owner so
+                    # the lifecycle assertion still catches distinct client
+                    # locks without mistaking fork/open races for duplication.
+                    holders[(identity.st_dev, identity.st_ino)] = owner
                     break
-        return holders
+        return sorted(holders.values())
 
     def test_local_nested_client_claims_and_releases_its_exact_parent_pane(
         self,
@@ -1246,27 +1170,6 @@ class NestedFocusTest(unittest.TestCase):
             "selection hook repairing a stale dim override",
         )
 
-    def test_nested_client_process_exposes_its_exact_parent_route(self) -> None:
-        inner = self.new_server("route-inner", "sleep 30")
-        outer = self.new_server(
-            "route-outer",
-            f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus",
-        )
-        parent_pane = self.tmux(outer, "display-message", "-p", "#{pane_id}")
-        client = PtyClient(outer, self.environment)
-        self.clients.append(client)
-        client_pid, _client_tty = self.client_identity(inner)
-        parent = self.module.parent_for_client(client_pid, str(inner))
-        process_scope = {
-            name: self.module.process_env(client_pid, name)
-            for name in ("TMUX", "TMUX_PANE", "TERMNAV_PARENT_RELAY")
-        }
-        self.assertEqual(
-            self.module.Parent(tmux_socket=str(outer), pane=parent_pane),
-            parent,
-            f"client_pid={client_pid} process_scope={process_scope!r}",
-        )
-
     def test_three_levels_keep_exactly_one_highlighted_leaf(self) -> None:
         deepest = self.new_server("deepest", "sleep 30")
         deepest_other = self.tmux(
@@ -1378,6 +1281,13 @@ class NestedFocusTest(unittest.TestCase):
         client_two = PtyClient(outer_two, self.environment)
         self.clients.extend((client_one, client_two))
 
+        # The outer PTYs can finish their own tmux handshakes before the pane
+        # commands have attached both nested clients. Waiting for the topology
+        # itself avoids dropping an early focus event on a slow CI runner.
+        wait_until(
+            lambda: len(self.tmux(inner, "list-clients", "-F", "#{client_pid}").splitlines()) == 2,
+            "two clients attached to the shared inner session",
+        )
         client_one.focus()
         client_two.focus()
         wait_until(
@@ -1546,17 +1456,9 @@ def main() -> int:
     parser.add_argument("--focus", required=True, type=pathlib.Path)
     parser.add_argument("--relay", required=True, type=pathlib.Path)
     arguments, unittest_arguments = parser.parse_known_args()
-    library = arguments.focus.parent.parent / "lib" / "termnav"
-    sys.path.insert(0, str(library))
-    import process_info
-    import tmux_focus
-
     FocusClaimTest.focus = arguments.focus
-    FocusLibraryTest.module = tmux_focus
-    FocusLibraryTest.process_info = process_info
     RelayFocusTest.relay = arguments.relay
     NestedFocusTest.focus = arguments.focus
-    NestedFocusTest.module = tmux_focus
     os.environ.setdefault("XDG_RUNTIME_DIR", tempfile.gettempdir())
     program = unittest.main(argv=[__file__, *unittest_arguments], verbosity=2, exit=False)
     return 0 if program.result.wasSuccessful() else 1

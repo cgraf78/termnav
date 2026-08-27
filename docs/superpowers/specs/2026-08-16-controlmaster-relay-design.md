@@ -2,12 +2,13 @@
 
 > Superseded on 2026-08-17 by the per-session `SendEnv` transport. The shipped
 > implementation no longer occupies the remote command channel or launches a
-> replacement login shell; see `termnav-relay(1)` for the current contract.
+> replacement login shell. This document describes the retired Python command
+> names; see `termnav(1)` and `termnav ssh` for the current Rust contract.
 
 ## Problem
 
-`termnav-relay ssh` currently publishes a per-session remote relay socket with
-OpenSSH `SetEnv`. A reused ControlMaster retains the environment configuration
+The historical `termnav-relay ssh` design published a per-session remote relay
+socket with OpenSSH `SetEnv`. A reused ControlMaster retains the environment configuration
 from the master connection, so later multiplexed sessions receive a missing or
 stale `TERMNAV_PARENT_RELAY`. The request then fails closed even though the new
 remote forwarding exists.
@@ -51,4 +52,4 @@ before Termnav, opens sequential relay sessions through it, and proves each
 remote session sees its own live socket without another authentication or
 connection. Retain argument-contract tests for delegated modes. Run the full
 Termnav suite, reproduce the stale-master case against real OpenSSH, and repeat
-the NAS to Bevo2 to Taylor live chord matrix.
+the live chord matrix across a three-host SSH chain.

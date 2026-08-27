@@ -43,19 +43,15 @@ pub fn ssh_open(host: &str, target: &str) -> io::Result<i32> {
 
 /// Build the remote shell command used by SSH and tmux typed-command fallback.
 ///
-/// The additive release retains the old opener as a rollout fallback because
-/// local and remote hosts update independently. The cleanup release removes
-/// that branch only after every supported host has the unified CLI.
+/// Remote hosts may update independently, but the versioned relay protocol is
+/// the compatibility boundary. A host without the unified binary fails
+/// visibly instead of silently invoking a second implementation with different
+/// routing or authentication behavior.
 #[must_use]
 pub fn remote_nvim_command(arguments: &[&str]) -> String {
     let mut command = String::from(
         r#"PATH="$PATH:$HOME/.local/bin:$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin"; export PATH; if command -v termnav >/dev/null 2>&1; then termnav nvim open"#,
     );
-    for argument in arguments {
-        command.push(' ');
-        command.push_str(&crate::shell::quote(argument));
-    }
-    command.push_str(r#"; elif command -v nvim-tmux-open >/dev/null 2>&1; then nvim-tmux-open"#);
     for argument in arguments {
         command.push(' ');
         command.push_str(&crate::shell::quote(argument));
@@ -140,7 +136,7 @@ mod tests {
 
         assert!(command.contains("'/tmp/a b'\\''s.txt:4'"));
         assert!(command.contains("termnav nvim open"));
-        assert!(command.contains("nvim-tmux-open"));
+        assert!(!command.contains("nvim-tmux-open"));
     }
 
     #[test]

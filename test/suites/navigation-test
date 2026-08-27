@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# navigation-test - shared semantic navigation state-machine behavior.
-
-set -euo pipefail
-
-test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-
-python3 "$test_dir/support/navigation.py"
-python3 "$test_dir/support/relay-navigation.py"

@@ -5,13 +5,8 @@ local vim = vim
 local uv = vim.uv or vim.loop
 local M = {}
 
-local function source_dir()
-  local info = debug.getinfo(1, "S")
-  return (info.source:gsub("^@", "")):match("^(.*)/[^/]+$") or "."
-end
-
 local function default_command()
-  return vim.fn.resolve(vim.fn.fnamemodify(source_dir() .. "/../../../bin/vscode-nvim-focus", ":p"))
+  return { "termnav", "vscode", "focus" }
 end
 
 local function default_observed()
@@ -65,14 +60,14 @@ function M.new(options)
 
   local function run(operation, callback)
     ctx.sequence = ctx.sequence + 1
-    local command = {
-      ctx.command,
+    local command = vim.deepcopy(ctx.command)
+    vim.list_extend(command, {
       operation,
       ctx.source,
       tostring(ctx.cycle),
       tostring(ctx.sequence),
       tostring(ctx.observed()),
-    }
+    })
     if options.run then
       options.run(command, callback)
       return

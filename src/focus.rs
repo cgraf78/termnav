@@ -10,7 +10,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -342,36 +342,44 @@ pub fn handle_relay(request: &Value) -> Value {
     reply("claimed")
 }
 
-/// Start the deduplicated expiry helper for a newly owned pane.
+/// Ask the parent tmux server to own the deduplicated expiry helper.
 pub fn start_expirer(socket: &str, pane: &str) -> bool {
-    let Ok(binary) = std::env::current_exe() else {
-        return false;
-    };
-    let mut command = Command::new(binary);
-    command
-        .args([
-            "tmux",
-            "focus",
-            "expire",
-            "--parent-tmux",
-            socket,
-            "--parent-pane",
-            pane,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command.spawn().is_ok()
+    let helper = crate::shell::join(&[
+        "termnav".to_owned(),
+        "tmux".to_owned(),
+        "focus".to_owned(),
+        "expire".to_owned(),
+        "--parent-tmux".to_owned(),
+        socket.to_owned(),
+        "--parent-pane".to_owned(),
+        pane.to_owned(),
+    ]);
+    let helper = crate::shell::escape_tmux_format(&helper);
+
+    // The lease is state owned by this exact tmux server, so that server is
+    // the natural supervisor too. Directly daemonizing from a short-lived CLI
+    // leaves process lifetime up to the invoking shell; Android/Termux can
+    // reap that orphan even though `spawn` succeeded. `run-shell -b` survives
+    // the publishing command and dies with the server whose state it protects.
+    // Resolve the one public `termnav` executable through the same server PATH
+    // used by every other tmux hook. Android cannot reliably re-execute the
+    // process-specific `current_exe` spelling from a later tmux job, and a
+    // second lookup contract would make installed behavior less predictable.
+    //
+    // Tmux format escaping is separate from shell quoting: without both
+    // layers, a valid socket or executable path containing `#{...}` or `#(...)`
+    // would be rewritten before the shell starts. The helper still takes its
+    // per-pane nonblocking lock, so concurrent replacements converge on one
+    // worker rather than creating a timer fan-out.
+    run_tmux(
+        socket,
+        &[
+            "run-shell".to_owned(),
+            "-b".to_owned(),
+            format!("exec {helper}"),
+        ],
+    )
+    .is_some_and(|output| output.status.success())
 }
 
 fn current_claim(socket: &str, pane: &str) -> Option<String> {
@@ -784,31 +792,56 @@ fn pane_has_focused_client(socket: &str, pane: &str) -> bool {
 }
 
 fn process_is_watcher(pid: u32, socket: &str, client_pid: u32, client_tty: &str) -> bool {
-    let expected = [
-        "tmux",
-        "focus",
-        "watch",
-        "--tmux-socket",
-        socket,
-        "--client-pid",
-        &client_pid.to_string(),
-        "--client-tty",
-        client_tty,
-    ];
+    let client_pid = client_pid.to_string();
+    let expected = watcher_identity(socket, &client_pid, client_tty);
     if let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) {
         let arguments = bytes
             .split(|byte| *byte == 0)
             .filter(|value| !value.is_empty())
             .map(|value| String::from_utf8_lossy(value))
             .collect::<Vec<_>>();
-        return arguments.windows(expected.len()).any(|window| {
-            window
-                .iter()
-                .zip(expected.iter())
-                .all(|(actual, expected)| actual.as_ref() == *expected)
-        });
+        return watcher_arguments_match(&arguments, &expected);
     }
-    false
+
+    // macOS has no procfs. This is a cold focus-out path, so one bounded `ps`
+    // query is preferable to leaving the publisher alive until its next lease
+    // heartbeat. Match the complete ordered watcher identity before signaling;
+    // a bare PID check could kill an unrelated process after PID reuse.
+    let mut command = Command::new("ps");
+    command.args(["-p", &pid.to_string(), "-o", "command="]);
+    process::output_timeout(&mut command, Duration::from_secs(2))
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            watcher_command_matches(&String::from_utf8_lossy(&output.stdout), &expected)
+        })
+}
+
+fn watcher_identity<'a>(socket: &'a str, client_pid: &'a str, client_tty: &'a str) -> [&'a str; 9] {
+    [
+        "tmux",
+        "focus",
+        "watch",
+        "--tmux-socket",
+        socket,
+        "--client-pid",
+        client_pid,
+        "--client-tty",
+        client_tty,
+    ]
+}
+
+fn watcher_arguments_match(arguments: &[std::borrow::Cow<'_, str>], expected: &[&str]) -> bool {
+    arguments.windows(expected.len()).any(|window| {
+        window
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.as_ref() == *expected)
+    })
+}
+
+fn watcher_command_matches(command: &str, expected: &[&str]) -> bool {
+    command.contains(&expected.join(" "))
 }
 
 fn mutation_lock(socket: &str, pane: &str) -> io::Result<File> {
@@ -899,7 +932,12 @@ fn reply(result: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_claim, valid_interval, valid_lease, valid_token};
+    use std::borrow::Cow;
+
+    use super::{
+        parse_claim, valid_interval, valid_lease, valid_token, watcher_arguments_match,
+        watcher_command_matches, watcher_identity,
+    };
 
     #[test]
     fn focus_identifiers_and_timings_are_bounded() {
@@ -920,5 +958,32 @@ mod tests {
         );
         assert!(parse_claim("short:123").is_none());
         assert!(parse_claim("0123456789abcdef01234567:nope").is_none());
+    }
+
+    #[test]
+    fn watcher_identity_rejects_pid_reuse_on_procfs_and_ps_paths() {
+        let expected = watcher_identity("/tmp/tmux.sock", "123", "/dev/pts/4");
+        let exact = [
+            "/bin/termnav",
+            "tmux",
+            "focus",
+            "watch",
+            "--tmux-socket",
+            "/tmp/tmux.sock",
+            "--client-pid",
+            "123",
+            "--client-tty",
+            "/dev/pts/4",
+        ]
+        .map(Cow::Borrowed);
+        assert!(watcher_arguments_match(&exact, &expected));
+        assert!(watcher_command_matches(
+            "/bin/termnav tmux focus watch --tmux-socket /tmp/tmux.sock --client-pid 123 --client-tty /dev/pts/4",
+            &expected,
+        ));
+        assert!(!watcher_command_matches(
+            "/bin/termnav tmux focus watch --tmux-socket /tmp/other.sock --client-pid 123 --client-tty /dev/pts/4",
+            &expected,
+        ));
     }
 }

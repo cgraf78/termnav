@@ -5,9 +5,13 @@ use std::io::{self, Write};
 use std::os::fd::RawFd;
 use std::path::Path;
 
+use crate::navigation::{Action, Direction};
 use crate::relay::server;
 
-const HELP: &str = "usage: termnav relay <send|serve|commit|sweep> [arguments]\n";
+const HELP: &str = "usage: termnav relay <send|serve|commit|sweep> [arguments]\n\
+\n\
+send: termnav relay send ACTION DIRECTION [options]\n\
+      ACTION is pane-select, tab-select, or tab-move\n";
 
 /// Parse and execute relay transport and commit operations.
 pub fn run(
@@ -54,14 +58,19 @@ fn send_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--client-pid" => {
-                client_pid = Some(
-                    option(arguments, &mut index, "--client-pid")?
-                        .parse::<u32>()
-                        .map_err(|_| invalid("--client-pid requires a positive integer"))?,
-                );
+                let Some(value) = option(arguments, &mut index) else {
+                    return usage(stderr, "--client-pid requires a value");
+                };
+                let Ok(value) = value.parse::<u32>() else {
+                    return usage(stderr, "--client-pid requires a positive integer");
+                };
+                client_pid = Some(value);
             }
             "--client-tty" => {
-                client_tty = Some(option(arguments, &mut index, "--client-tty")?.to_owned());
+                let Some(value) = option(arguments, &mut index) else {
+                    return usage(stderr, "--client-tty requires a value");
+                };
+                client_tty = Some(value.to_owned());
             }
             value if value.starts_with('-') => {
                 return usage(stderr, &format!("unknown send option: {value}"));
@@ -73,7 +82,7 @@ fn send_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
         }
     }
     if positional.len() != 2 {
-        return usage(stderr, "send requires SCOPE and DIRECTION");
+        return usage(stderr, "send requires ACTION and DIRECTION");
     }
     if client_pid.is_some() != client_tty.is_some() {
         return usage(
@@ -81,9 +90,17 @@ fn send_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
             "--client-pid and --client-tty must be provided together",
         );
     }
+    let action = match Action::parse(&positional[0]) {
+        Ok(action) => action,
+        Err(message) => return usage(stderr, &message),
+    };
+    let direction = match Direction::parse(action, &positional[1]) {
+        Ok(direction) => direction,
+        Err(message) => return usage(stderr, &message),
+    };
     Ok(server::send_navigation(
-        &positional[0],
-        &positional[1],
+        action,
+        direction,
         client_pid,
         client_tty.as_deref(),
         None,
@@ -97,14 +114,19 @@ fn serve_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--socket" => {
-                socket = Some(option(arguments, &mut index, "--socket")?.to_owned());
+                let Some(value) = option(arguments, &mut index) else {
+                    return usage(stderr, "--socket requires a value");
+                };
+                socket = Some(value.to_owned());
             }
             "--owner-fd" => {
-                owner_fd = Some(
-                    option(arguments, &mut index, "--owner-fd")?
-                        .parse()
-                        .map_err(|_| invalid("--owner-fd requires an integer"))?,
-                );
+                let Some(value) = option(arguments, &mut index) else {
+                    return usage(stderr, "--owner-fd requires a value");
+                };
+                let Ok(value) = value.parse() else {
+                    return usage(stderr, "--owner-fd requires an integer");
+                };
+                owner_fd = Some(value);
             }
             value => return usage(stderr, &format!("unknown serve option: {value}")),
         }
@@ -112,7 +134,7 @@ fn serve_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32
     let Some(socket) = socket else {
         return usage(stderr, "serve requires --socket");
     };
-    match server::serve(Path::new(&socket), owner_fd) {
+    match server::serve(Path::new(&socket), owner_fd, None) {
         Ok(()) => Ok(0),
         Err(error) => {
             writeln!(stderr, "termnav relay serve: {error}")?;
@@ -137,32 +159,34 @@ fn commit_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i3
             | "--client-pid"
             | "--client-created"
             | "--passthrough-decrqm"
-            | "--pane" => option(arguments, &mut index, name)?,
+            | "--pane" => {
+                let Some(value) = option(arguments, &mut index) else {
+                    return usage(stderr, &format!("{name} requires a value"));
+                };
+                value
+            }
             _ => return usage(stderr, &format!("unknown commit option: {name}")),
         };
         match name {
             "--tmux-socket" => tmux_socket = Some(value.to_owned()),
             "--client-tty" => client_tty = Some(value.to_owned()),
             "--client-pid" => {
-                client_pid = Some(
-                    value
-                        .parse()
-                        .map_err(|_| invalid("--client-pid requires an integer"))?,
-                );
+                let Ok(value) = value.parse() else {
+                    return usage(stderr, "--client-pid requires an integer");
+                };
+                client_pid = Some(value);
             }
             "--client-created" => {
-                client_created = Some(
-                    value
-                        .parse()
-                        .map_err(|_| invalid("--client-created requires an integer"))?,
-                );
+                let Ok(value) = value.parse() else {
+                    return usage(stderr, "--client-created requires an integer");
+                };
+                client_created = Some(value);
             }
             "--passthrough-decrqm" => {
-                passthrough_state = Some(
-                    value
-                        .parse()
-                        .map_err(|_| invalid("--passthrough-decrqm requires an integer"))?,
-                );
+                let Ok(value) = value.parse() else {
+                    return usage(stderr, "--passthrough-decrqm requires an integer");
+                };
+                passthrough_state = Some(value);
             }
             "--pane" => pane = Some(value.to_owned()),
             _ => unreachable!(),
@@ -186,20 +210,14 @@ fn commit_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i3
     ))
 }
 
-fn option<'a>(arguments: &'a [String], index: &mut usize, name: &str) -> io::Result<&'a str> {
-    let value = arguments
-        .get(*index + 1)
-        .ok_or_else(|| invalid(&format!("{name} requires a value")))?;
+fn option<'a>(arguments: &'a [String], index: &mut usize) -> Option<&'a str> {
+    let value = arguments.get(*index + 1)?;
     *index += 2;
-    Ok(value)
+    Some(value)
 }
 
 fn usage(stderr: &mut dyn Write, message: &str) -> io::Result<i32> {
     writeln!(stderr, "termnav relay: {message}")?;
     stderr.write_all(HELP.as_bytes())?;
     Ok(2)
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message)
 }

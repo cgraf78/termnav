@@ -10,10 +10,10 @@ import time
 from importlib.machinery import SourceFileLoader
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RELAY = ROOT / "lib" / "termnav" / "relay.py"
-# `relay.py` deliberately lazy-loads its heavier routing modules after startup.
-# Put the production library first now so those later imports cannot resolve to
-# this directory's same-named test adapters and form a circular import.
+RELAY = ROOT / "test" / "support" / "python-peer" / "relay.py"
+# Import the frozen wire peer under a private module name so this deterministic
+# concurrency fixture can replace only its navigation callback. The peer has
+# no production navigation implementation of its own.
 sys.path.insert(0, str(RELAY.parent))
 spec = importlib.util.spec_from_loader(
     "termnav_relay_server_test",
@@ -46,7 +46,7 @@ def main() -> int:
                 output.write(f"completed {request.get('scope')} {request.get('direction')}\n")
         return {"v": 2, "result": arguments.result}
 
-    relay.handle_navigate = navigate
+    relay.navigate = navigate
     return relay.serve(arguments.socket)
 
 

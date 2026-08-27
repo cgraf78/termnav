@@ -8,13 +8,14 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::ffi::CStr;
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, IsTerminal};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,7 @@ use crate::relay::server;
 const SOCKET_WAIT: Duration = Duration::from_secs(1);
 const CHILD_POLL: Duration = Duration::from_millis(10);
 const SIGNAL_GRACE: Duration = Duration::from_millis(75);
+const SIGNAL_KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// Run SSH, enriching only an interactive session Termnav can safely own.
 pub fn run(arguments: &[OsString]) -> io::Result<i32> {
@@ -32,7 +34,8 @@ pub fn run(arguments: &[OsString]) -> io::Result<i32> {
     let Some(destination) = destination_index(arguments) else {
         return run_plain(&binary, arguments);
     };
-    if control_mode(&arguments[..destination]) || !interactive(arguments, destination) {
+    let stdin_tty = io::stdin().is_terminal();
+    if control_mode(&arguments[..destination]) || !interactive(arguments, destination, stdin_tty) {
         return run_plain(&binary, arguments);
     }
 
@@ -49,35 +52,80 @@ pub fn run(arguments: &[OsString]) -> io::Result<i32> {
         || settings
             .get("exitonforwardfailure")
             .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
-        || !resolved_tty(&settings, arguments, destination)
+        || !resolved_tty(&settings, arguments, destination, stdin_tty)
     {
         return run_plain(&binary, arguments);
     }
 
-    server::sweep()?;
+    if server::sweep().is_err() {
+        return run_plain(&binary, arguments);
+    }
     let token = format!("{}{}", new_nonce(), new_nonce());
-    let runtime = runtime_directory()?;
-    let local_socket = runtime.join(format!("relay-{token}.sock"));
+    let socket_name = OsString::from(format!("relay-{token}.sock"));
+    let runtime = match crate::runtime::private_socket_directory(&socket_name) {
+        Ok(runtime) => runtime,
+        Err(_) => return run_plain(&binary, arguments),
+    };
+    let local_socket = runtime.join(socket_name);
     let remote_socket = format!("/tmp/termnav-relay-{token}.sock");
-    let (owner_read, owner_write) = pipe()?;
+    let (owner_read, owner_write) = match process::pipe(false) {
+        Ok(pipe) => pipe,
+        Err(_) => return run_plain(&binary, arguments),
+    };
+    let direct_terminal = if env::var_os("TMUX").is_none() && env::var_os("TMUX_PANE").is_none() {
+        terminal_identity()
+    } else {
+        None
+    };
     let server_socket = local_socket.clone();
-    let server_thread = thread::spawn(move || {
-        let result = server::serve(&server_socket, Some(owner_read.as_raw_fd()));
-        drop(owner_read);
-        result
-    });
-    if !wait_for_socket(&local_socket, &server_thread) {
+    let (ready_send, ready_receive) = sync_channel(1);
+    let server_thread = match thread::Builder::new()
+        .name("termnav-relay".to_owned())
+        .spawn(move || {
+            let result = server::serve_ready(
+                &server_socket,
+                Some(owner_read.as_raw_fd()),
+                direct_terminal,
+                ready_send,
+            );
+            drop(owner_read);
+            result
+        }) {
+        Ok(thread) => thread,
+        Err(_) => {
+            drop(owner_write);
+            return run_plain(&binary, arguments);
+        }
+    };
+    if !wait_for_socket(&ready_receive, &server_thread) {
         drop(owner_write);
         let _ = server_thread.join();
         return run_plain(&binary, arguments);
     }
 
     let enhanced = enhanced_arguments(arguments, destination, &local_socket, &remote_socket);
-    let mut child = Command::new(&binary)
+    let mut child = match Command::new(&binary)
         .args(&enhanced)
         .env("TERMNAV_PARENT_RELAY", &remote_socket)
-        .spawn()?;
-    let status = wait_for_ssh(&mut child)?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            drop(owner_write);
+            let _ = server_thread.join();
+            return Err(error);
+        }
+    };
+    let status = match wait_for_ssh(&mut child) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(owner_write);
+            let _ = server_thread.join();
+            return Err(error);
+        }
+    };
 
     // Closing the only writer is a kernel-owned lifetime signal. It wakes the
     // server even when no request is active and avoids a detached process or
@@ -107,13 +155,9 @@ fn run_plain(binary: &Path, arguments: &[OsString]) -> io::Result<i32> {
 }
 
 pub(crate) fn real_ssh() -> io::Result<PathBuf> {
-    if let Some(binary) = env::var_os("TERMNAV_SSH_BINARY") {
-        return Ok(PathBuf::from(binary));
-    }
     let installed_shim = env::current_exe()
         .ok()
-        .and_then(|binary| binary.parent()?.parent().map(Path::to_owned))
-        .map(|prefix| prefix.join("share/termnav/shims"));
+        .and_then(|binary| installed_shim_for(&binary));
     let source_shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("share/termnav/shims");
     for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
         if same_path(&directory, &source_shim)
@@ -132,6 +176,19 @@ pub(crate) fn real_ssh() -> io::Result<PathBuf> {
         io::ErrorKind::NotFound,
         "ssh is not installed",
     ))
+}
+
+fn installed_shim_for(binary: &Path) -> Option<PathBuf> {
+    // `current_exe` may report the public symlink spelling on some platforms.
+    // Resolve it before deriving the release root; otherwise `termnav ssh`
+    // can mistake its own private PATH adapter for the real OpenSSH binary and
+    // recurse. Failure remains conservative for source/test binaries, whose
+    // separately known source shim is still filtered below.
+    let binary = fs::canonicalize(binary).unwrap_or_else(|_| binary.to_owned());
+    binary
+        .parent()?
+        .parent()
+        .map(|prefix| prefix.join("share/termnav/shims"))
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -160,14 +217,11 @@ pub(crate) fn effective_config(
     Ok(settings)
 }
 
-fn interactive(arguments: &[OsString], destination: usize) -> bool {
+fn interactive(arguments: &[OsString], destination: usize, stdin_tty: bool) -> bool {
     let explicit_tty = arguments[..destination]
         .iter()
         .filter_map(|value| value.to_str())
         .any(|value| value.starts_with("-t"));
-    let stdin_tty = env::var("TERMNAV_TEST_STDIN_TTY")
-        .ok()
-        .map_or_else(|| io::stdin().is_terminal(), |value| value == "1");
     stdin_tty || explicit_tty
 }
 
@@ -175,6 +229,7 @@ fn resolved_tty(
     settings: &HashMap<String, String>,
     arguments: &[OsString],
     destination: usize,
+    stdin_tty: bool,
 ) -> bool {
     let explicit_tty = arguments[..destination]
         .iter()
@@ -190,10 +245,7 @@ fn resolved_tty(
         return true;
     }
     let has_remote_command = destination + 1 < arguments.len();
-    request == "auto" && !has_remote_command && io::stdin().is_terminal()
-        || request == "auto"
-            && !has_remote_command
-            && env::var("TERMNAV_TEST_STDIN_TTY").is_ok_and(|value| value == "1")
+    request == "auto" && !has_remote_command && stdin_tty
 }
 
 fn control_mode(arguments: &[OsString]) -> bool {
@@ -222,17 +274,27 @@ fn destination_index(arguments: &[OsString]) -> Option<usize> {
         if !value.starts_with('-') || value == "-" {
             return Some(index);
         }
-        let bytes = value.as_bytes();
-        if bytes.len() == 2 && no_value_flag(bytes[1]) || bytes.len() > 2 && value_option(bytes[1])
-        {
-            index += 1;
-        } else if bytes.len() == 2 && value_option(bytes[1]) {
-            index += 2;
-        } else {
-            return None;
-        }
+        index += option_width(value)?;
     }
     None
+}
+
+fn option_width(value: &str) -> Option<usize> {
+    let flags = value.as_bytes().strip_prefix(b"-")?;
+    for (index, flag) in flags.iter().copied().enumerate() {
+        if no_value_flag(flag) {
+            continue;
+        }
+        if value_option(flag) {
+            // OpenSSH permits both `-p 22` and attached values such as
+            // `-p22`. In a cluster like `-vp22`, every byte after the first
+            // value-taking flag belongs to that option rather than naming
+            // more flags.
+            return Some(if index + 1 < flags.len() { 1 } else { 2 });
+        }
+        return None;
+    }
+    Some(1)
 }
 
 fn no_value_flag(value: u8) -> bool {
@@ -309,27 +371,32 @@ fn cancel_forward(
         .status();
 }
 
-fn wait_for_socket(socket: &Path, server_thread: &thread::JoinHandle<io::Result<()>>) -> bool {
-    let deadline = Instant::now() + SOCKET_WAIT;
-    while Instant::now() < deadline {
-        if socket.exists() {
-            return true;
-        }
-        if server_thread.is_finished() {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    false
+fn wait_for_socket(
+    ready: &Receiver<()>,
+    server_thread: &thread::JoinHandle<io::Result<()>>,
+) -> bool {
+    ready.recv_timeout(SOCKET_WAIT).is_ok() && !server_thread.is_finished()
 }
 
 fn wait_for_ssh(child: &mut Child) -> io::Result<ExitStatus> {
-    let mut forwarded = false;
+    let mut kill_deadline = None;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        if !forwarded && let Some(signal) = server::shutdown_signal() {
+        if let Some(deadline) = kill_deadline
+            && Instant::now() >= deadline
+        {
+            // A configured wrapper or ProxyCommand may trap the forwarded
+            // signal. Bound that cooperation window so the supervising
+            // process, its owner pipe, and its relay socket cannot leak
+            // indefinitely after the user has terminated the connection.
+            let _ = child.kill();
+            return child.wait();
+        }
+        if kill_deadline.is_none()
+            && let Some(signal) = server::shutdown_signal()
+        {
             // A terminal-generated signal normally reaches both processes in
             // the foreground group. Give SSH a brief chance to report that
             // exit before forwarding the same signal for direct `kill` cases.
@@ -341,42 +408,58 @@ fn wait_for_ssh(child: &mut Child) -> io::Result<ExitStatus> {
                 thread::sleep(CHILD_POLL);
             }
             let _ = unsafe { libc::kill(child.id() as i32, signal) };
-            forwarded = true;
+            kill_deadline = Some(Instant::now() + SIGNAL_KILL_GRACE);
         }
         thread::sleep(CHILD_POLL);
     }
 }
 
-fn runtime_directory() -> io::Result<PathBuf> {
-    let base = env::var_os("XDG_RUNTIME_DIR")
-        .filter(|value| Path::new(value).is_absolute())
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
-    let path = base.join(format!("termnav-{}", unsafe { libc::getuid() }));
-    fs::create_dir_all(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-    Ok(path)
+fn terminal_identity() -> Option<server::DirectTerminal> {
+    // Prefer stdout/stderr because redirected stdin may be non-terminal or
+    // read-only even when SSH was explicitly allocated a usable terminal.
+    for descriptor in [1, 2, 0] {
+        let Some(tty) = tty_name(descriptor) else {
+            continue;
+        };
+        let status_flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+        if status_flags == -1 || status_flags & libc::O_ACCMODE == libc::O_RDONLY {
+            continue;
+        }
+        let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate == -1 {
+            continue;
+        }
+        // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this
+        // process. DirectTerminal keeps it alive for exactly the SSH relay.
+        let output = unsafe { File::from_raw_fd(duplicate) };
+        return Some(server::DirectTerminal::captured(
+            std::process::id(),
+            tty,
+            env::var("TERM").unwrap_or_default(),
+            output,
+        ));
+    }
+    None
 }
 
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut descriptors = [-1; 2];
-    if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+fn tty_name(descriptor: i32) -> Option<String> {
+    let mut buffer = vec![0_u8; 1024];
+    let result = unsafe { libc::ttyname_r(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
     }
-    // SAFETY: a successful `pipe` returns two newly owned descriptors.
-    Ok(unsafe {
-        (
-            OwnedFd::from_raw_fd(descriptors[0]),
-            OwnedFd::from_raw_fd(descriptors[1]),
-        )
-    })
+    let value = unsafe { CStr::from_ptr(buffer.as_ptr().cast()) };
+    value.to_str().ok().map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::symlink;
 
-    use super::{control_mode, destination_index};
+    use super::{control_mode, destination_index, installed_shim_for, interactive, resolved_tty};
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -386,6 +469,9 @@ mod tests {
     fn destination_parser_preserves_option_boundaries() {
         assert_eq!(destination_index(&args(&["-p", "22", "host"])), Some(2));
         assert_eq!(destination_index(&args(&["-p22", "host"])), Some(1));
+        assert_eq!(destination_index(&args(&["-vvv", "host"])), Some(1));
+        assert_eq!(destination_index(&args(&["-tt", "host"])), Some(1));
+        assert_eq!(destination_index(&args(&["-vp22", "host"])), Some(1));
         assert_eq!(destination_index(&args(&["--", "-host"])), Some(1));
         assert_eq!(destination_index(&args(&["-p"])), None);
     }
@@ -396,5 +482,45 @@ mod tests {
         assert!(control_mode(&args(&["-O", "check"])));
         assert!(control_mode(&args(&["-TN"])));
         assert!(!control_mode(&args(&["-t", "-p", "22"])));
+    }
+
+    #[test]
+    fn tty_classification_uses_real_input_or_explicit_flags() {
+        let settings = HashMap::from([("requesttty".to_owned(), "auto".to_owned())]);
+
+        assert!(interactive(&args(&["host"]), 0, true));
+        assert!(!interactive(&args(&["host"]), 0, false));
+        assert!(interactive(&args(&["-t", "host"]), 1, false));
+        assert!(resolved_tty(&settings, &args(&["host"]), 0, true));
+        assert!(!resolved_tty(
+            &settings,
+            &args(&["host", "command"]),
+            0,
+            true
+        ));
+    }
+
+    #[test]
+    fn installed_shim_resolution_follows_the_public_binary_symlink() {
+        let root =
+            std::env::temp_dir().join(format!("termnav-installed-shim-{}", std::process::id()));
+        let release = root.join("release");
+        let public = root.join("public");
+        fs::create_dir_all(release.join("bin")).expect("create release bin");
+        fs::create_dir_all(release.join("share/termnav/shims")).expect("create shim dir");
+        fs::create_dir_all(&public).expect("create public bin");
+        fs::write(release.join("bin/termnav"), b"binary").expect("create binary");
+        symlink(release.join("bin/termnav"), public.join("termnav"))
+            .expect("create public command link");
+
+        // macOS exposes temporary paths through both /var and /private/var.
+        // Compare filesystem identity instead of the caller-visible spelling.
+        let expected = release
+            .join("share/termnav/shims")
+            .canonicalize()
+            .expect("canonicalize shim dir");
+
+        assert_eq!(installed_shim_for(&public.join("termnav")), Some(expected));
+        fs::remove_dir_all(root).expect("remove symlink fixture");
     }
 }

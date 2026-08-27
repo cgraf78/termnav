@@ -1,0 +1,21 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: cgraf78/actions/.github/workflows/rust-release.yml@92508d3ea7b6d5e074785afb1d47263497e967cf
+    permissions:
+      contents: write
+    with:
+      android-aarch64: true
+      android-x86_64: true
+      tag-command: scripts/release-tag.sh
+      package-command: scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+      smoke-command: scripts/smoke-release.sh "$ASSET_PLATFORM"

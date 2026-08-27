@@ -6,14 +6,15 @@
 //! query at the outer edge, and commits inward only when the reply traverses
 //! the exact clients that were validated during preparation.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,17 +27,81 @@ use crate::navigation::{Action, Backend, Client, Direction, Outcome, Scope, Syst
 use crate::process;
 
 const MAX_MESSAGE_BYTES: u64 = 513;
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+// A client can be descheduled after connect(2) but before its first write,
+// especially while a multi-hop navigation burst is starting helper processes
+// on a loaded host. Keep admission bounded, but allow ordinary scheduler
+// latency rather than converting it into a broken pipe on the user's gesture.
+// The private socket and handler cap below bound deliberate idle connections.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(8);
 const COMMIT_QUERY: &[u8] = b"\x1b[?2004$p";
 const COMMIT_KEY: &[u8] = b"\x1b[777009u";
+const MAX_CONNECTION_HANDLERS: usize = 64;
 
 static STOPPING: AtomicBool = AtomicBool::new(false);
 static WAKE_WRITE: AtomicI32 = AtomicI32::new(-1);
 static LAST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// Stable identity of the terminal that owns a relay outside tmux.
+#[derive(Clone)]
+pub struct DirectTerminal {
+    /// PID whose controlling terminal must still match at dispatch time.
+    pub pid: u32,
+    /// Character device used for the terminal commit barrier.
+    pub tty: String,
+    /// Terminal type exposed to navigation backends.
+    pub termtype: String,
+    /// Writable descriptor captured before SSH can replace the foreground job.
+    output: Arc<File>,
+}
+
+impl DirectTerminal {
+    /// Build an identity captured before the SSH supervisor starts threads.
+    #[must_use]
+    pub fn captured(pid: u32, tty: String, termtype: String, output: File) -> Self {
+        Self {
+            pid,
+            tty,
+            termtype,
+            output: Arc::new(output),
+        }
+    }
+
+    fn emit_commit(&self) -> bool {
+        // Android may allow an inherited terminal descriptor while refusing a
+        // later pathname reopen of the same /dev/pts node. Retaining this
+        // descriptor also removes a time-of-check/time-of-use window between
+        // terminal identity capture and the commit barrier.
+        let mut output = self.output.as_ref();
+        output.write_all(COMMIT_QUERY).is_ok()
+    }
+}
+
 /// Serve requests on one owner-protected Unix socket.
-pub fn serve(path: &Path, owner_fd: Option<RawFd>) -> io::Result<()> {
+pub fn serve(
+    path: &Path,
+    owner_fd: Option<RawFd>,
+    direct_terminal: Option<DirectTerminal>,
+) -> io::Result<()> {
+    serve_inner(path, owner_fd, direct_terminal, None)
+}
+
+/// Serve after notifying the in-process SSH supervisor that setup is complete.
+pub(crate) fn serve_ready(
+    path: &Path,
+    owner_fd: Option<RawFd>,
+    direct_terminal: Option<DirectTerminal>,
+    ready: SyncSender<()>,
+) -> io::Result<()> {
+    serve_inner(path, owner_fd, direct_terminal, Some(ready))
+}
+
+fn serve_inner(
+    path: &Path,
+    owner_fd: Option<RawFd>,
+    direct_terminal: Option<DirectTerminal>,
+    ready: Option<SyncSender<()>>,
+) -> io::Result<()> {
     STOPPING.store(false, Ordering::SeqCst);
     LAST_SIGNAL.store(0, Ordering::SeqCst);
     prepare_socket_path(path)?;
@@ -44,28 +109,73 @@ pub fn serve(path: &Path, owner_fd: Option<RawFd>) -> io::Result<()> {
     let listener = UnixListener::bind(path);
     unsafe { libc::umask(old_umask) };
     let listener = listener?;
+    // Binding creates the filesystem entry before any of the remaining setup
+    // can fail. Own it immediately so chmod, nonblocking, pipe, and signal
+    // setup errors cannot strand a path that later looks like a live relay.
+    let mut socket_path = SocketPathGuard::new(path);
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
-    let (wake_read, wake_write) = pipe()?;
+    let (wake_read, wake_write) = process::pipe(true)?;
     WAKE_WRITE.store(wake_write.as_raw_fd(), Ordering::SeqCst);
     install_signal_handlers()?;
     let ordering = Arc::new(OrderGate::default());
+    if let Some(ready) = ready {
+        // Binding alone is not readiness: every fallible permission, pipe,
+        // and signal setup step above must complete before SSH advertises this
+        // socket as a reverse forward.
+        let _ = ready.send(());
+    }
 
     // `poll` has no periodic wakeup: the process sleeps until a connection,
     // owner death, or catchable signal. This keeps the connection-owned relay
     // effectively free while idle and lets the kernel close it immediately if
     // the supervisor is killed.
-    let result = poll_loop(&listener, owner_fd, &wake_read, ordering);
+    let result = poll_loop(&listener, owner_fd, &wake_read, ordering, direct_terminal);
     WAKE_WRITE.store(-1, Ordering::SeqCst);
     drop(listener);
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) if result.is_ok() => return Err(error),
-        Err(_) => {}
+    if let Err(error) = socket_path.remove()
+        && result.is_ok()
+    {
+        return Err(error);
     }
     result
+}
+
+struct SocketPathGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl SocketPathGuard {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn remove(&mut self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for SocketPathGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Return the catchable signal that requested relay shutdown, if any.
@@ -78,14 +188,18 @@ pub fn shutdown_signal() -> Option<i32> {
 /// Handle one validated protocol object without socket framing.
 #[must_use]
 pub fn dispatch(request: &Value) -> Value {
+    dispatch_with_terminal(request, None)
+}
+
+fn dispatch_with_terminal(request: &Value, direct_terminal: Option<&DirectTerminal>) -> Value {
     if request.get("v").and_then(Value::as_u64) != Some(2) {
         return reply("error");
     }
     match request.get("op").and_then(Value::as_str) {
-        Some("navigate") => handle_navigate(request),
+        Some("navigate") => handle_navigate(request, direct_terminal),
         Some("prepare-path") => handle_prepare(request),
         Some("abort-path") => handle_abort(request),
-        Some("commit-path") => handle_commit(request),
+        Some("commit-path") => handle_commit(request, direct_terminal),
         Some("focus") => crate::focus::handle_relay(request),
         _ => reply("error"),
     }
@@ -94,15 +208,12 @@ pub fn dispatch(request: &Value) -> Value {
 /// Send a navigation request to the parent advertised by a live client.
 #[must_use]
 pub fn send_navigation(
-    scope: &str,
-    direction: &str,
+    action: Action,
+    direction: Direction,
     client_pid: Option<u32>,
     client_tty: Option<&str>,
     parent_override: Option<&str>,
 ) -> i32 {
-    if wire_action(scope, direction).is_none() {
-        return 2;
-    }
     let mut parent = client_pid
         .and_then(|pid| process::environment(pid, "TERMNAV_PARENT_RELAY"))
         .filter(|value| !value.is_empty());
@@ -123,8 +234,11 @@ pub fn send_navigation(
     let request = json!({
         "v": 2,
         "op": "navigate",
-        "scope": scope,
-        "direction": direction,
+        // Protocol v2 uses compact scope names. Keep that vocabulary isolated
+        // at this boundary so mixed-version SSH paths interoperate without
+        // exposing old names through the unified public command interface.
+        "scope": wire_scope(action),
+        "direction": direction.as_str(),
         "nonce": super::client::new_nonce(),
     });
     match send(Path::new(&parent), &request, RELAY_TIMEOUT)
@@ -233,7 +347,7 @@ pub fn commit(
     0
 }
 
-fn handle_navigate(request: &Value) -> Value {
+fn handle_navigate(request: &Value, direct_terminal: Option<&DirectTerminal>) -> Value {
     let Some(nonce) = request
         .get("nonce")
         .and_then(Value::as_str)
@@ -286,7 +400,7 @@ fn handle_navigate(request: &Value) -> Value {
             return reply("error");
         }
         if parent.is_empty() {
-            if !emit_commit(&directive.local_client_tty, false) {
+            if !emit_commit(&directive.local_client_tty) {
                 let _ = store.discard(nonce);
                 return reply("error");
             }
@@ -317,6 +431,7 @@ fn handle_navigate(request: &Value) -> Value {
     reply(dispatch_terminal(
         &mut backend,
         info.as_ref(),
+        direct_terminal,
         action,
         direction,
     ))
@@ -398,7 +513,7 @@ fn handle_abort(request: &Value) -> Value {
     reply("aborted")
 }
 
-fn handle_commit(request: &Value) -> Value {
+fn handle_commit(request: &Value, direct_terminal: Option<&DirectTerminal>) -> Value {
     let Some(nonce) = request
         .get("nonce")
         .and_then(Value::as_str)
@@ -424,7 +539,7 @@ fn handle_commit(request: &Value) -> Value {
         let parent = process::environment(directive.local_client_pid, "TERMNAV_PARENT_RELAY")
             .unwrap_or_default();
         if parent.is_empty() {
-            if !emit_commit(&directive.local_client_tty, false) {
+            if !emit_commit(&directive.local_client_tty) {
                 let _ = store.discard(nonce);
                 return reply("error");
             }
@@ -455,8 +570,10 @@ fn handle_commit(request: &Value) -> Value {
         .filter(valid_navigation_reply)
         .unwrap_or_else(|| reply("error"));
     }
-    let tty = std::env::var("TERMNAV_RELAY_CLIENT_TTY").unwrap_or_default();
-    if emit_commit(&tty, true) {
+    let Some(direct_terminal) = direct_terminal else {
+        return reply("error");
+    };
+    if direct_terminal.emit_commit() {
         reply("emitted")
     } else {
         reply("error")
@@ -588,10 +705,11 @@ fn execute_directive(directive: &Directive) -> bool {
 fn dispatch_terminal(
     backend: &mut SystemBackend,
     info: Option<&LocalScope>,
+    direct_terminal: Option<&DirectTerminal>,
     action: Action,
     direction: Direction,
 ) -> &'static str {
-    let direct = direct_terminal_client();
+    let direct = direct_terminal_client(direct_terminal);
     let client = info.map(|scope| &scope.client).or(direct.as_ref());
     if info.is_none() && client.is_none() {
         return "declined";
@@ -608,20 +726,13 @@ fn dispatch_terminal(
     }
 }
 
-fn direct_terminal_client() -> Option<Client> {
-    let tty = std::env::var("TERMNAV_RELAY_CLIENT_TTY").ok()?;
-    let pid = std::env::var("TERMNAV_RELAY_CLIENT_PID")
-        .ok()?
-        .parse()
-        .ok()?;
-    if tty.is_empty() || pid == 0 {
-        return None;
-    }
+fn direct_terminal_client(direct_terminal: Option<&DirectTerminal>) -> Option<Client> {
+    let direct_terminal = direct_terminal?;
     Some(Client {
         activity: 0,
-        pid,
-        tty,
-        termtype: std::env::var("TERM").unwrap_or_default(),
+        pid: direct_terminal.pid,
+        tty: direct_terminal.tty.clone(),
+        termtype: direct_terminal.termtype.clone(),
         session: String::new(),
         pane: String::new(),
         focused: false,
@@ -632,20 +743,9 @@ fn direct_terminal_client() -> Option<Client> {
     })
 }
 
-fn emit_commit(tty: &str, direct_terminal: bool) -> bool {
+fn emit_commit(tty: &str) -> bool {
     if tty.is_empty() {
         return false;
-    }
-    if direct_terminal {
-        let Ok(expected) = fs::canonicalize(tty) else {
-            return false;
-        };
-        let Ok(actual) = fs::canonicalize("/dev/tty") else {
-            return false;
-        };
-        if expected != actual {
-            return false;
-        }
     }
     let Ok(mut descriptor) = OpenOptions::new()
         .append(true)
@@ -678,6 +778,14 @@ fn wire_action(scope: &str, direction: &str) -> Option<(Action, Direction)> {
     Direction::parse(action, direction)
         .ok()
         .map(|direction| (action, direction))
+}
+
+fn wire_scope(action: Action) -> &'static str {
+    match action {
+        Action::PaneSelect => "pane",
+        Action::TabSelect => "window",
+        Action::TabMove => "move",
+    }
 }
 
 fn valid_nonce(value: &str) -> bool {
@@ -730,8 +838,10 @@ fn prepare_socket_path(path: &Path) -> io::Result<()> {
             "relay socket has no parent",
         ));
     };
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    // Socket creation must not turn an arbitrary symlink or another user's
+    // directory into trusted transport state. Keep this check centralized
+    // with every other Termnav runtime directory boundary.
+    crate::runtime::ensure_private_directory(parent)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let uid = unsafe { libc::getuid() };
@@ -754,7 +864,9 @@ fn poll_loop(
     owner_fd: Option<RawFd>,
     wake_read: &OwnedFd,
     ordering: Arc<OrderGate>,
+    direct_terminal: Option<DirectTerminal>,
 ) -> io::Result<()> {
+    let mut handlers = Vec::new();
     while !STOPPING.load(Ordering::SeqCst) {
         let mut descriptors = vec![libc::pollfd {
             fd: listener.as_raw_fd(),
@@ -802,23 +914,67 @@ fn poll_loop(
         if descriptors[0].revents & libc::POLLIN == 0 {
             continue;
         }
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let ordering = Arc::clone(&ordering);
-                    thread::spawn(move || handle_connection(stream, ordering));
+        reap_finished(&mut handlers);
+        match listener.accept() {
+            Ok((stream, _)) => {
+                reap_finished(&mut handlers);
+                if handlers.len() >= MAX_CONNECTION_HANDLERS {
+                    // The socket is private to the user, but a stuck or buggy
+                    // client must not create unbounded thread stacks or turn
+                    // shutdown into an N-times-timeout delay.
+                    drop(stream);
+                    continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error),
+                let ordering = Arc::clone(&ordering);
+                let direct_terminal = direct_terminal.clone();
+                handlers.push(thread::spawn(move || {
+                    handle_connection(stream, owner_fd, ordering, direct_terminal.as_ref())
+                }));
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
         }
+    }
+    ordering.stop();
+    // No new requests are accepted after owner death, but an admitted request
+    // owns transactional state that must reach its bounded success/abort path.
+    // Draining only active handlers prevents dead-owner directives from
+    // poisoning a still-live outer tmux client after the SSH wrapper exits.
+    for handler in handlers {
+        let _ = handler.join();
     }
     Ok(())
 }
 
-fn handle_connection(mut stream: UnixStream, ordering: Arc<OrderGate>) {
-    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(RELAY_TIMEOUT));
+fn reap_finished(handlers: &mut Vec<thread::JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            let handler = handlers.swap_remove(index);
+            let _ = handler.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn handle_connection(
+    mut stream: UnixStream,
+    owner_fd: Option<RawFd>,
+    ordering: Arc<OrderGate>,
+    direct_terminal: Option<&DirectTerminal>,
+) {
+    // BSD-derived kernels may propagate O_NONBLOCK from the listener to an
+    // accepted socket. Linux does not, which hid this portability bug until a
+    // macOS client was deliberately descheduled between connect and write.
+    // Normalize the per-request stream before applying bounded blocking I/O;
+    // otherwise the first read can return WouldBlock and close a valid gesture.
+    if stream.set_nonblocking(false).is_err()
+        || stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(RELAY_TIMEOUT)).is_err()
+    {
+        return;
+    }
     let mut line = String::new();
     let mut reader = BufReader::new((&mut stream).take(MAX_MESSAGE_BYTES));
     if reader.read_line(&mut line).is_err() || line.len() > 512 || !line.ends_with('\n') {
@@ -832,10 +988,24 @@ fn handle_connection(mut stream: UnixStream, ordering: Arc<OrderGate>) {
     }
 
     let response = if request.get("op").and_then(Value::as_str) == Some("focus") {
-        dispatch(&request)
+        if ordering.stopped() {
+            return;
+        }
+        dispatch_with_terminal(&request, direct_terminal)
     } else {
-        let ticket = ordering.enter();
-        let response = dispatch(&request);
+        let Some(ticket) = ordering.enter() else {
+            return;
+        };
+        // The poll thread and the active handler race when the owner closes at
+        // the exact instant a transaction finishes. Recheck the kernel-owned
+        // lifetime signal after acquiring the serial turn so a queued request
+        // cannot slip through before the poll thread marks the gate stopped.
+        if owner_fd.is_some_and(owner_closed) {
+            ordering.stop();
+            ordering.leave(ticket);
+            return;
+        }
+        let response = dispatch_with_terminal(&request, direct_terminal);
         ordering.leave(ticket);
         response
     };
@@ -845,27 +1015,42 @@ fn handle_connection(mut stream: UnixStream, ordering: Arc<OrderGate>) {
     }
 }
 
+fn owner_closed(owner_fd: RawFd) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: owner_fd,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    let closed_events = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    ready > 0 && descriptor.revents & closed_events != 0
+}
+
 #[derive(Default)]
 struct OrderGate {
     next: AtomicU64,
     serving: Mutex<u64>,
     changed: Condvar,
+    stopping: AtomicBool,
 }
 
 impl OrderGate {
-    fn enter(&self) -> u64 {
+    fn enter(&self) -> Option<u64> {
+        if self.stopped() {
+            return None;
+        }
         let ticket = self.next.fetch_add(1, Ordering::SeqCst);
         let mut serving = self
             .serving
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        while *serving != ticket {
+        while *serving != ticket && !self.stopped() {
             serving = self
                 .changed
                 .wait(serving)
                 .unwrap_or_else(|error| error.into_inner());
         }
-        ticket
+        (!self.stopped()).then_some(ticket)
     }
 
     fn leave(&self, ticket: u64) {
@@ -878,20 +1063,23 @@ impl OrderGate {
             self.changed.notify_all();
         }
     }
-}
 
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut descriptors = [-1; 2];
-    if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
+    fn stop(&self) {
+        // Serialize the state transition with the predicate check in enter().
+        // Without this lock, a waiter can observe `stopping == false`, lose the
+        // notification just before Condvar::wait releases the mutex, and keep
+        // an SSH-owned relay alive after its owner pipe closes.
+        let _serving = self
+            .serving
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.stopping.store(true, Ordering::SeqCst);
+        self.changed.notify_all();
     }
-    // SAFETY: a successful `pipe` returns two newly owned file descriptors.
-    Ok(unsafe {
-        (
-            OwnedFd::from_raw_fd(descriptors[0]),
-            OwnedFd::from_raw_fd(descriptors[1]),
-        )
-    })
+
+    fn stopped(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
 }
 
 fn install_signal_handlers() -> io::Result<()> {
@@ -917,11 +1105,24 @@ fn install_signal_handlers() -> io::Result<()> {
 /// Remove only old owner-held relay sockets that no longer accept connections.
 pub fn sweep() -> io::Result<()> {
     let now = SystemTime::now();
-    let mut roots = vec![PathBuf::from("/tmp"), std::env::temp_dir()];
+    let uid = unsafe { libc::getuid() };
+    let runtime_base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| Path::new(value).is_absolute())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let mut roots = vec![
+        (PathBuf::from("/tmp"), "termnav-relay-"),
+        (std::env::temp_dir(), "termnav-relay-"),
+        (runtime_base.join(format!("termnav-{uid}")), "relay-"),
+        // `private_socket_directory` uses this short owner-only root when a
+        // macOS TMPDIR/XDG path cannot fit in sockaddr_un. Scan it without
+        // creating it so a crash-only stale pathname is reclaimed on the next
+        // connection just like a normal runtime-root socket.
+        (PathBuf::from(format!("/tmp/termnav-{uid}")), "relay-"),
+    ];
     roots.sort();
     roots.dedup();
-    let uid = unsafe { libc::getuid() };
-    for root in roots {
+    for (root, prefix) in roots {
         let Ok(entries) = fs::read_dir(root) else {
             continue;
         };
@@ -930,7 +1131,7 @@ pub fn sweep() -> io::Result<()> {
             let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
                 continue;
             };
-            if !name.starts_with("termnav-relay-") || !name.ends_with(".sock") {
+            if !name.starts_with(prefix) || !name.ends_with(".sock") {
                 continue;
             }
             let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -954,9 +1155,14 @@ pub fn sweep() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
+
     use serde_json::json;
 
-    use super::{dispatch, wire_action};
+    use super::{SocketPathGuard, dispatch, prepare_socket_path, wire_action, wire_scope};
+    use crate::navigation::Action;
 
     #[test]
     fn invalid_protocol_objects_fail_closed() {
@@ -972,9 +1178,52 @@ mod tests {
 
     #[test]
     fn wire_vocabulary_is_action_specific() {
+        assert_eq!(wire_scope(Action::PaneSelect), "pane");
+        assert_eq!(wire_scope(Action::TabSelect), "window");
+        assert_eq!(wire_scope(Action::TabMove), "move");
         assert!(wire_action("pane", "left").is_some());
         assert!(wire_action("pane", "next").is_none());
         assert!(wire_action("window", "previous").is_some());
         assert!(wire_action("move", "down").is_none());
+    }
+
+    #[test]
+    fn socket_parent_rejects_a_symlinked_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "termnav-socket-parent-{}-{}",
+            std::process::id(),
+            super::now_seconds()
+        ));
+        let target = root.join("target");
+        let linked = root.join("linked");
+        fs::create_dir_all(&target).expect("create target directory");
+        symlink(&target, &linked).expect("create parent symlink");
+
+        let error = prepare_socket_path(&linked.join("relay.sock"))
+            .expect_err("symlinked socket parent must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!target.join("relay.sock").exists());
+        fs::remove_dir_all(&root).expect("remove test directory");
+    }
+
+    #[test]
+    fn post_bind_failure_guard_removes_the_socket_path() {
+        let root = std::env::temp_dir().join(format!(
+            "termnav-socket-guard-{}-{}",
+            std::process::id(),
+            super::now_seconds()
+        ));
+        fs::create_dir_all(&root).expect("create socket directory");
+        let path = root.join("relay.sock");
+
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let guard = SocketPathGuard::new(&path);
+        assert!(path.exists());
+        drop(listener);
+        drop(guard);
+
+        assert!(!path.exists());
+        fs::remove_dir_all(&root).expect("remove test directory");
     }
 }

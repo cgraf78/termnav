@@ -10,7 +10,10 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
 
-navigate="$TERMNAV_ROOT/bin/termnav-navigate"
+navigate_dir=$(_tmpdir)
+navigate="$navigate_dir/termnav-navigate"
+_termnav_command_adapter "$navigate" \
+  "${TERMNAV_TEST_BINARY:-$TERMNAV_ROOT/target/release/termnav}" navigate
 python_bin=$(python3 -c 'import sys; print(sys.executable)')
 
 echo "=== semantic navigation CLI ==="
@@ -127,17 +130,6 @@ _assert_eq "navigation CLI: current pane handles an available left neighbor" \
   "$left_pane" \
   "$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')"
 
-# Stream mode must follow the window's new active pane without selecting one
-# physical tmux client. A stale source would treat the second, opposite move as
-# an edge and leave the right pane selected.
-stream_results=$(printf 'pane-select right\npane-select left\n' |
-  TMUX="$socket_path,1,0" TMUX_PANE="$left_pane" "$navigate" --stream)
-_assert_eq "navigation CLI: pane stream applies every queued action" $'0\n0' \
-  "$stream_results"
-_assert_eq "navigation CLI: pane stream follows the active window pane" \
-  "$left_pane" \
-  "$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')"
-
 tmux -L "$socket_name" new-window -d -t nav -n second
 first_window=$(tmux -L "$socket_name" list-windows -t nav -F '#{window_id}' | sed -n '1p')
 second_window=$(tmux -L "$socket_name" list-windows -t nav -F '#{window_id}' | sed -n '2p')
@@ -218,20 +210,6 @@ _assert_eq "navigation CLI: linked pane selects a tab in the attached session" \
 _assert_eq "navigation CLI: linked pane leaves the other session selected tab unchanged" \
   "$linked_before" \
   "$(tmux -L "$socket_name" display-message -p -t linked '#{window_id}')"
-
-# A burst can remain buffered in the application after the first action moves
-# its tmux client. Stream mode retains that exact client and follows its new
-# live pane, so every accepted key takes effect in order.
-tmux -L "$socket_name" new-window -d -t nav -n third
-third_window=$(tmux -L "$socket_name" list-windows -t nav -F '#{window_id}' | sed -n '3p')
-tmux -L "$socket_name" select-window -t "nav:$first_window"
-stream_results=$(printf 'tab-select next\ntab-select next\n' |
-  TMUX="$socket_path,1,0" TMUX_PANE="$source_pane" "$navigate" --stream)
-_assert_eq "navigation CLI: stream applies every queued action" $'0\n0' \
-  "$stream_results"
-_assert_eq "navigation CLI: stream follows the client after each action" \
-  "$third_window" \
-  "$(tmux -L "$socket_name" display-message -p -t nav '#{window_id}')"
 
 echo
 echo "=== exact-client local parent traversal ==="

@@ -16,17 +16,31 @@ permissions:
   contents: read
 
 jobs:
-  shell:
-    uses: cgraf78/actions/.github/workflows/shell-ci.yml@de3f6086e36a77eec8ee62f2c9871266e4b5c05c
+  rust:
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@92508d3ea7b6d5e074785afb1d47263497e967cf
     with:
       matrix-set: full
-      profiles: base,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
-      # wezterm-test falls back to `nvim -l`, so Termux does not need a second
-      # standalone Lua runtime. Avoid the current lua54/lua51 collision over
-      # the generic lua++.pc package metadata file.
+      msrv-toolchain: "1.88"
+      profiles: base,shellcheck,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
+      test-command: cargo test --locked && test/termnav-test
       termux-profiles: base,zsh,neovim,tmux,python,openssh-netcat-lsof
-      shellcheck-inventory-path: .github/shellcheck-files.txt
-      test-command: TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test
+      termux-command: TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test
+      termux-host-command: |
+        archive=$(
+          CARGO_TARGET_DIR="$RUNNER_TEMP/termnav-termux-target" \
+            scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        )
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
+        mkdir -p .termux-ci
+        tar -xzf "$archive" -C .termux-ci ./bin/termnav
+        cp .termux-ci/bin/termnav ./termnav
+      android-package-smoke-command: |
+        scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM"
+        scripts/smoke-release.sh "$ASSET_PLATFORM"
+      package-smoke-musl-target: x86_64-unknown-linux-musl
+      package-smoke-command: |
+        scripts/package-release.sh "$RUST_TARGET" linux-x86_64-musl
+        scripts/smoke-release.sh linux-x86_64-musl
 
   actions-sync:
     name: cgraf78/actions sync
@@ -42,7 +56,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@de3f6086e36a77eec8ee62f2c9871266e4b5c05c
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@92508d3ea7b6d5e074785afb1d47263497e967cf
 
   relay-performance:
     name: Relay hot path / Ubuntu
@@ -54,9 +68,50 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # This is a standalone benchmark job, not a child of the reusable Rust
+      # matrix above, so it must establish its own toolchain before the harness
+      # builds both the base revision and the pull-request candidate.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
       - name: Compare relay hot paths with the PR base
         env:
           TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}
+        run: test/suites/relay-performance-test
+
+      - name: Exercise the post-cutover baseline path
+        env:
+          TERMNAV_PERFORMANCE_BASELINE: HEAD
+          TERMNAV_PERFORMANCE_SAMPLES: "2"
+        run: test/suites/relay-performance-test
+
+  relay-performance-macos:
+    name: Relay hot path / macOS
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Install tmux
+        run: brew install tmux
+
+      # macOS has no procfs. This repeats the real nested-boundary benchmark on
+      # the fallback process-inspection path so a change cannot be fast on
+      # Linux while spawning enough `ps` processes to feel sluggish on Macs.
+      - name: Compare relay hot paths with the PR base
+        env:
+          TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}
+          TERMNAV_PERFORMANCE_SAMPLES: "20"
         run: test/suites/relay-performance-test
 
   eza-current:
@@ -70,7 +125,7 @@ jobs:
         run: |
           pacman-key --init
           pacman-key --populate
-          pacman -Syu --noconfirm bash eza git lua python zsh
+          pacman -Syu --noconfirm bash eza git lua python rust zsh
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,28 +133,36 @@ jobs:
 
       - name: Exercise current eza CLI
         shell: bash
-        run: test/suites/wezterm-integration-test
+        run: |
+          cargo build --release --locked
+          test/suites/wezterm-integration-test
 
   required:
     name: Required
     if: ${{ always() }}
-    needs: [shell, eza-current, relay-performance]
+    needs: [rust, eza-current, relay-performance, relay-performance-macos]
     runs-on: ubuntu-24.04
     env:
-      SHELL_RESULT: ${{ needs.shell.result }}
+      RUST_RESULT: ${{ needs.rust.result }}
       EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}
       RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}
+      RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}
     steps:
       - name: Require all Termnav compatibility checks
         shell: bash
         run: |-
-          printf 'Shell CI: %s\n' "$SHELL_RESULT"
+          printf 'Rust CI: %s\n' "$RUST_RESULT"
           printf 'Current eza: %s\n' "$EZA_CURRENT_RESULT"
           printf 'Relay performance: %s\n' "$RELAY_PERFORMANCE_RESULT"
+          printf 'Relay performance macOS: %s\n' "$RELAY_PERFORMANCE_MACOS_RESULT"
 
-          test "$SHELL_RESULT" = success
+          test "$RUST_RESULT" = success
           test "$EZA_CURRENT_RESULT" = success
           case "$RELAY_PERFORMANCE_RESULT" in
+            success | skipped) ;;
+            *) exit 1 ;;
+          esac
+          case "$RELAY_PERFORMANCE_MACOS_RESULT" in
             success | skipped) ;;
             *) exit 1 ;;
           esac

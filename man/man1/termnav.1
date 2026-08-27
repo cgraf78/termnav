@@ -1,0 +1,64 @@
+.TH TERMNAV 1 "August 2026" "termnav" "User Commands"
+.SH NAME
+termnav \- route terminal navigation, focus, links, and editor opens
+.SH SYNOPSIS
+.B termnav
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+.B termnav
+is one native command for navigation across Neovim, tmux, SSH, WezTerm, and
+VS Code terminal boundaries. Integrations should invoke the structured
+subcommands below instead of reproducing routing policy.
+.SH COMMANDS
+.TP
+.B navigate
+Route pane selection, tab selection, or tab movement through the nearest
+available scope.
+.TP
+.B relay
+Send or serve the connection-scoped Unix relay protocol. The send form uses
+the same pane-select, tab-select, and tab-move actions as navigate. Serve and
+commit forms are internal integration interfaces.
+.TP
+.B ssh
+Run one requested SSH session with its reverse-forward relay. Termnav never
+opens a second authenticated transport connection.
+.TP
+.B link-host
+Print the host represented by the current terminal context for semantic links.
+.TP
+.B tmux context
+Publish tmux ownership metadata to one exact terminal client.
+.TP
+.B tmux focus
+Publish and maintain hierarchical focus leases between adjacent tmux layers.
+.TP
+.B tmux follow-click
+Resolve tmux mouse metadata to a browser URL or Neovim file target.
+.TP
+.B nvim open
+Open a local or remote target in the narrowest eligible Neovim scope.
+.TP
+.B nvim ssh-open
+Reuse one exact existing SSH ControlMaster without network fallback.
+.TP
+.B vscode focus
+Publish an authenticated, ordered Neovim focus lease to a VS Code window.
+.TP
+.B eza
+Run eza with remote-aware OSC-8 file hyperlinks.
+.TP
+.B version
+Print the timestamp and commit identity embedded at build time.
+.SH FILES
+.TP
+.I $XDG_RUNTIME_DIR/termnav-UID
+Owner-only relay, navigation, and focus coordination state.
+.TP
+.I $XDG_STATE_HOME/nvim-tmux-open
+Neovim socket registry shared with the editor integration.
+.SH SEE ALSO
+.BR tmux (1),
+.BR ssh (1),
+.BR nvim (1)

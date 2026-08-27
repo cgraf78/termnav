@@ -53,9 +53,9 @@ local function fake_context(options)
         arguments = arguments,
         on_exit = on_exit,
       }
-      function job.finish(status)
+      function job.finish(status, output)
         job.status = status
-        on_exit(status)
+        on_exit(status, output)
       end
       jobs[#jobs + 1] = job
       return job
@@ -113,7 +113,7 @@ test("tmux pane edge delegates arbitrary ancestry to the shared router", functio
   equal(#commands, 1, "edge detection should remain one tmux command")
   equal(
     jobs[1].arguments,
-    { "termnav", "navigate", "pane-select", "up" },
+    { "termnav", "navigate", "--emit-continuation", "pane-select", "up" },
     "the router should start one native request"
   )
 end)
@@ -182,7 +182,7 @@ test("single application tab delegates linked-session policy to the router", fun
   equal(#commands, 0, "nvim should not choose a tmux session itself")
   equal(
     jobs[1].arguments,
-    { "termnav", "navigate", "tab-select", "previous" },
+    { "termnav", "navigate", "--emit-continuation", "tab-select", "previous" },
     "tab selection should start one native request"
   )
 end)
@@ -201,16 +201,20 @@ test("boundary bursts use one bounded FIFO of native requests", function()
   equal(#jobs, 1, "only one native process should be in flight")
   equal(
     jobs[1].arguments,
-    { "termnav", "navigate", "pane-select", "left" },
+    { "termnav", "navigate", "--emit-continuation", "pane-select", "left" },
     "the first process should preserve input order"
   )
-  jobs[1].finish(0)
+  jobs[1].finish(0, '{"version":1}')
   equal(#jobs, 2, "completion should launch the next queued request")
-  equal(
-    jobs[2].arguments,
-    { "termnav", "navigate", "pane-select", "right" },
-    "the second process should preserve input order"
-  )
+  equal(jobs[2].arguments, {
+    "termnav",
+    "navigate",
+    "--emit-continuation",
+    "pane-select",
+    "right",
+    "--continuation",
+    '{"version":1}',
+  }, "the second process should preserve input order")
 end)
 
 test("boundary queue is bounded and reports overflow", function()
@@ -261,7 +265,11 @@ test("a failed one-shot does not block the next boundary", function()
   equal(attempts, 1, "the first boundary should make one attempt")
   ctx.tab_select("previous")
   equal(attempts, 2, "the next boundary should retry after launch failure")
-  equal(requests[2], { "termnav", "navigate", "tab-select", "previous" }, "retry request")
+  equal(
+    requests[2],
+    { "termnav", "navigate", "--emit-continuation", "tab-select", "previous" },
+    "retry request"
+  )
 end)
 
 test("previous split navigation remains local and process free", function()
@@ -319,7 +327,11 @@ test("previous pane returns to tmux after crossing the nvim boundary", function(
   })
 
   ctx.pane("left")
-  equal(jobs[1].arguments, { "termnav", "navigate", "pane-select", "left" }, "boundary route")
+  equal(
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "pane-select", "left" },
+    "boundary route"
+  )
   ctx.previous()
 
   equal(vim.api.nvim_get_current_win(), source, "previous should not enter another nvim split")

@@ -10,9 +10,14 @@ root="${test_dir%/test}"
 . "$test_dir/helpers.sh"
 
 echo "=== terminal-independent relay commit ==="
+relay_adapter=$(_tmpdir)/termnav-relay
+_termnav_command_adapter "$relay_adapter" \
+  "${TERMNAV_TEST_BINARY:-$root/target/release/termnav}" relay
 set +e
 output=$(python3 "$test_dir/support/relay-terminal.py" \
-  --relay "$root/bin/termnav-relay" 2>&1)
+  --relay "$relay_adapter" \
+  --python-relay "$test_dir/support/python-peer/relay.py" \
+  --termnav "${TERMNAV_TEST_BINARY:-$root/target/release/termnav}" 2>&1)
 rc=$?
 set -e
 printf '%s\n' "$output"
@@ -23,7 +28,13 @@ _assert_contains "relay terminal: nested tmux handoff and parent bubble are exer
   "test_nested_commit_and_parent_bubble_use_one_terminal_barrier" "$output"
 _assert_contains "relay terminal: three nested tmux levels share one barrier" \
   "test_three_tmux_levels_prepare_before_one_terminal_barrier" "$output"
-_assert_contains "relay terminal: pane, window, and move scopes are exercised" \
+_assert_contains "relay terminal: mixed Rust/Python paths commit both ways" \
+  "test_mixed_version_three_level_paths_commit_in_both_directions" "$output"
+_assert_contains "relay terminal: mixed lost prepare replies abort cleanly" \
+  "test_mixed_version_lost_prepare_reply_can_be_aborted" "$output"
+_assert_contains "relay terminal: one-shot continuation preserves burst routing" \
+  "test_one_shot_continuation_preserves_a_nested_navigation_burst" "$output"
+_assert_contains "relay terminal: every canonical navigation action is exercised" \
   "test_window_move_commits_after_terminal_response" "$output"
 _assert_contains "relay terminal: pane DECRQM remains application-safe" \
   "test_application_decrqm_response_is_preserved" "$output"

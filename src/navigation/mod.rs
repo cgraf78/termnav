@@ -10,6 +10,8 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 mod system;
 
 pub use system::{SystemBackend, parse_clients, process_tmux_parent};
@@ -38,12 +40,17 @@ pub enum Action {
 }
 
 impl Action {
-    /// Parse the stable command/wire spelling.
+    /// Parse the canonical public command spelling.
+    ///
+    /// Relay protocol spellings deliberately live at the relay boundary. They
+    /// predate the unified CLI vocabulary and remain wire details needed while
+    /// independently updated hosts share one SSH path; accepting them here
+    /// would accidentally turn that transport compatibility into public API.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "pane-select" | "pane" => Ok(Self::PaneSelect),
-            "tab-select" | "window" => Ok(Self::TabSelect),
-            "tab-move" | "move-window" => Ok(Self::TabMove),
+            "pane-select" => Ok(Self::PaneSelect),
+            "tab-select" => Ok(Self::TabSelect),
+            "tab-move" => Ok(Self::TabMove),
             _ => Err(format!("invalid navigation action: {value}")),
         }
     }
@@ -116,7 +123,7 @@ impl Direction {
 }
 
 /// One tmux pane together with the optional session that gives tabs meaning.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Scope {
     /// Explicit tmux server socket.
     pub socket: String,
@@ -148,7 +155,7 @@ impl Scope {
 }
 
 /// Physical tmux client identity capable of carrying a gesture outward.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Client {
     /// Last activity timestamp reported by tmux.
     pub activity: u64,

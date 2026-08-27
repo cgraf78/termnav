@@ -7,68 +7,98 @@
 
 `termnav` owns terminal navigation helpers: nearest-scope tab routing,
 WezTerm link routing, tmux ctrl-click follow-through, OSC-8-aware `eza`
-links, and `nvim-tmux-open`.
+links, and existing-session Neovim opens.
 
 ## Installation
 
-For the simplest checkout-backed install:
+Install the latest signed-by-checksum release archive with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cgraf78/termnav/main/install.sh | bash
 ```
 
-This keeps a durable managed checkout under `$XDG_DATA_HOME` when that path is
-absolute, or under `$HOME/.local/share` otherwise. To manage the checkout path
-yourself, keep it at a stable path and run:
+The installer selects the platform archive, verifies its SHA-256 checksum and
+embedded build identity, activates the complete release atomically, and links
+`termnav` into the user command directory. There is one executable and one
+installation path to build, publish, update, and diagnose.
 
-```bash
-./install.sh
-```
+## Command interface
 
-The installer creates checkout-backed symlinks for every public command under
-`$HOME/.local/bin` and for each matching manual page under
-`$HOME/.local/share/man/man1`. Set `PREFIX` to relocate both trees, or set
-`BIN_DIR` and `MAN_DIR` independently. Re-running the installer is safe and
-retargets existing symlinks, but it refuses to replace a non-symlink path.
-Moving or deleting the checkout breaks the installed links.
+`termnav` is the only compiled executable. Its stable command groups are:
 
-Command and shell-loader path resolution keeps `lib/termnav/` and
-`share/termnav/` version-coupled to this checkout. The installer creates no
-second library, shared-asset, or completion tree. Continue to resolve those
-non-binary assets through shdeps, or use their absolute paths in this checkout;
-consumers must still select versioned VS Code payloads explicitly.
+- `termnav navigate ACTION DIRECTION`: route pane selection, tab selection,
+  and tab movement through local tmux ancestry, SSH relays, and the originating
+  terminal.
+- `termnav ssh SSH-ARG...`: supervise the user's one requested SSH session and
+  its connection-scoped reverse relay. It never opens a second authenticated
+  transport, including during cleanup or remote editor reuse.
+- `termnav relay send ACTION DIRECTION`: send one navigation request to the
+  inherited relay using the same `pane-select`, `tab-select`, or `tab-move`
+  action names as `termnav navigate`. `serve`, `commit`, and `sweep` are
+  documented integration commands used by the SSH and tmux adapters rather
+  than interactive entry points.
+- `termnav tmux context ...`: publish tmux ownership to one exact terminal
+  client; `termnav tmux focus ...` maintains hierarchical focus leases; and
+  `termnav tmux follow-click ...` resolves mouse metadata to a browser or
+  editor target.
+- `termnav link-host`: print the host represented by the current terminal
+  context for hyperlink producers such as ripgrep and eza.
+- `termnav nvim open MODE ...`: open a target in the narrowest eligible editor
+  scope. `ssh-open` is the fail-closed existing-ControlMaster transport.
+- `termnav vscode focus ...`: publish ordered, authenticated Neovim focus
+  ownership to the VS Code window displaying the exact terminal client.
+- `termnav eza ...`: run eza with remote-aware OSC-8 file links.
+- `termnav version`: print the timestamp/commit build identity.
 
-## Public API
+Ripgrep's `--hostname-bin` accepts an executable name but cannot pass arguments.
+The sole dotfiles consumer owns its tiny `ripgrep-link-host` wrapper and
+delegates to the explicit `termnav link-host` command; Termnav therefore
+needs no alternate executable name or argv[0] dispatch. The wrapper is named
+for the ripgrep interface it adapts rather than for any current implementation
+detail inside Termnav. The private
+`share/termnav/shims/ssh` adapter is required for PATH interception and contains
+only enough policy to execute `termnav ssh`. Historical public command names
+are not installed.
 
-- `bin/nvim-tmux-open`: open local or remote terminal targets in Neovim.
-- `bin/nvim-link-host`: print the host token for `rg --hostname-bin`.
-- `bin/nvim-ssh-control-open`: open a remote target through an existing
-  SSH ControlMaster connection without starting a new authentication flow.
-- `bin/termnav-navigate`: route pane selection, tab selection, and tab movement
-  through arbitrary local tmux ancestry, SSH relays, and the originating
-  terminal. Neovim and tmux retain process-light local fast paths and invoke
-  this router only after their current scope declines.
-- `bin/vscode-nvim-focus`: publish ordered, leased Neovim focus ownership to
-  the window-scoped VS Code adapter. Persistent tmux sessions resolve the
-  currently focused client rather than trusting inherited window state.
-- `bin/termnav-relay`: carry pane, window, and window-move requests across
-  nested SSH/tmux boundaries. Shell activation warms one owner-only local
-  dispatcher, so tmux boundary navigation, relay sends, and commit responses
-  do not start Python for each keypress. The service exits after an hour
-  without a request and is restarted transparently. Its outer commit barrier
-  uses the standard, read-only DECRQM reply path supported by WezTerm and
-  xterm.js; intermediate tmux layers continue to forward the private `User8`
-  commit key. Unmatched replies pass back to applications on tmux versions
-  that do not virtualize DECRQM themselves.
-- `bin/termnav-tmux-context`: publish tmux ownership to a newly attached
-  terminal client before a shell or editor redraws.
-- `bin/termnav-tmux-focus`: publish leased, pane-scoped focus ownership from a
-  nested tmux client to its immediate parent. Local parents are discovered
-  from the exact client process; remote parents use the existing SSH relay.
-  One-hop claims compose to arbitrary nesting depth without naming hosts,
-  sessions, commands, or a maximum depth.
-- `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
-- `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
+There is intentionally no source-checkout installer. Shdeps consumers use the
+ordinary `cgraf78/termnav github` dependency form, which prefers a published
+release archive and falls back according to Shdeps' generic provider policy.
+
+### One-time single-binary cutover
+
+The release that removes the historical command files must be coordinated with
+its sole dotfiles consumer. Pause scheduled updates, land the shared Actions
+change, Termnav, and dotfiles in that order without an intervening fleet update,
+publish and smoke the Termnav release, then run `dot update -f` before resuming
+scheduled updates. Restart or re-exec existing login shells so their PATH names
+the newly activated provider tree, restart existing Neovim processes because
+they retain loaded Lua command tables, and reload or restart any non-default
+tmux servers; the default server is reloaded by dotfiles. Reconnect existing
+SSH sessions so the new connection-scoped supervisor owns their relay lifetime;
+no compatibility daemon or retirement path remains in the release.
+
+## Code organization
+
+The CLI adapters under `src/commands/` validate syntax and translate exit
+status. Reusable behavior lives behind focused library interfaces:
+
+- `navigation` owns typed scope traversal and routing decisions;
+- `relay` owns the versioned Unix-socket protocol and transactional directive
+  store;
+- `ssh` owns exactly one SSH child and its reverse-forward lifecycle;
+- `focus` owns one-hop tmux leases and pane-style restoration;
+- `nvim` owns target parsing, registry selection, RPC, pane fallback, and
+  mux-only remote reuse;
+- `click` owns mouse-text recognition and returns typed URL/file targets;
+- `terminal`, `process`, `runtime`, and `links` isolate operating-system and
+  terminal-protocol boundaries shared by those domains.
+
+Public Rust items use rustdoc to describe ownership, security, persistence, and
+performance contracts. Non-obvious implementation comments explain why a
+boundary exists; command adapters intentionally contain little policy.
+
+## Integration assets
+
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers. Navigation
   consumers use one pane-owner snapshot per gesture and avoid foreground
   process inspection when current Neovim or tmux metadata is already present.
@@ -80,8 +110,8 @@ consumers must still select versioned VS Code payloads explicitly.
 - `lib/termnav/nvim/setup.lua`: reusable Neovim-side setup for publishing the
   current editor socket, cwd, and remote context to WezTerm.
 - `lib/termnav/nvim/navigation.lua`: Neovim pane and tab navigation. Directional
-  pane edges and tab boundaries delegate to one ordered worker kept warm for
-  the editor lifetime, while Ctrl-backslash preserves the local
+  pane edges and tab boundaries use bounded one-shot native jobs, while
+  Ctrl-backslash preserves the local
   previous-split/previous-tmux-pane history expected from vim-tmux-navigator
   without guessing at an ancestor's history.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
@@ -114,9 +144,9 @@ dependency manager's contract:
 . "$(shdeps dep-file cgraf78/termnav share/termnav/shell.sh)"
 ```
 
-`shdeps` installs the `bin/` entry points as PATH-visible symlinks. Consumers
-own keybindings, terminal config, and environment-specific extension files;
-this repo owns reusable route parsing and open-through behavior.
+`shdeps` installs the release artifact and exposes its `termnav` binary.
+Consumers own keybindings, terminal config, and environment-specific extension
+files; this repo owns reusable route parsing and open-through behavior.
 
 The adapter directory is versioned because VS Code records that directory in
 its extension registry. Adapter releases must bump the manifest version, the
@@ -131,19 +161,19 @@ through Shdeps.
 
 ## Dependencies
 
-- Bash for the CLI entry points and shell loader.
-- `curl` with Unix-socket support for the warmed navigation dispatcher. Without
-  it, commands retain the same behavior through the portable per-invocation
-  Python path, but boundary gestures pay interpreter startup latency.
-- `tmux` for `tmux-follow-click`, tmux pane capture, tmux mouse forwarding, and
+- The prebuilt `termnav` binary for the current Linux, macOS, or Android
+  architecture. Building from source requires Rust 1.88 or newer.
+- Bash only for sourceable shell integration and optional click-detector
+  extensions; navigation gestures do not start a shell or Python interpreter.
+- `tmux` for `termnav tmux follow-click`, pane capture, mouse forwarding, and
   tmux-aware Neovim targeting.
-- Neovim with a server/socket setup for `nvim-tmux-open` to open file targets
+- Neovim with a server/socket setup for `termnav nvim open` to open file targets
   in an existing editor session.
 - WezTerm for the Lua link-route modules, OSC user-variable context
   publishing, and tab switch/move requests. The tmux and Neovim helpers remain
   useful without WezTerm when a consumer invokes them directly.
-- `eza` for `eza-nvim-links`.
-- `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
+- `eza` for `termnav eza`.
+- `ssh` for `termnav nvim ssh-open` when remote file links should reuse an
   existing ControlMaster connection.
 - VS Code with the local `cgraf.termnav` adapter installed. The adapter
   publishes a private, per-window socket into
@@ -157,7 +187,7 @@ through Shdeps.
 - `nvim-remote-pane-host` is an optional extension command for custom
   remote-pane workflows.
 
-`tmux-follow-click` loads environment-specific token detectors from
+`termnav tmux follow-click` loads environment-specific token detectors from
 an absolute `$XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d/*.sh`, falling
 back to `$HOME/.config/termnav/tmux-follow/extensions.d/*.sh` when the XDG value
 is empty or relative. With neither base directory, it simply loads no optional
@@ -169,7 +199,7 @@ setting `target` and `target_kind` and returning 0.
 
 Set `TERMNAV_REMOTE_LINK_HOST` when a shell, tmux server, or managed remote
 transport already knows the remote host identity that file links should carry.
-`bin/eza-nvim-links` also accepts `TERMNAV_EZA_NVIM_LINKS_FORCE_TTY=1` for
+`termnav eza` also accepts `TERMNAV_EZA_NVIM_LINKS_FORCE_TTY=1` for
 test harnesses that need to exercise TTY-restoration behavior while stdout is
 piped.
 
@@ -206,7 +236,7 @@ without restarting the editor.
 
 ### Tab Scope Routing
 
-`termnav-tmux-context` is intended for tmux's `client-attached` hook.
+`termnav tmux context` is intended for tmux's `client-attached` hook.
 WezTerm user variables belong to a terminal pane rather than the long-lived
 tmux pane, so attaching a new client to an existing session does not inherit
 the shell or Neovim metadata previously emitted there. The attach publisher
@@ -217,11 +247,11 @@ Control-mode clients are skipped without requiring terminal metadata.
 
 ### Nested tmux leaf focus
 
-`termnav-tmux-focus` lets a tmux configuration distinguish the single focused
+`termnav tmux focus` lets a tmux configuration distinguish the single focused
 leaf pane from active container panes higher in a nested tmux tree. A focused
 nested client publishes a short lease on the exact parent pane that hosts it.
 Local nesting is resolved from that client's process environment; nesting over
-SSH uses the same per-session relay established by `termnav-relay ssh`.
+SSH uses the same per-session relay established by `termnav ssh`.
 
 The publisher is intentionally one-hop. Every tmux layer runs the same hooks,
 so a chain of any depth converges without a root coordinator or topology
@@ -251,8 +281,8 @@ can render its own borders per client, but the nested application's already
 rendered cell backgrounds cannot differ between those viewers. Distinct outer
 panes attaching distinct clients to one inner session remain independent.
 
-The warmed `termnav-relay navigate` facade passes the exact tmux client,
-creation stamp, and source scope into the shared `termnav-navigate` policy.
+The native `termnav relay` path passes the exact tmux client,
+creation stamp, and source scope into the shared native navigation policy.
 Application-origin requests cannot carry that
 identity, so one client snapshot resolves both the logical tmux scope and any
 safe physical provenance. Local pane operations need no client, and local tab
@@ -309,12 +339,12 @@ inside a child interactive shell cannot change an already-running GUI or tmux
 server's environment.
 
 Set `TERMNAV_SSH_CONTROL_HOSTS` to a comma-separated allowlist of host aliases
-that `bin/nvim-ssh-control-open` may contact through an existing SSH
+that `termnav nvim ssh-open` may contact through an existing SSH
 ControlMaster connection. The helper fails closed when the variable is unset
 or the target host is not listed, so reusable installs do not inherit private
 host policy from this repo.
 
-`termnav-relay ssh` sends each relay path through OpenSSH's per-session
+`termnav ssh` sends each relay path through OpenSSH's per-session
 environment channel, including sessions carried by an existing ControlMaster.
 It never changes SSH's destination, remote-command arguments, or login-shell
 selection. Explicit commands are enhanced only when their command line requests

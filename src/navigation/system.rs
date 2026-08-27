@@ -751,13 +751,14 @@ pub fn parse_clients(socket: &str, output: &str) -> Vec<Client> {
 pub fn process_tmux_parent(mut pid: u32) -> Option<(String, String)> {
     let mut visited = std::collections::HashSet::new();
     while pid > 1 && visited.insert(pid) {
-        let tmux = process::environment(pid, "TMUX").unwrap_or_default();
-        let pane = process::environment(pid, "TMUX_PANE").unwrap_or_default();
+        let (parent, values) = process::parent_environment(pid, &["TMUX", "TMUX_PANE"])?;
+        let tmux = values[0].as_deref().unwrap_or_default();
+        let pane = values[1].as_deref().unwrap_or_default();
         let parts = tmux.rsplitn(3, ',').collect::<Vec<_>>();
-        if parts.len() == 3 && !parts[2].is_empty() && valid_pane(&pane) {
-            return Some((parts[2].to_owned(), pane));
+        if parts.len() == 3 && !parts[2].is_empty() && valid_pane(pane) {
+            return Some((parts[2].to_owned(), pane.to_owned()));
         }
-        pid = process::parent(pid)?;
+        pid = parent;
     }
     None
 }

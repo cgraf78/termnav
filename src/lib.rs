@@ -1,6 +1,7 @@
 //! Native Termnav implementation.
 
 pub mod cli;
+pub mod click;
 pub mod commands;
 pub mod focus;
 pub mod links;
@@ -13,3 +14,4 @@ pub mod shell;
 pub mod ssh;
 pub mod terminal;
 pub mod version;
+pub mod vscode;

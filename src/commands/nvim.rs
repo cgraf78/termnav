@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 
-const HELP: &str = "usage: termnav nvim <open|ssh-open|link-host> [arguments]\n";
+const HELP: &str = "usage: termnav nvim <open|ssh-open> [arguments]\n";
 
 /// Parse and execute Neovim integration commands.
 pub fn run(
@@ -31,11 +31,18 @@ pub fn run(
             crate::nvim::remote::ssh_open(&arguments[1], &arguments[2])
         }
         "ssh-open" => usage(stderr, "ssh-open requires HOST and TARGET"),
-        "link-host" if arguments.len() == 1 => {
-            writeln!(stdout, "{}", crate::links::host())?;
-            Ok(0)
+        "open" => {
+            let Some(mode) = arguments.get(1).map(String::as_str) else {
+                return usage(stderr, "open requires cli, link, or tmux-link mode");
+            };
+            let mode = match mode {
+                "cli" => crate::nvim::open::Mode::Cli,
+                "link" => crate::nvim::open::Mode::Link,
+                "tmux-link" => crate::nvim::open::Mode::TmuxLink,
+                _ => return usage(stderr, &format!("unknown open mode: {mode}")),
+            };
+            crate::nvim::open::open(mode, &arguments[2..])
         }
-        "link-host" => usage(stderr, "link-host accepts no arguments"),
         _ => usage(
             stderr,
             &format!("unknown or unimplemented Neovim command: {command}"),

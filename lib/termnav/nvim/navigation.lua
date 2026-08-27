@@ -19,9 +19,14 @@ local function default_command(arguments)
 end
 
 local function default_spawn(arguments, on_exit)
+  local stdout = {}
   local job = vim.fn.jobstart(arguments, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      stdout = data or {}
+    end,
     on_exit = function(_, status)
-      on_exit(status)
+      on_exit(status, table.concat(stdout, "\n"):gsub("\n+$", ""))
     end,
   })
   if job <= 0 then
@@ -74,6 +79,7 @@ function M.new(options)
   local running
   local generation = 0
   local tmux_was_last = false
+  local continuation
 
   local function report(message)
     -- Navigation errors should be visible, but notifications are deliberately
@@ -96,12 +102,18 @@ function M.new(options)
     -- Keep exactly one native process in flight. Serial completion preserves
     -- key order without retaining a resident interpreter, and each successor
     -- observes the focus change completed by its predecessor.
-    local ok, handle = pcall(ctx.spawn, {
+    local arguments = {
       ctx.executable,
       "navigate",
+      "--emit-continuation",
       request.action,
       request.direction,
-    }, function(status)
+    }
+    if continuation ~= nil and continuation ~= "" then
+      arguments[#arguments + 1] = "--continuation"
+      arguments[#arguments + 1] = continuation
+    end
+    local ok, handle = pcall(ctx.spawn, arguments, function(status, output)
       ctx.schedule(function()
         -- VimLeave or a replacement generation may invalidate this callback
         -- after the child exits. Never let a stale completion drain a queue it
@@ -110,6 +122,7 @@ function M.new(options)
           return
         end
         running = nil
+        continuation = status == 0 and output ~= nil and output ~= "" and output or nil
         if status ~= 0 and status ~= 3 then
           report("navigation request failed (status " .. tostring(status) .. ")")
         end
@@ -132,6 +145,7 @@ function M.new(options)
 
   function ctx.stop()
     queue = {}
+    continuation = nil
     generation = generation + 1
     local current = running
     running = nil

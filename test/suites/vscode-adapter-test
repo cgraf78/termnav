@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# vscode-adapter-test — portable contract checks for the bundled extension.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+extension="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.3.0/extension.js"
+manifest="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.3.0/package.json"
+
+echo "=== VS Code adapter contract ==="
+_assert_file_exists "focus adapter: versioned manifest is shipped" "$manifest"
+_assert_file_exists "focus adapter: implementation is shipped" "$extension"
+content=$(cat "$extension")
+_assert_not_contains "focus adapter: sandbox does not inspect host procfs" \
+  '/proc/' "$content"
+_assert_not_contains "focus adapter: sandbox does not spawn host tools" \
+  'child_process' "$content"
+
+if command -v node >/dev/null 2>&1; then
+  module_root=$(_tmpdir)
+  mkdir -p "$module_root/node_modules/vscode"
+  printf 'module.exports = {};\n' >"$module_root/node_modules/vscode/index.js"
+  output=$(
+    NODE_PATH="$module_root/node_modules" node - "$extension" <<'JS'
+const extension = require(process.argv[2]);
+const valid = {
+  version: 2,
+  source: "nvim-123",
+  cycle: 1,
+  sequence: 2,
+  observed: 3,
+  operation: "claim",
+  token: "a".repeat(64),
+  ancestors: [123, 1],
+};
+console.log(extension.validateFocusMessage(valid));
+console.log(extension.validateFocusMessage({ ...valid, token: "short" }));
+console.log(extension.validateFocusMessage({ ...valid, ancestors: [123, 123] }));
+console.log(extension.socketLocation().socketPath.startsWith("/tmp/termnav-vscode-"));
+JS
+  )
+  _assert_eq "focus adapter: validates authenticated ordered messages" \
+    $'true\nfalse\nfalse\ntrue' "$output"
+else
+  echo "  SKIP: VS Code adapter behavior requires Node.js"
+fi
+
+_test_summary

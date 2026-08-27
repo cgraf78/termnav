@@ -31,7 +31,7 @@ printf '<%s>\n' "$@" >"$TERMNAV_TEST_SSH_LOG"
 
     let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
         .args(["nvim", "ssh-open", "duo-host", "/tmp/example.txt:4"])
-        .env("TERMNAV_SSH_BINARY", &binary)
+        .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
         .env("TERMNAV_TEST_SSH_LOG", &log)
         .env("TERMNAV_SSH_CONTROL_HOSTS", "duo-host")
         .output()
@@ -76,7 +76,7 @@ fn vanished_master_cannot_reach_the_configured_proxy_or_authentication() {
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
         .args(["nvim", "ssh-open", "race.invalid", "/tmp/example.txt"])
-        .env("TERMNAV_SSH_BINARY", &wrapper)
+        .env("PATH", format!("{}:/usr/bin:/bin", root.display()))
         .env("TERMNAV_SSH_CONTROL_HOSTS", "race.invalid")
         .output()
         .expect("run race fixture");

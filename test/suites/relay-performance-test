@@ -3,33 +3,40 @@
 
 set -euo pipefail
 export NO_COLOR=1
-export TERMNAV_TEST_HOT=1
 
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 root="${test_dir%/test}"
+candidate=${TERMNAV_TEST_BINARY:-$root/target/release/termnav}
+
+# The shared harness intentionally replaces HOME so tests cannot read or write
+# the caller's state. rustup, however, normally discovers its installed
+# toolchains through HOME. Preserve that one explicit location before entering
+# isolation so the calibrated baseline can compile without weakening the rest
+# of the test sandbox.
+if [[ -z ${RUSTUP_HOME:-} && -d ${HOME:-}/.rustup ]]; then
+  export RUSTUP_HOME="$HOME/.rustup"
+fi
+
+echo "=== relay startup performance ==="
+if [[ -z ${TERMNAV_TEST_BINARY:-} ]]; then
+  # Build before the shared harness replaces HOME with disposable state.
+  # rustup stores its selected toolchain under the caller's real HOME unless
+  # RUSTUP_HOME is explicit, so reversing this order breaks clean CI runners.
+  cargo build --release --locked --manifest-path "$root/Cargo.toml"
+fi
+
 # shellcheck source=../helpers.sh
 . "$test_dir/helpers.sh"
 
-relay="$root/bin/termnav-relay"
 tmp=$(_tmpdir)
-mkdir -p "$tmp/shadow"
-cat >"$tmp/shadow/argparse.py" <<'PY'
-raise RuntimeError("hot command imported argparse")
-PY
-
-echo "=== relay startup performance ==="
-# The shared hot service must be ready before a user can press the first chord.
-# Starting it through the public command also proves that the optimized client
-# and the daemon agree on their private protocol without test-only setup.
-XDG_RUNTIME_DIR="$tmp/runtime" "$relay" warm
 set +e
-env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$tmp/runtime" PYTHONPATH="$tmp/shadow" \
-  "$relay" send pane left >"$tmp/send.out" 2>"$tmp/send.err"
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$tmp/runtime" \
+  "$candidate" relay send pane-select left >"$tmp/send.out" 2>"$tmp/send.err"
 send_rc=$?
 client_tty=$(readlink "/proc/$$/fd/0" 2>/dev/null || true)
 if [[ "$client_tty" == /* ]]; then
-  env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$tmp/runtime" PYTHONPATH="$tmp/shadow" \
-    "$relay" send pane right --client-pid "$$" --client-tty "$client_tty" \
+  env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$tmp/runtime" \
+    "$candidate" relay send pane-select right --client-pid "$$" --client-tty "$client_tty" \
     >"$tmp/send-client.out" 2>"$tmp/send-client.err"
   send_client_rc=$?
 else
@@ -37,20 +44,18 @@ else
   : >"$tmp/send-client.out"
   : >"$tmp/send-client.err"
 fi
-XDG_RUNTIME_DIR="$tmp/runtime" PYTHONPATH="$tmp/shadow" "$relay" commit \
+XDG_RUNTIME_DIR="$tmp/runtime" "$candidate" relay commit \
   --tmux-socket "$tmp/tmux.sock" --client-tty /dev/null --client-pid 1 \
   --client-created 1 \
   >"$tmp/commit.out" 2>"$tmp/commit.err"
 commit_rc=$?
 set -e
-_assert_exit "relay performance: production send bypasses argparse" 3 "$send_rc"
+_assert_exit "relay performance: native send declines without a parent" 3 "$send_rc"
 _assert_eq "relay performance: production send stays silent" "" "$(cat "$tmp/send.out" "$tmp/send.err")"
-_assert_exit "relay performance: client-scoped send bypasses argparse" 3 "$send_client_rc"
+_assert_exit "relay performance: client-scoped native send declines" 3 "$send_client_rc"
 _assert_eq "relay performance: client-scoped send stays silent" "" "$(cat "$tmp/send-client.out" "$tmp/send-client.err")"
 _assert_exit "relay performance: production commit bypasses argparse" 0 "$commit_rc"
 _assert_eq "relay performance: stray commit stays silent" "" "$(cat "$tmp/commit.out" "$tmp/commit.err")"
-XDG_RUNTIME_DIR="$tmp/runtime" "$relay" stop
-
 if [[ -n "${TERMNAV_PERFORMANCE_BASELINE:-}" ]]; then
   python3 "$test_dir/relay-performance.py" \
     --baseline-ref "$TERMNAV_PERFORMANCE_BASELINE" \

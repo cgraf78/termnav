@@ -38,13 +38,16 @@ pub fn new_nonce() -> String {
 /// gesture before its reply was lost. Return a typed error and let the caller's
 /// operation-specific policy decide whether retrying would be safe.
 pub fn send(path: &Path, request: &Value, timeout: Duration) -> io::Result<Value> {
-    let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-
+    // Prepare bytes before connect(2). The server necessarily keeps a bounded
+    // pre-request deadline, so avoid spending any of that scheduling window on
+    // serialization after the connection has entered its accept queue.
     let mut payload = serde_json::to_vec(request)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     payload.push(b'\n');
+
+    let mut stream = UnixStream::connect(path)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     stream.write_all(&payload)?;
 
     let mut line = String::new();

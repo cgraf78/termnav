@@ -2,11 +2,17 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::navigation::{Action, Client, Direction, Navigator, SystemBackend};
+use serde::{Deserialize, Serialize};
+
+use crate::navigation::{Action, Client, Direction, Navigator, Scope, SystemBackend};
+
+const CONTINUATION_TTL: Duration = Duration::from_millis(250);
 
 const HELP: &str = "usage: termnav navigate [OPTIONS] ACTION DIRECTION\n\
+\n\
+actions: pane-select, tab-select, tab-move\n\
 \n\
 options:\n\
   --parent             start outside a tmux scope that already declined\n\
@@ -16,7 +22,9 @@ options:\n\
   --client-termtype T  exact source client terminal type\n\
   --source-socket PATH exact source tmux socket\n\
   --source-pane ID     exact source tmux pane\n\
-  --source-session ID  optional exact source tmux session\n";
+  --source-session ID  optional exact source tmux session\n\
+  --emit-continuation  print bounded state for one ordered successor\n\
+  --continuation JSON  resume from revalidated prior routing state\n";
 
 #[derive(Default)]
 struct Options {
@@ -28,7 +36,17 @@ struct Options {
     source_socket: Option<String>,
     source_pane: Option<String>,
     source_session: Option<String>,
+    emit_continuation: bool,
+    continuation: Option<String>,
     positional: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Continuation {
+    version: u8,
+    expires_at_monotonic_ms: u64,
+    client: Option<Client>,
+    scope: Option<Scope>,
 }
 
 /// Parse and execute one navigation request.
@@ -71,10 +89,56 @@ pub fn run(
         Ok(client) => client,
         Err(message) => return usage(stderr, message),
     };
+    if options.continuation.is_some() && (options.parent || exact_client.is_some()) {
+        return usage(
+            stderr,
+            "--continuation cannot be combined with --parent or exact client options",
+        );
+    }
+
+    let continuation = match options.continuation.as_deref() {
+        Some(value) => match serde_json::from_str::<Continuation>(value) {
+            Ok(state)
+                if state.version == 1 && state.expires_at_monotonic_ms >= monotonic_millis() =>
+            {
+                Some(state)
+            }
+            Ok(_) => None,
+            Err(_) => return usage(stderr, "--continuation requires valid Termnav state"),
+        },
+        None => None,
+    };
+    let (continuing_client, continuing_scope) = continuation
+        .map(|state| (state.client, state.scope))
+        .unwrap_or_default();
 
     let mut backend = SystemBackend::from_current_environment();
     let mut navigator = Navigator::new(&mut backend, now_seconds);
-    Ok(navigator.navigate(action, direction, !options.parent, exact_client) as i32)
+    let result = navigator.route(
+        action,
+        direction,
+        !options.parent,
+        exact_client,
+        continuing_client,
+        continuing_scope,
+    );
+    if options.emit_continuation && result.outcome == crate::navigation::Outcome::Handled {
+        let continuation = Continuation {
+            version: 1,
+            // Continuations bridge adjacent one-shot jobs on one running host.
+            // A monotonic deadline cannot be extended by NTP or a manual wall
+            // clock correction and therefore preserves the intended short
+            // gesture-burst lifetime.
+            expires_at_monotonic_ms: monotonic_millis()
+                .saturating_add(CONTINUATION_TTL.as_millis() as u64),
+            client: result.client,
+            scope: result.scope,
+        };
+        serde_json::to_writer(&mut *stdout, &continuation)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        writeln!(stdout)?;
+    }
+    Ok(result.outcome as i32)
 }
 
 fn parse(arguments: &[String]) -> Result<Options, String> {
@@ -86,6 +150,13 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
             "--parent" => {
                 options.parent = true;
                 index += 1;
+            }
+            "--emit-continuation" => {
+                options.emit_continuation = true;
+                index += 1;
+            }
+            "--continuation" => {
+                options.continuation = Some(value(arguments, &mut index, argument)?.to_owned());
             }
             "--client-pid" => {
                 options.client_pid = Some(
@@ -190,4 +261,17 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn monotonic_millis() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return 0;
+    }
+    (time.tv_sec as u64)
+        .saturating_mul(1_000)
+        .saturating_add((time.tv_nsec as u64) / 1_000_000)
 }

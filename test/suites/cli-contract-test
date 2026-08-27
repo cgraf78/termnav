@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cli-contract-test - black-box contracts retained through the native rewrite.
+# cli-contract-test - black-box contract for the unified executable surface.
 
 set -euo pipefail
 export NO_COLOR=1
@@ -9,50 +9,44 @@ root=${test_dir%/test}
 # shellcheck source=../helpers.sh
 . "$test_dir/helpers.sh"
 
-commands=(
-  eza-nvim-links
-  nvim-link-host
-  nvim-ssh-control-open
-  nvim-tmux-open
-  termnav-navigate
-  termnav-relay
-  termnav-tmux-context
-  termnav-tmux-focus
-  tmux-follow-click
-  vscode-nvim-focus
-)
+termnav=${TERMNAV_TEST_BINARY:-$root/target/release/termnav}
+_assert_file_exists "CLI contract: optimized unified binary exists" "$termnav"
+if [[ ! -x $termnav ]]; then
+  _test_summary
+fi
 
-expected=$(printf '%s\n' "${commands[@]}" | LC_ALL=C sort)
-actual=$(
-  for path in "$root"/bin/*; do
-    [[ -f $path && -x $path ]] || continue
-    printf '%s\n' "${path##*/}"
-  done | LC_ALL=C sort
-)
-_assert_eq "CLI contract: executable inventory is explicit" "$expected" "$actual"
+top_help=$($termnav --help)
+for command in navigate relay ssh link-host tmux nvim vscode eza version; do
+  _assert_contains "CLI contract: top-level help exposes $command" \
+    "$command" "$top_help"
+done
 
-navigate_help=$("$root/bin/termnav-navigate" --help 2>&1)
+navigate_help=$($termnav navigate --help 2>&1)
 _assert_contains "CLI contract: navigation exposes parent traversal" \
   "--parent" "$navigate_help"
 _assert_contains "CLI contract: navigation exposes exact client identity" \
   "--client-created" "$navigate_help"
 
-relay_help=$("$root/bin/termnav-relay" --help 2>&1)
-for command in send serve commit sweep navigate warm stop ssh; do
+relay_help=$($termnav relay --help 2>&1)
+for command in send serve commit sweep; do
   _assert_contains "CLI contract: relay exposes $command" "$command" "$relay_help"
 done
+for retired in warm stop hot-serve; do
+  _assert_not_contains "CLI contract: relay omits retired $retired command" \
+    "$retired" "$relay_help"
+done
 
-focus_help=$("$root/bin/termnav-tmux-focus" --help 2>&1)
+focus_help=$($termnav tmux focus --help 2>&1)
 for command in watch expire claim release stop sync; do
   _assert_contains "CLI contract: focus exposes $command" "$command" "$focus_help"
 done
 
 set +e
-"$root/bin/termnav-navigate" pane-select diagonal >/dev/null 2>&1
+$termnav navigate pane-select diagonal >/dev/null 2>&1
 navigate_invalid_rc=$?
-"$root/bin/termnav-relay" send pane diagonal >/dev/null 2>&1
+$termnav relay send pane-select diagonal >/dev/null 2>&1
 relay_invalid_rc=$?
-"$root/bin/termnav-tmux-context" unexpected >/dev/null 2>&1
+$termnav tmux context unexpected >/dev/null 2>&1
 context_invalid_rc=$?
 set -e
 _assert_exit "CLI contract: invalid navigation direction is usage error" \
@@ -62,9 +56,12 @@ _assert_exit "CLI contract: invalid relay direction is usage error" \
 _assert_exit "CLI contract: invalid context argument is usage error" \
   2 "$context_invalid_rc"
 
-link_host=$(TERMNAV_REMOTE_LINK_HOST=contract.example.invalid \
-  "$root/bin/nvim-link-host")
-_assert_eq "CLI contract: ripgrep host helper remains zero-argument" \
-  "contract.example.invalid" "$link_host"
+set +e
+missing_output=$($termnav 2>&1)
+missing_rc=$?
+set -e
+_assert_exit "CLI contract: bare termnav remains a usage error" 2 "$missing_rc"
+_assert_contains "CLI contract: bare termnav explains the required command" \
+  "a command is required" "$missing_output"
 
 _test_summary

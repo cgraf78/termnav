@@ -1,8 +1,9 @@
 # ControlMaster-safe Relay Implementation Plan
 
-> Superseded on 2026-08-17 by the per-session `SendEnv` transport. The shipped
-> implementation no longer uses a remote bootstrap command; see
-> `termnav-relay(1)` for the current contract.
+> Superseded first by the per-session `SendEnv` transport and then, on
+> 2026-08-27, by the single-binary Rust implementation. The paths and Python
+> stack below are retained only as historical implementation context; see
+> `termnav(1)` for the current contract.
 >
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -59,4 +60,4 @@
 - [x] Cover stale-master reuse, option-like destinations, common login-shell parsing, configured commands, forced TTY mode, and SSH failure.
 - [x] Run `checkrun format`, `checkrun lint`, and `test/termnav-test`.
 - [x] Perform fresh-eyes correctness, security, and portability review.
-- [ ] Commit, push explicitly, open a separate PR, monitor CI, and live-test NAS to Bevo2 to Taylor without landing.
+- [ ] Commit, push explicitly, open a separate PR, monitor CI, and live-test a three-host SSH chain without landing.

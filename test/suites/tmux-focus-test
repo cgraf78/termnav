@@ -10,10 +10,16 @@ root="${test_dir%/test}"
 . "$test_dir/helpers.sh"
 
 echo "=== tmux leaf-focus ownership ==="
+adapter_dir=$(_tmpdir)
+focus_adapter=$adapter_dir/termnav-tmux-focus
+relay_adapter=$adapter_dir/termnav-relay
+termnav=${TERMNAV_TEST_BINARY:-$root/target/release/termnav}
+_termnav_command_adapter "$focus_adapter" "$termnav" tmux focus
+_termnav_command_adapter "$relay_adapter" "$termnav" relay
 set +e
 output=$(python3 "$test_dir/support/tmux-focus.py" \
-  --focus "$root/bin/termnav-tmux-focus" \
-  --relay "$root/bin/termnav-relay" 2>&1)
+  --focus "$focus_adapter" \
+  --relay "$relay_adapter" 2>&1)
 rc=$?
 set -e
 printf '%s\n' "$output"
@@ -40,22 +46,6 @@ _assert_contains "tmux focus: a renewed claim keeps its lease" \
   "test_renewal_extends_the_same_claim" "$output"
 _assert_contains "tmux focus: stale cleanup cannot clear a replacement" \
   "test_stale_release_cannot_clear_a_replacement" "$output"
-_assert_contains "tmux focus: macOS environment parsing preserves values" \
-  "test_macos_process_environment_parser_preserves_values_with_spaces" "$output"
-_assert_contains "tmux focus: runtime state rejects a symlink leaf" \
-  "test_runtime_directory_rejects_a_symlinked_focus_leaf" "$output"
-_assert_contains "tmux focus: lock names remain bounded" \
-  "test_lock_names_hash_unbounded_socket_and_tty_values" "$output"
-_assert_contains "tmux focus: relative XDG runtime state falls back safely" \
-  "test_relative_runtime_directory_falls_back_to_private_tmp_state" "$output"
-_assert_contains "tmux focus: expirer launch failures fail closed" \
-  "test_expirer_spawn_failure_is_reported_for_fail_closed_cleanup" "$output"
-_assert_contains "tmux focus: Boolean leases cannot mutate tmux" \
-  "test_boolean_lease_is_rejected_before_any_tmux_mutation" "$output"
-_assert_contains "tmux focus: invalid heartbeat timing has no side effects" \
-  "test_invalid_watch_timing_is_rejected_before_parent_discovery" "$output"
-_assert_contains "tmux focus: a refocus during style sync is never stopped" \
-  "test_refocus_during_style_sync_cannot_stop_the_current_watcher" "$output"
 _assert_contains "tmux focus: SSH relay claims only the immediate parent pane" \
   "test_relay_claim_is_scoped_to_its_immediate_parent_pane" "$output"
 _assert_contains "tmux focus: tmuxless hops forward to the nearest parent" \
@@ -72,8 +62,6 @@ _assert_contains "tmux focus: direct client focus repaints its own leaf" \
   "test_direct_client_focus_changes_repaint_its_active_leaf" "$output"
 _assert_contains "tmux focus: selection repairs stale pane dimming" \
   "test_selecting_a_stale_dimmed_pane_repairs_its_style" "$output"
-_assert_contains "tmux focus: real client processes expose their exact parent route" \
-  "test_nested_client_process_exposes_its_exact_parent_route" "$output"
 _assert_contains "tmux focus: arbitrary depth retains one highlighted leaf" \
   "test_three_levels_keep_exactly_one_highlighted_leaf" "$output"
 _assert_contains "tmux focus: shared inner sessions keep attachments independent" \

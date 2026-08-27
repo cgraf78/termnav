@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Teach tmux-follow-click one host-defined token without forking Termnav.
+# Teach `termnav tmux follow-click` one host-defined token without forking it.
 #
 # Extension files run inside the helper. A detector claims a token by setting
 # `target` and `target_kind`, then returning success. Non-matches must return
@@ -16,7 +16,7 @@ _termnav_example_ticket_detector() {
     "" | *[!0-9]*) return 1 ;;
   esac
 
-  # These are documented output variables consumed by tmux-follow-click after
+  # These are documented output variables consumed by Termnav after
   # the sourced detector returns; they are intentionally not read in this file.
   # shellcheck disable=SC2034
   target="https://issues.example.com/$token"
