@@ -69,6 +69,24 @@ _assert_exit "hot service: ordinary repository tests retain parser semantics" \
 _assert_file_missing "hot service: ordinary repository tests start no daemon" \
   "$isolated_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
 
+# macOS limits pathname Unix sockets to 103 bytes, while deeply nested CI and
+# temporary directories routinely exceed that. The fallback name hashes the
+# complete preferred path so independent runtime roots remain isolated even
+# though their sockets share the short owner-only /tmp directory.
+long_runtime=$(_tmpdir)/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+long_candidate="$long_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+provider_key_for "$long_candidate"
+long_socket="/tmp/termnav-${UID:-$(id -u)}/hot-v1-$provider_key.sock"
+XDG_RUNTIME_DIR="$long_runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=2 "$relay" warm
+if wait_for_path present "$long_socket"; then
+  _pass "hot service: long runtime paths use an isolated short socket"
+else
+  _fail "hot service: long runtime paths use an isolated short socket"
+fi
+_assert_file_missing "hot service: long runtime paths are never bound directly" \
+  "$long_candidate"
+XDG_RUNTIME_DIR="$long_runtime" "$relay" stop || true
+
 runtime=$(_tmpdir)/runtime
 socket="$runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
 XDG_RUNTIME_DIR="$runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
@@ -481,6 +499,7 @@ import os
 import socket
 import sys
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(os.environ["TERMNAV_TEST_ROOT"]) / "lib" / "termnav"))
 from hot_service import _socket_identity, _unlink_socket
@@ -494,7 +513,12 @@ path.unlink()
 replacement = socket.socket(socket.AF_UNIX)
 try:
     replacement.bind(str(path))
-    _unlink_socket(path, identity)
+    replacement.listen()
+    # Overlay filesystems and several Unix kernels may immediately reuse the
+    # old pathname's inode. Force that valid result so this regression is
+    # deterministic even on filesystems that happened to allocate a new one.
+    with mock.patch("hot_service._socket_identity", return_value=identity):
+        _unlink_socket(path, identity)
     if not path.exists():
         raise SystemExit("an old owner removed its replacement")
 finally:

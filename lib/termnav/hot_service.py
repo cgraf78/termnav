@@ -419,7 +419,11 @@ def _socket_identity(path: Path) -> tuple[int, int] | None:
 def _unlink_socket(path: Path, identity: tuple[int, int] | None) -> None:
     """Remove only the socket inode created by this service instance."""
 
-    if identity is None or _socket_identity(path) != identity:
+    # Device/inode identity is normally enough, but Unix filesystems may reuse
+    # an inode immediately after a stale pathname is removed. A replacement
+    # that is already accepting connections is authoritative even if its
+    # recycled stat tuple happens to match the retiring owner.
+    if identity is None or _live_socket(path) or _socket_identity(path) != identity:
         return
     try:
         path.unlink()
@@ -548,5 +552,17 @@ def serve_hot(
         if maintenance_stopped is not None:
             maintenance_stopped.set()
         server.server_close()
-        _unlink_socket(path, identity)
+        # Closing before taking the startup lock lets a waiting replacement
+        # win promptly. Once the lock is ours, that replacement is either fully
+        # listening (and must be preserved) or no replacement can race the
+        # identity check and unlink below. If the lock path became unsafe while
+        # this service was alive, leave a stale socket for explicit recovery
+        # instead of risking another process's endpoint.
+        cleanup_lock = _startup_lock(path)
+        if cleanup_lock is not None:
+            try:
+                _unlink_socket(path, identity)
+            finally:
+                fcntl.flock(cleanup_lock, fcntl.LOCK_UN)
+                os.close(cleanup_lock)
     return 0

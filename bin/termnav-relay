@@ -65,6 +65,24 @@ provider_key_for() {
 provider_key_for "$root"
 socket=$runtime/hot-v1-$provider_key.sock
 
+socket_path_too_long() {
+  local path=$1
+  local LC_ALL=C
+  # macOS allows only 103 pathname bytes in sockaddr_un.sun_path. Stay below
+  # that portable floor rather than optimistically relying on Linux's slightly
+  # larger limit or counting locale characters instead of encoded bytes.
+  ((${#path} > 100))
+}
+
+if socket_path_too_long "$socket"; then
+  # Preserve XDG/TMP runtime isolation even when the pathname itself must move
+  # to /tmp: hashing the complete preferred socket path distinguishes separate
+  # test sandboxes, login runtimes, and provider checkouts for the same user.
+  provider_key_for "$socket"
+  runtime=/tmp/termnav-$uid
+  socket=$runtime/hot-v1-$provider_key.sock
+fi
+
 fallback() {
   if [[ ${1:-} == navigate ]]; then
     shift
