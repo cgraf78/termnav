@@ -436,4 +436,12 @@ store_rc=$?
 set -e
 _assert_exit "relay store: prepared, committed, lost-response, and isolation cases pass" 0 "$store_rc"
 
+echo
+echo "=== SSH relay lifecycle ==="
+set +e
+python3 "$test_dir/support/relay_lifecycle_test.py"
+lifecycle_rc=$?
+set -e
+_assert_exit "relay lifecycle: ownership and hard-kill cleanup cases pass" 0 "$lifecycle_rc"
+
 _test_summary
