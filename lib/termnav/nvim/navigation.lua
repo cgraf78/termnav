@@ -18,21 +18,8 @@ local function default_command(arguments)
   return vim.v.shell_error, output
 end
 
-local function default_stream(arguments, on_result, on_exit)
-  local partial = ""
+local function default_spawn(arguments, on_exit)
   local job = vim.fn.jobstart(arguments, {
-    stdout_buffered = false,
-    on_stdout = function(_, data)
-      for index, chunk in ipairs(data) do
-        partial = partial .. chunk
-        if index < #data then
-          if partial ~= "" then
-            on_result(tonumber(partial))
-          end
-          partial = ""
-        end
-      end
-    end,
     on_exit = function(_, status)
       on_exit(status)
     end,
@@ -41,11 +28,8 @@ local function default_stream(arguments, on_result, on_exit)
     return nil
   end
   return {
-    send = function(request)
-      return vim.fn.chansend(job, request .. "\n") > 0
-    end,
-    close = function()
-      vim.fn.chanclose(job, "stdin")
+    cancel = function()
+      vim.fn.jobstop(job)
     end,
   }
 end
@@ -80,84 +64,89 @@ function M.new(options)
   local ctx = {
     application = options.application or default_application(),
     command = options.command or default_command,
-    defer = options.defer or vim.defer_fn,
-    executable = options.executable or "termnav-navigate",
+    executable = options.executable or "termnav",
     mappings = options.mappings ~= false,
+    notify = options.notify or vim.notify,
     schedule = options.schedule or vim.schedule,
-    stream = options.stream or default_stream,
-    -- A resident worker removes interpreter startup from the first boundary
-    -- gesture after an idle period. Consumers that explicitly prefer memory
-    -- reclamation can still provide a numeric idle timeout.
-    stream_idle_ms = options.stream_idle_ms,
+    spawn = options.spawn or default_spawn,
   }
-  local worker
-  local outstanding = 0
+  local queue = {}
+  local running
   local generation = 0
   local tmux_was_last = false
 
-  local function retire_when_idle(expected_generation)
-    if ctx.stream_idle_ms == nil then
-      return
-    end
-    ctx.defer(function()
-      if worker ~= nil and outstanding == 0 and generation == expected_generation then
-        local retiring = worker
-        worker = nil
-        retiring.close()
-      end
-    end, ctx.stream_idle_ms)
+  local function report(message)
+    -- Navigation errors should be visible, but notifications are deliberately
+    -- emitted only for launch/queue failures. A command returning "declined"
+    -- is ordinary routing policy and stays silent.
+    ctx.notify(message, vim.log.levels.WARN, { title = "Termnav" })
   end
 
-  function ctx.start()
-    if worker == nil then
-      local created
-      local started
-      -- vim.fn.jobstart raises when an installation is briefly incomplete or
-      -- PATH has not converged yet. Prewarming is an optimization, so it must
-      -- not abort editor setup; later boundary gestures will retry the worker.
-      started, created = pcall(ctx.stream, { ctx.executable, "--stream" }, function()
-        ctx.schedule(function()
-          if worker ~= created then
-            return
-          end
-          outstanding = math.max(0, outstanding - 1)
-          if outstanding == 0 then
-            retire_when_idle(generation)
-          end
-        end)
-      end, function()
-        ctx.schedule(function()
-          if worker == created then
-            worker = nil
-            outstanding = 0
-          end
-        end)
-      end)
-      worker = started and created or nil
+  local drain
+  drain = function()
+    if running ~= nil or #queue == 0 then
+      return
     end
-    return worker ~= nil
+
+    local request = table.remove(queue, 1)
+    generation = generation + 1
+    local token = { generation = generation }
+    running = token
+
+    -- Keep exactly one native process in flight. Serial completion preserves
+    -- key order without retaining a resident interpreter, and each successor
+    -- observes the focus change completed by its predecessor.
+    local ok, handle = pcall(ctx.spawn, {
+      ctx.executable,
+      "navigate",
+      request.action,
+      request.direction,
+    }, function(status)
+      ctx.schedule(function()
+        -- VimLeave or a replacement generation may invalidate this callback
+        -- after the child exits. Never let a stale completion drain a queue it
+        -- no longer owns.
+        if running ~= token then
+          return
+        end
+        running = nil
+        if status ~= 0 and status ~= 3 then
+          report("navigation request failed (status " .. tostring(status) .. ")")
+        end
+        drain()
+      end)
+    end)
+    if not ok or handle == nil or handle == false then
+      if running == token then
+        running = nil
+      end
+      report("cannot start native navigation request")
+      -- The failed request is consumed, but later queued keys remain useful.
+      -- Schedule rather than recurse so a broken executable cannot overflow
+      -- Lua's stack while draining a large burst of already queued requests.
+      ctx.schedule(drain)
+      return
+    end
+    token.handle = handle
   end
 
   function ctx.stop()
-    if worker ~= nil then
-      local retiring = worker
-      worker = nil
-      outstanding = 0
-      retiring.close()
+    queue = {}
+    generation = generation + 1
+    local current = running
+    running = nil
+    if current ~= nil and type(current.handle) == "table" and current.handle.cancel ~= nil then
+      current.handle.cancel()
     end
   end
 
   function ctx.route(action, direction)
-    generation = generation + 1
-    ctx.start()
-    if worker ~= nil then
-      outstanding = outstanding + 1
-      if not worker.send(action .. " " .. direction) then
-        worker.close()
-        worker = nil
-        outstanding = 0
-      end
+    if #queue >= 100 then
+      report("navigation queue is full; dropping the newest request")
+      return false
     end
+    queue[#queue + 1] = { action = action, direction = direction }
+    drain()
     return true
   end
 
@@ -403,11 +392,6 @@ function M.new(options)
     if vim.g.Netrw_UserMaps == nil then
       vim.g.Netrw_UserMaps = { { "<C-l>", "<Plug>(TermnavPaneRight)" } }
     end
-
-    -- jobstart returns as soon as the child is launched, so prewarming does
-    -- not block editor startup. Keeping this one ordered stream alive removes
-    -- Python startup from every later boundary gesture in the session.
-    ctx.start()
   end
 
   return ctx
