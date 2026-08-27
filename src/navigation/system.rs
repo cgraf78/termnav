@@ -212,6 +212,66 @@ impl SystemBackend {
         ))
     }
 
+    /// Return whether a scope owns an action without mutating tmux state.
+    ///
+    /// Relay navigation must prepare its terminal commit path before the
+    /// mutation occurs. This read-only probe uses the same ownership predicates
+    /// as [`Backend::execute`] so preparation cannot arm an unrelated pane.
+    #[must_use]
+    pub fn can_execute(&self, scope: &Scope, action: Action, direction: Direction) -> bool {
+        if action == Action::PaneSelect {
+            let edge = match direction {
+                Direction::Left => "pane_at_left",
+                Direction::Down => "pane_at_bottom",
+                Direction::Up => "pane_at_top",
+                Direction::Right => "pane_at_right",
+                _ => return false,
+            };
+            let Some(output) = self.tmux(
+                scope,
+                &[
+                    "display-message".to_owned(),
+                    "-p".to_owned(),
+                    "-t".to_owned(),
+                    scope.target(),
+                    tmux_format(&["window_active_clients", "pane_active", edge]),
+                ],
+            ) else {
+                return false;
+            };
+            let text = String::from_utf8_lossy(&output.stdout);
+            let fields = text.trim().split(FIELD_SEPARATOR).collect::<Vec<_>>();
+            return output.status.success()
+                && fields.len() == 3
+                && fields[0].parse::<u64>().is_ok_and(|active| active > 0)
+                && fields[1] == "1"
+                && fields[2] == "0";
+        }
+
+        if scope.session.is_none() {
+            return false;
+        }
+        let Some(output) = self.tmux(
+            scope,
+            &[
+                "display-message".to_owned(),
+                "-p".to_owned(),
+                "-t".to_owned(),
+                scope.target(),
+                tmux_format(&["window_active", "pane_active", "session_windows"]),
+            ],
+        ) else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let fields = text.trim().split(FIELD_SEPARATOR).collect::<Vec<_>>();
+        output.status.success()
+            && fields.len() == 3
+            && fields[0] == "1"
+            && fields[1] == "1"
+            && fields[2].parse::<u64>().is_ok_and(|windows| windows > 1)
+    }
+
     fn terminal_environment(&self, pid: u32, name: &str) -> Option<String> {
         process::environment(pid, name).or_else(|| self.environment.get(name).cloned())
     }

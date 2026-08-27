@@ -66,3 +66,16 @@ fn parent_navigation_requires_exact_client_identity() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--client-pid"));
 }
+
+#[test]
+fn relay_send_declines_without_an_advertised_parent() {
+    let output = termnav()
+        .args(["relay", "send", "pane", "left"])
+        .env_remove("TERMNAV_PARENT_RELAY")
+        .output()
+        .expect("run termnav");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}

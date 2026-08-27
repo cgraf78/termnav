@@ -41,7 +41,10 @@ where
             Ok(0)
         }
         "navigate" => crate::commands::navigate::run(&arguments[1..], stdout, stderr),
-        "relay" | "ssh" | "tmux" | "nvim" | "vscode" | "eza" => {
+        "relay" => crate::commands::relay::run(&arguments[1..], stdout, stderr),
+        "ssh" => crate::commands::ssh::run(&arguments[1..]),
+        "nvim" => crate::commands::nvim::run(&arguments[1..], stdout, stderr),
+        "tmux" | "vscode" | "eza" => {
             writeln!(stderr, "termnav: {command} is not implemented yet")?;
             Ok(2)
         }
