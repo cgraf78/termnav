@@ -221,6 +221,18 @@ test("setup prewarms one persistent router stream", function()
   truthy(not streams[1].closed, "the shared worker should remain ready between gestures")
 end)
 
+test("setup remains usable while the router executable is unavailable", function()
+  local ctx = navigation.new({
+    mappings = true,
+    stream = function()
+      error("router unavailable")
+    end,
+  })
+
+  local ok = pcall(ctx.setup)
+  truthy(ok, "an unavailable prewarm must not abort editor setup")
+end)
+
 test("previous split navigation remains local and process free", function()
   vim.cmd("vsplit")
   vim.cmd("wincmd l")

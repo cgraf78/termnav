@@ -111,7 +111,11 @@ function M.new(options)
   function ctx.start()
     if worker == nil then
       local created
-      created = ctx.stream({ ctx.executable, "--stream" }, function()
+      local started
+      -- vim.fn.jobstart raises when an installation is briefly incomplete or
+      -- PATH has not converged yet. Prewarming is an optimization, so it must
+      -- not abort editor setup; later boundary gestures will retry the worker.
+      started, created = pcall(ctx.stream, { ctx.executable, "--stream" }, function()
         ctx.schedule(function()
           if worker ~= created then
             return
@@ -129,7 +133,7 @@ function M.new(options)
           end
         end)
       end)
-      worker = created
+      worker = started and created or nil
     end
     return worker ~= nil
   end
