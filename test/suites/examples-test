@@ -98,12 +98,19 @@ local vscode_focus = {
   blur = function() end,
   dispose = function() end,
 }
+-- The example test validates composition, not the installed command lookup.
+-- Navigation now eagerly prewarms its resident worker during setup, so inject
+-- the same inert collaborator pattern used for the other side-effectful
+-- integrations. Dedicated navigation and install suites cover the real worker
+-- and executable contracts without depending on a developer's global PATH.
+local navigation = { setup = function() end }
 
 local example = dofile(root .. "/examples/nvim.lua")
 local context = example.setup({
   shdeps = shdeps,
   termnav_options = {
     opener = opener,
+    navigation = navigation,
     wezterm_vars = wezterm_vars,
     vscode_focus = vscode_focus,
     publish_delay_ms = -1,
