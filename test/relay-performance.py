@@ -540,7 +540,7 @@ def main() -> int:
 
         send_decline = ["send", "pane", "left"]
         send_dead_socket = ["send", "pane", "left"]
-        old_stray_commit = [
+        stray_commit = [
             "commit",
             "--tmux-socket",
             str(tmp / "tmux.sock"),
@@ -548,13 +548,9 @@ def main() -> int:
             "/dev/null",
             "--client-pid",
             "1",
+            "--client-created",
+            "1",
         ]
-        new_stray_commit = [*old_stray_commit, "--client-created", "1"]
-        baseline_stray_commit = (
-            new_stray_commit
-            if "--client-created" in baseline.read_text(encoding="utf-8")
-            else old_stray_commit
-        )
         scenarios = [
             ("send decline", send_decline, send_decline, {}, 3),
             (
@@ -566,8 +562,8 @@ def main() -> int:
             ),
             (
                 "stray commit",
-                baseline_stray_commit,
-                new_stray_commit,
+                stray_commit,
+                stray_commit,
                 {},
                 0,
             ),

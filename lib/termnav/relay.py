@@ -89,10 +89,11 @@ def load_commit_runtime() -> None:
 
 def load_server_runtime() -> None:
     """Load long-lived server and SSH modules outside the per-chord client."""
-    global argparse, shutil, signal, socket, threading, NAVIGATION_CONDITION
+    global argparse, selectors, shutil, signal, socket, threading, NAVIGATION_CONDITION
 
     load_commit_runtime()
     import argparse
+    import selectors
     import shutil
     import signal
     import socket
@@ -1289,8 +1290,22 @@ def handle_focus(request: dict) -> dict:
     return {"v": 2, "result": "claimed"}
 
 
-def serve(path: str) -> int:
+def serve(path: str, *, owner_fd: int | None = None) -> int:
+    """Serve one relay socket until signalled or its explicit owner disappears.
+
+    SSH-created relays receive the read side of a private pipe. The wrapper
+    owns the only writer, so EOF is a portable kernel notification even when
+    the wrapper is killed by a signal that cannot run Python cleanup. Keeping
+    the pipe off standard input preserves the noninteractive contract inherited
+    by every tmux and process-inspection helper the relay may launch.
+    """
+
     load_server_runtime()
+    if owner_fd is not None:
+        try:
+            os.set_inheritable(owner_fd, False)
+        except OSError as exc:
+            die(f"invalid owner descriptor {owner_fd}: {exc}")
     socket_path = Path(path)
     socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if socket_path.exists() or socket_path.is_socket():
@@ -1310,11 +1325,18 @@ def serve(path: str) -> int:
         os.umask(old_umask)
     os.chmod(path, 0o600)
     server.listen(8)
-    stopping = False
+    stopping = threading.Event()
+    wakeup_read = None
+    wakeup_write = None
 
     def stop(_signum: int, _frame: object) -> None:
-        nonlocal stopping
-        stopping = True
+        stopping.set()
+        if wakeup_write is not None:
+            try:
+                os.write(wakeup_write, b"\0")
+                return
+            except OSError:
+                pass
         server.close()
 
     signal.signal(signal.SIGTERM, stop)
@@ -1430,17 +1452,68 @@ def serve(path: str) -> int:
             ):
                 return
 
-    while not stopping:
-        try:
-            connection, _ = server.accept()
-        except OSError:
-            break
-        threading.Thread(target=handle, args=(connection,), daemon=True).start()
-    server.close()
+    owner_selector = None
     try:
-        socket_path.unlink()
-    except FileNotFoundError:
-        pass
+        if owner_fd is not None:
+            # A selector sleeps until either work arrives or the owner pipe
+            # reaches EOF. A second private pipe lets signal handlers wake that
+            # same selector; closing a watched listener alone does not reliably
+            # wake epoll or kqueue. Neither pipe adds periodic idle wakeups.
+            wakeup_read, wakeup_write = os.pipe()
+            os.set_blocking(wakeup_read, False)
+            os.set_blocking(wakeup_write, False)
+            os.set_inheritable(wakeup_read, False)
+            os.set_inheritable(wakeup_write, False)
+            owner_selector = selectors.DefaultSelector()
+            owner_selector.register(server, selectors.EVENT_READ, "server")
+            owner_selector.register(owner_fd, selectors.EVENT_READ, "owner")
+            owner_selector.register(wakeup_read, selectors.EVENT_READ, "wakeup")
+
+        while not stopping.is_set():
+            try:
+                if owner_selector is not None:
+                    ready = owner_selector.select()
+                    if any(key.data == "wakeup" for key, _mask in ready):
+                        try:
+                            os.read(wakeup_read, 4096)
+                        except OSError:
+                            pass
+                        if stopping.is_set():
+                            continue
+                    if any(key.data == "owner" for key, _mask in ready):
+                        try:
+                            owner_data = os.read(owner_fd, 4096)
+                        except OSError:
+                            owner_data = b""
+                        if not owner_data:
+                            stopping.set()
+                            continue
+                    if not any(key.data == "server" for key, _mask in ready):
+                        continue
+                connection, _ = server.accept()
+            except OSError:
+                break
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
+    finally:
+        if owner_selector is not None:
+            owner_selector.close()
+        server.close()
+        for descriptor in (wakeup_read, wakeup_write):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if owner_fd is not None:
+            try:
+                os.close(owner_fd)
+            except OSError:
+                pass
+        try:
+            socket_path.unlink()
+        except FileNotFoundError:
+            pass
     return 0
 
 
@@ -1607,18 +1680,32 @@ def ssh_command(arguments: list[str], *, stdin_tty: bool | None = None) -> int:
         if tty_path:
             server_environment["TERMNAV_RELAY_CLIENT_TTY"] = tty_path
             server_environment["TERMNAV_RELAY_CLIENT_PID"] = str(os.getpid())
-    server = subprocess.Popen(
-        [
-            str(Path(_ROOT) / "bin" / "termnav-relay"),
-            "serve",
-            "--socket",
-            str(local_socket),
-        ],
-        env=server_environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    owner_read, owner_write = os.pipe()
+    try:
+        server = subprocess.Popen(
+            [
+                str(Path(_ROOT) / "bin" / "termnav-relay"),
+                "serve",
+                "--socket",
+                str(local_socket),
+                "--owner-fd",
+                str(owner_read),
+            ],
+            env=server_environment,
+            # Standard input must stay /dev/null because relay request handlers
+            # launch ordinary tmux and process-inspection helpers. Only the
+            # private descriptor crosses exec, and serve() immediately marks it
+            # non-inheritable before accepting any work.
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(owner_read,),
+        )
+    except BaseException:
+        os.close(owner_write)
+        raise
+    finally:
+        os.close(owner_read)
     try:
         for _ in range(100):
             if local_socket.is_socket():
@@ -1676,11 +1763,22 @@ def ssh_command(arguments: list[str], *, stdin_tty: bool | None = None) -> int:
             )
         return result
     finally:
-        server.terminate()
+        # Keep normal disconnects on the existing immediate signal path rather
+        # than depending on selector scheduling. The pipe is the crash-only
+        # backstop for cases where this block cannot run.
+        try:
+            server.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            os.close(owner_write)
+        except OSError:
+            pass
         try:
             server.wait(timeout=2)
         except subprocess.TimeoutExpired:
             server.kill()
+            server.wait()
         try:
             local_socket.unlink()
         except FileNotFoundError:
@@ -1766,6 +1864,7 @@ def main() -> int:
     send.add_argument("--client-tty")
     server = subparsers.add_parser("serve")
     server.add_argument("--socket", required=True)
+    server.add_argument("--owner-fd", type=int, help=argparse.SUPPRESS)
     hot_server = subparsers.add_parser("hot-serve")
     hot_server.add_argument("--socket", required=True)
     hot_server.add_argument("--detach", action="store_true")
@@ -1782,7 +1881,7 @@ def main() -> int:
     if args.command == "send":
         return send_command(args.scope, args.direction, args.client_pid, args.client_tty)
     if args.command == "serve":
-        return serve(args.socket)
+        return serve(args.socket, owner_fd=args.owner_fd)
     if args.command == "hot-serve":
         from hot_service import serve_hot
 
