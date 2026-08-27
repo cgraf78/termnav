@@ -1,0 +1,25 @@
+[package]
+name = "termnav"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Unified navigation across editors, tmux, SSH, and terminal applications"
+build = "build.rs"
+
+[lib]
+name = "termnav"
+
+[[bin]]
+name = "termnav"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints.rust]
+warnings = "deny"
