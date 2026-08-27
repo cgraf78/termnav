@@ -64,7 +64,7 @@ performance_job=$(awk '
 # These are literal GitHub expressions in the workflow contract.
 # shellcheck disable=SC2016
 for contract in \
-  'name: Relay startup / Ubuntu' \
+  'name: Relay hot path / Ubuntu' \
   "if: \${{ github.event_name == 'pull_request' }}" \
   'runs-on: ubuntu-24.04' \
   'fetch-depth: 0' \

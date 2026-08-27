@@ -3,6 +3,7 @@ program	bin/eza-nvim-links
 program	bin/nvim-link-host
 program	bin/nvim-ssh-control-open
 program	bin/nvim-tmux-open
+program	bin/termnav-relay
 program	bin/termnav-tmux-context
 program	bin/tmux-follow-click
 program	bin/vscode-nvim-focus
@@ -24,6 +25,7 @@ program	share/termnav/shims/ssh
 program	test/helpers.sh
 program	test/suites/ci-contract-test
 program	test/suites/examples-test
+program	test/suites/hot-service-test
 program	test/suites/install-test
 program	test/suites/manpage-test
 program	test/suites/navigation-cli-test

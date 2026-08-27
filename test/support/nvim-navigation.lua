@@ -210,6 +210,45 @@ test("boundary bursts share one ordered router stream", function()
   )
 end)
 
+test("setup prewarms one persistent router stream", function()
+  local ctx, _, streams = fake_context({ mappings = true })
+
+  ctx.setup()
+
+  equal(#streams, 1, "setup should hide Python startup before the first gesture")
+  equal(streams[1].arguments, { "termnav-navigate", "--stream" }, "prewarmed stream command")
+  equal(streams[1].sent, {}, "prewarming should not invent a navigation request")
+  truthy(not streams[1].closed, "the shared worker should remain ready between gestures")
+end)
+
+test("setup retries a temporarily unavailable router on the next boundary", function()
+  local attempts = 0
+  local requests = {}
+  local ctx = navigation.new({
+    mappings = true,
+    stream = function()
+      attempts = attempts + 1
+      if attempts == 1 then
+        error("router unavailable")
+      end
+      return {
+        send = function(request)
+          requests[#requests + 1] = request
+          return true
+        end,
+        close = function() end,
+      }
+    end,
+  })
+
+  local ok = pcall(ctx.setup)
+  truthy(ok, "an unavailable prewarm must not abort editor setup")
+  equal(attempts, 1, "setup should try one prewarm")
+  ctx.tab_select("next")
+  equal(attempts, 2, "the next boundary should retry the router")
+  equal(requests, { "tab-select next" }, "the recovered stream should receive the gesture")
+end)
+
 test("previous split navigation remains local and process free", function()
   vim.cmd("vsplit")
   vim.cmd("wincmd l")

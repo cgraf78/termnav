@@ -216,6 +216,13 @@ class RelayHarness:
         self.terminals: list[TerminalClient] = []
 
     def close(self) -> None:
+        subprocess.run(
+            [self.relay, "stop"],
+            env=self.environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         for relay in reversed(self.relays):
             relay.terminate()
             try:
@@ -504,6 +511,11 @@ class RelayTerminalTest(unittest.TestCase):
         for state, response in enumerate(DECRQM_RESPONSES):
             with self.subTest(state=state):
                 self.harness.tmux(tmux_socket, "select-pane", "-t", left)
+                # Each DECRQM reply enters through the synthetic client's
+                # input queue. Prove tmux consumed the previous reply before
+                # starting the next transaction; otherwise a fast CI worker
+                # can race client input processing and observe no next query.
+                terminal.synchronize_input()
                 terminal.drain()
                 request = self.harness.start_send(relay_socket, "pane", "right")
                 terminal.read_until(COMMIT_QUERY)

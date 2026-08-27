@@ -941,12 +941,59 @@ check(
   ))
 )
 check(
-  "foreground tmux wins while a child shell is starting",
+  "foreground tmux wins after an explicit shell handoff",
   routes.is_tmux(pane({ TERMNAV_TMUX = "" }, nil, { foreground = "/usr/bin/tmux" }))
 )
 check(
   "tmux context rejects an ordinary shell pane",
   not routes.is_tmux(pane({}, nil, { foreground = "/bin/zsh" }))
+)
+
+local owner_var_reads = 0
+local owner_foreground_reads = 0
+local function owner_pane(vars, foreground)
+  return {
+    get_user_vars = function()
+      owner_var_reads = owner_var_reads + 1
+      return vars
+    end,
+    get_foreground_process_name = function()
+      owner_foreground_reads = owner_foreground_reads + 1
+      return foreground
+    end,
+  }
+end
+
+check(
+  "terminal owner reads nvim metadata once without a process query",
+  routes.terminal_owner(owner_pane({ IS_NVIM = "true", TERMNAV_TMUX = "true" }, "/usr/bin/tmux"))
+      == "nvim"
+    and owner_var_reads == 1
+    and owner_foreground_reads == 0
+)
+owner_var_reads = 0
+owner_foreground_reads = 0
+check(
+  "terminal owner reads tmux metadata once without a process query",
+  routes.terminal_owner(owner_pane({ TERMNAV_TMUX = "true" }, "/bin/bash")) == "tmux"
+    and owner_var_reads == 1
+    and owner_foreground_reads == 0
+)
+owner_var_reads = 0
+owner_foreground_reads = 0
+check(
+  "terminal owner validates explicit non-tmux metadata with one process query",
+  routes.terminal_owner(owner_pane({ TERMNAV_TMUX = "" }, "/bin/zsh")) == "terminal"
+    and owner_var_reads == 1
+    and owner_foreground_reads == 1
+)
+owner_var_reads = 0
+owner_foreground_reads = 0
+check(
+  "terminal owner falls back to one foreground query when metadata is absent",
+  routes.terminal_owner(owner_pane({}, "/bin/zsh")) == "terminal"
+    and owner_var_reads == 1
+    and owner_foreground_reads == 1
 )
 
 local function last()

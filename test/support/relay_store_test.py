@@ -14,7 +14,7 @@ from importlib.machinery import SourceFileLoader
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RELAY = ROOT / "bin" / "termnav-relay"
+RELAY = ROOT / "lib" / "termnav" / "relay.py"
 spec = importlib.util.spec_from_loader(
     "termnav_relay_store_test",
     SourceFileLoader("termnav_relay_store_test", str(RELAY)),

@@ -16,6 +16,13 @@ termnav-relay \- route navigation through nested SSH and tmux scopes
 .br
 .B termnav-relay commit --tmux-socket \fIsocket\fR --client-tty \fItty\fR --client-pid \fIpid\fR --client-created \fIseconds\fR
 .br
+.B termnav-relay navigate
+.I action direction --parent client-options
+.br
+.B termnav-relay warm
+.br
+.B termnav-relay stop
+.br
 .B termnav-relay ssh
 [\fIssh arguments\fR]
 .SH DESCRIPTION
@@ -23,6 +30,14 @@ Termnav establishes one owner-only Unix socket forwarding channel on each
 interactive SSH connection. Navigation requests are handled by the nearest
 tmux scope and otherwise forwarded to its parent. The protocol contains only
 fixed pane and window navigation operations.
+.PP
+Interactive shell activation starts one owner-only dispatcher under
+\fB$XDG_RUNTIME_DIR/termnav-$UID\fR. The hot \fBsend\fR, \fBcommit\fR, and
+tmux-only \fBnavigate\fR forms reuse that process instead of starting a Python
+interpreter for each keypress. \fBwarm\fR starts it asynchronously; \fBstop\fR
+shuts it down. It also exits after one hour without a request. Unsupported or
+unusual argument forms retain the ordinary command parser, and transport
+failures remain fail-closed so a gesture is never executed twice.
 .PP
 Install \fBshare/termnav/sshd_config\fR as an sshd_config.d fragment on any
 host that should participate, validate with \fBsshd -t\fR, and reload sshd.

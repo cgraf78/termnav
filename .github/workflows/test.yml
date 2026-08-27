@@ -45,7 +45,7 @@ jobs:
       - uses: cgraf78/actions/.github/actions/verify-consumer-sync@de3f6086e36a77eec8ee62f2c9871266e4b5c05c
 
   relay-performance:
-    name: Relay startup / Ubuntu
+    name: Relay hot path / Ubuntu
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     steps:

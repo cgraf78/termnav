@@ -52,11 +52,14 @@ consumers must still select versioned VS Code payloads explicitly.
   the window-scoped VS Code adapter. Persistent tmux sessions resolve the
   currently focused client rather than trusting inherited window state.
 - `bin/termnav-relay`: carry pane, window, and window-move requests across
-  nested SSH/tmux boundaries. Its outer commit barrier uses the standard,
-  read-only DECRQM reply path supported by WezTerm and xterm.js; intermediate
-  tmux layers continue to forward the private `User8` commit key. Unmatched
-  replies pass back to applications on tmux versions that do not virtualize
-  DECRQM themselves.
+  nested SSH/tmux boundaries. Shell activation warms one owner-only local
+  dispatcher, so tmux boundary navigation, relay sends, and commit responses
+  do not start Python for each keypress. The service exits after an hour
+  without a request and is restarted transparently. Its outer commit barrier
+  uses the standard, read-only DECRQM reply path supported by WezTerm and
+  xterm.js; intermediate tmux layers continue to forward the private `User8`
+  commit key. Unmatched replies pass back to applications on tmux versions
+  that do not virtualize DECRQM themselves.
 - `bin/termnav-tmux-context`: publish tmux ownership to a newly attached
   terminal client before a shell or editor redraws.
 - `bin/termnav-tmux-focus`: publish leased, pane-scoped focus ownership from a
@@ -66,7 +69,9 @@ consumers must still select versioned VS Code payloads explicitly.
   sessions, commands, or a maximum depth.
 - `bin/tmux-follow-click`: resolve tmux mouse clicks to URL/file actions.
 - `bin/eza-nvim-links`: run `eza` with remote-aware file hyperlinks.
-- `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers.
+- `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers. Navigation
+  consumers use one pane-owner snapshot per gesture and avoid foreground
+  process inspection when current Neovim or tmux metadata is already present.
 - `lib/termnav/wezterm/public-link-rules.lua`: public WezTerm link rules
   for terminal tokens such as localhost URLs, git SSH remotes, CVEs, and RFCs.
   The module returns fresh rule copies from `public_link_rules()` and appends
@@ -75,9 +80,10 @@ consumers must still select versioned VS Code payloads explicitly.
 - `lib/termnav/nvim/setup.lua`: reusable Neovim-side setup for publishing the
   current editor socket, cwd, and remote context to WezTerm.
 - `lib/termnav/nvim/navigation.lua`: Neovim pane and tab navigation. Directional
-  pane edges and tab boundaries delegate to the shared router, while
-  Ctrl-backslash preserves the local previous-split/previous-tmux-pane history
-  expected from vim-tmux-navigator without guessing at an ancestor's history.
+  pane edges and tab boundaries delegate to one ordered worker kept warm for
+  the editor lifetime, while Ctrl-backslash preserves the local
+  previous-split/previous-tmux-pane history expected from vim-tmux-navigator
+  without guessing at an ancestor's history.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
   `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
   setup module and advanced consumers.
@@ -126,6 +132,9 @@ through Shdeps.
 ## Dependencies
 
 - Bash for the CLI entry points and shell loader.
+- `curl` with Unix-socket support for the warmed navigation dispatcher. Without
+  it, commands retain the same behavior through the portable per-invocation
+  Python path, but boundary gestures pay interpreter startup latency.
 - `tmux` for `tmux-follow-click`, tmux pane capture, tmux mouse forwarding, and
   tmux-aware Neovim targeting.
 - Neovim with a server/socket setup for `nvim-tmux-open` to open file targets
@@ -136,8 +145,8 @@ through Shdeps.
 - `eza` for `eza-nvim-links`.
 - `ssh` for `nvim-ssh-control-open` when remote file links should reuse an
   existing ControlMaster connection.
-- VS Code with the local `cgraf.termnav` adapter installed, plus `curl` with
-  Unix-socket support. The adapter publishes a private, per-window socket into
+- VS Code with the local `cgraf.termnav` adapter installed. The adapter
+  publishes a private, per-window socket into
   its terminals; VS Code, VS Code Insiders, Cursor, and compatible builds use
   the same transport without product-specific CLI discovery.
 - `nabheet.vscode-ide-mcp` is required only when
@@ -242,8 +251,9 @@ can render its own borders per client, but the nested application's already
 rendered cell backgrounds cannot differ between those viewers. Distinct outer
 panes attaching distinct clients to one inner session remain independent.
 
-`termnav-navigate` receives the exact tmux client, creation stamp, and source
-scope from tmux bindings. Application-origin requests cannot carry that
+The warmed `termnav-relay navigate` facade passes the exact tmux client,
+creation stamp, and source scope into the shared `termnav-navigate` policy.
+Application-origin requests cannot carry that
 identity, so one client snapshot resolves both the logical tmux scope and any
 safe physical provenance. Local pane operations need no client, and local tab
 operations need only a session shared by the clients viewing that pane. A sole

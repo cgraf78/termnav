@@ -28,8 +28,11 @@ and terminal scopes. It visits local tmux parents before crossing an SSH relay
 and fails closed when a shared-client topology cannot be attributed safely.
 .PP
 Neovim keeps split and application-tab operations local, then delegates every
-tmux boundary to this command so client and session provenance have one owner.
-tmux bindings use
+boundary to this command's ordered stream so client and session provenance have
+one owner. Latency-sensitive tmux bindings enter the same policy through
+.BR "termnav-relay navigate" .
+Its warmed dispatcher avoids starting an interpreter for each keypress. The
+fallback parser uses
 .B --parent
 with exact client identity after their current scope declines.
 .SH ACTIONS
