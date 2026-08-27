@@ -85,7 +85,10 @@ function M.new(options)
     mappings = options.mappings ~= false,
     schedule = options.schedule or vim.schedule,
     stream = options.stream or default_stream,
-    stream_idle_ms = options.stream_idle_ms or 250,
+    -- A resident worker removes interpreter startup from the first boundary
+    -- gesture after an idle period. Consumers that explicitly prefer memory
+    -- reclamation can still provide a numeric idle timeout.
+    stream_idle_ms = options.stream_idle_ms,
   }
   local worker
   local outstanding = 0
@@ -93,6 +96,9 @@ function M.new(options)
   local tmux_was_last = false
 
   local function retire_when_idle(expected_generation)
+    if ctx.stream_idle_ms == nil then
+      return
+    end
     ctx.defer(function()
       if worker ~= nil and outstanding == 0 and generation == expected_generation then
         local retiring = worker
@@ -102,8 +108,7 @@ function M.new(options)
     end, ctx.stream_idle_ms)
   end
 
-  function ctx.route(action, direction)
-    generation = generation + 1
+  function ctx.start()
     if worker == nil then
       local created
       created = ctx.stream({ ctx.executable, "--stream" }, function()
@@ -126,6 +131,21 @@ function M.new(options)
       end)
       worker = created
     end
+    return worker ~= nil
+  end
+
+  function ctx.stop()
+    if worker ~= nil then
+      local retiring = worker
+      worker = nil
+      outstanding = 0
+      retiring.close()
+    end
+  end
+
+  function ctx.route(action, direction)
+    generation = generation + 1
+    ctx.start()
     if worker ~= nil then
       outstanding = outstanding + 1
       if not worker.send(action .. " " .. direction) then
@@ -338,6 +358,10 @@ function M.new(options)
         tmux_was_last = false
       end,
     })
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      group = group,
+      callback = ctx.stop,
+    })
     -- Tab navigation is application-level rather than cursor input. Keep it
     -- consistent in normal, insert, and terminal modes so a mode transition
     -- cannot strand the user inside one scope.
@@ -375,6 +399,11 @@ function M.new(options)
     if vim.g.Netrw_UserMaps == nil then
       vim.g.Netrw_UserMaps = { { "<C-l>", "<Plug>(TermnavPaneRight)" } }
     end
+
+    -- jobstart returns as soon as the child is launched, so prewarming does
+    -- not block editor startup. Keeping this one ordered stream alive removes
+    -- Python startup from every later boundary gesture in the session.
+    ctx.start()
   end
 
   return ctx

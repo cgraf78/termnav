@@ -10,7 +10,7 @@ import time
 from importlib.machinery import SourceFileLoader
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-RELAY = ROOT / "bin" / "termnav-relay"
+RELAY = ROOT / "lib" / "termnav" / "relay.py"
 spec = importlib.util.spec_from_loader(
     "termnav_relay_server_test",
     SourceFileLoader("termnav_relay_server_test", str(RELAY)),

@@ -14,13 +14,28 @@ sys.path.insert(0, str(ROOT / "lib" / "termnav"))
 from navigation import Client, Navigator, Outcome, SystemBackend
 from navigation_protocol import validate_request
 
+STREAM_CONTINUATION_SECONDS = 0.25
 
-def run_stream(navigator: Navigator) -> int:
-    """Route an ordered burst while following its selected tmux client."""
+
+def run_stream(
+    navigator: Navigator,
+    *,
+    clock=time.monotonic,
+    continuation_seconds: float = STREAM_CONTINUATION_SECONDS,
+) -> int:
+    """Route ordered bursts while retaining no stale cross-burst identity."""
 
     continuation_client = None
     continuation_scope = None
+    last_completed = None
     for line in sys.stdin:
+        if last_completed is not None and clock() - last_completed >= continuation_seconds:
+            # The former short-lived worker naturally forgot continuation state
+            # after 250 ms. Keep the interpreter resident, but preserve that
+            # semantic boundary so a later gesture re-resolves live focus and
+            # topology instead of following a client selected minutes earlier.
+            continuation_client = None
+            continuation_scope = None
         fields = line.split()
         if len(fields) != 2:
             print(1, flush=True)
@@ -44,6 +59,7 @@ def run_stream(navigator: Navigator) -> int:
             return 1
         continuation_client = result.client
         continuation_scope = result.scope
+        last_completed = clock()
     return 0
 
 
@@ -81,7 +97,7 @@ def main() -> int:
             or arguments.parent
         ):
             parser.error("--stream does not accept an initial action or --parent")
-        backend = SystemBackend(ROOT / "bin")
+        backend = SystemBackend()
         return run_stream(
             Navigator(backend, now=lambda: time.time_ns() // 1_000_000_000)
         )
@@ -121,7 +137,7 @@ def main() -> int:
             created=arguments.client_created,
         )
 
-    backend = SystemBackend(ROOT / "bin")
+    backend = SystemBackend()
     return int(
         Navigator(backend, now=lambda: time.time_ns() // 1_000_000_000).navigate(
             arguments.action,

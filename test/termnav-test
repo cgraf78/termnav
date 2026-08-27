@@ -12,6 +12,7 @@ runtime_shell_files=(
   "$root/bin/nvim-link-host"
   "$root/bin/nvim-ssh-control-open"
   "$root/bin/nvim-tmux-open"
+  "$root/bin/termnav-relay"
   "$root/bin/termnav-tmux-context"
   "$root/bin/tmux-follow-click"
   "$root/bin/vscode-nvim-focus"

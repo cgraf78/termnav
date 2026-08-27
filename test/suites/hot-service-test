@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+# hot-service-test - lifecycle and fail-safe behavior of the warmed dispatcher.
+
+set -euo pipefail
+export NO_COLOR=1
+export TERMNAV_TEST_HOT=1
+
+test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+root="${test_dir%/test}"
+# shellcheck source=../helpers.sh
+. "$test_dir/helpers.sh"
+
+relay="$root/bin/termnav-relay"
+provider_key_for() {
+  local value=$1 hash=2166136261 index byte
+  local LC_ALL=C
+  for ((index = 0; index < ${#value}; index++)); do
+    printf -v byte '%d' "'${value:index:1}"
+    hash=$(((hash ^ byte) * 16777619 & 0xffffffff))
+  done
+  printf -v provider_key '%08x' "$hash"
+}
+provider_key_for "$root"
+hot_socket_name="hot-v1-$provider_key.sock"
+
+wait_for_path() {
+  local mode="$1" path="$2" attempt
+  for ((attempt = 0; attempt < 200; attempt++)); do
+    if [[ $mode == present && -S $path ]] || [[ $mode == absent && ! -e $path ]]; then
+      return 0
+    fi
+    sleep 0.01
+  done
+  return 1
+}
+
+echo "=== hot service lifecycle ==="
+
+relay_help=$("$relay" --help)
+_assert_contains "hot service: public help names warm lifecycle control" \
+  "warm" "$relay_help"
+_assert_contains "hot service: public help names the navigation facade" \
+  "navigate" "$relay_help"
+_assert_contains "hot service: public help retains the SSH facade" \
+  "ssh" "$relay_help"
+_assert_not_contains "hot service: public help hides internal server control" \
+  "hot-serve" "$relay_help"
+set +e
+"$relay" >/dev/null 2>&1
+empty_args_rc=$?
+"$relay" warm unexpected >/dev/null 2>&1
+warm_args_rc=$?
+"$relay" stop unexpected >/dev/null 2>&1
+stop_args_rc=$?
+set -e
+_assert_exit "hot service: an empty command retains parser rejection" \
+  2 "$empty_args_rc"
+_assert_exit "hot service: warm rejects extra arguments" 2 "$warm_args_rc"
+_assert_exit "hot service: stop rejects extra arguments" 2 "$stop_args_rc"
+
+isolated_runtime=$(_tmpdir)/runtime
+set +e
+env -u TERMNAV_PARENT_RELAY REPO_TEST=1 TERMNAV_TEST_HOT=0 \
+  XDG_RUNTIME_DIR="$isolated_runtime" "$relay" send pane left
+isolated_rc=$?
+set -e
+_assert_exit "hot service: ordinary repository tests retain parser semantics" \
+  3 "$isolated_rc"
+_assert_file_missing "hot service: ordinary repository tests start no daemon" \
+  "$isolated_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+
+runtime=$(_tmpdir)/runtime
+socket="$runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+XDG_RUNTIME_DIR="$runtime" TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
+if wait_for_path present "$socket"; then
+  _pass "hot service: warm starts the private dispatcher"
+else
+  _fail "hot service: warm starts the private dispatcher"
+fi
+
+socket_mode=$(stat -c '%a' "$socket" 2>/dev/null || stat -f '%Lp' "$socket")
+runtime_mode=$(stat -c '%a' "${socket%/*}" 2>/dev/null || stat -f '%Lp' "${socket%/*}")
+_assert_eq "hot service: socket is owner-only" "600" "$socket_mode"
+_assert_eq "hot service: runtime directory is owner-only" "700" "$runtime_mode"
+
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$runtime" \
+  TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" send pane left
+send_rc=$?
+set -e
+_assert_exit "hot service: warmed send preserves declined status" 3 "$send_rc"
+
+set +e
+XDG_RUNTIME_DIR="$runtime" "$relay" commit \
+  --tmux-socket /tmp/missing-termnav-tmux.sock \
+  --client-tty /dev/null --client-pid 1 --client-created 1 \
+  --passthrough-decrqm 9 --pane %1 >/dev/null 2>&1
+invalid_commit_rc=$?
+set -e
+_assert_exit "hot service: invalid commit options retain parser rejection" \
+  2 "$invalid_commit_rc"
+
+path_bin=$(_tmpdir)/bin
+path_log=$(_tmpdir)/tmux.log
+mkdir -p "$path_bin"
+cat >"$path_bin/tmux" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >"$path_log"
+exit 1
+SH
+chmod 0755 "$path_bin/tmux"
+PATH="$path_bin:$PATH" XDG_RUNTIME_DIR="$runtime" "$relay" commit \
+  --tmux-socket /tmp/missing-termnav-tmux.sock \
+  --client-tty /dev/null --client-pid 1 --client-created 1
+_assert_contains "hot service: each request uses its caller's tmux PATH" \
+  "list-clients" "$(cat "$path_log")"
+
+long_path=""
+for ((path_index = 0; path_index < 500; path_index++)); do
+  long_path="${long_path}/tmp/termnav-long-path-$path_index:"
+done
+set +e
+env -u TERMNAV_PARENT_RELAY PATH="$long_path$PATH" \
+  XDG_RUNTIME_DIR="$runtime" "$relay" send pane left
+long_path_rc=$?
+set -e
+_assert_exit "hot service: a realistic large PATH remains routable" \
+  3 "$long_path_rc"
+
+# A source update should replace an otherwise healthy resident process before
+# the next gesture. This is the normal rolling-upgrade path used after install.
+touch -t 200001010000 "$socket"
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$runtime" \
+  TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" send pane left
+upgrade_rc=$?
+set -e
+_assert_exit "hot service: a source-newer dispatcher preserves the gesture" \
+  3 "$upgrade_rc"
+if [[ $socket -nt $root/lib/termnav/relay.py ]]; then
+  _pass "hot service: a source-newer dispatcher is replaced"
+else
+  _fail "hot service: a source-newer dispatcher is replaced"
+fi
+
+set +e
+TERMNAV_TEST_SOCKET="$socket" python3 - <<'PY'
+import os
+import socket
+
+fields = (
+    "termnav-hot-v1",
+    "/different/provider",
+    "",
+    os.environ.get("PATH", ""),
+    os.environ.get("HOME", ""),
+    os.environ.get("XDG_STATE_HOME", ""),
+    os.environ.get("TERMNAV_VSCODE_CURL", ""),
+    os.environ.get("TERMNAV_VSCODE_FALLBACK_BACKEND", ""),
+    os.environ.get("VSCODE_MCP_PORT", ""),
+    "warm",
+)
+body = "\0".join(fields).encode() + b"\0"
+header = (
+    b"POST /v1 HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+)
+with socket.socket(socket.AF_UNIX) as client:
+    client.settimeout(2)
+    client.connect(os.environ["TERMNAV_TEST_SOCKET"])
+    client.sendall(header + body)
+    reply = b""
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        reply += chunk
+if not reply.endswith(b"\r\n\r\n125"):
+    raise SystemExit(f"unexpected reply: {reply!r}")
+PY
+provider_rc=$?
+set -e
+_assert_exit "hot service: a different provider root must use its own parser" \
+  0 "$provider_rc"
+
+if wait_for_path absent "$socket"; then
+  _pass "hot service: an abandoned dispatcher exits after its idle deadline"
+else
+  _fail "hot service: an abandoned dispatcher exits after its idle deadline"
+  XDG_RUNTIME_DIR="$runtime" "$relay" stop || true
+fi
+
+sweep_runtime=$(_tmpdir)/runtime
+sweep_tmp=$(_tmpdir)/tmp
+mkdir -p "$sweep_tmp"
+sweep_socket="$sweep_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+REPO_TEST=1 XDG_RUNTIME_DIR="$sweep_runtime" TMPDIR="$sweep_tmp" \
+  TERMNAV_TEST_HOT_IDLE_SECONDS=1 TERMNAV_TEST_HOT_SWEEP_SECONDS=0.05 \
+  "$relay" warm
+if ! wait_for_path present "$sweep_socket"; then
+  _fail "hot service: periodic-sweep fixture starts the dispatcher"
+fi
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$sweep_runtime" TMPDIR="$sweep_tmp" \
+  "$relay" send pane left
+sweep_ready_rc=$?
+set -e
+_assert_exit "hot service: periodic-sweep fixture becomes responsive" \
+  3 "$sweep_ready_rc"
+stale_forward="$sweep_tmp/termnav-relay-periodic.sock"
+TERMNAV_TEST_SOCKET="$stale_forward" python3 - <<'PY'
+import os
+import socket
+import time
+
+path = os.environ["TERMNAV_TEST_SOCKET"]
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+server.close()
+old = time.time() - 120
+os.utime(path, (old, old))
+PY
+if wait_for_path absent "$stale_forward"; then
+  _pass "hot service: periodic maintenance removes abandoned relay sockets"
+else
+  _fail "hot service: periodic maintenance removes abandoned relay sockets"
+fi
+XDG_RUNTIME_DIR="$sweep_runtime" TMPDIR="$sweep_tmp" "$relay" stop || true
+
+set +e
+TERMNAV_TEST_ROOT="$root" TERMNAV_TEST_DIR="$(_tmpdir)" \
+TERMNAV_TEST_HOT_IDLE_SECONDS=2 TERMNAV_TEST_HOT_SWEEP_SECONDS=60 \
+  python3 - <<'PY'
+import os
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+root = Path(os.environ["TERMNAV_TEST_ROOT"])
+sys.path.insert(0, str(root / "lib" / "termnav"))
+from hot_service import PROVIDER_ROOT, serve_hot
+
+socket_path = Path(os.environ["TERMNAV_TEST_DIR"]) / "slow-sweep.sock"
+sweep_started = threading.Event()
+sweep_release = threading.Event()
+
+
+def sweep() -> int:
+    sweep_started.set()
+    if not sweep_release.wait(2):
+        raise RuntimeError("slow sweep was not released")
+    return 0
+
+
+def send(_scope: str, _direction: str, **_kwargs) -> int:
+    return 3
+
+
+def commit(*_args, **_kwargs) -> int:
+    return 0
+
+
+server = threading.Thread(
+    target=serve_hot,
+    args=(str(socket_path), send, commit, sweep),
+    daemon=True,
+)
+server.start()
+if not sweep_started.wait(2):
+    raise SystemExit("maintenance sweep did not start")
+
+
+def request(action: str) -> bytes:
+    fields = (
+        "termnav-hot-v1",
+        PROVIDER_ROOT,
+        "",
+        os.environ.get("PATH", ""),
+        os.environ.get("HOME", ""),
+        os.environ.get("XDG_STATE_HOME", ""),
+        "",
+        "",
+        "",
+        action,
+    )
+    body = "\0".join(fields).encode() + b"\0"
+    header = (
+        b"POST /v1 HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+    )
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(0.5)
+        client.connect(str(socket_path))
+        client.sendall(header + body)
+        reply = b""
+        while True:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        return reply
+
+
+if not request("warm").endswith(b"\r\n\r\n0"):
+    raise SystemExit("slow maintenance blocked request admission")
+sweep_release.set()
+if not request("stop").endswith(b"\r\n\r\n0"):
+    raise SystemExit("slow-sweep service did not stop")
+server.join(2)
+if server.is_alive():
+    raise SystemExit("slow-sweep service did not exit")
+PY
+slow_sweep_rc=$?
+set -e
+_assert_exit "hot service: slow maintenance never blocks request admission" \
+  0 "$slow_sweep_rc"
+
+stale_runtime=$(_tmpdir)/runtime
+stale_socket="$stale_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+mkdir -p "${stale_socket%/*}"
+STALE_SOCKET="$stale_socket" python3 - <<'PY'
+import os
+import socket
+
+path = os.environ["STALE_SOCKET"]
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+server.close()
+PY
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$stale_runtime" "$relay" send pane left
+stale_rc=$?
+set -e
+_assert_exit "hot service: an owner-held stale socket is replaced" 3 "$stale_rc"
+if [[ -S $stale_socket ]]; then
+  _pass "hot service: stale recovery leaves a live service socket"
+else
+  _fail "hot service: stale recovery leaves a live service socket"
+fi
+XDG_RUNTIME_DIR="$stale_runtime" "$relay" stop
+if wait_for_path absent "$stale_socket"; then
+  _pass "hot service: explicit stop removes its socket"
+else
+  _fail "hot service: explicit stop removes its socket"
+fi
+
+unsafe_runtime=$(_tmpdir)/runtime
+unsafe_socket="$unsafe_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+mkdir -p "${unsafe_socket%/*}"
+printf 'not a socket\n' >"$unsafe_socket"
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$unsafe_runtime" "$relay" send pane left
+unsafe_rc=$?
+set -e
+_assert_exit "hot service: unsafe runtime entries retain fallback semantics" 3 "$unsafe_rc"
+_assert_file_content "hot service: unsafe runtime entries are never replaced" \
+  "not a socket" "$unsafe_socket"
+
+symlink_runtime=$(_tmpdir)/runtime
+symlink_target=$(_tmpdir)/target
+mkdir -p "$symlink_runtime" "$symlink_target"
+ln -s "$symlink_target" "$symlink_runtime/termnav-${UID:-$(id -u)}"
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$symlink_runtime" \
+  "$relay" send pane left
+symlink_rc=$?
+set -e
+_assert_exit "hot service: a symlinked runtime falls back safely" 3 "$symlink_rc"
+_assert_file_missing "hot service: a symlinked runtime receives no socket" \
+  "$symlink_target/$hot_socket_name"
+
+fallback_bin=$(_tmpdir)/bin
+mkdir -p "$fallback_bin"
+ln -s "$(command -v bash)" "$fallback_bin/bash"
+fallback_log=$(_tmpdir)/python.log
+cat >"$fallback_bin/python3" <<'SH'
+#!/usr/bin/env bash
+printf 'args=%s\nlocale=%s\n' "$*" "${LC_ALL:-}" >"$TERMNAV_TEST_PYTHON_LOG"
+SH
+chmod 0755 "$fallback_bin/python3"
+PATH="$fallback_bin" TERMNAV_TEST_PYTHON_LOG="$fallback_log" \
+  TERMNAV_PYTHON="$fallback_bin/python3" "$relay" warm
+_assert_contains "hot service: missing curl retains stale relay cleanup" \
+  "lib/termnav/relay.py sweep" "$(cat "$fallback_log")"
+LC_ALL=C.UTF-8 PATH="$fallback_bin" TERMNAV_TEST_PYTHON_LOG="$fallback_log" \
+  TERMNAV_PYTHON="$fallback_bin/python3" "$relay" sweep
+_assert_contains "hot service: provider hashing preserves the caller locale" \
+  "locale=C.UTF-8" "$(cat "$fallback_log")"
+set +e
+env -u TERMNAV_PARENT_RELAY PATH="$fallback_bin" \
+  TERMNAV_PYTHON="$(command -v python3)" "$relay" send pane left
+fallback_rc=$?
+set -e
+_assert_exit "hot service: missing curl preserves the Python fallback" 3 "$fallback_rc"
+
+unsupported_bin=$(_tmpdir)/bin
+mkdir -p "$unsupported_bin"
+cat >"$unsupported_bin/curl" <<'SH'
+#!/usr/bin/env bash
+# Simulate a platform curl that cannot initialize the Unix-socket option.
+exit 2
+SH
+chmod 0755 "$unsupported_bin/curl"
+unsupported_runtime=$(_tmpdir)/runtime
+unsupported_socket="$unsupported_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" warm
+if ! wait_for_path present "$unsupported_socket"; then
+  _fail "hot service: unsupported-curl fixture starts the dispatcher"
+fi
+set +e
+env -u TERMNAV_PARENT_RELAY PATH="$unsupported_bin:$PATH" \
+  XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" send pane left
+unsupported_rc=$?
+set -e
+_assert_exit "hot service: unsupported curl preserves the Python fallback" \
+  3 "$unsupported_rc"
+XDG_RUNTIME_DIR="$unsupported_runtime" "$relay" stop
+
+active_runtime=$(_tmpdir)/runtime
+active_socket="$active_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+REPO_TEST=1 XDG_RUNTIME_DIR="$active_runtime" \
+  TERMNAV_TEST_HOT_IDLE_SECONDS=0.2 "$relay" warm
+if ! wait_for_path present "$active_socket"; then
+  _fail "hot service: active-request fixture starts the dispatcher"
+fi
+set +e
+TERMNAV_TEST_SOCKET="$active_socket" TERMNAV_TEST_ROOT="$root" python3 - <<'PY'
+import os
+import socket
+import time
+
+fields = (
+    "termnav-hot-v1",
+    os.environ["TERMNAV_TEST_ROOT"],
+    "",
+    os.environ.get("PATH", ""),
+    os.environ.get("HOME", ""),
+    os.environ.get("XDG_STATE_HOME", ""),
+    os.environ.get("TERMNAV_VSCODE_CURL", ""),
+    os.environ.get("TERMNAV_VSCODE_FALLBACK_BACKEND", ""),
+    os.environ.get("VSCODE_MCP_PORT", ""),
+    "send",
+    "pane",
+    "left",
+)
+body = "\0".join(fields).encode() + b"\0"
+header = (
+    b"POST /v1 HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+)
+with socket.socket(socket.AF_UNIX) as client:
+    client.settimeout(2)
+    client.connect(os.environ["TERMNAV_TEST_SOCKET"])
+    client.sendall(header + body[:1])
+    time.sleep(0.35)
+    client.sendall(body[1:])
+    reply = b""
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        reply += chunk
+if not reply.endswith(b"\r\n\r\n3"):
+    raise SystemExit(f"unexpected reply: {reply!r}")
+PY
+active_rc=$?
+set -e
+_assert_exit "hot service: idle retirement preserves an active request" \
+  0 "$active_rc"
+XDG_RUNTIME_DIR="$active_runtime" "$relay" stop || true
+
+identity_dir=$(_tmpdir)
+set +e
+TERMNAV_TEST_ROOT="$root" TERMNAV_TEST_IDENTITY_DIR="$identity_dir" python3 - <<'PY'
+import os
+import socket
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(os.environ["TERMNAV_TEST_ROOT"]) / "lib" / "termnav"))
+from hot_service import _socket_identity, _unlink_socket
+
+path = Path(os.environ["TERMNAV_TEST_IDENTITY_DIR"]) / "replacement.sock"
+first = socket.socket(socket.AF_UNIX)
+first.bind(str(path))
+identity = _socket_identity(path)
+first.close()
+path.unlink()
+replacement = socket.socket(socket.AF_UNIX)
+try:
+    replacement.bind(str(path))
+    _unlink_socket(path, identity)
+    if not path.exists():
+        raise SystemExit("an old owner removed its replacement")
+finally:
+    replacement.close()
+    path.unlink(missing_ok=True)
+PY
+identity_rc=$?
+set -e
+_assert_exit "hot service: old cleanup preserves a replacement socket" \
+  0 "$identity_rc"
+
+drain_runtime=$(_tmpdir)/runtime
+drain_socket="$drain_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+drain_ready=$(_tmpdir)/ready
+drain_release=$(_tmpdir)/release
+REPO_TEST=1 XDG_RUNTIME_DIR="$drain_runtime" \
+  TERMNAV_TEST_HOT_IDLE_SECONDS=2 "$relay" warm
+if ! wait_for_path present "$drain_socket"; then
+  _fail "hot service: drain fixture starts the dispatcher"
+fi
+TERMNAV_TEST_SOCKET="$drain_socket" TERMNAV_TEST_ROOT="$root" \
+  TERMNAV_TEST_READY="$drain_ready" TERMNAV_TEST_RELEASE="$drain_release" \
+  python3 - <<'PY' &
+import os
+import socket
+import time
+from pathlib import Path
+
+fields = (
+    "termnav-hot-v1",
+    os.environ["TERMNAV_TEST_ROOT"],
+    "",
+    os.environ.get("PATH", ""),
+    os.environ.get("HOME", ""),
+    os.environ.get("XDG_STATE_HOME", ""),
+    os.environ.get("TERMNAV_VSCODE_CURL", ""),
+    os.environ.get("TERMNAV_VSCODE_FALLBACK_BACKEND", ""),
+    os.environ.get("VSCODE_MCP_PORT", ""),
+    "send",
+    "pane",
+    "left",
+)
+body = "\0".join(fields).encode() + b"\0"
+header = (
+    b"POST /v1 HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+)
+with socket.socket(socket.AF_UNIX) as client:
+    client.settimeout(5)
+    client.connect(os.environ["TERMNAV_TEST_SOCKET"])
+    client.sendall(header + body[:1])
+    Path(os.environ["TERMNAV_TEST_READY"]).touch()
+    deadline = time.monotonic() + 5
+    while not Path(os.environ["TERMNAV_TEST_RELEASE"]).exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit("release gate did not open")
+        time.sleep(0.01)
+    client.sendall(body[1:])
+    reply = b""
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        reply += chunk
+if not reply.endswith(b"\r\n\r\n3"):
+    raise SystemExit(f"unexpected slow reply: {reply!r}")
+PY
+drain_pid=$!
+drain_ready_seen=0
+for ((attempt = 0; attempt < 200; attempt++)); do
+  if [[ -e $drain_ready ]]; then
+    drain_ready_seen=1
+    break
+  fi
+  sleep 0.01
+done
+_assert_eq "hot service: drain fixture reaches an active request" \
+  1 "$drain_ready_seen"
+
+stale_bin=$(_tmpdir)/bin
+stale_fallback_log=$(_tmpdir)/fallback.log
+mkdir -p "$stale_bin"
+ln -s "$(command -v curl)" "$stale_bin/curl"
+cat >"$stale_bin/sleep" <<'SH'
+#!/usr/bin/env bash
+# Collapse the production ten-second shutdown budget while the fixture keeps
+# an accepted request pinned. The observable socket condition remains real.
+exit 0
+SH
+cat >"$stale_bin/python3" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$TERMNAV_TEST_FALLBACK_LOG"
+exit 37
+SH
+chmod 0755 "$stale_bin/sleep" "$stale_bin/python3"
+touch -t 200001010000 "$drain_socket"
+set +e
+PATH="$stale_bin:/usr/bin:/bin" TERMNAV_PYTHON="$stale_bin/python3" \
+  TERMNAV_TEST_FALLBACK_LOG="$stale_fallback_log" \
+  XDG_RUNTIME_DIR="$drain_runtime" "$relay" send pane left
+stale_busy_rc=$?
+set -e
+_assert_exit "hot service: busy stale dispatcher uses the current fallback" \
+  37 "$stale_busy_rc"
+_assert_contains "hot service: busy stale fallback receives the gesture" \
+  "lib/termnav/relay.py send pane left" "$(cat "$stale_fallback_log")"
+
+for action in stop warm; do
+  set +e
+  TERMNAV_TEST_SOCKET="$drain_socket" TERMNAV_TEST_ROOT="$root" \
+    TERMNAV_TEST_ACTION="$action" python3 - <<'PY'
+import os
+import socket
+
+fields = (
+    "termnav-hot-v1",
+    os.environ["TERMNAV_TEST_ROOT"],
+    "",
+    os.environ.get("PATH", ""),
+    os.environ.get("HOME", ""),
+    os.environ.get("XDG_STATE_HOME", ""),
+    os.environ.get("TERMNAV_VSCODE_CURL", ""),
+    os.environ.get("TERMNAV_VSCODE_FALLBACK_BACKEND", ""),
+    os.environ.get("VSCODE_MCP_PORT", ""),
+    os.environ["TERMNAV_TEST_ACTION"],
+)
+body = "\0".join(fields).encode() + b"\0"
+header = (
+    b"POST /v1 HTTP/1.1\r\n"
+    b"Host: localhost\r\n"
+    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+)
+with socket.socket(socket.AF_UNIX) as client:
+    client.settimeout(2)
+    client.connect(os.environ["TERMNAV_TEST_SOCKET"])
+    client.sendall(header + body)
+    reply = b""
+    while True:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        reply += chunk
+if not reply.endswith(b"\r\n\r\n0"):
+    raise SystemExit(f"unexpected {os.environ['TERMNAV_TEST_ACTION']} reply: {reply!r}")
+PY
+  drain_followup_rc=$?
+  set -e
+  _assert_exit "hot service: stopping service accepts active-route $action request" \
+    0 "$drain_followup_rc"
+done
+if [[ -S $drain_socket ]]; then
+  _pass "hot service: stop retains the socket while an active route drains"
+else
+  _fail "hot service: stop retains the socket while an active route drains"
+fi
+: >"$drain_release"
+set +e
+wait "$drain_pid"
+drain_rc=$?
+set -e
+_assert_exit "hot service: active route completes during graceful stop" \
+  0 "$drain_rc"
+if wait_for_path absent "$drain_socket"; then
+  _pass "hot service: graceful stop removes the drained service socket"
+else
+  _fail "hot service: graceful stop removes the drained service socket"
+fi
+
+concurrent_runtime=$(_tmpdir)/runtime
+concurrent_socket="$concurrent_runtime/termnav-${UID:-$(id -u)}/$hot_socket_name"
+warm_pids=()
+for _ in 1 2 3 4 5 6 7 8; do
+  XDG_RUNTIME_DIR="$concurrent_runtime" "$relay" warm &
+  warm_pids+=("$!")
+done
+for warm_pid in "${warm_pids[@]}"; do
+  wait "$warm_pid"
+done
+if wait_for_path present "$concurrent_socket"; then
+  _pass "hot service: concurrent shell activation converges on a dispatcher"
+else
+  _fail "hot service: concurrent shell activation converges on a dispatcher"
+fi
+set +e
+env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$concurrent_runtime" \
+  "$relay" send pane left
+concurrent_rc=$?
+set -e
+_assert_exit "hot service: concurrent startup leaves a usable dispatcher" \
+  3 "$concurrent_rc"
+
+request_dir=$(_tmpdir)/requests
+mkdir -p "$request_dir"
+concurrent_failures=0
+for ((round = 1; round <= 5; round++)); do
+  request_pids=()
+  for ((request = 1; request <= 16; request++)); do
+    (
+      set +e
+      env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$concurrent_runtime" \
+        "$relay" send pane left
+      printf '%s\n' "$?" >"$request_dir/$round-$request"
+    ) &
+    request_pids+=("$!")
+  done
+  for request_pid in "${request_pids[@]}"; do
+    wait "$request_pid"
+  done
+  for ((request = 1; request <= 16; request++)); do
+    [[ $(cat "$request_dir/$round-$request") == 3 ]] ||
+      concurrent_failures=$((concurrent_failures + 1))
+  done
+done
+_assert_eq "hot service: concurrent clients retain independent results" \
+  0 "$concurrent_failures"
+XDG_RUNTIME_DIR="$concurrent_runtime" "$relay" stop
+
+_test_summary

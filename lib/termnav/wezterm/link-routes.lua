@@ -44,25 +44,54 @@ function M.new(wezterm)
     return pane:get_user_vars()[user_vars.is_nvim] == "true"
   end
 
+  local function tmux_owner(pane, pane_user_vars)
+    local shell_tmux = pane_user_vars[shell_user_vars.tmux]
+    if shell_tmux == "true" then
+      -- Positive metadata is authoritative and keeps managed tmux panes off
+      -- WezTerm's foreground-process query on every navigation gesture.
+      return true
+    end
+    if shell_tmux ~= nil then
+      -- An empty shell value clears stale remote metadata after a child exits,
+      -- but it cannot describe an unmanaged tmux process launched afterward.
+      -- Retain the compatibility probe so that child still owns its chords.
+      return routes.foreground_basename(pane) == "tmux"
+    end
+
+    if pane_user_vars[user_vars.remote_tmux] == "true" then
+      return true
+    end
+
+    -- Metadata-free panes retain the compatibility fallback for unmanaged
+    -- tmux clients. This is intentionally the only path that asks WezTerm to
+    -- inspect the foreground process.
+    return routes.foreground_basename(pane) == "tmux"
+  end
+
   function routes.is_tmux(pane)
     if not pane or type(pane.get_user_vars) ~= "function" then
       return false
     end
 
+    return tmux_owner(pane, pane:get_user_vars() or {})
+  end
+
+  function routes.terminal_owner(pane)
+    if not pane or type(pane.get_user_vars) ~= "function" then
+      return "terminal"
+    end
+
+    -- Navigation callbacks need one mutually exclusive answer. Snapshot the
+    -- protocol once so a single UI gesture cannot perform duplicate RPC-like
+    -- user-var reads or observe two different publication generations.
     local pane_user_vars = pane:get_user_vars() or {}
-    if routes.foreground_basename(pane) == "tmux" then
-      return true
+    if pane_user_vars[user_vars.is_nvim] == "true" then
+      return "nvim"
     end
-
-    local shell_tmux = pane_user_vars[shell_user_vars.tmux]
-    if shell_tmux ~= nil then
-      -- The current shell reasserts both true and empty values after a child
-      -- exits. An explicit empty value must therefore win over remote metadata
-      -- left by the child process that previously controlled this pane.
-      return shell_tmux == "true"
+    if tmux_owner(pane, pane_user_vars) then
+      return "tmux"
     end
-
-    return routes.remote_tmux_pane(pane)
+    return "terminal"
   end
 
   function routes.file_uri_path(uri)

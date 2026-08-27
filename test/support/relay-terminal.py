@@ -216,6 +216,13 @@ class RelayHarness:
         self.terminals: list[TerminalClient] = []
 
     def close(self) -> None:
+        subprocess.run(
+            [self.relay, "stop"],
+            env=self.environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         for relay in reversed(self.relays):
             relay.terminate()
             try:

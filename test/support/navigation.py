@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
+import runpy
 import shlex
 import subprocess
 import sys
@@ -21,6 +23,7 @@ from navigation import (  # noqa: E402
     Client,
     Navigator,
     Outcome,
+    RouteResult,
     Scope,
     SystemBackend,
     choose_client,
@@ -28,6 +31,65 @@ from navigation import (  # noqa: E402
     process_tmux_parent,
     validate_request,
 )
+
+
+class NavigationStreamTest(unittest.TestCase):
+    """Verify a resident router preserves only same-burst continuation state."""
+
+    @staticmethod
+    def run_at(times: list[float]) -> list[tuple[bool, Client | None, Scope | None]]:
+        """Run two requests against a deterministic stream clock."""
+
+        calls: list[tuple[bool, Client | None, Scope | None]] = []
+        selected_client = Client(
+            activity=1,
+            pid=10,
+            tty="/dev/pts/10",
+            termtype="tmux-256color",
+            session="$1",
+            pane="%1",
+            socket="/tmp/tmux.sock",
+        )
+        selected_scope = Scope("/tmp/tmux.sock", "%1", "$1")
+
+        class StreamNavigator:
+            def route(
+                self,
+                _action: str,
+                _direction: str,
+                *,
+                include_current: bool,
+                continuing_client: Client | None,
+                continuing_scope: Scope | None,
+            ) -> RouteResult:
+                calls.append((include_current, continuing_client, continuing_scope))
+                return RouteResult(Outcome.HANDLED, selected_client, selected_scope)
+
+        namespace = runpy.run_path(str(ROOT / "bin" / "termnav-navigate"))
+        clock_values = iter(times)
+        with (
+            mock.patch("sys.stdin", io.StringIO("pane-select left\npane-select right\n")),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            result = namespace["run_stream"](StreamNavigator(), clock=lambda: next(clock_values))
+        if result != 0:
+            raise AssertionError(f"stream exited {result}")
+        return calls
+
+    def test_same_burst_follows_the_selected_scope(self) -> None:
+        calls = self.run_at([0.0, 0.1, 0.1])
+
+        self.assertTrue(calls[0][0])
+        self.assertFalse(calls[1][0])
+        self.assertIsNotNone(calls[1][1])
+        self.assertIsNotNone(calls[1][2])
+
+    def test_later_burst_resolves_current_focus_again(self) -> None:
+        calls = self.run_at([0.0, 0.3, 0.3])
+
+        self.assertTrue(calls[1][0])
+        self.assertIsNone(calls[1][1])
+        self.assertIsNone(calls[1][2])
 
 
 class FakeBackend:
@@ -231,7 +293,7 @@ class ProcessParentTest(unittest.TestCase):
 
 class ClientRevalidationTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.backend = SystemBackend("/tmp")
+        self.backend = SystemBackend()
         self.expected = client(10, activity=100, focused=True)
 
     @staticmethod
@@ -626,69 +688,40 @@ class SystemBackendDispatchTest(unittest.TestCase):
         )
 
     def test_relay_reads_the_selected_clients_parent_socket(self) -> None:
-        self.executable(
-            "tmux",
-            'printf "%s|%s|%s|%s|%s|%s|%s|0|1\\n" '
-            '"$TERMNAV_CLIENT_ACTIVITY" "$TERMNAV_CLIENT_PID" '
-            '"$TERMNAV_CLIENT_TTY" tmux-256color "$TERMNAV_CLIENT_SESSION" '
-            '"$TERMNAV_CLIENT_PANE" attached\n',
-        )
-        self.executable(
-            "termnav-relay",
-            'printf "%s\\n" "$*" >>"$TERMNAV_TEST_LOG"\n',
-        )
-        process = self.spawn_client(TERMNAV_PARENT_RELAY="/tmp/selected.sock")
-        backend = SystemBackend(
-            self.bin_dir,
-            environment={
-                **os.environ,
-                "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
-                "TERMNAV_TEST_LOG": str(self.log),
-                "TERMNAV_CLIENT_ACTIVITY": "100",
-                "TERMNAV_CLIENT_PID": str(process.pid),
-                "TERMNAV_CLIENT_TTY": f"/dev/pts/{process.pid}",
-                "TERMNAV_CLIENT_SESSION": "$session",
-                "TERMNAV_CLIENT_PANE": "%1",
-            },
-        )
-
-        result = backend.relay(client(process.pid), "pane-select", "down")
+        backend = SystemBackend()
+        selected = client(123)
+        with (
+            mock.patch(
+                "navigation.process_env",
+                side_effect=lambda pid, name: (
+                    "/tmp/selected.sock"
+                    if pid == selected.pid and name == "TERMNAV_PARENT_RELAY"
+                    else None
+                ),
+            ),
+            mock.patch("navigation.tty_matches", return_value=True) as matches,
+            mock.patch("navigation.send_message", return_value={"v": 2, "result": "armed"}) as send,
+        ):
+            result = backend.relay(selected, "pane-select", "down")
 
         self.assertEqual(result, Outcome.HANDLED)
-        self.assertEqual(
-            self.log.read_text(encoding="utf-8").strip(),
-            f"send pane down --client-pid {process.pid} --client-tty /dev/pts/{process.pid}",
-        )
+        matches.assert_called_once_with(selected.pid, selected.tty)
+        self.assertEqual(send.call_args.args[0], "/tmp/selected.sock")
+        self.assertEqual(send.call_args.args[1]["scope"], "pane")
+        self.assertEqual(send.call_args.args[1]["direction"], "down")
 
     def test_relay_accepts_exact_client_identity_without_optional_session(self) -> None:
-        self.executable(
-            "tmux",
-            'printf "%s|%s|%s|tmux-256color|%s|%%1|attached|0|1\\n" '
-            '"$TERMNAV_CLIENT_ACTIVITY" "$TERMNAV_CLIENT_PID" '
-            "\"$TERMNAV_CLIENT_TTY\" '$session'\n",
-        )
-        self.executable(
-            "termnav-relay",
-            'printf "%s\\n" "$*" >>"$TERMNAV_TEST_LOG"\n',
-        )
-        process = self.spawn_client(TERMNAV_PARENT_RELAY="/tmp/selected.sock")
-        backend = SystemBackend(
-            self.bin_dir,
-            environment={
-                **os.environ,
-                "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
-                "TERMNAV_TEST_LOG": str(self.log),
-                "TERMNAV_CLIENT_ACTIVITY": "100",
-                "TERMNAV_CLIENT_PID": str(process.pid),
-                "TERMNAV_CLIENT_TTY": f"/dev/pts/{process.pid}",
-            },
-        )
-
-        selected = replace(client(process.pid), session="")
-        result = backend.relay(selected, "pane-select", "down")
+        backend = SystemBackend()
+        selected = replace(client(123), session="")
+        with (
+            mock.patch("navigation.process_env", return_value="/tmp/selected.sock"),
+            mock.patch("navigation.tty_matches", return_value=True),
+            mock.patch("navigation.send_message", return_value={"v": 2, "result": "armed"}) as send,
+        ):
+            result = backend.relay(selected, "pane-select", "down")
 
         self.assertEqual(result, Outcome.HANDLED)
-        self.assertTrue(self.log.exists())
+        self.assertEqual(send.call_args.args[0], "/tmp/selected.sock")
 
     def test_vscode_terminal_uses_only_the_selected_clients_credentials(self) -> None:
         self.executable(
@@ -703,7 +736,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
         )
         self.matching_tmux(process)
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -732,7 +764,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
             TERMNAV_VSCODE_TOKEN="short",
         )
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -760,7 +791,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
         process = self.spawn_client(TERM_PROGRAM="vscode")
         self.matching_tmux(process)
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -802,7 +832,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
         )
         process = self.spawn_client(TERM_PROGRAM="vscode")
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -824,7 +853,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
         process = self.spawn_client(TERM_PROGRAM="vscode")
         self.matching_tmux(process)
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -843,7 +871,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
         process = self.spawn_client(TERM_PROGRAM="WezTerm")
         self.matching_tmux(process, tty=str(tty))
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -872,7 +899,6 @@ class SystemBackendDispatchTest(unittest.TestCase):
         process = self.spawn_client(TERM_PROGRAM="WezTerm")
         self.matching_tmux(process, tty=str(tty))
         backend = SystemBackend(
-            self.bin_dir,
             environment={
                 **os.environ,
                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
@@ -896,7 +922,7 @@ class SystemBackendCapabilityTest(unittest.TestCase):
     def backend_with(self, *outputs: str) -> SystemBackend:
         """Return a backend whose tmux probes consume fixed stdout values."""
 
-        backend = SystemBackend("/tmp")
+        backend = SystemBackend()
         responses = iter(outputs)
 
         def fake_tmux(_scope: Scope, *_arguments: str) -> subprocess.CompletedProcess[str]:
@@ -920,7 +946,7 @@ class SystemBackendCapabilityTest(unittest.TestCase):
         self.assertFalse(self.backend_with("1|1|1\n").can_execute(current, "tab-select", "next"))
 
     def test_tab_move_targets_stable_window_ids(self) -> None:
-        backend = SystemBackend("/tmp")
+        backend = SystemBackend()
         calls: list[tuple[str, ...]] = []
         outputs = iter(("2|@0\n", "@0\n@1\n", ""))
 

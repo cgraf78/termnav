@@ -324,6 +324,7 @@ for test_shell in bash zsh; do
       HOME="$HOME" \
       LD_PRELOAD="${LD_PRELOAD:-}" \
       PATH="$TERMNAV_ROOT/bin:$ssh_probe_bin:/usr/bin:/bin" \
+      REPO_TEST=1 \
       CHILD_BASH="$BASH" \
       SHELL_INTEGRATION="$shell_integration" \
       SSH_PLAIN_LOG="$ssh_plain_log" \

@@ -210,6 +210,17 @@ test("boundary bursts share one ordered router stream", function()
   )
 end)
 
+test("setup prewarms one persistent router stream", function()
+  local ctx, _, streams = fake_context({ mappings = true })
+
+  ctx.setup()
+
+  equal(#streams, 1, "setup should hide Python startup before the first gesture")
+  equal(streams[1].arguments, { "termnav-navigate", "--stream" }, "prewarmed stream command")
+  equal(streams[1].sent, {}, "prewarming should not invent a navigation request")
+  truthy(not streams[1].closed, "the shared worker should remain ready between gestures")
+end)
+
 test("previous split navigation remains local and process free", function()
   vim.cmd("vsplit")
   vim.cmd("wincmd l")

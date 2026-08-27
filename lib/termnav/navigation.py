@@ -23,6 +23,7 @@ from typing import ClassVar, Protocol
 from navigation_protocol import WIRE_ACTIONS, validate_request
 from process_info import environment as process_env
 from process_info import parent as process_parent
+from relay_client import new_nonce, send_message, tty_matches
 
 TMUX_FIELD_SEPARATOR = "|"
 
@@ -447,8 +448,7 @@ class SystemBackend:
         "right": ("pane_at_right", "R"),
     }
 
-    def __init__(self, script_dir: str | Path, environment: dict[str, str] | None = None) -> None:
-        self.script_dir = Path(script_dir)
+    def __init__(self, environment: dict[str, str] | None = None) -> None:
         self.environment = dict(os.environ if environment is None else environment)
 
     def _tmux(self, scope: Scope, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -753,17 +753,28 @@ class SystemBackend:
         parent = process_env(client.pid, "TERMNAV_PARENT_RELAY") or ""
         if not parent:
             return Outcome.DECLINED
-        result = self._helper(
-            "termnav-relay",
-            "send",
-            WIRE_ACTIONS[action],
-            direction,
-            "--client-pid",
-            str(client.pid),
-            "--client-tty",
-            client.tty,
+        # The router is already long-lived in Neovim and in the tmux hot
+        # service. Contact the relay directly instead of paying for a second
+        # Python interpreter on every remote-boundary gesture. Keep the final
+        # tty check here so PID reuse cannot redirect a delayed request.
+        if not tty_matches(client.pid, client.tty):
+            return Outcome.ERROR
+        reply = send_message(
+            parent,
+            {
+                "v": 2,
+                "op": "navigate",
+                "scope": WIRE_ACTIONS[action],
+                "direction": direction,
+                "nonce": new_nonce(),
+            },
         )
-        return self._returncode_outcome(result.returncode)
+        result = reply.get("result")
+        if result in {"armed", "emitted"}:
+            return Outcome.HANDLED
+        if result == "declined":
+            return Outcome.DECLINED
+        return Outcome.ERROR
 
     @staticmethod
     def _same_route(current: Client, expected: Client) -> bool:
@@ -995,30 +1006,3 @@ class SystemBackend:
         finally:
             os.close(descriptor)
         return True
-
-    @staticmethod
-    def _returncode_outcome(returncode: int) -> Outcome:
-        if returncode == 0:
-            return Outcome.HANDLED
-        if returncode == Outcome.DECLINED:
-            return Outcome.DECLINED
-        return Outcome.ERROR
-
-    def _helper(
-        self,
-        name: str,
-        *arguments: str,
-        environment: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        try:
-            return subprocess.run(
-                [str(self.script_dir / name), *arguments],
-                env=environment or self.environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=3,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return subprocess.CompletedProcess((name, *arguments), 1)
