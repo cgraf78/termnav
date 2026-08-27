@@ -5,10 +5,11 @@
 //! one physical tmux client. Files remain intentionally compatible with the
 //! Python v2 implementation so independently updated hosts can interoperate.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -457,35 +458,9 @@ impl Drop for FileLock {
     }
 }
 
-fn runtime_directory() -> io::Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|value| Path::new(value).is_absolute())
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let uid = unsafe { libc::getuid() };
-    let path = base.join(format!("termnav-{uid}"));
-    fs::create_dir_all(&path)?;
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.file_type().is_dir() || metadata.uid() != uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "refusing unsafe Termnav runtime directory",
-        ));
-    }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-    Ok(path)
-}
-
 fn directive_directory(tmux_socket: &str) -> io::Result<PathBuf> {
-    let path = runtime_directory()?
-        .join("directives")
-        .join(digest_prefix(tmux_socket, 12));
-    fs::create_dir_all(&path)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-    if let Some(parent) = path.parent() {
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(path)
+    let digest = digest_prefix(tmux_socket, 12);
+    crate::runtime::private_subdirectory(&[OsStr::new("directives"), OsStr::new(&digest)])
 }
 
 fn read_directive(path: &Path) -> io::Result<Option<Directive>> {

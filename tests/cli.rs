@@ -79,3 +79,15 @@ fn relay_send_declines_without_an_advertised_parent() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
+
+#[test]
+fn link_host_uses_the_explicit_remote_context() {
+    let output = termnav()
+        .args(["nvim", "link-host"])
+        .env("TERMNAV_REMOTE_LINK_HOST", "remote.example.invalid")
+        .output()
+        .expect("run link host");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"remote.example.invalid\n");
+}

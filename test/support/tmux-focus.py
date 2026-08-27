@@ -606,7 +606,11 @@ class RelayFocusTest(unittest.TestCase):
             command,
             env=environment,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            # Preserve server tracebacks in the test log. A closed socket is
+            # otherwise indistinguishable from the concurrency behavior this
+            # fixture is meant to validate, which hid fixture failures behind
+            # an empty JSON reply.
+            stderr=None,
         )
         self.processes.append(process)
         wait_until(path.is_socket, f"relay listener {path}")
@@ -1016,6 +1020,18 @@ class NestedFocusTest(unittest.TestCase):
         return " | ".join(rows)
 
     def helper_processes(self, command: str, socket_path: pathlib.Path) -> list[int]:
+        def is_helper(arguments: list[str]) -> bool:
+            """Recognize both the rollout alias and the unified Rust CLI."""
+            legacy = (str(self.focus), command)
+            unified = ("tmux", "focus", command)
+            pairs = zip(arguments, arguments[1:], strict=False)
+            if legacy in pairs:
+                return True
+            return any(
+                tuple(arguments[index : index + 3]) == unified
+                for index in range(max(0, len(arguments) - 2))
+            )
+
         proc_root = pathlib.Path("/proc")
         if proc_root.is_dir():
             processes = []
@@ -1030,11 +1046,8 @@ class NestedFocusTest(unittest.TestCase):
                     ]
                 except OSError:
                     continue
-                for index, value in enumerate(arguments[:-1]):
-                    if value == str(self.focus) and arguments[index + 1] == command:
-                        if str(socket_path) in arguments:
-                            processes.append(int(process_dir.name))
-                        break
+                if is_helper(arguments) and str(socket_path) in arguments:
+                    processes.append(int(process_dir.name))
             return processes
 
         listing = subprocess.run(
@@ -1043,12 +1056,18 @@ class NestedFocusTest(unittest.TestCase):
             capture_output=True,
             check=True,
         ).stdout
-        marker = f"{self.focus} {command} "
+        legacy_marker = f"{self.focus} {command} "
+        unified_marker = f" tmux focus {command} "
         socket_marker = str(socket_path)
         processes = []
         for line in listing.splitlines():
             pid, separator, arguments = line.strip().partition(" ")
-            if separator and pid.isdigit() and marker in arguments and socket_marker in arguments:
+            if (
+                separator
+                and pid.isdigit()
+                and (legacy_marker in arguments or unified_marker in arguments)
+                and socket_marker in arguments
+            ):
                 processes.append(int(pid))
         return processes
 

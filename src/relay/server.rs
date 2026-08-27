@@ -86,10 +86,7 @@ pub fn dispatch(request: &Value) -> Value {
         Some("prepare-path") => handle_prepare(request),
         Some("abort-path") => handle_abort(request),
         Some("commit-path") => handle_commit(request),
-        // Focus is ported through the same wire contract in the focus phase.
-        // Returning a structured error now is safer than accepting a partially
-        // implemented lease that could leave a pane highlighted indefinitely.
-        Some("focus") => reply("error"),
+        Some("focus") => crate::focus::handle_relay(request),
         _ => reply("error"),
     }
 }

@@ -11,6 +11,10 @@ from importlib.machinery import SourceFileLoader
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RELAY = ROOT / "lib" / "termnav" / "relay.py"
+# `relay.py` deliberately lazy-loads its heavier routing modules after startup.
+# Put the production library first now so those later imports cannot resolve to
+# this directory's same-named test adapters and form a circular import.
+sys.path.insert(0, str(RELAY.parent))
 spec = importlib.util.spec_from_loader(
     "termnav_relay_server_test",
     SourceFileLoader("termnav_relay_server_test", str(RELAY)),

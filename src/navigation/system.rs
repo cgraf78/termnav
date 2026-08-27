@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use super::{Action, Backend, Client, Direction, Outcome, Scope, choose_client};
 use crate::process;
 use crate::relay::client::{new_nonce, send};
+use crate::terminal::{self, TmuxMode};
 
 const FIELD_SEPARATOR: char = '|';
 const DECLINED_MARKER: &str = "__TERMNAV_DECLINED__";
@@ -186,7 +187,7 @@ impl SystemBackend {
             // an edge, which must bubble to the next navigation scope.
             return Outcome::Handled;
         };
-        let swap = shell_join(&[
+        let swap = crate::shell::join(&[
             "swap-window".to_owned(),
             "-d".to_owned(),
             "-s".to_owned(),
@@ -203,7 +204,7 @@ impl SystemBackend {
                 scope.target(),
                 "#{&&:#{window_active},#{pane_active}}".to_owned(),
                 swap,
-                shell_join(&[
+                crate::shell::join(&[
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     ERROR_MARKER.to_owned(),
@@ -377,8 +378,7 @@ impl SystemBackend {
             .unwrap_or_default()
             .as_nanos();
         let value = format!("{}:{nanos}.{}", direction.as_str(), std::process::id());
-        let encoded = base64(value.as_bytes());
-        let sequence = format!("\u{1b}]1337;SetUserVar={name}={encoded}\u{7}");
+        let sequence = terminal::user_var(name, &value, TmuxMode::Raw);
         let Ok(mut descriptor) = OpenOptions::new()
             .append(true)
             .custom_flags(libc::O_NOCTTY)
@@ -386,7 +386,7 @@ impl SystemBackend {
         else {
             return false;
         };
-        descriptor.write_all(sequence.as_bytes()).is_ok()
+        descriptor.write_all(&sequence).is_ok()
     }
 }
 
@@ -420,23 +420,23 @@ impl Backend for SystemBackend {
                 Direction::Right => ("pane_at_right", "R"),
                 _ => return Outcome::Error,
             };
-            let select = shell_join(&[
+            let select = crate::shell::join(&[
                 "select-pane".to_owned(),
                 "-t".to_owned(),
                 scope.pane.clone(),
                 format!("-{flag}"),
             ]);
-            let declined = shell_join(&[
+            let declined = crate::shell::join(&[
                 "display-message".to_owned(),
                 "-p".to_owned(),
                 DECLINED_MARKER.to_owned(),
             ]);
-            let error = shell_join(&[
+            let error = crate::shell::join(&[
                 "display-message".to_owned(),
                 "-p".to_owned(),
                 ERROR_MARKER.to_owned(),
             ]);
-            let inner = shell_join(&[
+            let inner = crate::shell::join(&[
                 "if-shell".to_owned(),
                 "-F".to_owned(),
                 "-t".to_owned(),
@@ -472,12 +472,12 @@ impl Backend for SystemBackend {
         } else {
             "next-window"
         };
-        let owned = shell_join(&[
+        let owned = crate::shell::join(&[
             "if-shell".to_owned(),
             "-F".to_owned(),
             "#{>:#{session_windows},1}".to_owned(),
-            shell_join(&[command.to_owned(), "-t".to_owned(), session.clone()]),
-            shell_join(&[
+            crate::shell::join(&[command.to_owned(), "-t".to_owned(), session.clone()]),
+            crate::shell::join(&[
                 "display-message".to_owned(),
                 "-p".to_owned(),
                 DECLINED_MARKER.to_owned(),
@@ -492,7 +492,7 @@ impl Backend for SystemBackend {
                 scope.target(),
                 "#{&&:#{window_active},#{pane_active}}".to_owned(),
                 owned,
-                shell_join(&[
+                crate::shell::join(&[
                     "display-message".to_owned(),
                     "-p".to_owned(),
                     ERROR_MARKER.to_owned(),
@@ -776,19 +776,6 @@ fn tmux_format(fields: &[&str]) -> String {
         .join("|")
 }
 
-fn shell_join(arguments: &[String]) -> String {
-    arguments
-        .iter()
-        .map(|argument| {
-            // tmux parses nested command strings with a shell-like grammar.
-            // Always quoting is slightly longer but prevents IDs or paths from
-            // acquiring syntax if a future tmux format expands unexpectedly.
-            format!("'{}'", argument.replace('\'', "'\\''"))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn http_request(path: &str, body: &str, headers: &[(&str, &str)]) -> String {
     let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -838,32 +825,9 @@ impl ReadWrite for TcpStream {
     }
 }
 
-fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        output.push(ALPHABET[(first >> 2) as usize] as char);
-        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
-        output.push(if chunk.len() > 1 {
-            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        output.push(if chunk.len() > 2 {
-            ALPHABET[(third & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{base64, parse_clients};
+    use super::parse_clients;
 
     #[test]
     fn client_parser_preserves_route_identity() {
@@ -877,13 +841,5 @@ mod tests {
         assert!(clients[0].focused);
         assert!(!clients[0].control);
         assert_eq!(clients[0].created, 80);
-    }
-
-    #[test]
-    fn base64_matches_terminal_protocol_examples() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"ab"), "YWI=");
-        assert_eq!(base64(b"foo"), "Zm9v");
     }
 }

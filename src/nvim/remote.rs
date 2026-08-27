@@ -53,12 +53,12 @@ pub fn remote_nvim_command(arguments: &[&str]) -> String {
     );
     for argument in arguments {
         command.push(' ');
-        command.push_str(&shell_quote(argument));
+        command.push_str(&crate::shell::quote(argument));
     }
     command.push_str(r#"; elif command -v nvim-tmux-open >/dev/null 2>&1; then nvim-tmux-open"#);
     for argument in arguments {
         command.push(' ');
-        command.push_str(&shell_quote(argument));
+        command.push_str(&crate::shell::quote(argument));
     }
     command.push_str(
         r#"; else printf "%s\n" "termnav: remote Neovim opener not found on PATH" >&2; exit 127; fi"#,
@@ -130,13 +130,9 @@ fn allowed_host(host: &str) -> bool {
         })
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{remote_nvim_command, shell_quote, valid_host};
+    use super::{remote_nvim_command, valid_host};
 
     #[test]
     fn remote_command_quotes_shell_metacharacters() {
@@ -152,10 +148,5 @@ mod tests {
         assert!(valid_host("dev1.example"));
         assert!(!valid_host("-oProxyCommand=bad"));
         assert!(!valid_host("../host"));
-    }
-
-    #[test]
-    fn shell_quote_handles_empty_values() {
-        assert_eq!(shell_quote(""), "''");
     }
 }

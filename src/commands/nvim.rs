@@ -31,6 +31,11 @@ pub fn run(
             crate::nvim::remote::ssh_open(&arguments[1], &arguments[2])
         }
         "ssh-open" => usage(stderr, "ssh-open requires HOST and TARGET"),
+        "link-host" if arguments.len() == 1 => {
+            writeln!(stdout, "{}", crate::links::host())?;
+            Ok(0)
+        }
+        "link-host" => usage(stderr, "link-host accepts no arguments"),
         _ => usage(
             stderr,
             &format!("unknown or unimplemented Neovim command: {command}"),

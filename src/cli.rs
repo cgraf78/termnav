@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 
 const HELP: &str = "usage: termnav <command> [arguments]\n\
 \n\
@@ -14,6 +15,38 @@ commands:\n\
   vscode    publish VS Code focus\n\
   eza       render terminal-aware directory links\n\
   version   print the embedded build identity\n";
+
+/// Translate fixed-name integrations and temporary rollout aliases to the
+/// authoritative CLI grammar.
+///
+/// Dispatching by `argv[0]` keeps one compiled artifact while satisfying tools
+/// such as ripgrep that can name an executable but cannot provide arguments.
+/// Most aliases are removed after the consumer migration; `nvim-link-host`
+/// remains because that external interface is permanently argument-less.
+#[must_use]
+pub fn normalize_argv(
+    program: &OsString,
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Vec<OsString> {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("termnav");
+    let prefix: &[&str] = match name {
+        "termnav-navigate" => &["navigate"],
+        "termnav-relay" => &["relay"],
+        "termnav-tmux-context" => &["tmux", "context"],
+        "termnav-tmux-focus" => &["tmux", "focus"],
+        "nvim-link-host" => &["nvim", "link-host"],
+        "nvim-ssh-control-open" => &["nvim", "ssh-open"],
+        "nvim-tmux-open" => &["nvim", "open"],
+        "tmux-follow-click" => &["tmux", "follow-click"],
+        "vscode-nvim-focus" => &["vscode", "focus"],
+        "eza-nvim-links" => &["eza"],
+        _ => &[],
+    };
+    prefix.iter().map(OsString::from).chain(arguments).collect()
+}
 
 /// Run the CLI and return its process exit status.
 pub fn run<I, S>(arguments: I, stdout: &mut dyn Write, stderr: &mut dyn Write) -> io::Result<i32>
@@ -44,7 +77,9 @@ where
         "relay" => crate::commands::relay::run(&arguments[1..], stdout, stderr),
         "ssh" => crate::commands::ssh::run(&arguments[1..]),
         "nvim" => crate::commands::nvim::run(&arguments[1..], stdout, stderr),
-        "tmux" | "vscode" | "eza" => {
+        "tmux" => crate::commands::tmux::run(&arguments[1..], stdout, stderr),
+        "eza" => crate::commands::eza::run(&arguments[1..], stdout, stderr),
+        "vscode" => {
             writeln!(stderr, "termnav: {command} is not implemented yet")?;
             Ok(2)
         }
@@ -57,7 +92,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use std::ffi::OsString;
+
+    use super::{normalize_argv, run};
 
     #[test]
     fn missing_command_is_usage_error() {
@@ -70,5 +107,13 @@ mod tests {
         );
         assert!(stdout.is_empty());
         assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn fixed_name_host_helper_maps_to_the_unified_command() {
+        assert_eq!(
+            normalize_argv(&OsString::from("/prefix/bin/nvim-link-host"), []),
+            ["nvim", "link-host"].map(OsString::from)
+        );
     }
 }
