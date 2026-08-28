@@ -68,6 +68,7 @@ fn remote_eza_streams_rewritten_binary_output_and_preserves_stderr_and_status() 
     let _cleanup = Cleanup(root.clone());
     let fake_eza = root.join("eza");
     let early_path = root.join("early");
+    let early_stderr_path = root.join("early-stderr");
     let payload_path = root.join("payload");
     let stderr_path = root.join("stderr");
     let ready_path = root.join("ready");
@@ -81,8 +82,10 @@ fn remote_eza_streams_rewritten_binary_output_and_preserves_stderr_and_status() 
     while payload.len() < 256 * 1024 {
         payload.extend_from_slice(b"\0\xff:\x1b]8;;file:///tmp/large\x1b\\value\n");
     }
-    let stderr = vec![0xa5; 192 * 1024];
+    let early_stderr = vec![0xa5; 96 * 1024];
+    let stderr = vec![0x5a; 192 * 1024];
     fs::write(&early_path, early).expect("write early output");
+    fs::write(&early_stderr_path, &early_stderr).expect("write early stderr");
     fs::write(&payload_path, &payload).expect("write large stdout payload");
     fs::write(&stderr_path, &stderr).expect("write large stderr payload");
     fs::write(
@@ -92,6 +95,7 @@ if [ "${2-}" = "--version" ] || [ "${1-}" = "--version" ]; then
   exit 0
 fi
 cat "$TERMNAV_TEST_EZA_EARLY"
+cat "$TERMNAV_TEST_EZA_EARLY_STDERR" >&2
 : >"$TERMNAV_TEST_EZA_READY"
 while [ ! -e "$TERMNAV_TEST_EZA_RELEASE" ]; do
   sleep 0.01
@@ -111,6 +115,7 @@ exit 37
         .env("TERMNAV_EZA_BINARY", &fake_eza)
         .env("TERMNAV_REMOTE_LINK_HOST", host)
         .env("TERMNAV_TEST_EZA_EARLY", &early_path)
+        .env("TERMNAV_TEST_EZA_EARLY_STDERR", &early_stderr_path)
         .env("TERMNAV_TEST_EZA_PAYLOAD", &payload_path)
         .env("TERMNAV_TEST_EZA_STDERR", &stderr_path)
         .env("TERMNAV_TEST_EZA_READY", &ready_path)
@@ -138,16 +143,25 @@ exit 37
             .expect("read remaining stdout");
         output
     });
+    let early_stderr_length = early_stderr.len();
+    let (stderr_sender, stderr_receiver) = mpsc::channel();
     let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
+        let mut output = vec![0; early_stderr_length];
+        stderr_pipe
+            .read_exact(&mut output)
+            .expect("read streamed eza stderr");
+        stderr_sender
+            .send(output.clone())
+            .expect("report streamed eza stderr");
         stderr_pipe
             .read_to_end(&mut output)
-            .expect("read termnav stderr");
+            .expect("read remaining stderr");
         output
     });
 
     wait_for_file(&ready_path, &mut child);
     let streamed = early_receiver.recv_timeout(Duration::from_secs(1));
+    let streamed_stderr = stderr_receiver.recv_timeout(Duration::from_secs(1));
     fs::write(&release_path, b"release\n").expect("release fake eza");
     let status = wait_for_exit(&mut child);
     let stdout = stdout_reader.join().expect("join stdout reader");
@@ -161,5 +175,11 @@ exit 37
     let mut expected_stdout = rewritten(early, host);
     expected_stdout.extend_from_slice(&rewritten(&payload, host));
     assert_eq!(stdout, expected_stdout);
-    assert_eq!(actual_stderr, stderr);
+    assert_eq!(
+        streamed_stderr.expect("stderr was buffered until child exit"),
+        early_stderr
+    );
+    let mut expected_stderr = early_stderr;
+    expected_stderr.extend_from_slice(&stderr);
+    assert_eq!(actual_stderr, expected_stderr);
 }
