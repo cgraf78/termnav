@@ -1970,23 +1970,18 @@ _assert_not_contains "helper cli mode avoids home reference expansion in cli pat
   "$test_home/src/launcher.lua" "$launcher_home_call"
 
 remote_cmd_home="$tmp/remote-cmd-home"
-remote_cmd_path="$tmp/remote-cmd-path"
-mkdir -p "$remote_cmd_home/.local/bin" "$remote_cmd_home/.local/state/nvim-tmux-open" "$remote_cmd_path"
+mkdir -p "$remote_cmd_home/.local/bin" "$remote_cmd_home/.local/state/nvim-tmux-open"
 # This case verifies only fallback PATH selection; earlier cases separately
-# verify the exact Neovim RPC arguments. Use native no-op executables here so
-# an intentionally stripped environment does not also depend on Termux's
-# LD_PRELOAD-based `/usr/bin/env` shebang rewriting. `true` proves that the
-# user-managed Neovim path was selected, while `false` makes any accidental
-# tmux fallback observable as a nonzero result.
-true_path=$(type -P true)
-false_path=$(type -P false)
-ln -s "$true_path" "$remote_cmd_home/.local/bin/nvim"
-ln -s "$false_path" "$remote_cmd_home/.local/bin/tmux"
-cat >"$remote_cmd_path/uname" <<'EOF'
-#!/usr/bin/env bash
-echo Linux
-EOF
-chmod +x "$remote_cmd_path/uname"
+# verify the exact Neovim RPC arguments. Generate tiny fixtures with the
+# platform's absolute `sh` path: absolute symlinks to host utilities do not
+# survive the Android emulator boundary, while `/usr/bin/env` shebangs depend
+# on Termux's LD_PRELOAD interposition. Exit success proves that the
+# user-managed Neovim path was selected; exit failure makes an accidental tmux
+# fallback observable.
+remote_cmd_shell=$(command -v sh)
+printf '#!%s\nexit 0\n' "$remote_cmd_shell" >"$remote_cmd_home/.local/bin/nvim"
+printf '#!%s\nexit 1\n' "$remote_cmd_shell" >"$remote_cmd_home/.local/bin/tmux"
+chmod +x "$remote_cmd_home/.local/bin/nvim" "$remote_cmd_home/.local/bin/tmux"
 printf '%s\n' "$socket_two" >"$remote_cmd_home/.local/state/nvim-tmux-open/current"
 remote_cmd_system_path=$(printf '%s:%s' \
   "$(dirname "$(command -v sh)")" \
@@ -1994,7 +1989,7 @@ remote_cmd_system_path=$(printf '%s:%s' \
 _with_timeout 5 env -i \
   HOME="$remote_cmd_home" \
   PREFIX="${PREFIX:-}" \
-  PATH="$remote_cmd_path:$remote_cmd_system_path" \
+  PATH="$remote_cmd_system_path" \
   "$termnav" nvim open link '/tmp/remote-cmd-env.txt:12:13' '/tmp' terminal \
   >/dev/null 2>&1
 remote_cmd_status=$?
