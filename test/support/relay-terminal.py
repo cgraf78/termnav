@@ -1184,6 +1184,10 @@ class RelayTerminalTest(unittest.TestCase):
                 payload,
                 "tmux-virtualized DECRQM must not reach the outer client",
             )
+        # unittest prints a method name even when the method is skipped. Emit a
+        # distinct marker only after the behavioral assertions above so the
+        # shell aggregator cannot report unsupported tmux behavior as covered.
+        print("APPLICATION_DECRQM_PRESERVED")
 
     def test_nested_commit_and_parent_bubble_use_one_terminal_barrier(self) -> None:
         inner_socket = self.harness.new_server("inner", "inner", "cat")

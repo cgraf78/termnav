@@ -18,6 +18,32 @@ export SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22'
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
 
+_process_running() {
+  local pid=$1 stat state
+
+  # `kill -0` also succeeds for a zombie. Minimal container PID 1 processes
+  # do not consistently reap orphaned fixture grandchildren promptly, so an
+  # existence-only probe makes the cleanup assertion depend on the CI image.
+  # The contract under test is that no descendant can still execute or retain
+  # IO after its owned process group is killed; a zombie has already met it.
+  if [[ -r /proc/$pid/stat ]]; then
+    stat=$(<"/proc/$pid/stat") || return 1
+    stat=${stat##*) }
+    state=${stat%% *}
+    [[ $state != Z ]]
+    return
+  fi
+
+  # macOS has no procfs. Its BSD `ps` exposes the same state field, while the
+  # final signal probe preserves compatibility with an unusual ps lacking it.
+  if state=$(ps -o stat= -p "$pid" 2>/dev/null); then
+    state=${state#"${state%%[![:space:]]*}"}
+    [[ -n $state && $state != Z* ]]
+    return
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+
 case "$HOME" in
   "$_TEST_TMP_ROOT"/*) _pass "test isolation: HOME is invocation-owned" ;;
   *) _fail "test isolation: HOME escaped the invocation root ($HOME)" ;;
@@ -34,5 +60,120 @@ for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION; do
     _pass "test isolation: $variable is cleared"
   fi
 done
+
+timeout_fixture=$(_tmpdir)
+timeout_leader_pid=$timeout_fixture/leader.pid
+timeout_child_pid=$timeout_fixture/child.pid
+test_shell=$(command -v sh)
+test_sleep=$(command -v sleep)
+set +e
+(
+  # The leader deliberately exits when TERM arrives while its forked child
+  # ignores TERM. Waiting only for the leader therefore leaks the exact process
+  # class that an outer suite deadline is supposed to contain.
+  # shellcheck disable=SC2016
+  _with_timeout 0.1s "$test_shell" -c '
+    trap "exit 0" TERM
+    "$3" -c '\''trap "" TERM; exec "$1" 60'\'' sh "$4" &
+    child=$!
+    printf "%s\n" "$$" >"$1"
+    printf "%s\n" "$child" >"$2"
+    wait "$child"
+  ' sh "$timeout_leader_pid" "$timeout_child_pid" "$test_shell" "$test_sleep"
+) &
+timeout_runner=$!
+deadline=$((SECONDS + 3))
+while kill -0 "$timeout_runner" 2>/dev/null && ((SECONDS < deadline)); do
+  sleep 0.02
+done
+if kill -0 "$timeout_runner" 2>/dev/null; then
+  # This watchdog exists only to make a broken timeout regression fail quickly
+  # instead of reproducing the same unbounded CI hang that the helper prevents.
+  [[ -s $timeout_leader_pid ]] && kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null
+  kill -KILL "$timeout_runner" 2>/dev/null
+  wait "$timeout_runner" 2>/dev/null
+  timeout_status=255
+else
+  wait "$timeout_runner"
+  timeout_status=$?
+fi
+set -e
+_assert_exit "test isolation: timeout returns its stable deadline status" 124 "$timeout_status"
+if [[ -s $timeout_child_pid ]] && _process_running "$(cat "$timeout_child_pid")"; then
+  _fail "test isolation: timeout left a stubborn descendant running"
+  if [[ -s $timeout_leader_pid ]]; then
+    kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null || true
+  fi
+else
+  _pass "test isolation: timeout cleans up the complete fixture process group"
+fi
+
+# Blocking terminal signals around fork closes the supervisor's ownership race,
+# but that mask must be restored in the command before exec. Otherwise every
+# process in a wrapped suite silently inherits blocked INT/TERM and lifecycle
+# assertions test a different signal contract than production.
+set +e
+_with_timeout 2s python3 -c '
+import signal
+import sys
+
+blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+raise SystemExit(1 if signal.SIGINT in blocked or signal.SIGTERM in blocked else 0)
+'
+signal_mask_status=$?
+set -e
+_assert_exit "test isolation: child inherits an unblocked terminal signal mask" 0 "$signal_mask_status"
+
+# Signals delivered to the Python supervisor are another cancellation boundary.
+# The wrapper must tear down the owned command group before reporting the
+# conventional 128+signal status, even when both child generations ignore it.
+signal_fixture=$(_tmpdir)
+signal_supervisor_pid=$signal_fixture/supervisor.pid
+signal_leader_pid=$signal_fixture/leader.pid
+signal_child_pid=$signal_fixture/child.pid
+set +e
+(
+  # shellcheck disable=SC2016
+  _with_timeout 60s "$test_shell" -c '
+    trap "" INT TERM
+    "$4" -c '\''trap "" INT TERM; exec "$1" 60'\'' sh "$5" &
+    child=$!
+    printf "%s\n" "$PPID" >"$1"
+    printf "%s\n" "$$" >"$2"
+    printf "%s\n" "$child" >"$3"
+    wait "$child"
+  ' sh "$signal_supervisor_pid" "$signal_leader_pid" "$signal_child_pid" "$test_shell" "$test_sleep"
+) &
+signal_runner=$!
+deadline=$((SECONDS + 3))
+while [[ ! -s $signal_child_pid || ! -s $signal_supervisor_pid ]] && ((SECONDS < deadline)); do
+  sleep 0.02
+done
+if [[ -s $signal_supervisor_pid ]]; then
+  kill -TERM "$(cat "$signal_supervisor_pid")" 2>/dev/null
+fi
+deadline=$((SECONDS + 3))
+while kill -0 "$signal_runner" 2>/dev/null && ((SECONDS < deadline)); do
+  sleep 0.02
+done
+if kill -0 "$signal_runner" 2>/dev/null; then
+  [[ -s $signal_leader_pid ]] && kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null
+  kill -KILL "$signal_runner" 2>/dev/null
+  wait "$signal_runner" 2>/dev/null
+  signal_status=255
+else
+  wait "$signal_runner"
+  signal_status=$?
+fi
+set -e
+_assert_exit "test isolation: TERM returns the conventional signal status" 143 "$signal_status"
+if [[ -s $signal_child_pid ]] && _process_running "$(cat "$signal_child_pid")"; then
+  _fail "test isolation: interrupted timeout supervisor left a descendant running"
+  if [[ -s $signal_leader_pid ]]; then
+    kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null || true
+  fi
+else
+  _pass "test isolation: interrupted timeout supervisor cleans up its process group"
+fi
 
 _test_summary

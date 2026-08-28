@@ -6,6 +6,11 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 workflow="$root/.github/workflows/test.yml"
 retry_workflow="$root/.github/workflows/retry-infrastructure.yml"
 lock_file="$root/.github/cgraf78-actions.lock"
+performance_suite="$root/test/suites/relay-performance-test"
+performance_harness="$root/test/relay-performance.py"
+relay_suite="$root/test/suites/relay-test"
+terminal_suite="$root/test/suites/relay-terminal-test"
+focus_suite="$root/test/suites/tmux-focus-test"
 
 fail() {
   printf 'ci-contract-test: %s\n' "$*" >&2
@@ -78,12 +83,19 @@ performance_macos_job=$(awk '
   in_performance { print }
 ' "$workflow")
 
+vscode_job=$(awk '
+  /^  vscode-adapter:$/ { in_vscode = 1 }
+  in_vscode && /^  [^ ]/ && $0 != "  vscode-adapter:" { exit }
+  in_vscode { print }
+' "$workflow")
+
 # These are literal GitHub expressions in the workflow contract.
 # shellcheck disable=SC2016
 for contract in \
   'name: Relay hot path / Ubuntu' \
   "if: \${{ github.event_name == 'pull_request' }}" \
   'runs-on: ubuntu-24.04' \
+  'timeout-minutes: 20' \
   'fetch-depth: 0' \
   'name: Install Rust' \
   'toolchain: stable' \
@@ -95,6 +107,16 @@ for contract in \
     fail "Relay performance job is missing: $contract"
 done
 
+for contract in \
+  'name: VS Code adapter / Ubuntu' \
+  'runs-on: ubuntu-24.04' \
+  'timeout-minutes: 5' \
+  'node --version' \
+  'test/suites/vscode-adapter-test'; do
+  [[ "$vscode_job" == *"$contract"* ]] ||
+    fail "required VS Code adapter job is missing: $contract"
+done
+
 # The macOS job protects the procfs-free ancestry path, where each avoidable
 # process spawn is visible latency that Linux-only measurements would miss.
 # shellcheck disable=SC2016
@@ -102,6 +124,7 @@ for contract in \
   'name: Relay hot path / macOS' \
   "if: \${{ github.event_name == 'pull_request' }}" \
   'runs-on: macos-latest' \
+  'timeout-minutes: 20' \
   'fetch-depth: 0' \
   'name: Install Rust' \
   'toolchain: stable' \
@@ -118,12 +141,14 @@ done
 for contract in \
   'name: Required' \
   'if: ${{ always() }}' \
-  'needs: [rust, eza-current, relay-performance, relay-performance-macos]' \
+  'needs: [rust, vscode-adapter, eza-current, relay-performance, relay-performance-macos]' \
   'RUST_RESULT: ${{ needs.rust.result }}' \
+  'VSCODE_ADAPTER_RESULT: ${{ needs.vscode-adapter.result }}' \
   'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
   'RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}' \
   'RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}' \
   'test "$RUST_RESULT" = success' \
+  'test "$VSCODE_ADAPTER_RESULT" = success' \
   'test "$EZA_CURRENT_RESULT" = success' \
   'success | skipped) ;;' \
   '*) exit 1 ;;'; do
@@ -132,5 +157,29 @@ for contract in \
 done
 [[ "$required_job" == *"case \"\$RELAY_PERFORMANCE_MACOS_RESULT\" in"* ]] ||
   fail "Required aggregate does not validate the macOS performance result"
+
+# Process-heavy integration fixtures intentionally own subprocess trees. Keep
+# their outer deadline in the portable process-group wrapper so a child that
+# defeats an inner protocol timeout cannot occupy a CI worker indefinitely.
+grep -Fq "_with_timeout 15m python3 \"\$test_dir/relay-performance.py\"" "$performance_suite" ||
+  fail "relay performance suite has no bounded outer deadline"
+grep -Fq "_with_timeout 5m python3 \"\$test_dir/support/relay_lifecycle_test.py\"" "$relay_suite" ||
+  fail "relay lifecycle suite has no bounded outer deadline"
+grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/relay-terminal.py\"" "$terminal_suite" ||
+  fail "relay terminal suite has no bounded outer deadline"
+grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/tmux-focus.py\"" "$focus_suite" ||
+  fail "tmux focus suite has no bounded outer deadline"
+
+performance_content=$(<"$performance_harness")
+for contract in \
+  '"baseline_median_ms": tmux_before_median' \
+  '"candidate_median_ms": tmux_after_median' \
+  'if tmux_after_median > 75:' \
+  'if tmux_after_p95 > 100:' \
+  'if tmux_after_median > tmux_before_median * 1.20 + 5:' \
+  'navigation tmux route did not select'; do
+  [[ "$performance_content" == *"$contract"* ]] ||
+    fail "local tmux performance contract is missing: $contract"
+done
 
 printf 'ci-contract-test: ok\n'

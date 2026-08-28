@@ -57,7 +57,10 @@ _assert_eq "relay performance: client-scoped send stays silent" "" "$(cat "$tmp/
 _assert_exit "relay performance: production commit bypasses argparse" 0 "$commit_rc"
 _assert_eq "relay performance: stray commit stays silent" "" "$(cat "$tmp/commit.out" "$tmp/commit.err")"
 if [[ -n "${TERMNAV_PERFORMANCE_BASELINE:-}" ]]; then
-  python3 "$test_dir/relay-performance.py" \
+  # The benchmark contains narrower readiness and child cleanup bounds, but an
+  # unknown historical baseline can still hang before those boundaries. Own the
+  # whole subprocess group so local and CI runs fail with a useful deadline.
+  _with_timeout 15m python3 "$test_dir/relay-performance.py" \
     --baseline-ref "$TERMNAV_PERFORMANCE_BASELINE" \
     --samples "${TERMNAV_PERFORMANCE_SAMPLES:-50}"
   _pass "relay performance: calibrated subprocess budgets"

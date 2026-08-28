@@ -25,28 +25,13 @@ _assert_not_contains "focus adapter: sandbox does not spawn host tools" \
 if command -v node >/dev/null 2>&1; then
   module_root=$(_tmpdir)
   mkdir -p "$module_root/node_modules/vscode"
-  printf 'module.exports = {};\n' >"$module_root/node_modules/vscode/index.js"
+  printf 'module.exports = global.__termnavVscode;\n' >"$module_root/node_modules/vscode/index.js"
   output=$(
-    NODE_PATH="$module_root/node_modules" node - "$extension" <<'JS'
-const extension = require(process.argv[2]);
-const valid = {
-  version: 2,
-  source: "nvim-123",
-  cycle: 1,
-  sequence: 2,
-  observed: 3,
-  operation: "claim",
-  token: "a".repeat(64),
-  ancestors: [123, 1],
-};
-console.log(extension.validateFocusMessage(valid));
-console.log(extension.validateFocusMessage({ ...valid, token: "short" }));
-console.log(extension.validateFocusMessage({ ...valid, ancestors: [123, 123] }));
-console.log(extension.socketLocation().socketPath.startsWith("/tmp/termnav-vscode-"));
-JS
+    _with_timeout 20s env NODE_PATH="$module_root/node_modules" \
+      node "$TERMNAV_TEST_DIR/support/vscode-adapter.js" "$extension" "$module_root"
   )
-  _assert_eq "focus adapter: validates authenticated ordered messages" \
-    $'true\nfalse\nfalse\ntrue' "$output"
+  _assert_contains "focus adapter: production behavior passes" \
+    "vscode-adapter: production controller, server, and lifecycle pass" "$output"
 else
   echo "  SKIP: VS Code adapter behavior requires Node.js"
 fi

@@ -468,7 +468,10 @@ _assert_exit "ssh relay: preserves the original SSH failure" 37 "$ssh_rc"
 echo
 echo "=== SSH relay lifecycle ==="
 set +e
-python3 "$test_dir/support/relay_lifecycle_test.py"
+# Lifecycle tests intentionally create process trees and exercise SIGKILL. The
+# outer group deadline guarantees that a regression in teardown cannot leak a
+# relay or SSH fixture and hold the remaining suite indefinitely.
+_with_timeout 5m python3 "$test_dir/support/relay_lifecycle_test.py"
 lifecycle_rc=$?
 set -e
 _assert_exit "relay lifecycle: ownership and hard-kill cleanup cases pass" 0 "$lifecycle_rc"

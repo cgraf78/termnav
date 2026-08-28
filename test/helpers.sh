@@ -318,26 +318,23 @@ _termnav_command_adapter() {
 }
 
 # ---------------------------------------------------------------------------
-# Portable timeout wrapper — `timeout` is GNU coreutils and is absent on
-# macOS by default. Falls back to `gtimeout` (installed by `brew install
-# coreutils`), then to Python's process supervision. The Python path terminates
-# the whole fixture process group so a timed-out shell cannot strand an SSH
-# child or relay and poison a later test.
+# Portable timeout wrapper. Python owns a new process group and escalates TERM
+# to KILL, giving every supported CI platform the same exit status and cleanup
+# contract. GNU timeout remains a bootstrap fallback for environments without
+# Python, but it also needs an explicit kill-after bound: TERM alone can leave a
+# deliberately stubborn fixture alive forever.
 # ---------------------------------------------------------------------------
 
 _with_timeout() {
   local secs="$1"
   shift
-  if command -v timeout &>/dev/null; then
-    timeout "$secs" "$@"
-  elif command -v gtimeout &>/dev/null; then
-    gtimeout "$secs" "$@"
-  elif command -v python3 &>/dev/null; then
-    python3 - "$secs" "$@" <<'PY'
+  if command -v python3 &>/dev/null; then
+    if python3 - "$secs" "$@" <<'PY'; then
 import os
 import signal
 import subprocess
 import sys
+import time
 
 
 def seconds(value: str) -> float:
@@ -347,22 +344,106 @@ def seconds(value: str) -> float:
     return float(value)
 
 
-process = subprocess.Popen(
-    sys.argv[2:],
-    stdin=subprocess.DEVNULL,
-    start_new_session=True,
-)
-try:
-    raise SystemExit(process.wait(timeout=seconds(sys.argv[1])))
-except subprocess.TimeoutExpired:
-    os.killpg(process.pid, signal.SIGTERM)
+class SupervisorSignal(Exception):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+def interrupted(signum: int, _frame: object) -> None:
+    raise SupervisorSignal(signum)
+
+
+def group_alive(group: int) -> bool:
     try:
-        process.wait(timeout=1.0)
+        os.killpg(group, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def signal_group(group: int, signum: int) -> None:
+    try:
+        os.killpg(group, signum)
+    except ProcessLookupError:
+        pass
+
+
+def stop_group(process: subprocess.Popen[bytes], first_signal: int) -> None:
+    # Once cleanup starts, a second terminal signal must not interrupt the only
+    # code responsible for the child group. The group identifier remains valid
+    # while any descendant survives, even after the direct leader exits.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal_group(process.pid, first_signal)
+    deadline = time.monotonic() + 1.0
+    while group_alive(process.pid) and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.01)
+    if group_alive(process.pid):
+        signal_group(process.pid, signal.SIGKILL)
+    process.wait()
+
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+process = None
+try:
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+
+    def restore_child_mask() -> None:
+        # Popen inherits the caller's signal mask across exec. This supervisor
+        # is deliberately single-threaded, so a small pre-exec hook is safe and
+        # keeps the ownership race closed without changing the wrapped suite's
+        # signal semantics.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    try:
+        process = subprocess.Popen(
+            sys.argv[2:],
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            preexec_fn=restore_child_mask,
+        )
+    finally:
+        # A pending signal is delivered only after `process` owns the new group,
+        # closing the otherwise unavoidable spawn-before-assignment leak window.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    try:
+        raise SystemExit(process.wait(timeout=seconds(sys.argv[1])))
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    raise SystemExit(124)
+        stop_group(process, signal.SIGTERM)
+        raise SystemExit(124)
+    except SupervisorSignal as caught:
+        stop_group(process, caught.signum)
+        raise SystemExit(128 + caught.signum)
+except SupervisorSignal as caught:
+    if process is not None:
+        stop_group(process, caught.signum)
+    raise SystemExit(128 + caught.signum)
 PY
+      return 0
+    else
+      return $?
+    fi
+  elif command -v timeout &>/dev/null; then
+    if timeout --kill-after=1s "$secs" "$@"; then
+      return 0
+    else
+      local status=$?
+      [[ $status -eq 137 ]] && return 124
+      return "$status"
+    fi
+  elif command -v gtimeout &>/dev/null; then
+    if gtimeout --kill-after=1s "$secs" "$@"; then
+      return 0
+    else
+      local status=$?
+      [[ $status -eq 137 ]] && return 124
+      return "$status"
+    fi
   else
     printf 'test timeout requires timeout, gtimeout, or python3\n' >&2
     return 127

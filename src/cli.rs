@@ -71,7 +71,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
+    use std::rc::Rc;
+
     use super::run;
+
+    struct ProcessLocalWriter {
+        bytes: Vec<u8>,
+        _not_send: Rc<()>,
+    }
+
+    impl Write for ProcessLocalWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn missing_command_is_a_usage_error() {
@@ -84,6 +103,24 @@ mod tests {
         );
         assert!(stdout.is_empty());
         assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn public_cli_accepts_a_process_local_error_writer() {
+        // Only the eza adapter needs concurrent pipe handling. Keep that
+        // implementation detail from imposing Send on embedders of the public
+        // command dispatcher, whose writers may intentionally contain Rc state.
+        let mut stdout = Vec::new();
+        let mut stderr = ProcessLocalWriter {
+            bytes: Vec::new(),
+            _not_send: Rc::new(()),
+        };
+
+        assert_eq!(
+            run(Vec::<String>::new(), &mut stdout, &mut stderr).unwrap(),
+            2
+        );
+        assert!(!stderr.bytes.is_empty());
     }
 
     #[cfg(unix)]

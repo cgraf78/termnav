@@ -17,7 +17,7 @@ termnav=${TERMNAV_TEST_BINARY:-$root/target/release/termnav}
 _termnav_command_adapter "$focus_adapter" "$termnav" tmux focus
 _termnav_command_adapter "$relay_adapter" "$termnav" relay
 set +e
-output=$(python3 "$test_dir/support/tmux-focus.py" \
+output=$(_with_timeout 10m python3 "$test_dir/support/tmux-focus.py" \
   --focus "$focus_adapter" \
   --relay "$relay_adapter" 2>&1)
 rc=$?

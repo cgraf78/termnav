@@ -10,7 +10,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,26 @@ pub fn pipe(nonblocking: bool) -> io::Result<(OwnedFd, OwnedFd)> {
         }
     }
     Ok(owned)
+}
+
+/// Spawn one helper as the leader of a process group owned by the caller.
+///
+/// UI adapters sometimes need to abort after their output destination closes.
+/// A dedicated group lets them stop shell wrappers and descendants together
+/// without changing process-group behavior for the public CLI as a whole.
+pub(crate) fn spawn_owned_group(command: &mut Command) -> io::Result<Child> {
+    command.process_group(0).spawn()
+}
+
+/// Kill a child and every descendant that remains in its owned process group.
+pub(crate) fn kill_owned_group(child: &mut Child) {
+    // Shell adapters can exit before descendants that still hold pipes or
+    // sockets. Address the process group first, then retain Child::kill as a
+    // defensive fallback if the platform rejects the group operation.
+    if let Ok(group) = i32::try_from(child.id()) {
+        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
 }
 
 /// Run a command with structurally bounded captured output and a hard deadline.
@@ -110,12 +130,12 @@ fn output_timeout_draining_limited(
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let Some(stdout) = child.stdout.take() else {
-        kill_child_group(&mut child);
+        kill_owned_group(&mut child);
         let _ = child.wait();
         return Err(io::Error::other("child stdout pipe is unavailable"));
     };
     let Some(stderr) = child.stderr.take() else {
-        kill_child_group(&mut child);
+        kill_owned_group(&mut child);
         let _ = child.wait();
         return Err(io::Error::other("child stderr pipe is unavailable"));
     };
@@ -176,7 +196,7 @@ fn output_timeout_draining_limited(
         // process group. Kill the full group and reap its leader here so future
         // changes cannot accidentally add an early-return path that leaks a
         // helper descendant.
-        kill_child_group(&mut child);
+        kill_owned_group(&mut child);
         let _ = child.wait();
     }
     result
@@ -237,7 +257,7 @@ fn wait_for_child(
             Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) => {}
             Err(error) => {
-                kill_child_group(child);
+                kill_owned_group(child);
                 let _ = child.wait();
                 return Err(error);
             }
@@ -246,23 +266,12 @@ fn wait_for_child(
             // A timeout is an uncertainty boundary. Kill and reap the exact
             // child before returning so a failed UI gesture never accumulates
             // helper processes in the background.
-            kill_child_group(child);
+            kill_owned_group(child);
             child.wait()?;
             return Ok(None);
         }
         thread::sleep(Duration::from_millis(2));
     }
-}
-
-fn kill_child_group(child: &mut std::process::Child) {
-    // Every bounded command starts a fresh process group. Killing that owned
-    // group closes the common shell-wrapper leak where the direct child exits
-    // but a grandchild retains pipes, sockets, or remote work. Keep Child::kill
-    // as a defensive fallback if the platform rejects the group operation.
-    if let Ok(group) = i32::try_from(child.id()) {
-        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
-    }
-    let _ = child.kill();
 }
 
 /// Return one process environment value through procfs or the macOS `ps` form.
