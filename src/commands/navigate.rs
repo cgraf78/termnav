@@ -10,21 +10,23 @@ use crate::navigation::{Action, Client, Direction, Navigator, Scope, SystemBacke
 
 const CONTINUATION_TTL: Duration = Duration::from_millis(250);
 
-const HELP: &str = "usage: termnav navigate [OPTIONS] ACTION DIRECTION\n\
-\n\
-actions: pane-select, tab-select, tab-move\n\
-\n\
-options:\n\
-  --parent             start outside a tmux scope that already declined\n\
-  --client-pid PID     exact source client process ID\n\
-  --client-tty TTY     exact source client tty\n\
-  --client-created N   exact source client creation time\n\
-  --client-termtype T  exact source client terminal type\n\
-  --source-socket PATH exact source tmux socket\n\
-  --source-pane ID     exact source tmux pane\n\
-  --source-session ID  optional exact source tmux session\n\
-  --emit-continuation  print bounded state for one ordered successor\n\
-  --continuation JSON  resume from revalidated prior routing state\n";
+const HELP: &str = r#"usage: termnav navigate [OPTIONS] ACTION DIRECTION
+
+actions: pane-select, tab-select, tab-move
+directions: pane-select=left|right|up|down; tab-select=previous|next; tab-move=left|right
+
+options:
+  --parent             start outside a tmux scope that already declined
+  --client-pid PID     exact source client process ID
+  --client-tty TTY     exact source client tty
+  --client-created N   exact source client creation time
+  --client-termtype T  exact source client terminal type
+  --source-socket PATH exact source tmux socket
+  --source-pane ID     exact source tmux pane
+  --source-session ID  optional exact source tmux session
+  --emit-continuation  print bounded state for one ordered successor
+  --continuation JSON  resume from revalidated prior routing state
+"#;
 
 #[derive(Default)]
 struct Options {

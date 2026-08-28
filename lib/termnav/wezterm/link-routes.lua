@@ -337,6 +337,25 @@ function M.new(wezterm, options)
     wezterm.on("open-uri", function(window, pane, uri)
       return routes.open_uri(window, pane, uri)
     end)
+    wezterm.on("user-var-changed", function(window, pane, name, value)
+      if value == "" then
+        return
+      end
+
+      -- Rust appends a nonce to navigation values so repeated gestures still
+      -- produce distinct user-var updates. The direction before the colon is
+      -- the stable public vocabulary consumed here.
+      local direction = value:match("^([^:]+):") or value
+      if name == "TERMNAV_TAB_SELECT" and (direction == "next" or direction == "previous") then
+        local relative = direction == "previous" and -1 or 1
+        window:perform_action(wezterm.action.ActivateTabRelative(relative), pane)
+      elseif name == "TERMNAV_TAB_MOVE" and (direction == "left" or direction == "right") then
+        local relative = direction == "left" and -1 or 1
+        window:perform_action(wezterm.action.MoveTabRelative(relative), pane)
+      elseif name == "TERMNAV_OPEN_URL" then
+        wezterm.open_with(value)
+      end
+    end)
   end
 
   return routes

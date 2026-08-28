@@ -65,7 +65,7 @@ fn browser_targets_are_returned_to_the_exact_click_client() {
         .expect("route browser target");
     assert!(status.success());
     let output = std::fs::read(&tty).expect("read terminal escape");
-    assert!(output.starts_with(b"\x1b]1337;SetUserVar=term_open_url="));
+    assert!(output.starts_with(b"\x1b]1337;SetUserVar=TERMNAV_OPEN_URL="));
 }
 
 #[test]

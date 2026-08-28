@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 fn termnav() -> Command {
     Command::new(env!("CARGO_BIN_EXE_termnav"))
@@ -31,12 +32,84 @@ fn top_level_help_lists_the_cohesive_surface() {
         "nvim",
         "vscode",
         "eza",
+        "asset-path",
     ] {
         assert!(
             stdout.contains(command),
             "missing {command:?} in {stdout:?}"
         );
     }
+}
+
+#[test]
+fn asset_path_resolves_only_existing_assets_below_the_provider_root() {
+    let root = std::env::temp_dir().join(format!("termnav-assets-{}", std::process::id()));
+    let asset = root.join("lib/termnav/wezterm/link-routes.lua");
+    std::fs::create_dir_all(asset.parent().expect("asset parent")).expect("create asset root");
+    std::fs::write(&asset, "return {}\n").expect("write asset");
+
+    let output = termnav()
+        .args(["asset-path", "lib/termnav/wezterm/link-routes.lua"])
+        .env("TERMNAV_ASSET_ROOT", &root)
+        .output()
+        .expect("resolve installed asset");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        asset.display().to_string()
+    );
+
+    for relative in ["../outside", "/tmp/outside", "missing"] {
+        let output = termnav()
+            .args(["asset-path", relative])
+            .env("TERMNAV_ASSET_ROOT", &root)
+            .output()
+            .expect("reject unsafe or missing asset");
+        assert_eq!(output.status.code(), Some(1), "relative={relative:?}");
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn nvim_open_cli_rejects_arguments_beyond_its_wire_arity() {
+    let arguments = ["nvim", "open", "cli", "file", "cwd", "extra"];
+    let output = termnav()
+        .args(arguments)
+        .output()
+        .expect("validate open arity");
+    assert_eq!(output.status.code(), Some(2), "arguments={arguments:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("accepts"));
+}
+
+#[test]
+fn follow_click_stdin_is_bounded_by_lines_and_bytes() {
+    for input in ["x\n".repeat(12), "x".repeat(65 * 1024)] {
+        let mut child = termnav()
+            .args(["tmux", "follow-click", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start follow-click");
+        child
+            .stdin
+            .take()
+            .expect("follow-click stdin")
+            .write_all(input.as_bytes())
+            .expect("write follow-click input");
+        let output = child.wait_with_output().expect("wait for follow-click");
+        assert_eq!(output.status.code(), Some(2));
+    }
+}
+
+#[test]
+fn follow_click_stdin_mode_rejects_mixed_arguments() {
+    let output = termnav()
+        .args(["tmux", "follow-click", "--stdin", "extra"])
+        .output()
+        .expect("validate stdin mode");
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
@@ -49,6 +122,21 @@ fn unknown_command_is_a_usage_error() {
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn leaf_commands_expose_help_and_reject_extra_arguments() {
+    for arguments in [&["asset-path", "--help"][..], &["link-host", "--help"][..]] {
+        let output = termnav().args(arguments).output().expect("run leaf help");
+        assert!(output.status.success(), "arguments={arguments:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("usage:"));
+    }
+
+    let output = termnav()
+        .args(["version", "extra"])
+        .output()
+        .expect("reject version argument");
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]

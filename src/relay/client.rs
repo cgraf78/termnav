@@ -8,6 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use super::protocol::VERSION;
+
 const MAX_REPLY_BYTES: u64 = 513;
 
 /// Return the fixed-width request identity used by relay navigation.
@@ -61,7 +63,7 @@ pub fn send(path: &Path, request: &Value, timeout: Duration) -> io::Result<Value
     }
     let reply: Value = serde_json::from_str(&line)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if reply.get("v") != Some(&json!(2)) || !reply.is_object() {
+    if reply.get("v") != Some(&json!(VERSION)) || !reply.is_object() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "relay reply has an unsupported shape",

@@ -44,9 +44,7 @@ local wezterm = {
   hostname = function() return "example-host" end,
   on = function(name, callback) registered[name] = callback end,
 }
-local shdeps = {}
-function shdeps.dep_file(dependency, asset)
-  assert(dependency == "cgraf78/termnav")
+local function asset_path(asset)
   return root .. "/" .. asset
 end
 
@@ -54,7 +52,7 @@ local example = dofile(root .. "/examples/wezterm.lua")
 local config = { hyperlink_rules = { { regex = "existing", format = "$0" } } }
 local integration = example.apply({
   wezterm = wezterm,
-  shdeps = shdeps,
+  asset_path = asset_path,
   config = config,
 })
 
@@ -82,9 +80,7 @@ if command -v nvim >/dev/null 2>&1; then
   cat >"$_nvim_test" <<'LUA'
 local root = assert(os.getenv("TERMNAV_ROOT"))
 local resolved = false
-local shdeps = {}
-function shdeps.dep_file(dependency, asset)
-  assert(dependency == "cgraf78/termnav")
+local function asset_path(asset)
   assert(asset == "lib/termnav/nvim/setup.lua")
   resolved = true
   return root .. "/" .. asset
@@ -108,7 +104,7 @@ local navigation = { setup = function() end }
 
 local example = dofile(root .. "/examples/nvim.lua")
 local context = example.setup({
-  shdeps = shdeps,
+  asset_path = asset_path,
   termnav_options = {
     opener = opener,
     navigation = navigation,
@@ -211,7 +207,7 @@ import sys
 from pathlib import Path
 
 payload = Path(sys.argv[1]).read_bytes()
-match = re.search(rb"SetUserVar=term_open_url=([A-Za-z0-9+/=]+)", payload)
+match = re.search(rb"SetUserVar=TERMNAV_OPEN_URL=([A-Za-z0-9+/=]+)", payload)
 assert match, payload
 assert base64.b64decode(match.group(1)) == b"https://issues.example.com/TICKET-42"
 PY

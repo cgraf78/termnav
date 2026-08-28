@@ -100,9 +100,8 @@ pub fn configured_open(
 /// routing or authentication behavior.
 #[must_use]
 pub fn remote_nvim_command(arguments: &[&str]) -> String {
-    let mut command = String::from(
-        r#"PATH="$PATH:$HOME/.local/bin:$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin"; export PATH; if command -v termnav >/dev/null 2>&1; then termnav nvim open"#,
-    );
+    let mut command = super::tool_path::remote_assignment();
+    command.push_str("; if command -v termnav >/dev/null 2>&1; then termnav nvim open");
     for argument in arguments {
         command.push(' ');
         command.push_str(&crate::shell::quote(argument));

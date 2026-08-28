@@ -6,43 +6,18 @@
 
 local M = {}
 
-local function required(value, name)
-  if type(value) ~= "string" or value == "" then
-    error("termnav WezTerm example requires options." .. name, 3)
+local function asset_path(options, relative_path)
+  if type(options.asset_path) == "function" then
+    return options.asset_path(relative_path)
   end
-  return value
-end
-
-local function shdeps_api(options)
-  if type(options.shdeps) == "table" then
-    return options.shdeps
+  local command = options.termnav_command or "termnav"
+  local pipe = assert(io.popen(string.format("%q asset-path %q", command, relative_path), "r"))
+  local path = pipe:read("*l")
+  local ok = pipe:close()
+  if not ok or not path or path == "" then
+    error("termnav could not resolve asset " .. relative_path, 3)
   end
-
-  local home = options.home or os.getenv("HOME")
-  local lua_dir = options.shdeps_lua_dir or os.getenv("SHDEPS_LUA_DIR")
-  if not lua_dir then
-    lua_dir = required(home, "home") .. "/.local/lib/shdeps"
-  end
-
-  -- Ask Shdeps for provider assets rather than assuming Termnav is a source
-  -- checkout. This keeps the same config valid for repo and release installs.
-  local bootstrap = dofile(lua_dir .. "/shdeps/bootstrap.lua")
-  return bootstrap.new({
-    home = home,
-    conf_dir = options.shdeps_conf_dir,
-    bin = options.shdeps_bin,
-    bin_dir = options.shdeps_bin_dir,
-    root = options.shdeps_root,
-    env = options.shdeps_env,
-  })
-end
-
-local function dependency_module(api, relative_path)
-  local path = api.dep_file("cgraf78/termnav", relative_path)
-  if not path then
-    error("Shdeps could not resolve Termnav asset " .. relative_path, 3)
-  end
-  return dofile(path)
+  return path
 end
 
 function M.apply(options)
@@ -50,10 +25,8 @@ function M.apply(options)
   local wezterm = options.wezterm or require("wezterm")
   local config = options.config
     or (type(wezterm.config_builder) == "function" and wezterm.config_builder() or {})
-  local api = shdeps_api(options)
-
-  local routes = dependency_module(api, "lib/termnav/wezterm/link-routes.lua").new(wezterm)
-  local public_rules = dependency_module(api, "lib/termnav/wezterm/public-link-rules.lua")
+  local routes = dofile(asset_path(options, "lib/termnav/wezterm/link-routes.lua")).new(wezterm)
+  local public_rules = dofile(asset_path(options, "lib/termnav/wezterm/public-link-rules.lua"))
 
   -- Preserve caller rules and append fresh Termnav-owned copies. A caller may
   -- reorder the result afterward without mutating the provider's definitions.

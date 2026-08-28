@@ -95,6 +95,34 @@ fn noninteractive_ssh_is_exactly_one_plain_invocation() {
 }
 
 #[test]
+fn path_lookup_skips_a_non_executable_ssh_shadow() {
+    let (root, _binary, log, _cleanup) = fixture();
+    let shadow = root.join("shadow");
+    fs::create_dir(&shadow).expect("create shadow directory");
+    fs::write(shadow.join("ssh"), "not executable\n").expect("write shadow");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
+        .args(["ssh", "plain.example.invalid"])
+        .env(
+            "PATH",
+            format!("{}:{}:/usr/bin:/bin", shadow.display(), root.display()),
+        )
+        .env("TERMNAV_TEST_SSH_LOG", &log)
+        .output()
+        .expect("run plain SSH through executable fallback");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(log).expect("read ssh log"),
+        "SESSION\n<plain.example.invalid>\n"
+    );
+}
+
+#[test]
 fn failed_session_spawn_joins_and_removes_the_connection_relay() {
     let (root, binary, log, _cleanup) = fixture();
     fs::create_dir(root.join("runtime")).expect("create XDG runtime root");

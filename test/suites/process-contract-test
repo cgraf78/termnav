@@ -9,11 +9,10 @@ root=${test_dir%/test}
 # shellcheck source=../helpers.sh
 . "$test_dir/helpers.sh"
 
-# Dotfiles is Termnav's sole consumer and migrates in the paired change. Old
-# executable bodies therefore buy no supported compatibility, while retaining
-# them would leave two implementations of latency- and security-sensitive
-# routing policy. Keep this inventory explicit so an obsolete facade cannot
-# quietly return in a later release.
+# Old executable bodies buy no supported compatibility, while retaining them
+# would leave two implementations of latency- and security-sensitive routing
+# policy. Keep this inventory explicit so an obsolete facade cannot quietly
+# return in a later release.
 retired_paths=(
   bin/eza-nvim-links
   bin/nvim-link-host

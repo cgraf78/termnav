@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use super::client::send;
+use super::protocol;
 use super::store::{Directive, DirectiveAction, Store};
 use crate::navigation::{Action, Backend, Client, Direction, Outcome, Scope, SystemBackend};
 use crate::process;
@@ -192,16 +193,17 @@ pub fn dispatch(request: &Value) -> Value {
 }
 
 fn dispatch_with_terminal(request: &Value, direct_terminal: Option<&DirectTerminal>) -> Value {
-    if request.get("v").and_then(Value::as_u64) != Some(2) {
-        return reply("error");
+    use super::protocol::{VERSION, operation, result};
+    if request.get("v").and_then(Value::as_u64) != Some(u64::from(VERSION)) {
+        return reply(result::ERROR);
     }
     match request.get("op").and_then(Value::as_str) {
-        Some("navigate") => handle_navigate(request, direct_terminal),
-        Some("prepare-path") => handle_prepare(request),
-        Some("abort-path") => handle_abort(request),
-        Some("commit-path") => handle_commit(request, direct_terminal),
-        Some("focus") => crate::focus::handle_relay(request),
-        _ => reply("error"),
+        Some(operation::NAVIGATE) => handle_navigate(request, direct_terminal),
+        Some(operation::PREPARE_PATH) => handle_prepare(request),
+        Some(operation::ABORT_PATH) => handle_abort(request),
+        Some(operation::COMMIT_PATH) => handle_commit(request, direct_terminal),
+        Some(operation::FOCUS) => crate::focus::handle_relay(request),
+        _ => reply(result::ERROR),
     }
 }
 
@@ -232,8 +234,8 @@ pub fn send_navigation(
         return 3;
     };
     let request = json!({
-        "v": 2,
-        "op": "navigate",
+        "v": super::protocol::VERSION,
+        "op": super::protocol::operation::NAVIGATE,
         // Protocol v2 uses compact scope names. Keep that vocabulary isolated
         // at this boundary so mixed-version SSH paths interoperate without
         // exposing old names through the unified public command interface.
@@ -251,8 +253,8 @@ pub fn send_navigation(
         })
         .as_deref()
     {
-        Some("armed") => 0,
-        Some("declined") => 3,
+        Some(super::protocol::result::ARMED) => 0,
+        Some(super::protocol::result::DECLINED) => 3,
         _ => 1,
     }
 }
@@ -384,7 +386,7 @@ fn handle_navigate(request: &Value, direct_terminal: Option<&DirectTerminal>) ->
         if !parent.is_empty() {
             let prepared = send(
                 Path::new(&parent),
-                &json!({"v": 2, "op": "prepare-path", "nonce": nonce}),
+                &json!({"v": protocol::VERSION, "op": protocol::operation::PREPARE_PATH, "nonce": nonce}),
                 RELAY_TIMEOUT,
             )
             .ok();
@@ -410,7 +412,7 @@ fn handle_navigate(request: &Value, direct_terminal: Option<&DirectTerminal>) ->
             // can prove whether retrying would duplicate the gesture.
             let _ = send(
                 Path::new(&parent),
-                &json!({"v": 2, "op": "commit-path", "nonce": nonce}),
+                &json!({"v": protocol::VERSION, "op": protocol::operation::COMMIT_PATH, "nonce": nonce}),
                 RELAY_TIMEOUT,
             );
         }
@@ -546,7 +548,7 @@ fn handle_commit(request: &Value, direct_terminal: Option<&DirectTerminal>) -> V
         } else {
             let _ = send(
                 Path::new(&parent),
-                &json!({"v": 2, "op": "commit-path", "nonce": nonce}),
+                &json!({"v": protocol::VERSION, "op": protocol::operation::COMMIT_PATH, "nonce": nonce}),
                 RELAY_TIMEOUT,
             );
         }
@@ -563,7 +565,7 @@ fn handle_commit(request: &Value, direct_terminal: Option<&DirectTerminal>) -> V
     if !parent.is_empty() {
         return send(
             Path::new(&parent),
-            &json!({"v": 2, "op": "commit-path", "nonce": nonce}),
+            &json!({"v": protocol::VERSION, "op": protocol::operation::COMMIT_PATH, "nonce": nonce}),
             RELAY_TIMEOUT,
         )
         .ok()
@@ -763,7 +765,7 @@ fn abort_parent(parent: &str, nonce: &str) {
     }
     let _ = send(
         Path::new(parent),
-        &json!({"v": 2, "op": "abort-path", "nonce": nonce}),
+        &json!({"v": protocol::VERSION, "op": protocol::operation::ABORT_PATH, "nonce": nonce}),
         RELAY_TIMEOUT,
     );
 }
@@ -807,11 +809,11 @@ fn result(reply: &Value) -> Option<&str> {
 }
 
 fn reply(result: &str) -> Value {
-    json!({"v": 2, "result": result})
+    json!({"v": super::protocol::VERSION, "result": result})
 }
 
 fn valid_navigation_reply(value: &Value) -> bool {
-    value.get("v").and_then(Value::as_u64) == Some(2)
+    value.get("v").and_then(Value::as_u64) == Some(u64::from(super::protocol::VERSION))
         && matches!(
             result(value),
             Some("armed" | "declined" | "error" | "emitted")

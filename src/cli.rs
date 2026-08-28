@@ -2,19 +2,22 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 
-const HELP: &str = "usage: termnav <command> [arguments]\n\
-\n\
-commands:\n\
-  navigate  route pane and tab navigation\n\
-  relay     communicate across terminal boundaries\n\
-  ssh       run an SSH session with Termnav relay transport\n\
-  link-host print the host represented by the current terminal context\n\
-  tmux      manage tmux context, focus, and click routing\n\
-  nvim      open and route Neovim targets\n\
-  vscode    publish VS Code focus\n\
-  eza       render terminal-aware directory links\n\
-  version   print the embedded build identity\n";
+const HELP: &str = r#"usage: termnav <command> [arguments]
+
+commands:
+  navigate   route pane and tab navigation
+  relay      communicate across terminal boundaries
+  ssh        run an SSH session with Termnav relay transport
+  link-host  print the host represented by the current terminal context
+  tmux       manage tmux context, focus, and click routing
+  nvim       open and route Neovim targets
+  vscode     publish VS Code focus
+  eza        render terminal-aware directory links
+  asset-path print the absolute path of an installed runtime asset
+  version    print the embedded build identity
+"#;
 
 /// Run the CLI and return its process exit status.
 pub fn run<I, S>(arguments: I, stdout: &mut dyn Write, stderr: &mut dyn Write) -> io::Result<i32>
@@ -41,9 +44,13 @@ where
             stdout.write_all(HELP.as_bytes())?;
             Ok(0)
         }
-        "version" | "--version" => {
+        "version" | "--version" if arguments.len() == 1 => {
             writeln!(stdout, "{}", crate::version::line())?;
             Ok(0)
+        }
+        "version" | "--version" => {
+            writeln!(stderr, "usage: termnav version")?;
+            Ok(2)
         }
         "navigate" => crate::commands::navigate::run(&arguments[1..], stdout, stderr),
         "relay" => crate::commands::relay::run(&arguments[1..], stdout, stderr),
@@ -54,6 +61,13 @@ where
             writeln!(stdout, "{}", crate::links::host())?;
             Ok(0)
         }
+        "link-host"
+            if arguments.len() == 2
+                && matches!(arguments[1].to_str(), Some("-h" | "--help" | "help")) =>
+        {
+            writeln!(stdout, "usage: termnav link-host")?;
+            Ok(0)
+        }
         "link-host" => {
             writeln!(stderr, "termnav link-host: no arguments are accepted")?;
             Ok(2)
@@ -61,6 +75,33 @@ where
         "nvim" => crate::commands::nvim::run(&arguments[1..], stdout, stderr),
         "tmux" => crate::commands::tmux::run(&arguments[1..], stdout, stderr),
         "eza" => crate::commands::eza::run(&arguments[1..], stdout, stderr),
+        "asset-path"
+            if arguments.len() == 2
+                && matches!(arguments[1].to_str(), Some("-h" | "--help" | "help")) =>
+        {
+            writeln!(stdout, "usage: termnav asset-path RELATIVE_PATH")?;
+            Ok(0)
+        }
+        "asset-path" if arguments.len() == 2 => match arguments[1].to_str() {
+            Some(relative) => match crate::assets::resolve(Path::new(relative)) {
+                Ok(asset) => {
+                    writeln!(stdout, "{}", asset.display())?;
+                    Ok(0)
+                }
+                Err(error) => {
+                    writeln!(stderr, "termnav asset-path: {error}")?;
+                    Ok(1)
+                }
+            },
+            None => {
+                writeln!(stderr, "termnav asset-path: path must be valid UTF-8")?;
+                Ok(2)
+            }
+        },
+        "asset-path" => {
+            writeln!(stderr, "usage: termnav asset-path RELATIVE_PATH")?;
+            Ok(2)
+        }
         "vscode" => crate::commands::vscode::run(&arguments[1..], stdout, stderr),
         _ => {
             writeln!(stderr, "termnav: unknown command: {command}")?;

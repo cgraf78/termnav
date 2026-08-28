@@ -16,7 +16,7 @@ if [[ ! -x $termnav ]]; then
 fi
 
 top_help=$($termnav --help)
-for command in navigate relay ssh link-host tmux nvim vscode eza version; do
+for command in navigate relay ssh link-host tmux nvim vscode eza asset-path version; do
   _assert_contains "CLI contract: top-level help exposes $command" \
     "$command" "$top_help"
 done
@@ -31,6 +31,10 @@ relay_help=$($termnav relay --help 2>&1)
 for command in send serve commit sweep; do
   _assert_contains "CLI contract: relay exposes $command" "$command" "$relay_help"
 done
+_assert_contains "CLI contract: relay documents serve socket syntax" \
+  "serve --socket PATH" "$relay_help"
+_assert_contains "CLI contract: relay documents commit identity syntax" \
+  "--client-created N" "$relay_help"
 for retired in warm stop hot-serve; do
   _assert_not_contains "CLI contract: relay omits retired $retired command" \
     "$retired" "$relay_help"
@@ -40,6 +44,12 @@ focus_help=$($termnav tmux focus --help 2>&1)
 for command in watch expire claim release stop sync; do
   _assert_contains "CLI contract: focus exposes $command" "$command" "$focus_help"
 done
+_assert_contains "CLI contract: focus documents exact client syntax" \
+  "--client-pid PID" "$focus_help"
+
+nvim_help=$($termnav nvim --help 2>&1)
+_assert_contains "CLI contract: nvim documents cli arity" "cli FILE [CWD]" "$nvim_help"
+_assert_contains "CLI contract: nvim documents remote reuse" "ssh-open HOST TARGET" "$nvim_help"
 
 set +e
 $termnav navigate pane-select diagonal >/dev/null 2>&1

@@ -170,7 +170,7 @@ pub(crate) fn real_ssh() -> io::Result<PathBuf> {
             continue;
         }
         let candidate = directory.join("ssh");
-        if candidate.is_file() && !is_termnav_shim(&candidate) {
+        if executable(&candidate) && !is_termnav_shim(&candidate) {
             return Ok(candidate);
         }
     }
@@ -178,6 +178,16 @@ pub(crate) fn real_ssh() -> io::Result<PathBuf> {
         io::ErrorKind::NotFound,
         "ssh is not installed",
     ))
+}
+
+fn executable(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // `is_file` accepts a non-executable shadow and makes Command fail before
+    // PATH lookup can reach a usable OpenSSH. Ask the kernel the same question
+    // execve will answer so uncommon PATH entries fail closed and fall through.
+    !path.as_bytes().is_empty() && unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
 }
 
 fn ssh_command(binary: &Path) -> Command {
