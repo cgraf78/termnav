@@ -4,6 +4,7 @@
 # omit it because remote absolute targets already carry their host context.
 # A context of "-" means the route should not pass a fourth helper argument.
 local-nvim	nvim-open://src/main.lua:12	src/main.lua:12	/repo	terminal	-
+local-nvim-space	nvim-open://src/file%20with%20space.lua:9	src/file with space.lua:9	/repo	terminal	-
 lazygit-space	lazygit-edit://src/file%20with%20space.lua:7	src/file with space.lua:7	/repo	terminal	-
 localhost-file	file://localhost/tmp/local.lua:4	/tmp/local.lua:4	/repo	terminal	-
 remote-file	file://remote.example/home/alex/.bashrc:1	/home/alex/.bashrc:1	/repo	remote	remote.example

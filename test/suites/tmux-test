@@ -63,6 +63,7 @@ _assert_contains "native opener: leaves cursor parsing to an existing target" \
 
 cat >"$mock_bin/tmux" <<'MOCK'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"${TERMNAV_TMUX_TEST_LOG:?}"
 case "$1" in
   list-panes) printf '%%1\tbash\n' ;;
   display-popup) printf '%s\n' "${@: -1}" >>"${TERMNAV_TMUX_TEST_LOG:?}" ;;
@@ -81,5 +82,140 @@ TMUX="/tmp/termnav-test.sock,1,0" \
 _assert_exit "native opener: missing remote session is user-facing success" 0 "$?"
 _assert_contains "native opener: remote diagnostic names the host" \
   'No nvim session found for remote.example: /home/alex/.zshrc' "$(cat "$log")"
+
+remote_helper="$tmp/remote-open-helper"
+remote_helper_log="$tmp/remote-open-helper.log"
+cat >"$remote_helper" <<'MOCK'
+#!/usr/bin/env bash
+printf '<%s>\n' "$@" >"${TERMNAV_REMOTE_OPEN_TEST_LOG:?}"
+MOCK
+chmod +x "$remote_helper"
+
+: >"$log"
+TMUX="/tmp/termnav-test.sock,1,0" \
+  TMUX_PANE=%1 \
+  PATH="$mock_bin:/usr/bin:/bin" \
+  TERMNAV_TMUX_TEST_LOG="$log" \
+  TERMNAV_REMOTE_OPEN_HELPER="$remote_helper" \
+  TERMNAV_REMOTE_OPEN_TEST_LOG="$remote_helper_log" \
+  "$termnav" tmux follow-click --stdin <<'EOF'
+file://remote.example/home/alex/.zshrc
+
+
+0
+/home/alex
+/dev/pts/9
+%9
+0
+0
+0
+/tmp/termnav-test.sock
+EOF
+_assert_exit "native opener: configured remote route succeeds" 0 "$?"
+_assert_eq "native opener: configured route receives host target and exact clicked pane" \
+  $'<tmux>\n</tmp/termnav-test.sock>\n<%9>\n<remote.example>\n</home/alex/.zshrc>' \
+  "$(cat "$remote_helper_log")"
+_assert_not_contains "native opener: configured route never scans or types into another pane" \
+  'list-panes' "$(cat "$log")"
+_assert_not_contains "native opener: configured route never injects tmux prefix keys" \
+  'send-keys' "$(cat "$log")"
+
+cat >"$mock_bin/ssh" <<'MOCK'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -G ]]; then
+  printf 'controlpath /tmp/termnav-existing-master\n'
+  exit 0
+fi
+printf '%s\n' "$$" >"${TERMNAV_TIMEOUT_CHILD_PID:?}"
+exec sleep 30
+MOCK
+cat >"$mock_bin/nvim" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"${TERMNAV_TIMEOUT_CHILD_PID:?}"
+exec sleep 30
+MOCK
+cat >"$tmp/hanging-remote-open-helper" <<'MOCK'
+#!/usr/bin/env bash
+sleep 30 &
+printf '%s %s\n' "$$" "$!" >"${TERMNAV_TIMEOUT_CHILD_PID:?}"
+wait
+MOCK
+chmod +x "$mock_bin/ssh" "$mock_bin/nvim" "$tmp/hanging-remote-open-helper"
+
+# These are real process-lifecycle checks rather than mocked call assertions.
+# The outer deadline only prevents a pre-fix test run from wedging forever;
+# Termnav must return first and must leave no helper PID alive.
+python3 - "$termnav" "$mock_bin" "$tmp" <<'PY'
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+termnav, mock_bin, root = sys.argv[1:]
+
+def run_bounded(arguments, pid_file, extra_env):
+    env = os.environ.copy()
+    env.update(extra_env)
+    env["PATH"] = mock_bin + ":/usr/bin:/bin"
+    env["TERMNAV_TIMEOUT_CHILD_PID"] = pid_file
+    started = time.monotonic()
+    process = subprocess.Popen([termnav, *arguments], env=env, start_new_session=True)
+    try:
+        code = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise SystemExit(f"unbounded child execution: {' '.join(arguments)}")
+    if time.monotonic() - started >= 4:
+        raise SystemExit(f"child deadline was not enforced: {' '.join(arguments)}")
+    if code == 0:
+        raise SystemExit(f"timed-out child unexpectedly succeeded: {' '.join(arguments)}")
+    with open(pid_file, encoding="utf-8") as stream:
+        child_pids = [int(value) for value in stream.read().split()]
+    deadline = time.monotonic() + 1
+    while True:
+        alive = []
+        for child_pid in child_pids:
+            try:
+                os.kill(child_pid, 0)
+                alive.append(child_pid)
+            except ProcessLookupError:
+                pass
+        if not alive:
+            return
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"timed-out child processes remain alive: {alive}")
+        time.sleep(0.01)
+
+run_bounded(
+    ["nvim", "ssh-open", "remote.example", "/tmp/file.lua:1"],
+    root + "/ssh-child.pid",
+    {"TERMNAV_SSH_CONTROL_HOSTS": "remote.example"},
+)
+
+run_bounded(
+    [
+        "nvim", "open", "link", "/tmp/file.lua:1", "", "remote",
+        "remote.example", "wezterm", "", "17",
+    ],
+    root + "/remote-helper-child.pid",
+    {"TERMNAV_REMOTE_OPEN_HELPER": root + "/hanging-remote-open-helper"},
+)
+
+socket_path = root + "/nvim.sock"
+server = socket.socket(socket.AF_UNIX)
+server.bind(socket_path)
+try:
+    run_bounded(
+        ["nvim", "open", "link", "/tmp/file.lua:1", "", "nvim", socket_path],
+        root + "/nvim-child.pid",
+        {},
+    )
+finally:
+    server.close()
+PY
+_assert_exit "native opener: SSH and nvim children are bounded, killed, and reaped" 0 "$?"
 
 _test_summary

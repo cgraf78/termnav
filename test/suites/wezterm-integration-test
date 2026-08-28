@@ -333,6 +333,24 @@ shell_tmux_empty_recovery_count=$(wc -l <"$shell_tmux_log" | tr -d ' ')
 _assert_eq "shell wezterm vars: empty nested-client query remains retryable" \
   "2" "$shell_tmux_empty_recovery_count"
 
+: >"$shell_tmux_log"
+TMUX=/tmp/tmux-publish-recovery,1,0 \
+  TMUX_MOCK_DISPLAY_FAIL=1 \
+  TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+  PATH="$shell_tmux_mock:$PATH" \
+  SHELL_INTEGRATION="$TERMNAV_ROOT/share/termnav/shell.sh" \
+  bash --noprofile --norc -c '
+    source "$SHELL_INTEGRATION" >/dev/null
+    _termnav_wezterm_sent_NVIM_LINK_CWD=0
+    _termnav_wezterm_tmux_client_cache_set=0
+    : >"$TERMNAV_TMUX_QUERY_LOG"
+    _termnav_wezterm_set_user_var NVIM_LINK_CWD /repo >/dev/null
+    unset TMUX_MOCK_DISPLAY_FAIL
+    _termnav_wezterm_set_user_var NVIM_LINK_CWD /repo >/dev/null
+  '
+_assert_eq "shell integration: failed publication does not commit the value cache" \
+  "2" "$(wc -l <"$shell_tmux_log" | tr -d ' ')"
+
 encoder_mock=$(_tmpdir)/encoder-bin
 encoder_log=$(_tmpdir)/encoder.log
 mkdir -p "$encoder_mock"
@@ -838,11 +856,6 @@ local function check(name, ok)
   end
 end
 
-check(
-  "remote helper augments ordinary user command paths",
-  routes.remote_path_command():find('$HOME/.local/bin', 1, true) ~= nil
-)
-
 local function pane(vars, cwd_uri, opts)
   opts = opts or {}
   local p = {
@@ -851,6 +864,9 @@ local function pane(vars, cwd_uri, opts)
     end,
     get_current_working_dir = function()
       return cwd_uri
+    end,
+    pane_id = function()
+      return opts.pane_id or 17
     end,
   }
   if opts.foreground then
@@ -1073,11 +1089,13 @@ handled = routes.open_uri(nil, pane({
   send_text = true,
 }), "nvim-open://src/main.lua:12")
 check("controlmaster remote nvim-open handled", handled == false)
-check("controlmaster remote nvim-open uses unified ssh-open", child_calls[1][1]:match("termnav$") ~= nil and child_calls[1][2] == "nvim" and child_calls[1][3] == "ssh-open")
-check("controlmaster remote nvim-open passes host", child_calls[1][4] == "remote.example")
-check("controlmaster remote nvim-open passes resolved target", child_calls[1][5] == "/remote/repo/src/main.lua:12")
+check("controlmaster remote nvim-open stays asynchronous", #child_calls == 0 and #calls == 1)
+check("controlmaster remote nvim-open uses unified opener", calls[1][1]:match("termnav$") ~= nil and calls[1][2] == "nvim" and calls[1][3] == "open")
+check("controlmaster remote nvim-open passes host", calls[1][8] == "remote.example")
+check("controlmaster remote nvim-open passes resolved target", calls[1][5] == "/remote/repo/src/main.lua:12")
+check("controlmaster remote nvim-open types the pane identity", calls[1][9] == "wezterm")
+check("controlmaster remote nvim-open passes exact pane", calls[1][11] == "17")
 check("controlmaster remote nvim-open skips pane send", #sent_text == 0)
-check("controlmaster remote nvim-open skips background helper", #calls == 0)
 
 calls = {}
 sent_text = {}
@@ -1093,16 +1111,10 @@ handled = routes.open_uri(nil, pane({
   send_text = true,
 }), "nvim-open://src/main.lua:12")
 check("direct remote nvim-open handled", handled == false)
-check("direct remote nvim-open tries controlmaster first", child_calls[1][4] == "remote.example")
-check("direct remote nvim-open skips local helper", #calls == 0)
-check("direct remote nvim-open sends prefix first", sent_text[1] == "\002:")
-check("direct remote nvim-open waits for tmux command prompt", timers[1].delay == 0.15)
-flush_timers()
-check("direct remote nvim-open sends remote tmux command", sent_text[2]:find("run%-shell ") == 1)
-check(
-  "direct remote nvim-open includes resolved target",
-  sent_text[2]:find("command termnav nvim open tmux-link '/remote/repo/src/main.lua:12'", 1, true) ~= nil
-)
+check("direct remote nvim-open stays asynchronous", #child_calls == 0 and #calls == 1)
+check("direct remote nvim-open never injects terminal input", #sent_text == 0 and #timers == 0)
+check("direct remote nvim-open types the pane identity", calls[1][9] == "wezterm")
+check("direct remote nvim-open passes exact pane", calls[1][11] == "17")
 
 calls = {}
 sent_text = {}
@@ -1118,7 +1130,7 @@ handled = routes.open_uri(nil, pane({
   send_text = true,
 }), "nvim-open://src/main.lua:12")
 check("local tmux remote nvim-open handled", handled == false)
-check("local tmux remote nvim-open tries controlmaster first", child_calls[1][4] == "remote.example")
+check("local tmux remote nvim-open stays asynchronous", #child_calls == 0 and #calls == 1)
 check("local tmux remote nvim-open does not send raw prefix", #sent_text == 0)
 check("local tmux remote nvim-open uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
 
@@ -1151,13 +1163,12 @@ handled = routes.open_uri(nil, pane({
   send_text = true,
 }), "nvim-open://src/main.lua:12")
 check("non-tmux remote shell nvim-open handled", handled == false)
-check("non-tmux remote shell tries controlmaster", child_calls[1][4] == "remote.example")
 check(
   "non-tmux remote shell passes resolved target",
-  child_calls[1][5] == "/remote/repo/src/main.lua:12"
+  calls[1][5] == "/remote/repo/src/main.lua:12"
 )
 check("non-tmux remote shell does not send raw prefix", #sent_text == 0)
-check("non-tmux remote shell skips helper when controlmaster succeeds", #calls == 0)
+check("non-tmux remote shell stays asynchronous", #child_calls == 0 and #calls == 1)
 
 calls = {}
 sent_text = {}
@@ -1172,7 +1183,6 @@ handled = routes.open_uri(nil, pane({
   send_text = true,
 }), "nvim-open://src/main.lua:12")
 check("non-tmux remote shell fallback nvim-open handled", handled == false)
-check("non-tmux remote shell fallback tries controlmaster first", child_calls[1][4] == "remote.example")
 check("non-tmux remote shell fallback does not send raw prefix", #sent_text == 0)
 check("non-tmux remote shell fallback uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
 
@@ -1216,9 +1226,8 @@ errors = {}
 child_success = false
 handled = routes.open_uri(window(), pane({}, { host = "", file_path = "/local" }), "file://localhost/tmp/missing.lua:4")
 check("local file link failure is handled by custom route", handled == false)
-check("local file link failure tries nvim helper synchronously", child_calls[1][4] == "link")
-check("local file link failure shows a toast", toasts[1].message == "mock opener failure")
-check("local file link failure is logged", errors[1] == "mock opener failure")
+check("local file link callback stays asynchronous", #child_calls == 0 and calls[1][4] == "link")
+check("local file link callback does not wait to synthesize an error", #toasts == 0 and #errors == 0)
 
 calls = {}
 child_calls = {}
@@ -1439,57 +1448,6 @@ case "$1" in
 esac
 EOF
 chmod +x "$mock_bin/tmux"
-
-cat >"$mock_bin/ssh" <<'EOF'
-#!/usr/bin/env bash
-{
-  printf 'argv:'
-  printf ' <%s>' "$@"
-  printf '\n'
-} >>"$SSH_MOCK_LOG"
-
-is_check=false
-prev=
-for arg in "$@"; do
-  if [[ "$prev" == "-O" && "$arg" == "check" ]]; then
-    is_check=true
-    break
-  fi
-  prev="$arg"
-done
-
-if "$is_check"; then
-  [[ "${SSH_MOCK_MASTER:-}" == "yes" ]]
-  exit $?
-fi
-
-if [[ "${SSH_MOCK_RUN_FAIL:-}" == "yes" ]]; then
-  exit 42
-fi
-
-exit 0
-EOF
-chmod +x "$mock_bin/ssh"
-
-cat >"$mock_bin/ps" <<'EOF'
-#!/usr/bin/env bash
-if [[ -n "${PS_MOCK_PROCS:-}" ]]; then
-  cat "$PS_MOCK_PROCS"
-  exit 0
-fi
-exec /bin/ps "$@"
-EOF
-chmod +x "$mock_bin/ps"
-
-cat >"$mock_bin/nvim-remote-pane-host" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "customremote" && "${2:-}" == *"--host custom-host"* ]]; then
-  printf '%s\n' "custom-host"
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$mock_bin/nvim-remote-pane-host"
 
 socket_listener() {
   local socket="$1"
