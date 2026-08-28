@@ -282,6 +282,70 @@ ssh_shim="$TERMNAV_ROOT/share/termnav/shims/ssh"
 ssh_probe=$(_tmpdir)
 ssh_probe_bin="$ssh_probe/bin"
 mkdir -p "$ssh_probe_bin"
+
+# Repository synchronization can update this shim before Shdeps reaches its
+# later tool-install phase. During that bounded cutover window, SSH must remain
+# usable so the same update can finish installing the new Termnav binary.
+ssh_fallback_bin="$ssh_probe/fallback-bin"
+ssh_fallback_log="$ssh_probe/fallback.log"
+mkdir -p "$ssh_fallback_bin"
+printf '#!%s\n' "$BASH" >"$ssh_fallback_bin/ssh"
+cat >>"$ssh_fallback_bin/ssh" <<'SH'
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
+SH
+chmod +x "$ssh_fallback_bin/ssh"
+TERMNAV_TEST_COMMAND_LOG="$ssh_fallback_log" \
+  PATH="${ssh_shim%/ssh}:$ssh_fallback_bin:${BASH%/*}:/usr/bin:/bin" \
+  _with_timeout 5s "$ssh_shim" bootstrap.example printf hello \
+  >/dev/null 2>&1
+ssh_fallback_status=$?
+_assert_exit "ssh shim: missing termnav falls back without recursion" \
+  0 "$ssh_fallback_status"
+_assert_eq "ssh shim: fallback preserves the exact command" \
+  $'<bootstrap.example>\n<printf>\n<hello>' "$(cat "$ssh_fallback_log" 2>/dev/null)"
+
+ssh_fallback_cwd="$ssh_probe/fallback-cwd"
+ssh_fallback_cwd_log="$ssh_probe/fallback-cwd.log"
+mkdir -p "$ssh_fallback_cwd"
+printf '#!%s\n' "$BASH" >"$ssh_fallback_cwd/ssh"
+cat >>"$ssh_fallback_cwd/ssh" <<'SH'
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
+SH
+chmod +x "$ssh_fallback_cwd/ssh"
+(
+  cd "$ssh_fallback_cwd" || exit 1
+  TERMNAV_TEST_COMMAND_LOG="$ssh_fallback_cwd_log" \
+    _with_timeout 5s env \
+    PATH="${ssh_shim%/ssh}:" \
+    "$BASH" "$ssh_shim" current-dir.example true \
+    >/dev/null 2>&1
+)
+ssh_fallback_cwd_status=$?
+_assert_exit "ssh shim: trailing empty PATH component searches the current directory" \
+  0 "$ssh_fallback_cwd_status"
+_assert_eq "ssh shim: current-directory fallback preserves the exact command" \
+  $'<current-dir.example>\n<true>' "$(cat "$ssh_fallback_cwd_log" 2>/dev/null)"
+
+ssh_fallback_glob="$ssh_probe/fallback-[x]"
+ssh_fallback_expansion="$ssh_probe/fallback-x"
+ssh_fallback_glob_log="$ssh_probe/fallback-glob.log"
+mkdir -p "$ssh_fallback_glob" "$ssh_fallback_expansion"
+printf '#!%s\n' "$BASH" >"$ssh_fallback_glob/ssh"
+cat >>"$ssh_fallback_glob/ssh" <<'SH'
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
+SH
+printf '#!%s\nexit 9\n' "$BASH" >"$ssh_fallback_expansion/ssh"
+chmod +x "$ssh_fallback_glob/ssh" "$ssh_fallback_expansion/ssh"
+TERMNAV_TEST_COMMAND_LOG="$ssh_fallback_glob_log" \
+  PATH="${ssh_shim%/ssh}:$ssh_fallback_glob:${BASH%/*}:/usr/bin:/bin" \
+  _with_timeout 5s "$ssh_shim" literal-path.example true \
+  >/dev/null 2>&1
+ssh_fallback_glob_status=$?
+_assert_exit "ssh shim: glob characters in PATH remain literal" \
+  0 "$ssh_fallback_glob_status"
+_assert_eq "ssh shim: literal PATH fallback preserves the exact command" \
+  $'<literal-path.example>\n<true>' "$(cat "$ssh_fallback_glob_log" 2>/dev/null)"
+
 cat >"$ssh_probe_bin/termnav" <<'SH'
 #!/usr/bin/env bash
 printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
