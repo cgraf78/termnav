@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# process-contract-test - keep production navigation single-process by design.
+
+set -euo pipefail
+export NO_COLOR=1
+
+test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=${test_dir%/test}
+# shellcheck source=../helpers.sh
+. "$test_dir/helpers.sh"
+
+# Dotfiles is Termnav's sole consumer and migrates in the paired change. Old
+# executable bodies therefore buy no supported compatibility, while retaining
+# them would leave two implementations of latency- and security-sensitive
+# routing policy. Keep this inventory explicit so an obsolete facade cannot
+# quietly return in a later release.
+retired_paths=(
+  bin/eza-nvim-links
+  bin/nvim-link-host
+  bin/nvim-ssh-control-open
+  bin/nvim-tmux-open
+  bin/termnav-navigate
+  bin/termnav-relay
+  bin/termnav-tmux-context
+  bin/termnav-tmux-focus
+  bin/tmux-follow-click
+  bin/vscode-nvim-focus
+  lib/termnav/hot_service.py
+  lib/termnav/navigation.py
+  lib/termnav/navigation_protocol.py
+  lib/termnav/process_info.py
+  lib/termnav/relay.py
+  lib/termnav/relay_client.py
+  lib/termnav/tmux_focus.py
+)
+for relative in "${retired_paths[@]}"; do
+  _assert_file_missing "process contract: retired production path stays absent: $relative" \
+    "$root/$relative"
+done
+
+config=$(<"$root/scripts/release.conf")
+_assert_contains "process contract: release publishes the unified binary" \
+  "RELEASE_BINARY=termnav" "$config"
+_assert_contains "process contract: release exposes commands through archive bin" \
+  "RELEASE_BINARY_DEST=bin/termnav" "$config"
+_assert_not_contains "process contract: release has no binary aliases" \
+  "RELEASE_BINARY_ALIASES" "$config"
+for retired in termnav-relay termnav-navigate nvim-tmux-open tmux-follow-click; do
+  _assert_not_contains "process contract: release omits retired alias $retired" \
+    "$retired" "$config"
+done
+
+# Sourcing the interactive integration must be inert. In particular it must
+# not recreate the historical hot service merely to save native startup time.
+tmp=$(_tmpdir)
+mkdir -p "$tmp/bin" "$tmp/home"
+# Termux installs Bash below its application prefix rather than /bin or
+# /usr/bin. Resolve the interpreter before constraining the child PATH so this
+# fixture tests inert activation, not a host filesystem-layout assumption.
+bash_path=$(command -v bash)
+cat >"$tmp/bin/termnav" <<'SH'
+#!/usr/bin/env sh
+printf 'invoked\n' >>"$TERMNAV_PROCESS_CONTRACT_LOG"
+exit 99
+SH
+chmod 0700 "$tmp/bin/termnav"
+# The literal $1 belongs to the deliberately isolated child shell.
+# shellcheck disable=SC2016
+TERMNAV_PROCESS_CONTRACT_LOG="$tmp/invocations" \
+  HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/runtime" \
+  PATH="$tmp/bin:/usr/bin:/bin" \
+  TMUX='' TMUX_PANE='' TERM_PROGRAM='' WEZTERM_PANE='' SSH_CONNECTION='' \
+  "$bash_path" --noprofile --norc -c '. "$1"' termnav-shell "$root/share/termnav/shell.sh"
+_assert_file_missing "process contract: shell activation invokes no Termnav command" \
+  "$tmp/invocations"
+_assert_eq "process contract: shell activation creates no runtime state" \
+  false "$([[ -e "$tmp/runtime" ]] && echo true || echo false)"
+
+_test_summary

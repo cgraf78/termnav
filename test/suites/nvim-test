@@ -9,8 +9,33 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
-# shellcheck source=../../lib/termnav/nvim-open/common.sh
-. "$TERMNAV_ROOT/lib/termnav/nvim-open/common.sh"
+
+_nvim_test_pane_key() {
+  local pane=$1 tmux_value=${TMUX:-} tmux_fields tmux_socket tmux_pid key
+  local chunk first=1
+
+  tmux_fields=${tmux_value%,*}
+  if [[ $tmux_fields == "$tmux_value" || $tmux_fields != *,* ]]; then
+    tmux_socket=$tmux_value
+    tmux_pid=
+  else
+    tmux_socket=${tmux_fields%,*}
+    tmux_pid=${tmux_fields##*,}
+  fi
+  key=$(printf '%s\0%s\0%s' "$tmux_socket" "$tmux_pid" "$pane" |
+    LC_ALL=C od -An -tx1 -v | tr -d ' \n') || return 1
+  while [[ -n $key ]]; do
+    chunk=${key:0:120}
+    key=${key:120}
+    if [[ $first == 1 ]]; then
+      printf 'v1-%s' "$chunk"
+      first=0
+    else
+      printf '/%s' "$chunk"
+    fi
+  done
+  printf '\n'
+}
 
 _nvim_lua() {
   nvim --headless --noplugin -u NONE -i NONE \
@@ -391,7 +416,7 @@ _assert_eq "setup: publishes current nvim under XDG_STATE_HOME" "$expected" "$re
 
 NVIM_TMUX_OPEN_REGISTRY=$(_tmpdir)
 registry_socket='/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-registry_key=$(TMUX="$registry_socket,101,0" nvim_open_pane_key '%1')
+registry_key=$(TMUX="$registry_socket,101,0" _nvim_test_pane_key '%1')
 result=$(
   umask 000
   _nvim_lua "
@@ -441,8 +466,8 @@ for server_pid in 101 202; do
     opener.setup()
   " >/dev/null
 done
-comma_server_one_key=$(TMUX='/tmp/tmux,comma.sock,101,0' nvim_open_pane_key '%1')
-comma_server_two_key=$(TMUX='/tmp/tmux,comma.sock,202,0' nvim_open_pane_key '%1')
+comma_server_one_key=$(TMUX='/tmp/tmux,comma.sock,101,0' _nvim_test_pane_key '%1')
+comma_server_two_key=$(TMUX='/tmp/tmux,comma.sock,202,0' _nvim_test_pane_key '%1')
 result="$(
   printf '%s\n' "$([[ -d "$NVIM_TMUX_OPEN_COMMA/nvim-tmux-open/registry/panes/$comma_server_one_key" ]] && echo true || echo false)"
   printf '%s\n' "$([[ -d "$NVIM_TMUX_OPEN_COMMA/nvim-tmux-open/registry/panes/$comma_server_two_key" ]] && echo true || echo false)"
@@ -799,7 +824,7 @@ result=$(_nvim_lua "
   end
 
   local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
-    command = '/unused',
+    command = { '/unused' },
     observed = function() return 1234 end,
     source = 'nvim-test',
     run = function(_, callback) callback(0) end,
@@ -832,7 +857,7 @@ result=$(_nvim_lua "
   end
 
   local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
-    command = '/unused',
+    command = { '/unused' },
     observed = function() return 1234 end,
     source = 'nvim-test',
     run = function(_, callback) callback(10) end,
@@ -852,7 +877,7 @@ _assert_eq "nvim focus: detached or hidden panes keep probing for reattach" \
 result=$(_nvim_lua "
   local calls = {}
   local publisher = dofile('$TERMNAV_ROOT/lib/termnav/nvim/vscode-focus.lua').new({
-    command = '/unused',
+    command = { '/unused' },
     observed = function() return 1234 end,
     source = 'nvim-test',
     run = function(command, callback)

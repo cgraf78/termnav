@@ -12,6 +12,12 @@ TERMNAV_REPO_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 echo "=== termnav: manpages ==="
 
+termnav_page=$(cat "$TERMNAV_REPO_ROOT/man/man1/termnav.1")
+_assert_contains "manpage requires an explicit command" \
+  ".I command" "$termnav_page"
+_assert_not_contains "manpage does not document a zero-argument integration mode" \
+  "With no arguments" "$termnav_page"
+
 while IFS= read -r command; do
   page="$TERMNAV_REPO_ROOT/man/man1/$command.1"
   _assert_file_exists "manpage exists: $command" "$page"

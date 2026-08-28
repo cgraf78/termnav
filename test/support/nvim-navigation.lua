@@ -37,34 +37,33 @@ end
 local function fake_context(options)
   options = options or {}
   local commands = {}
-  local streams = {}
+  local jobs = {}
   options.command = options.command
     or function(arguments)
       commands[#commands + 1] = arguments
       return 0, ""
     end
   options.stream = options.stream
-    or function(arguments, on_result, on_exit)
-      local stream = {
+    or function()
+      error("resident navigation stream must not be used")
+    end
+  options.spawn = options.spawn
+    or function(arguments, on_exit)
+      local job = {
         arguments = arguments,
-        sent = {},
-        on_result = on_result,
         on_exit = on_exit,
       }
-      function stream.send(request)
-        stream.sent[#stream.sent + 1] = request
-        return true
+      function job.finish(status, output)
+        job.status = status
+        on_exit(status, output)
       end
-      function stream.close()
-        stream.closed = true
-      end
-      streams[#streams + 1] = stream
-      return stream
+      jobs[#jobs + 1] = job
+      return job
     end
   options.schedule = options.schedule or function(callback)
     callback()
   end
-  return navigation.new(options), commands, streams
+  return navigation.new(options), commands, jobs
 end
 
 test("local split navigation starts no process", function()
@@ -103,7 +102,7 @@ test("tmux pane edge delegates arbitrary ancestry to the shared router", functio
   vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
   vim.env.TMUX_PANE = "%7"
   local commands = {}
-  local ctx, _, streams = fake_context({
+  local ctx, _, jobs = fake_context({
     command = function(arguments)
       commands[#commands + 1] = arguments
       return 0, "__TERMNAV_DECLINED__\n"
@@ -113,11 +112,10 @@ test("tmux pane edge delegates arbitrary ancestry to the shared router", functio
   equal(ctx.pane("up"), true, "router should accept the tmux edge")
   equal(#commands, 1, "edge detection should remain one tmux command")
   equal(
-    streams[1].arguments,
-    { "termnav-navigate", "--stream" },
-    "the router should start one ordered stream"
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "pane-select", "up" },
+    "the router should start one native request"
   )
-  equal(streams[1].sent, { "pane-select up" }, "the stream should receive the pane request")
 end)
 
 test("outermost pane edge does not invent terminal pane navigation", function()
@@ -130,7 +128,7 @@ end)
 
 test("application tab selection stays process free", function()
   local selected = {}
-  local ctx, commands, streams = fake_context({
+  local ctx, commands, jobs = fake_context({
     application = {
       tab_count = function()
         return 2
@@ -145,12 +143,12 @@ test("application tab selection stays process free", function()
 
   equal(selected, { "next" }, "application callback should receive direction")
   equal(#commands, 0, "application tab should not invoke tmux")
-  equal(#streams, 0, "application tab should not start the router")
+  equal(#jobs, 0, "application tab should not start the router")
 end)
 
 test("application tab movement owns its boundary no-op", function()
   local moved = {}
-  local ctx, commands, streams = fake_context({
+  local ctx, commands, jobs = fake_context({
     application = {
       tab_count = function()
         return 2
@@ -165,13 +163,13 @@ test("application tab movement owns its boundary no-op", function()
 
   equal(moved, { "left" }, "application should receive the movement request")
   equal(#commands, 0, "application movement should not invoke tmux")
-  equal(#streams, 0, "application boundary should not bubble")
+  equal(#jobs, 0, "application boundary should not bubble")
 end)
 
 test("single application tab delegates linked-session policy to the router", function()
   vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
   vim.env.TMUX_PANE = "%7"
-  local ctx, commands, streams = fake_context({
+  local ctx, commands, jobs = fake_context({
     application = {
       tab_count = function()
         return 1
@@ -183,17 +181,16 @@ test("single application tab delegates linked-session policy to the router", fun
 
   equal(#commands, 0, "nvim should not choose a tmux session itself")
   equal(
-    streams[1].arguments,
-    { "termnav-navigate", "--stream" },
-    "tab selection should start one ordered stream"
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "tab-select", "previous" },
+    "tab selection should start one native request"
   )
-  equal(streams[1].sent, { "tab-select previous" }, "the stream should receive the tab request")
 end)
 
-test("boundary bursts share one ordered router stream", function()
+test("boundary bursts use one bounded FIFO of native requests", function()
   vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
   vim.env.TMUX_PANE = "%7"
-  local ctx, _, streams = fake_context({
+  local ctx, _, jobs = fake_context({
     command = function()
       return 0, "__TERMNAV_DECLINED__"
     end,
@@ -201,52 +198,78 @@ test("boundary bursts share one ordered router stream", function()
 
   ctx.pane("left")
   ctx.pane("right")
-  equal(#streams, 1, "one worker should own the entire burst")
-  equal(streams[1].arguments, { "termnav-navigate", "--stream" }, "stream command")
+  equal(#jobs, 1, "only one native process should be in flight")
   equal(
-    streams[1].sent,
-    { "pane-select left", "pane-select right" },
-    "requests should preserve input order"
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "pane-select", "left" },
+    "the first process should preserve input order"
   )
+  jobs[1].finish(0, '{"version":1}')
+  equal(#jobs, 2, "completion should launch the next queued request")
+  equal(jobs[2].arguments, {
+    "termnav",
+    "navigate",
+    "--emit-continuation",
+    "pane-select",
+    "right",
+    "--continuation",
+    '{"version":1}',
+  }, "the second process should preserve input order")
 end)
 
-test("setup prewarms one persistent router stream", function()
-  local ctx, _, streams = fake_context({ mappings = true })
+test("boundary queue is bounded and reports overflow", function()
+  local notices = {}
+  local ctx, _, jobs = fake_context({
+    notify = function(message)
+      notices[#notices + 1] = message
+    end,
+  })
+
+  for _ = 1, 102 do
+    ctx.tab_select("next")
+  end
+
+  equal(#jobs, 1, "only one native process should be in flight")
+  equal(#notices, 1, "the first request beyond the queue bound should be visible")
+  truthy(notices[1]:find("queue is full", 1, true) ~= nil, "overflow diagnostic")
+end)
+
+test("setup starts no navigation process", function()
+  local ctx, _, jobs = fake_context({ mappings = true })
 
   ctx.setup()
 
-  equal(#streams, 1, "setup should hide Python startup before the first gesture")
-  equal(streams[1].arguments, { "termnav-navigate", "--stream" }, "prewarmed stream command")
-  equal(streams[1].sent, {}, "prewarming should not invent a navigation request")
-  truthy(not streams[1].closed, "the shared worker should remain ready between gestures")
+  equal(#jobs, 0, "editor setup must not leave a resident navigation worker")
 end)
 
-test("setup retries a temporarily unavailable router on the next boundary", function()
+test("a failed one-shot does not block the next boundary", function()
   local attempts = 0
   local requests = {}
   local ctx = navigation.new({
     mappings = true,
-    stream = function()
+    spawn = function(arguments, on_exit)
       attempts = attempts + 1
+      requests[#requests + 1] = arguments
       if attempts == 1 then
-        error("router unavailable")
+        return false
       end
-      return {
-        send = function(request)
-          requests[#requests + 1] = request
-          return true
-        end,
-        close = function() end,
-      }
+      on_exit(0)
+      return true
     end,
   })
 
   local ok = pcall(ctx.setup)
-  truthy(ok, "an unavailable prewarm must not abort editor setup")
-  equal(attempts, 1, "setup should try one prewarm")
+  truthy(ok, "setup without prewarming should succeed")
+  equal(attempts, 0, "setup should not launch the router")
   ctx.tab_select("next")
-  equal(attempts, 2, "the next boundary should retry the router")
-  equal(requests, { "tab-select next" }, "the recovered stream should receive the gesture")
+  equal(attempts, 1, "the first boundary should make one attempt")
+  ctx.tab_select("previous")
+  equal(attempts, 2, "the next boundary should retry after launch failure")
+  equal(
+    requests[2],
+    { "termnav", "navigate", "--emit-continuation", "tab-select", "previous" },
+    "retry request"
+  )
 end)
 
 test("previous split navigation remains local and process free", function()
@@ -296,7 +319,7 @@ test("previous pane returns to tmux after crossing the nvim boundary", function(
   vim.cmd("wincmd h")
   local source = vim.api.nvim_get_current_win()
   local commands = {}
-  local ctx, _, streams = fake_context({
+  local ctx, _, jobs = fake_context({
     command = function(arguments)
       commands[#commands + 1] = arguments
       return 0, "__TERMNAV_DECLINED__"
@@ -304,7 +327,11 @@ test("previous pane returns to tmux after crossing the nvim boundary", function(
   })
 
   ctx.pane("left")
-  equal(streams[1].sent, { "pane-select left" }, "boundary route")
+  equal(
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "pane-select", "left" },
+    "boundary route"
+  )
   ctx.previous()
 
   equal(vim.api.nvim_get_current_win(), source, "previous should not enter another nvim split")

@@ -25,6 +25,6 @@ status=$?
 
 _assert_exit "nvim navigation: headless behavior suite exits successfully" 0 "$status"
 _assert_contains "nvim navigation: all fast-path and mapping cases pass" \
-  "nvim-navigation: 18 passed" "$output"
+  "nvim-navigation: 19 passed" "$output"
 
 _test_summary

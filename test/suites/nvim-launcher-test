@@ -31,7 +31,7 @@ ps_log="$case_root/ps.log"
 open_log="$case_root/open.log"
 mkdir -p "$case_bin" "$case_cwd"
 
-cat >"$case_bin/nvim-tmux-open" <<'SH'
+cat >"$case_bin/termnav" <<'SH'
 #!/usr/bin/env bash
 printf 'open:%s\n' "$*" >>"$TERMNAV_TEST_OPEN_LOG"
 exit "${NVIM_TMUX_OPEN_RC:-0}"
@@ -48,7 +48,7 @@ if [[ "$*" == "-ww -o comm= -o args= -p "* ]]; then
 fi
 exit 1
 SH
-chmod +x "$case_bin/nvim-tmux-open" "$case_bin/ps"
+chmod +x "$case_bin/termnav" "$case_bin/ps"
 
 _run_reuse_case() {
   local proc_mode="$1" parent="$2" parent_arg_count="$3"
@@ -110,7 +110,7 @@ export TERMNAV_TEST_PROC_ROOT="$case_root/proc"
 
 result=$(_run_reuse_case full zsh 2 zsh -z src/app.lua)
 _assert_eq "nvim launcher: interactive tmux file open reuses an existing pane" \
-  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+  "$(printf 'status:reused\nopen:nvim open cli src/app.lua %s' "$case_cwd")" "$result"
 _assert_eq "nvim launcher: readable procfs avoids the ps fallback" \
   "" "$(cat "$ps_log")"
 
@@ -125,19 +125,19 @@ _assert_eq "nvim launcher: procfs rejects editor-style parents" \
   "status:fallback" "$result"
 result=$(_run_reuse_case full zsh 1 '/opt/My Shell/zsh' src/app.lua)
 _assert_eq "nvim launcher: procfs preserves a spaced shell argv element" \
-  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+  "$(printf 'status:reused\nopen:nvim open cli src/app.lua %s' "$case_cwd")" "$result"
 _assert_eq "nvim launcher: authoritative procfs decisions do not invoke ps" \
   "" "$(cat "$ps_log")"
 
 result=$(_run_reuse_case empty zsh 0 src/app.lua)
 _assert_eq "nvim launcher: empty procfs argv falls back to ps" \
-  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+  "$(printf 'status:reused\nopen:nvim open cli src/app.lua %s' "$case_cwd")" "$result"
 _assert_contains "nvim launcher: empty procfs argv inspects its parent once" \
   "-ww -o comm= -o args= -p" "$(cat "$ps_log")"
 
 result=$(_run_reuse_case missing zsh 0 src/app.lua)
 _assert_eq "nvim launcher: missing procfs falls back to ps" \
-  "$(printf 'status:reused\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+  "$(printf 'status:reused\nopen:nvim open cli src/app.lua %s' "$case_cwd")" "$result"
 
 result=$(
   TERMNAV_TEST_PS_COMMAND=git \
@@ -186,6 +186,6 @@ _assert_eq "nvim launcher: force-new bypasses pane reuse" "fallback" "$result"
 
 result=$(NVIM_TMUX_OPEN_RC=1 _run_reuse_case full zsh 2 zsh -z src/app.lua)
 _assert_eq "nvim launcher: failed pane routing asks the caller to fall back" \
-  "$(printf 'status:fallback\nopen:cli src/app.lua %s' "$case_cwd")" "$result"
+  "$(printf 'status:fallback\nopen:nvim open cli src/app.lua %s' "$case_cwd")" "$result"
 
 _test_summary

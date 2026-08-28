@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# test-isolation-test — proves integration tests cannot reach live terminal state.
+
+set -o pipefail
+export NO_COLOR=1
+
+TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+# Deliberately seed values that would route native Termnav calls into the
+# developer's real tmux and Neovim sessions if the shared harness leaked them.
+export HOME=/termnav-live-home-sentinel
+export XDG_STATE_HOME=/termnav-live-state-sentinel
+export TMUX=/tmp/termnav-live-tmux-sentinel,1,0
+export TMUX_PANE=%999
+export NVIM=/tmp/termnav-live-nvim-sentinel
+export SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22'
+
+# shellcheck source=../helpers.sh
+. "$TERMNAV_TEST_DIR/helpers.sh"
+
+case "$HOME" in
+  "$_TEST_TMP_ROOT"/*) _pass "test isolation: HOME is invocation-owned" ;;
+  *) _fail "test isolation: HOME escaped the invocation root ($HOME)" ;;
+esac
+case "$XDG_STATE_HOME" in
+  "$_TEST_TMP_ROOT"/*) _pass "test isolation: XDG state is invocation-owned" ;;
+  *) _fail "test isolation: XDG state escaped the invocation root ($XDG_STATE_HOME)" ;;
+esac
+
+for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION; do
+  if [[ -v $variable ]]; then
+    _fail "test isolation: $variable leaked into a suite"
+  else
+    _pass "test isolation: $variable is cleared"
+  fi
+done
+
+_test_summary

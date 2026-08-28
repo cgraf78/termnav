@@ -2,7 +2,7 @@
 # Reuse an existing Neovim pane only for a simple file open typed at a prompt.
 #
 # `termnav_nvim_try_reuse <nvim-argv...>` returns 0 only after
-# nvim-tmux-open successfully handles the request. Any ineligible context,
+# `termnav nvim open` successfully handles the request. Any ineligible context,
 # uncertain parent process, or routing failure returns 1 so the caller can run
 # its real editor and preserve normal blocking $EDITOR semantics.
 
@@ -89,7 +89,7 @@ _termnav_nvim_should_reuse() {
       ;;
   esac
 
-  command -v nvim-tmux-open >/dev/null 2>&1 || return 1
+  command -v termnav >/dev/null 2>&1 || return 1
   [[ "${NVIM_LAUNCHER_ALLOW_NONSHELL_PARENT:-0}" == 1 ]] ||
     _termnav_nvim_parent_is_interactive_shell || return 1
   return 0
@@ -97,5 +97,5 @@ _termnav_nvim_should_reuse() {
 
 termnav_nvim_try_reuse() {
   _termnav_nvim_should_reuse "$@" || return 1
-  nvim-tmux-open cli "$1" "$PWD"
+  termnav nvim open cli "$1" "$PWD"
 }

@@ -6,27 +6,44 @@ focused suites from `test/suites/`.
 
 Suite ownership follows the integration boundary:
 
+- `ci-contract-test` keeps the repository's shared-workflow inputs and required
+  aggregate aligned with the supported platform and performance matrix.
+- `cli-contract-test` covers the unified command surface and usage failures.
+- `examples-test` verifies that the documented tmux, Neovim, WezTerm, and token
+  extension examples remain loadable and wired to the public API.
+- `install-test` verifies the generated one-binary installer policy, unified
+  manual page, retired checkout bootstrap, and absence of compatibility
+  aliases. Shared release behavior is exercised by the package smoke jobs.
+- `manpage-test` keeps the unified manual page aligned with explicit-command
+  behavior.
+- `navigation-cli-test` covers semantic navigation and exact-client tmux
+  traversal through real tmux clients.
 - `nvim-test` covers Neovim helper behavior.
 - `nvim-launcher-test` covers the conservative sourceable policy for reusing an
   existing Neovim pane from simple interactive-shell file opens.
-- `remote-test` covers remote open routing.
+- `nvim-navigation-test` covers Neovim's fast-path mappings and boundary
+  delegation.
+- `process-contract-test` ensures retired executable and Python implementation
+  paths stay absent from production artifacts.
 - `relay-test` covers nested SSH transport, directive storage, and in-band
   commit behavior.
 - `relay-performance-test` keeps production `send`, `commit`, and tmux-boundary
-  dispatch on the lightweight path. Set `TERMNAV_PERFORMANCE_BASELINE` to a Git revision
-  to compare alternating subprocess samples and enforce calibrated median and
-  p95 non-regression budgets; pull-request CI compares against the explicit PR
-  base revision automatically.
+  dispatch on the lightweight path. Set `TERMNAV_PERFORMANCE_BASELINE` to a Git
+  revision to compare alternating subprocess samples and enforce calibrated
+  median and p95 non-regression budgets; pull-request CI compares against the
+  explicit PR base revision automatically.
+- `relay-terminal-test` covers the terminal barrier, mixed-version relay paths,
+  arbitrary nesting depth, burst preservation, and VS Code terminal handoff.
 - `shell-test` covers direct and attached-client file-link classification plus
   shell-published tmux routing context.
-- `tmux-test` covers tmux command behavior.
-- `tab-switch-test` covers nearest-scope tmux traversal and terminal
-  bridge selection.
-- `vscode-test` covers VS Code command backends.
-- `wezterm-test` covers WezTerm link rules.
-- `install-test` covers the standalone checkout-backed command and manpage
-  links, idempotent retargeting, custom destinations, complete source
-  preflight, and refusal to overwrite user-owned paths.
+- `test-isolation-test` verifies that the harness cannot consume live user
+  session state.
+- `tmux-focus-test` covers hierarchical focus ownership, leases, nested tmux,
+  shared sessions, and pane-style restoration.
+- `tmux-test` covers tmux command behavior and context publication.
+- `vscode-adapter-test` covers the authenticated VS Code focus adapter.
+- `wezterm-integration-test` covers WezTerm link routing, semantic eza links,
+  shell integration, and Neovim opener edge cases.
 
 Prefer fake terminal commands and fixture files over depending on an active
 tmux, Neovim, SSH, or WezTerm session.

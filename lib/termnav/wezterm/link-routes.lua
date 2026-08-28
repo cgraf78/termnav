@@ -235,7 +235,7 @@ function M.new(wezterm)
 
   function routes.remote_tmux_open_command(path_info)
     local shell_command = routes.remote_path_command()
-      .. "; command nvim-tmux-open tmux-link "
+      .. "; command termnav nvim open tmux-link "
       .. routes.shell_quote(path_info)
     return "run-shell " .. routes.tmux_double_quote(shell_command)
   end
@@ -283,7 +283,9 @@ function M.new(wezterm)
     end
 
     local ok = wezterm.run_child_process({
-      routes.helper_command("nvim-ssh-control-open"),
+      routes.helper_command("termnav"),
+      "nvim",
+      "ssh-open",
       remote_host,
       path_info,
     })
@@ -329,7 +331,9 @@ function M.new(wezterm)
 
   function routes.open_in_nvim(window, pane, path_info)
     routes.run_nvim_helper(window, {
-      routes.helper_command("nvim-tmux-open"),
+      routes.helper_command("termnav"),
+      "nvim",
+      "open",
       "link",
       path_info,
       routes.pane_link_cwd(pane),
@@ -355,7 +359,9 @@ function M.new(wezterm)
     -- bytes directly through a local tmux pane would be consumed locally
     -- instead of reaching the remote tmux session.
     routes.run_nvim_helper(window, {
-      routes.helper_command("nvim-tmux-open"),
+      routes.helper_command("termnav"),
+      "nvim",
+      "open",
       "link",
       path_info,
       "",

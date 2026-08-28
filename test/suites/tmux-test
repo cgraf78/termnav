@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-test — checks tmux config syntax, key bindings, and terminal features.
+# tmux-test — native tmux integration without historical executable facades.
 
 set -o pipefail
 export NO_COLOR=1
@@ -10,7 +10,7 @@ TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
 
-tmux_follow_helper="$TERMNAV_ROOT/bin/tmux-follow-click"
+termnav=${TERMNAV_TEST_BINARY:-$TERMNAV_ROOT/target/release/termnav}
 
 echo "=== termnav shell API ==="
 
@@ -26,666 +26,60 @@ _assert_contains "shell api: exposes WezTerm context publisher" \
 _assert_contains "shell api: exposes prompt hook callback" \
   "precmd" "$shell_api_output"
 
-echo "=== tmux Ctrl-click helper ==="
+echo "=== native nvim tmux opener ==="
 
 tmp=$(_tmpdir)
 mock_bin="$tmp/bin"
 mkdir -p "$mock_bin"
-cat >"$mock_bin/nvim-tmux-open" <<'EOF'
+cat >"$mock_bin/tmux" <<'MOCK'
 #!/usr/bin/env bash
-for arg in "$@"; do
-  printf '<%s>\n' "$arg"
-done >>"$TMUX_FOLLOW_LOG"
-EOF
-chmod +x "$mock_bin/nvim-tmux-open"
-
-shared_route_fixture="$TERMNAV_TEST_DIR/fixtures/nvim-link-routes.tsv"
-_assert_contains "tmux follow helper has shared route contract fixture" \
-  "remote-file" "$(cat "$shared_route_fixture" 2>/dev/null || true)"
-
-while IFS=$'\t' read -r case_name uri target cwd source context; do
-  [[ -n "$case_name" && "$case_name" != \#* ]] || continue
-  [[ "$context" == "-" ]] && context=""
-  log_file="$tmp/shared-$case_name.log"
-  if [[ -n "$context" ]]; then
-    expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>\n<%s>' "$target" "$cwd" "$source" "$context")"
-  else
-    expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "$target" "$cwd" "$source")"
-  fi
-  TMUX_FOLLOW_LOG="$log_file" \
-    PATH="$mock_bin:$PATH" \
-    "$tmux_follow_helper" "$uri" "" "" 0 "$cwd"
-  _assert_eq "tmux follow helper shared route: $case_name" "$expected" "$(cat "$log_file")"
-done <"$shared_route_fixture"
-
-TMUX_FOLLOW_LOG="$tmp/file-uri.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "file://localhost/tmp/a%20b.txt:4:5" "" "" 0 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "/tmp/a b.txt:4:5" "/repo" "terminal")"
-_assert_eq "tmux follow helper decodes file hyperlinks" "$expected" "$(cat "$tmp/file-uri.log")"
-
-TMUX_FOLLOW_LOG="$tmp/remote-file-uri.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "file://remote.example/tmp/a%20b.txt:4:5" "" "" 0 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>\n<%s>' "/tmp/a b.txt:4:5" "/repo" "remote" "remote.example")"
-_assert_eq "tmux follow helper preserves remote file hyperlink hosts" "$expected" "$(cat "$tmp/remote-file-uri.log")"
-
-TMUX_FOLLOW_LOG="$tmp/remote-alias-file-uri.log" \
-  TERMNAV_REMOTE_LINK_HOST="dev1" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "file://dev1/tmp/a%20b.txt:4:5" "" "" 0 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "/tmp/a b.txt:4:5" "/repo" "terminal")"
-_assert_eq "tmux follow helper treats published remote alias as local" "$expected" "$(cat "$tmp/remote-alias-file-uri.log")"
-
-TMUX_FOLLOW_LOG="$tmp/nvim-open-uri.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "nvim-open://src/main.lua:12" "" "" 0 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/main.lua:12" "/repo" "terminal")"
-_assert_eq "tmux follow helper accepts nvim-open hyperlinks" "$expected" "$(cat "$tmp/nvim-open-uri.log")"
-
-browser_tty="$tmp/browser-tty.out"
-mock_tmux="$mock_bin/tmux"
-cat >"$mock_tmux" <<EOF
-#!/usr/bin/env bash
-if [[ "\$1 \$2 \$3" == "display-message -p #{client_tty}" ]]; then
-  printf '%s\n' '$browser_tty'
-  exit 0
-fi
-exit 1
-EOF
-chmod +x "$mock_tmux"
-_follow_opened_url() {
-  local encoded decoded
-
-  encoded=$(tr -d '\033\007' <"$browser_tty" |
-    sed -n 's/.*SetUserVar=term_open_url=\([A-Za-z0-9+\/=]*\).*/\1/p' |
-    tail -1)
-  [ -n "$encoded" ] || return 0
-  if decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null); then
-    printf '%s\n' "$decoded"
-    return 0
-  fi
-  if decoded=$(printf '%s' "$encoded" | base64 -D 2>/dev/null); then
-    printf '%s\n' "$decoded"
-  fi
-}
-_assert_follow_browser_word() {
-  local label="$1" token="$2" expected_url="$3"
-
-  : >"$browser_tty"
-  TMUX_FOLLOW_LOG="$tmp/$label-word-nvim.log" \
-    TMUX="/tmp/tmux-test,1,0" \
-    PATH="$mock_bin:$PATH" \
-    "$tmux_follow_helper" "" "$token" "" 0 "/repo" "$browser_tty"
-  _assert_eq "tmux follow helper does not route $label words to nvim" \
-    "" "$(cat "$tmp/$label-word-nvim.log" 2>/dev/null || true)"
-  _assert_eq "tmux follow helper opens $label words as browser URLs" \
-    "$expected_url" "$(_follow_opened_url)"
-}
-_assert_follow_browser_line() {
-  local label="$1" line="$2" x="$3" expected_url="$4"
-
-  : >"$browser_tty"
-  TMUX_FOLLOW_LOG="$tmp/$label-line-nvim.log" \
-    TMUX="/tmp/tmux-test,1,0" \
-    PATH="$mock_bin:$PATH" \
-    "$tmux_follow_helper" "" "" "$line" "$x" "/repo" "$browser_tty"
-  _assert_eq "tmux follow helper does not route $label line fallback to nvim" \
-    "" "$(cat "$tmp/$label-line-nvim.log" 2>/dev/null || true)"
-  _assert_eq "tmux follow helper opens $label line fallback as browser URLs" \
-    "$expected_url" "$(_follow_opened_url)"
-}
-TMUX_FOLLOW_LOG="$tmp/url-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "https://example.com/a/b?x=1" "" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route URL hyperlinks to nvim" \
-  "" "$(cat "$tmp/url-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open URL hyperlinks" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/uppercase-url-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "HTTPS://example.com/Upper" "" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route uppercase URL hyperlinks to nvim" \
-  "" "$(cat "$tmp/uppercase-url-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open uppercase URL hyperlinks" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-TMUX_FOLLOW_LOG="$tmp/word.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "src/app.cpp:42" "" 0 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/app.cpp:42" "/repo" "terminal")"
-_assert_eq "tmux follow helper falls back to path-like mouse word" "$expected" "$(cat "$tmp/word.log")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/url-word-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "https://example.com/from-word" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route URL words to nvim" \
-  "" "$(cat "$tmp/url-word-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open URL words" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/uppercase-url-word-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "HTTPS://example.com/from-word" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route uppercase URL words to nvim" \
-  "" "$(cat "$tmp/uppercase-url-word-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open uppercase URL words" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/wrapped-uppercase-url-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "nvim-open://HTTPS%3A%2F%2Fexample.com%2Fwrapped" "" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route wrapped uppercase URLs to nvim" \
-  "" "$(cat "$tmp/wrapped-uppercase-url-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open wrapped uppercase URLs" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-TMUX_FOLLOW_LOG="$tmp/url-line-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "" "see https://example.com/from-line for details" 5 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route URL line fallback to nvim" \
-  "" "$(cat "$tmp/url-line-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open URL line fallback" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/uppercase-url-line-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "" "see HTTPS://example.com/from-line for details" 5 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route uppercase URL line fallback to nvim" \
-  "" "$(cat "$tmp/uppercase-url-line-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper asks WezTerm to open uppercase URL line fallback" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/schemeless-domain-word-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "github.com/example/project" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route schemeless domain words to nvim" \
-  "" "$(cat "$tmp/schemeless-domain-word-nvim.log" 2>/dev/null || true)"
-_assert_eq "tmux follow helper opens schemeless domain words as https URLs" \
-  "https://github.com/example/project" "$(_follow_opened_url)"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/schemeless-domain-line-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "" "see github.com/example/project." 6 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route schemeless domain line fallback to nvim" \
-  "" "$(cat "$tmp/schemeless-domain-line-nvim.log" 2>/dev/null || true)"
-_assert_eq "tmux follow helper trims punctuation and opens schemeless domains" \
-  "https://github.com/example/project" "$(_follow_opened_url)"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/localhost-word-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "localhost:5173" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route localhost words to nvim" \
-  "" "$(cat "$tmp/localhost-word-nvim.log" 2>/dev/null || true)"
-_assert_eq "tmux follow helper opens localhost words as http URLs" \
-  "http://localhost:5173" "$(_follow_opened_url)"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/loopback-line-nvim.log" \
-  TMUX="/tmp/tmux-test,1,0" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "" "serving 127.0.0.1:8000/status now" 8 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper does not route loopback line fallback to nvim" \
-  "" "$(cat "$tmp/loopback-line-nvim.log" 2>/dev/null || true)"
-_assert_eq "tmux follow helper opens loopback line fallback as http URLs" \
-  "http://127.0.0.1:8000/status" "$(_follow_opened_url)"
-
-_assert_follow_browser_word \
-  "websocket-scheme" "wss://example.com/socket" \
-  "wss://example.com/socket"
-_assert_follow_browser_word \
-  "vscode-scheme" "vscode://file/home/example/project" \
-  "vscode://file/home/example/project"
-_assert_follow_browser_word \
-  "postgres-scheme" "postgres://user@localhost/db" \
-  "postgres://user@localhost/db"
-_assert_follow_browser_word \
-  "localhost-query" "localhost:5173?debug=1" \
-  "http://localhost:5173?debug=1"
-_assert_follow_browser_line \
-  "private-ip" "open 192.168.1.20:8080/status now" 5 \
-  "http://192.168.1.20:8080/status"
-_assert_follow_browser_word \
-  "docker-host" "host.docker.internal:8080" \
-  "http://host.docker.internal:8080"
-_assert_follow_browser_word \
-  "github-ssh-remote" "git@github.com:example/project.git" \
-  "https://github.com/example/project"
-_assert_follow_browser_word \
-  "gitlab-ssh-remote" "git@gitlab.com:org/subgroup/project.git" \
-  "https://gitlab.com/org/subgroup/project"
-_assert_follow_browser_word \
-  "cve-token" "CVE-2024-12345" \
-  "https://www.cve.org/CVERecord?id=CVE-2024-12345"
-_assert_follow_browser_word \
-  "rfc-token" "RFC-9110" \
-  "https://www.rfc-editor.org/rfc/rfc9110"
-_assert_follow_browser_line \
-  "rfc-spaced" "see RFC 9110 section 4" 5 \
-  "https://www.rfc-editor.org/rfc/rfc9110"
-
-extension_dir="$tmp/tmux-follow-extensions"
-mkdir -p "$extension_dir"
-cat >"$extension_dir/90-test.sh" <<'EOF'
-# shellcheck shell=bash
-
-tmux_follow_test_token() {
-  local token="$1"
-
-  if [[ "$token" == "EXT123" ]]; then
-    target="https://example.test/EXT123"
-    target_kind="url"
-    return 0
-  fi
-
-  return 1
-}
-
-tmux_follow_register_token_detector tmux_follow_test_token
-EOF
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/extension-url-nvim.log" \
-  TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="$extension_dir" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "EXT123" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper extensions do not route URL tokens to nvim" \
-  "" "$(cat "$tmp/extension-url-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper extensions can open URL tokens" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-xdg_home="$tmp/xdg"
-mkdir -p "$xdg_home/termnav/tmux-follow/extensions.d"
-cat >"$xdg_home/termnav/tmux-follow/extensions.d/90-test.sh" <<'EOF'
-# shellcheck shell=bash
-
-tmux_follow_xdg_token() {
-  local token="$1"
-
-  if [[ "$token" == "EXT456" ]]; then
-    target="https://example.test/EXT456"
-    target_kind="url"
-    return 0
-  fi
-
-  return 1
-}
-
-tmux_follow_register_token_detector tmux_follow_xdg_token
-EOF
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/extension-xdg-url-nvim.log" \
-  env -u HOME XDG_CONFIG_HOME="$xdg_home" PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper loads XDG extension tokens without nvim routing" \
-  "" "$(cat "$tmp/extension-xdg-url-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper loads XDG extension tokens" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-fallback_home="$tmp/extension-fallback-home"
-mkdir -p "$fallback_home/.config/termnav/tmux-follow/extensions.d"
-cp "$xdg_home/termnav/tmux-follow/extensions.d/90-test.sh" \
-  "$fallback_home/.config/termnav/tmux-follow/extensions.d/90-test.sh"
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/extension-relative-url-nvim.log" \
-  HOME="$fallback_home" XDG_CONFIG_HOME=relative/config PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
-_assert_contains "tmux follow helper rejects relative XDG config and uses HOME" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-newline_extension_dir="$tmp/extension-newline"$'\n'
-mkdir -p "$newline_extension_dir"
-cp "$xdg_home/termnav/tmux-follow/extensions.d/90-test.sh" \
-  "$newline_extension_dir/90-test.sh"
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/extension-newline-url-nvim.log" \
-  env -u HOME TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="$newline_extension_dir" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
-_assert_contains "tmux follow helper preserves explicit extension path bytes" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/extension-missing-root-nvim.log" \
-  env -u HOME -u TERMNAV_TMUX_FOLLOW_EXTENSION_DIR XDG_CONFIG_HOME=relative/config \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "EXT456" "" 0 "/repo" "$browser_tty"
-_assert_eq "tmux follow helper skips extensions when no config root exists" \
-  "" "$(cat "$browser_tty")"
-
-TMUX_FOLLOW_LOG="$tmp/noise.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "README.md" "" 0 "/repo"
-_assert_eq "tmux follow helper ignores bare filenames without line numbers" "" "$(cat "$tmp/noise.log" 2>/dev/null || true)"
-
-TMUX_FOLLOW_LOG="$tmp/line.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "" "see src/plain.cpp:99 for details" 6 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/plain.cpp:99" "/repo" "terminal")"
-_assert_eq "tmux follow helper extracts path from clicked line" "$expected" "$(cat "$tmp/line.log")"
-
-TMUX_FOLLOW_LOG="$tmp/status-line.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "sley" $'\tmodified:   src/tool/README.md' 20 "/home/example"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/tool/README.md" "/home/example" "terminal")"
-_assert_eq "tmux follow helper extracts indented status paths from clicked line" \
-  "$expected" "$(cat "$tmp/status-line.log")"
-
-cat >"$mock_bin/tmux" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$1" == "capture-pane" ]]; then
-  joined=0
-  for arg in "$@"; do
-    [[ "$arg" == "-J" ]] && joined=1
-  done
-  case "${TMUX_CAPTURE_FIXTURE:-}" in
-    two-line-path)
-      if [[ "$joined" -eq 1 ]]; then
-        printf 'prefix /very/long/path/file.cpp:123:45 suffix\n'
-      else
-        printf 'prefix /very/long/\npath/file.cpp:123:45 suffix\n'
-      fi
-      exit 0
-      ;;
-    three-line-path)
-      if [[ "$joined" -eq 1 ]]; then
-        printf 'see src/generated/deep/tree/file.rs:77 now\n'
-      else
-        printf 'see src/generated/\ndeep/tree/\nfile.rs:77 now\n'
-      fi
-      exit 0
-      ;;
-    quoted-space-path)
-      if [[ "$joined" -eq 1 ]]; then
-        printf "open './project dir/src/file with spaces.cpp:12' please\n"
-      else
-        printf "open './project dir/src/\nfile with spaces.cpp:12' please\n"
-      fi
-      exit 0
-      ;;
-    wrapped-shell-path)
-      if [[ "$joined" -eq 1 ]]; then
-        printf "==> Done! Run 'source ~/.bashrc' or 'source ~/.zshrc' to activate.\n"
-      else
-        printf "==> Done! Run 'source ~/.b\nashrc' or 'source ~/.zshrc' to activate.\n"
-      fi
-      exit 0
-      ;;
-    wrapped-url)
-      if [[ "$joined" -eq 1 ]]; then
-        printf 'see https://example.com/very/long/path?q=1 now\n'
-      else
-        printf 'see https://example.com/very/\nlong/path?q=1 now\n'
-      fi
-      exit 0
-      ;;
-  esac
-fi
-exit 1
-EOF
-chmod +x "$mock_bin/tmux"
-
-TMUX_FOLLOW_LOG="$tmp/wrapped-two-line-path.log" \
-  TMUX_CAPTURE_FIXTURE=two-line-path \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "path/file.cpp:123:45" "path/file.cpp:123:45 suffix" 0 "/repo" "" "%27" 1
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "/very/long/path/file.cpp:123:45" "/repo" "terminal")"
-_assert_eq "tmux follow helper reconstructs two-line wrapped paths from pane capture" \
-  "$expected" "$(cat "$tmp/wrapped-two-line-path.log")"
-
-TMUX_FOLLOW_LOG="$tmp/wrapped-three-line-path.log" \
-  TMUX_CAPTURE_FIXTURE=three-line-path \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "file.rs:77" "file.rs:77 now" 0 "/repo" "" "%27" 2
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/generated/deep/tree/file.rs:77" "/repo" "terminal")"
-_assert_eq "tmux follow helper reconstructs multi-line wrapped paths from pane capture" \
-  "$expected" "$(cat "$tmp/wrapped-three-line-path.log")"
-
-TMUX_FOLLOW_LOG="$tmp/quoted-space-path.log" \
-  TMUX_CAPTURE_FIXTURE=quoted-space-path \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "file" "file with spaces.cpp:12' please" 5 "/repo" "" "%27" 1
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "./project dir/src/file with spaces.cpp:12" "/repo" "terminal")"
-_assert_eq "tmux follow helper extracts quoted paths with spaces from pane capture" \
-  "$expected" "$(cat "$tmp/quoted-space-path.log")"
-
-TMUX_FOLLOW_LOG="$tmp/quoted-shell-path.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" ".bashrc" "'source ~/.bashrc'" 10 "/repo"
-# shellcheck disable=SC2088 # nvim-tmux-open expands literal terminal output.
-literal_bashrc='~/.bashrc'
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "$literal_bashrc" "/repo" "terminal")"
-_assert_eq "tmux follow helper extracts clicked paths inside quoted shell snippets" \
-  "$expected" "$(cat "$tmp/quoted-shell-path.log")"
-
-TMUX_FOLLOW_LOG="$tmp/quoted-shell-path-with-spaces.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "Config/file" "'source ~/My Config/file'" 14 "/repo"
-# shellcheck disable=SC2088 # nvim-tmux-open expands literal terminal output.
-literal_spaced_home_path='~/My Config/file'
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "$literal_spaced_home_path" "/repo" "terminal")"
-_assert_eq "tmux follow helper preserves path context inside quoted shell snippets" \
-  "$expected" "$(cat "$tmp/quoted-shell-path-with-spaces.log")"
-
-TMUX_FOLLOW_LOG="$tmp/quoted-shell-snippet.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "source" "'source ~/.bashrc'" 3 "/repo"
-_assert_eq "tmux follow helper ignores command words inside quoted shell snippets" \
-  "" "$(cat "$tmp/quoted-shell-snippet.log" 2>/dev/null || true)"
-
-TMUX_FOLLOW_LOG="$tmp/wrapped-shell-path.log" \
-  TMUX_CAPTURE_FIXTURE=wrapped-shell-path \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "shrc" "shrc' or 'source ~/.zshrc' to activate." 1 "/repo" "" "%27" 1
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "$literal_bashrc" "/repo" "terminal")"
-_assert_eq "tmux follow helper extracts clicked paths inside wrapped shell snippets" \
-  "$expected" "$(cat "$tmp/wrapped-shell-path.log")"
-
-: >"$browser_tty"
-TMUX_FOLLOW_LOG="$tmp/wrapped-url-capture-nvim.log" \
-  TMUX_CAPTURE_FIXTURE=wrapped-url \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" "" "long/path?q=1" "long/path?q=1 now" 0 "/repo" "$browser_tty" "%27" 1
-_assert_eq "tmux follow helper does not route pane-captured URLs to nvim" \
-  "" "$(cat "$tmp/wrapped-url-capture-nvim.log" 2>/dev/null || true)"
-_assert_contains "tmux follow helper opens pane-captured URLs in WezTerm" \
-  "SetUserVar=term_open_url=" "$(cat "$browser_tty")"
-
-TMUX_FOLLOW_LOG="$tmp/stdin-status-line.log" \
-  PATH="$mock_bin:$PATH" \
-  "$tmux_follow_helper" --stdin <<'EOF'
-
-sley
-	modified:   src/tool/README.md
-20
-/home/example
-EOF
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/tool/README.md" "/home/example" "terminal")"
-_assert_eq "tmux follow helper preserves here-doc click fields" \
-  "$expected" "$(cat "$tmp/stdin-status-line.log")"
-
-path_home="$tmp/home-path"
-mkdir -p "$path_home/.local/bin"
-cat >"$path_home/.local/bin/nvim-tmux-open" <<'EOF'
-#!/usr/bin/env bash
-for arg in "$@"; do
-  printf '<%s>\n' "$arg"
-done >>"$TMUX_FOLLOW_LOG"
-EOF
-chmod +x "$path_home/.local/bin/nvim-tmux-open"
-TMUX_FOLLOW_LOG="$tmp/restricted-path.log" \
-  HOME="$path_home" \
-  PATH="/usr/bin:/bin" \
-  "$tmux_follow_helper" "" "" "see src/restricted.cpp:12 for details" 6 "/repo"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "src/restricted.cpp:12" "/repo" "terminal")"
-_assert_eq "tmux follow helper finds opener without interactive PATH" \
-  "$expected" "$(cat "$tmp/restricted-path.log" 2>/dev/null || true)"
-
-fail_bin="$tmp/fail-bin"
-mkdir -p "$fail_bin"
-cat >"$fail_bin/nvim-tmux-open" <<'EOF'
-#!/usr/bin/env bash
-for arg in "$@"; do
-  printf '<%s>\n' "$arg"
-done >>"$TMUX_FOLLOW_LOG"
-exit 7
-EOF
-chmod +x "$fail_bin/nvim-tmux-open"
-TMUX_FOLLOW_LOG="$tmp/failing-opener.log" \
-  PATH="$fail_bin:$PATH" \
-  "$tmux_follow_helper" "file:///home/alex/.zshrc" "" "" 0 "/home/alex" >/dev/null 2>&1
-_assert_exit "tmux follow helper swallows opener failure after delegating" 0 "$?"
-expected="$(printf '<tmux-link>\n<%s>\n<%s>\n<%s>' "/home/alex/.zshrc" "/home/alex" "terminal")"
-_assert_eq "tmux follow helper delegates through user-facing opener mode" \
-  "$expected" "$(cat "$tmp/failing-opener.log")"
-
-echo "=== nvim tmux launcher ==="
-
-launcher_tmp=$(_tmpdir)
-launcher_bin="$launcher_tmp/bin"
-launcher_home="$launcher_tmp/home"
-launcher_home_bin="$launcher_home/.local/bin"
-mkdir -p "$launcher_bin" "$launcher_home_bin"
-cat >"$launcher_bin/tmux" <<'MOCK'
-#!/usr/bin/env bash
-log="${TMUX_LAUNCHER_LOG:?}"
 case "$1" in
   list-panes)
     printf '%%1\tbash\n%%2\tnvim\n'
     ;;
   send-keys)
-    printf 'send:%s\n' "$*" >>"$log"
+    printf '%s\n' "$*" >>"${TERMNAV_TMUX_TEST_LOG:?}"
     ;;
   *)
-    printf 'unexpected:%s\n' "$*" >>"$log"
     exit 1
     ;;
 esac
 MOCK
-chmod +x "$launcher_bin/tmux"
-# nvim-tmux-open prepends HOME-local command paths for GUI and ssh entry
-# points, so expose the test mock through the same path it will prefer.
-ln -sf "$launcher_bin/tmux" "$launcher_home_bin/tmux"
+chmod +x "$mock_bin/tmux"
 
-launcher_log="$launcher_tmp/tmux.log"
-TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:$PATH" \
-  TMUX_LAUNCHER_LOG="$launcher_log" \
-  "$TERMNAV_ROOT/bin/nvim-tmux-open" cli "a/src/app.lua:12" "/repo"
-_assert_exit "nvim tmux launcher: current-window pane opens" 0 "$?"
-_assert_contains "nvim tmux launcher: targets nvim pane" \
-  "send:send-keys -t %2" "$(cat "$launcher_log")"
-# The socketless fallback now opens via :exe 'e '.fnameescape(...)|call cursor()
-# so filename metachars can't glob; the file must survive verbatim inside
-# fnameescape() and no bare `:e +LINE` form is used.
-_assert_contains "nvim tmux launcher: preserves cli-like file arguments" \
-  'fnameescape("/repo/a/src/app.lua:12")' "$(cat "$launcher_log")"
+log="$tmp/tmux.log"
+TMUX="/tmp/termnav-test.sock,1,0" \
+  TMUX_PANE=%1 \
+  PATH="$mock_bin:$PATH" \
+  TERMNAV_TMUX_TEST_LOG="$log" \
+  "$termnav" nvim open cli 'a/src/app.lua:12' /repo
+_assert_exit "native opener: current-window pane opens" 0 "$?"
+_assert_contains "native opener: targets the nvim pane" \
+  'send-keys -t %2 -l' "$(cat "$log")"
+_assert_contains "native opener: preserves CLI-like file arguments verbatim" \
+  'fnameescape("/repo/a/src/app.lua:12")' "$(cat "$log")"
+_assert_contains "native opener: leaves cursor parsing to an existing target" \
+  'cursor(1,1)' "$(cat "$log")"
 
-launcher_log="$launcher_tmp/tmux-home-literal.log"
-launcher_literal_home="\$HOME/src/app.lua"
-# $HOME is intentionally literal here — it is part of the filename in the
-# expected keystroke, not a variable to expand.
-# shellcheck disable=SC2016
-launcher_expected_home='fnameescape("/repo/$HOME/src/app.lua")'
-TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:$PATH" \
-  TMUX_LAUNCHER_LOG="$launcher_log" \
-  "$TERMNAV_ROOT/bin/nvim-tmux-open" cli "$launcher_literal_home" "/repo"
-_assert_exit "nvim tmux launcher: home reference path opens" 0 "$?"
-_assert_contains "nvim tmux launcher: preserves literal home references" \
-  "$launcher_expected_home" "$(cat "$launcher_log")"
-
-cat >"$launcher_bin/tmux" <<'MOCK'
+cat >"$mock_bin/tmux" <<'MOCK'
 #!/usr/bin/env bash
 case "$1" in
   list-panes) printf '%%1\tbash\n' ;;
+  display-popup) printf '%s\n' "${@: -1}" >>"${TERMNAV_TMUX_TEST_LOG:?}" ;;
   *) exit 1 ;;
 esac
 MOCK
-chmod +x "$launcher_bin/tmux"
-if TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:$PATH" \
-  "$TERMNAV_ROOT/bin/nvim-tmux-open" cli "src/app.lua" "/repo" >/dev/null 2>&1; then
-  _fail "nvim tmux launcher: missing current-window nvim pane returns nonzero"
-else
-  _pass "nvim tmux launcher: missing current-window nvim pane returns nonzero"
-fi
+chmod +x "$mock_bin/tmux"
 
-_write_launcher_tmux_message_mock() {
-  cat >"$launcher_bin/tmux" <<'MOCK'
-#!/usr/bin/env bash
-case "$1" in
-  display-popup)
-    # The real helper falls back to display-message when popup is unavailable.
-    # Keep that branch explicit in the mock so the test covers both tmux
-    # capabilities without maintaining two nearly identical scripts.
-    if [[ "${TMUX_POPUP_RC:-0}" != 0 ]]; then
-      exit "$TMUX_POPUP_RC"
-    fi
-    printf '%s\n' "${@: -1}" >>"${TMUX_POPUP_LOG:?}"
-    ;;
-  display-message)
-    printf '%s\n' "$2" >>"${TMUX_DISPLAY_LOG:?}"
-    ;;
-  list-panes)
-    printf '%%1\tbash\tbash\t999\n'
-    ;;
-  *)
-    exit 1
-    ;;
-esac
-MOCK
-  chmod +x "$launcher_bin/tmux"
-}
-
-_write_launcher_tmux_message_mock
-popup_log="$launcher_tmp/display-popup.log"
-display_log="$launcher_tmp/display-message.log"
-TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:/usr/bin:/bin" \
-  TMUX_POPUP_LOG="$popup_log" \
-  TMUX_DISPLAY_LOG="$display_log" \
-  "$TERMNAV_ROOT/bin/nvim-tmux-open" tmux-link "/home/alex/.zshrc" "/home/alex" "terminal" >/dev/null 2>&1
-_assert_exit "nvim tmux launcher: tmux-link failure exits cleanly" 0 "$?"
-_assert_contains "nvim tmux launcher: tmux-link reports missing nvim target in popup" \
-  "No nvim session found for file link: /home/alex/.zshrc" "$(cat "$popup_log")"
-if [[ -e "$display_log" ]]; then
-  _fail "nvim tmux launcher: popup success skips status fallback"
-else
-  _pass "nvim tmux launcher: popup success skips status fallback"
-fi
-
-display_log="$launcher_tmp/fallback-display-message.log"
-TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:/usr/bin:/bin" \
-  TMUX_POPUP_RC=1 \
-  TMUX_DISPLAY_LOG="$display_log" \
-  "$TERMNAV_ROOT/bin/nvim-tmux-open" tmux-link "/home/alex/.zshrc" "/home/alex" "terminal" >/dev/null 2>&1
-_assert_exit "nvim tmux launcher: tmux-link popup fallback exits cleanly" 0 "$?"
-_assert_contains "nvim tmux launcher: tmux-link falls back to status message" \
-  "No nvim session found for file link: /home/alex/.zshrc" "$(cat "$display_log")"
-
-popup_log="$launcher_tmp/remote-display-popup.log"
-display_log="$launcher_tmp/remote-display-message.log"
-TMUX="/tmp/tmux.sock,1,0" HOME="$launcher_home" PATH="$launcher_bin:/usr/bin:/bin" \
-  TMUX_POPUP_LOG="$popup_log" \
-  TMUX_DISPLAY_LOG="$display_log" \
-  "$TERMNAV_ROOT/bin/nvim-tmux-open" tmux-link "/home/alex/.zshrc" "" "remote" "remote.example" >/dev/null 2>&1
-_assert_exit "nvim tmux launcher: remote tmux-link failure exits cleanly" 0 "$?"
-_assert_contains "nvim tmux launcher: remote tmux-link names the remote host" \
-  "No nvim session found for remote.example: /home/alex/.zshrc" "$(cat "$popup_log")"
+log="$tmp/missing.log"
+TMUX="/tmp/termnav-test.sock,1,0" \
+  TMUX_PANE=%1 \
+  PATH="$mock_bin:/usr/bin:/bin" \
+  TERMNAV_TMUX_TEST_LOG="$log" \
+  "$termnav" nvim open tmux-link /home/alex/.zshrc '' remote remote.example \
+  >/dev/null 2>&1
+_assert_exit "native opener: missing remote session is user-facing success" 0 "$?"
+_assert_contains "native opener: remote diagnostic names the host" \
+  'No nvim session found for remote.example: /home/alex/.zshrc' "$(cat "$log")"
 
 _test_summary

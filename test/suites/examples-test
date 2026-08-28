@@ -14,6 +14,8 @@ WEZTERM_EXAMPLE="$TERMNAV_ROOT/examples/wezterm.lua"
 NVIM_EXAMPLE="$TERMNAV_ROOT/examples/nvim.lua"
 TMUX_EXAMPLE="$TERMNAV_ROOT/examples/tmux.conf"
 DETECTOR_EXAMPLE="$TERMNAV_ROOT/examples/tmux-follow/extensions.d/example-ticket.sh"
+TERMNAV_BINARY=${TERMNAV_TEST_BINARY:-$TERMNAV_ROOT/target/release/termnav}
+TERMNAV_BINARY_DIR=$(cd -- "$(dirname -- "$TERMNAV_BINARY")" && pwd -P)
 
 echo "=== termnav: checked-in examples ==="
 
@@ -99,10 +101,9 @@ local vscode_focus = {
   dispose = function() end,
 }
 -- The example test validates composition, not the installed command lookup.
--- Navigation now eagerly prewarms its resident worker during setup, so inject
--- the same inert collaborator pattern used for the other side-effectful
--- integrations. Dedicated navigation and install suites cover the real worker
--- and executable contracts without depending on a developer's global PATH.
+-- Inject the same inert collaborator pattern used for other side-effectful
+-- integrations. Dedicated navigation suites exercise the native one-shot
+-- command without depending on a developer's live terminal topology.
 local navigation = { setup = function() end }
 
 local example = dofile(root .. "/examples/nvim.lua")
@@ -125,6 +126,7 @@ print("termnav Neovim example passed")
 LUA
   set +e
   output=$(TERMNAV_ROOT="$TERMNAV_ROOT" \
+    PATH="$TERMNAV_BINARY_DIR:$PATH" \
     nvim --headless --clean -n -u NONE -i NONE -l "$_nvim_test" 2>&1)
   rc=$?
   set -e
@@ -147,23 +149,23 @@ if command -v tmux >/dev/null 2>&1; then
   # portable while still proving both exact provider commands were installed.
   _tmux_keys=$(tmux -L "$_socket" list-keys -T root)
   _assert_contains "examples: tmux config wires tab switching" \
-    "termnav-relay navigate tab-select" "$_tmux_keys"
+    "termnav navigate tab-select" "$_tmux_keys"
   _assert_contains "examples: tmux passes exact source identity" \
     "--source-socket" "$_tmux_keys"
   _assert_contains "examples: tmux shell-quotes its dollar-prefixed session ID" \
     '--source-session #{q:session_id}' "$_tmux_keys"
   _assert_not_contains "examples: boundary navigation preserves key order" \
-    "run-shell -b" "$(grep 'termnav-relay navigate' "$TMUX_EXAMPLE")"
+    "run-shell -b" "$(grep 'termnav navigate' "$TMUX_EXAMPLE")"
   _assert_contains "examples: tmux config wires Ctrl-click" \
-    "tmux-follow-click" "$_tmux_keys"
+    "termnav tmux follow-click" "$_tmux_keys"
   _tmux_focus_hooks=$(tmux -L "$_socket" show-hooks -g client-focus-in)
   _assert_contains "examples: tmux config publishes nested focus" \
-    "termnav-tmux-focus watch" "$_tmux_focus_hooks"
+    "termnav tmux focus watch" "$_tmux_focus_hooks"
   _assert_contains "examples: tmux focus excludes control clients" \
     '#{==:#{client_control_mode},0}' "$_tmux_focus_hooks"
   _tmux_focus_sync_hook=$(tmux -L "$_socket" show-hooks -g after-select-pane)
   _assert_contains "examples: stale pane dimming is repaired on selection" \
-    'termnav-tmux-focus sync' "$_tmux_focus_sync_hook"
+    'termnav tmux focus sync' "$_tmux_focus_sync_hook"
   _assert_contains "examples: ordinary pane selection remains process-free" \
     '#{!=:#{@termnav_client_unfocused},}' "$_tmux_focus_sync_hook"
   _assert_eq "examples: tmux focus publishes its inactive pane style" \
@@ -174,7 +176,7 @@ else
   echo "  SKIP: tmux config example requires tmux"
 fi
 
-# Run the extension through tmux-follow-click rather than sourcing it directly.
+# Run the extension through the native click router rather than sourcing it.
 # That proves registration, precedence, and URL dispatch all match production.
 _td=${_td:-$(_tmpdir)}
 _mock_bin="$_td/mock-bin"
@@ -195,7 +197,8 @@ TMUX="/tmp/termnav-example,1,0" \
   TERMNAV_EXAMPLE_BROWSER_TTY="$_browser_tty" \
   TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="${DETECTOR_EXAMPLE%/*}" \
   PATH="$_mock_bin:$PATH" \
-  "$TERMNAV_ROOT/bin/tmux-follow-click" "" "TICKET-42" "" 0 "/tmp"
+  "$TERMNAV_BINARY" \
+  tmux follow-click "" "TICKET-42" "" 0 "/tmp" "$_browser_tty"
 
 python3 - "$_browser_tty" <<'PY'
 import base64

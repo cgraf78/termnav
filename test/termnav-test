@@ -6,23 +6,18 @@ set -euo pipefail
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 root="${test_dir%/test}"
 
+# Shell/Lua integration suites exercise the optimized artifact that users
+# receive, not a historical script facade or Cargo's debug-only test binary.
+# Build once here and pass one explicit path to every suite.
+if [[ -z ${TERMNAV_TEST_BINARY:-} ]]; then
+  cargo build --release --locked --manifest-path "$root/Cargo.toml"
+  TERMNAV_TEST_BINARY="$root/target/release/termnav"
+  export TERMNAV_TEST_BINARY
+fi
+
 # Keep runtime entry points explicit so additions require a lint review.
 runtime_shell_files=(
-  "$root/bin/eza-nvim-links"
-  "$root/bin/nvim-link-host"
-  "$root/bin/nvim-ssh-control-open"
-  "$root/bin/nvim-tmux-open"
-  "$root/bin/termnav-relay"
-  "$root/bin/termnav-tmux-context"
-  "$root/bin/tmux-follow-click"
-  "$root/bin/vscode-nvim-focus"
-  "$root/lib/termnav/nvim-link-context.sh"
-  "$root/lib/termnav/nvim-open/cli.sh"
-  "$root/lib/termnav/nvim-open/common.sh"
-  "$root/lib/termnav/nvim-open/link.sh"
   "$root/lib/termnav/nvim-open/launcher.sh"
-  "$root/lib/termnav/nvim-open/remote.sh"
-  "$root/lib/termnav/remote-command.sh"
   "$root/lib/termnav/shell/file-links.sh"
   "$root/lib/termnav/shell/wezterm-vars.sh"
   "$root/share/termnav/shell.sh"
@@ -31,6 +26,17 @@ runtime_shell_files=(
 
 example_shell_files=(
   "$root/examples/tmux-follow/extensions.d/example-ticket.sh"
+)
+
+tooling_shell_files=(
+  "$root/install.sh"
+  "$root/scripts/package-release.sh"
+  "$root/scripts/release-lib.sh"
+  "$root/scripts/release-smoke-hook.sh"
+  "$root/scripts/release-tag.sh"
+  "$root/scripts/release-version.sh"
+  "$root/scripts/release.sh"
+  "$root/scripts/smoke-release.sh"
 )
 
 check_runtime_shell_inventory() {
@@ -86,8 +92,7 @@ if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
     "${runtime_shell_files[@]}" \
     "${example_shell_files[@]}" \
-    "$root/install.sh" \
-    "$root/support/install-checkout.sh" \
+    "${tooling_shell_files[@]}" \
     "$test_dir/termnav-test" \
     "$test_dir/helpers.sh" \
     "$test_dir"/suites/*-test

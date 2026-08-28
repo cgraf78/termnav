@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# cli-contract-test - black-box contract for the unified executable surface.
+
+set -euo pipefail
+export NO_COLOR=1
+
+test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+root=${test_dir%/test}
+# shellcheck source=../helpers.sh
+. "$test_dir/helpers.sh"
+
+termnav=${TERMNAV_TEST_BINARY:-$root/target/release/termnav}
+_assert_file_exists "CLI contract: optimized unified binary exists" "$termnav"
+if [[ ! -x $termnav ]]; then
+  _test_summary
+fi
+
+top_help=$($termnav --help)
+for command in navigate relay ssh link-host tmux nvim vscode eza version; do
+  _assert_contains "CLI contract: top-level help exposes $command" \
+    "$command" "$top_help"
+done
+
+navigate_help=$($termnav navigate --help 2>&1)
+_assert_contains "CLI contract: navigation exposes parent traversal" \
+  "--parent" "$navigate_help"
+_assert_contains "CLI contract: navigation exposes exact client identity" \
+  "--client-created" "$navigate_help"
+
+relay_help=$($termnav relay --help 2>&1)
+for command in send serve commit sweep; do
+  _assert_contains "CLI contract: relay exposes $command" "$command" "$relay_help"
+done
+for retired in warm stop hot-serve; do
+  _assert_not_contains "CLI contract: relay omits retired $retired command" \
+    "$retired" "$relay_help"
+done
+
+focus_help=$($termnav tmux focus --help 2>&1)
+for command in watch expire claim release stop sync; do
+  _assert_contains "CLI contract: focus exposes $command" "$command" "$focus_help"
+done
+
+set +e
+$termnav navigate pane-select diagonal >/dev/null 2>&1
+navigate_invalid_rc=$?
+$termnav relay send pane-select diagonal >/dev/null 2>&1
+relay_invalid_rc=$?
+$termnav tmux context unexpected >/dev/null 2>&1
+context_invalid_rc=$?
+set -e
+_assert_exit "CLI contract: invalid navigation direction is usage error" \
+  2 "$navigate_invalid_rc"
+_assert_exit "CLI contract: invalid relay direction is usage error" \
+  2 "$relay_invalid_rc"
+_assert_exit "CLI contract: invalid context argument is usage error" \
+  2 "$context_invalid_rc"
+
+set +e
+missing_output=$($termnav 2>&1)
+missing_rc=$?
+set -e
+_assert_exit "CLI contract: bare termnav remains a usage error" 2 "$missing_rc"
+_assert_contains "CLI contract: bare termnav explains the required command" \
+  "a command is required" "$missing_output"
+
+_test_summary

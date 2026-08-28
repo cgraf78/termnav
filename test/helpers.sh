@@ -194,6 +194,64 @@ if [[ -z "$_TEST_TMP_ROOT" || ! -d "$_TEST_TMP_ROOT" ]]; then
 fi
 CLEANUP_DIRS+=("$_TEST_TMP_ROOT")
 
+# A managed dotfiles installation exposes `nvim` through a HOME-aware launcher.
+# Resolve its real payload before replacing HOME, so repository tests remain
+# isolated without accidentally turning the user's launcher into the test
+# subject. Distribution CI already resolves directly to its packaged binary.
+if [[ -z ${TERMNAV_TEST_NVIM_BINARY:-} ]]; then
+  if [[ -x ${HOME:-}/.local/share/neovim/neovim/bin/nvim ]]; then
+    TERMNAV_TEST_NVIM_BINARY=$HOME/.local/share/neovim/neovim/bin/nvim
+  else
+    TERMNAV_TEST_NVIM_BINARY=$(command -v nvim 2>/dev/null || true)
+  fi
+fi
+if [[ -n $TERMNAV_TEST_NVIM_BINARY ]]; then
+  export TERMNAV_TEST_NVIM_BINARY
+  PATH="$(dirname -- "$TERMNAV_TEST_NVIM_BINARY"):$PATH"
+  export PATH
+fi
+if [[ -n ${TERMNAV_TEST_BINARY:-} ]]; then
+  PATH="$(cd -- "$(dirname -- "$TERMNAV_TEST_BINARY")" && pwd -P):$PATH"
+  export PATH
+fi
+
+# Native Termnav commands can reach tmux clients, Neovim sockets, and SSH
+# transports directly. A forgotten mock must therefore fail inside disposable
+# state instead of falling through to the developer's live terminal topology.
+# Put every conventional state root under this suite's owned directory and
+# clear routing metadata before any test command can observe it. Individual
+# cases opt back into tmux, SSH, or editor context explicitly with their own
+# fixtures.
+export HOME="$_TEST_TMP_ROOT/home"
+export XDG_CONFIG_HOME="$_TEST_TMP_ROOT/config"
+export XDG_DATA_HOME="$_TEST_TMP_ROOT/data"
+export XDG_STATE_HOME="$_TEST_TMP_ROOT/state"
+export XDG_CACHE_HOME="$_TEST_TMP_ROOT/cache"
+export XDG_RUNTIME_DIR="$_TEST_TMP_ROOT/runtime"
+export TMPDIR="$_TEST_TMP_ROOT/tmp"
+mkdir -p \
+  "$HOME" \
+  "$XDG_CONFIG_HOME" \
+  "$XDG_DATA_HOME" \
+  "$XDG_STATE_HOME" \
+  "$XDG_CACHE_HOME" \
+  "$XDG_RUNTIME_DIR" \
+  "$TMPDIR"
+chmod 0700 "$XDG_RUNTIME_DIR"
+
+unset \
+  TMUX TMUX_PANE \
+  NVIM NVIM_LISTEN_ADDRESS \
+  SSH_CLIENT SSH_CONNECTION SSH_TTY \
+  WEZTERM_PANE TERM_PROGRAM \
+  TERMNAV_REMOTE_CWD TERMNAV_REMOTE_LINK_HOST TERMNAV_REMOTE_TMUX
+
+# Git and subprocesses launched by a test share the same isolation boundary.
+# An ordinary file is intentional: tests may safely exercise global writes,
+# whereas /dev/null would turn those into unrelated failures.
+export GIT_CONFIG_GLOBAL="$_TEST_TMP_ROOT/gitconfig"
+touch "$GIT_CONFIG_GLOBAL"
+
 _tmpdir() {
   local d
   d=$(mktemp -d "$_TEST_TMP_ROOT/tmp.XXXXXX") || {
@@ -240,11 +298,31 @@ _mock_bin() {
   echo "$d"
 }
 
+# Create a test-only executable adapter for a unified Termnav subcommand.
+# Production installs intentionally expose no historical command wrappers;
+# adapters let long-lived black-box fixtures keep exercising the same argument
+# and process boundaries while the asserted executable is the native binary.
+_termnav_command_adapter() {
+  local target=$1 binary=$2 argument
+  shift 2
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec %q' "$binary"
+    for argument in "$@"; do
+      printf ' %q' "$argument"
+    done
+    printf ' "$@"\n'
+  } >"$target"
+  chmod 0700 "$target"
+}
+
 # ---------------------------------------------------------------------------
 # Portable timeout wrapper — `timeout` is GNU coreutils and is absent on
 # macOS by default. Falls back to `gtimeout` (installed by `brew install
-# coreutils`), and to running the command directly if neither is present
-# (CI's outer job timeout will still catch a hang).
+# coreutils`), then to Python's process supervision. The Python path terminates
+# the whole fixture process group so a timed-out shell cannot strand an SSH
+# child or relay and poison a later test.
 # ---------------------------------------------------------------------------
 
 _with_timeout() {
@@ -254,8 +332,40 @@ _with_timeout() {
     timeout "$secs" "$@"
   elif command -v gtimeout &>/dev/null; then
     gtimeout "$secs" "$@"
+  elif command -v python3 &>/dev/null; then
+    python3 - "$secs" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+
+def seconds(value: str) -> float:
+    scale = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    if value[-1:] in scale:
+        return float(value[:-1]) * scale[value[-1]]
+    return float(value)
+
+
+process = subprocess.Popen(
+    sys.argv[2:],
+    stdin=subprocess.DEVNULL,
+    start_new_session=True,
+)
+try:
+    raise SystemExit(process.wait(timeout=seconds(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    raise SystemExit(124)
+PY
   else
-    "$@"
+    printf 'test timeout requires timeout, gtimeout, or python3\n' >&2
+    return 127
   fi
 }
 

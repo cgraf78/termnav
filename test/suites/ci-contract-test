@@ -15,9 +15,10 @@ fail() {
 [[ -f "$lock_file" && ! -L "$lock_file" ]] ||
   fail "cgraf78/actions lock is missing or is not a regular file"
 actions_sha=$(tr -d '\n' <"$lock_file")
-[[ "$actions_sha" =~ ^[0-9a-f]{40}$ ]] &&
-  [[ $(wc -l <"$lock_file") -eq 1 ]] ||
+if [[ ! "$actions_sha" =~ ^[0-9a-f]{40}$ ]] ||
+  [[ $(wc -l <"$lock_file") -ne 1 ]]; then
   fail "cgraf78/actions lock must contain one lowercase full commit SHA"
+fi
 
 content=$(<"$workflow")
 retry_content=$(<"$retry_workflow")
@@ -25,8 +26,18 @@ retry_content=$(<"$retry_workflow")
   fail "push CI does not target only the maintained main branch"
 [[ "$content" == *'cron: "57 8 * * *"'* ]] ||
   fail "daily matrix does not retain its portfolio offset"
-[[ "$content" == *"cgraf78/actions/.github/workflows/shell-ci.yml@$actions_sha"* ]] ||
-  fail "Shell CI does not use the locked actions revision"
+[[ "$content" == *"cgraf78/actions/.github/workflows/rust-ci.yml@$actions_sha"* ]] ||
+  fail "Rust CI does not use the locked actions revision"
+[[ "$content" == *'profiles: base,shellcheck,zsh,lua,neovim,tmux,python,openssh-netcat-lsof'* ]] ||
+  fail "Rust CI does not install the integration-test profiles"
+[[ "$content" == *'matrix-set: full'* ]] ||
+  fail "Rust CI does not run the full pull-request platform matrix"
+[[ "$content" == *'termux-profiles: base,zsh,neovim,tmux,python,openssh-netcat-lsof'* ]] ||
+  fail "Termux CI does not install the full integration-test profiles"
+[[ "$content" == *'termux-command: TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test'* ]] ||
+  fail "Termux CI does not run the packaged binary through the full suite"
+[[ "$content" == *'test-command: cargo test --locked && test/termnav-test'* ]] ||
+  fail "Rust CI does not run the native and integration suites together"
 [[ "$retry_content" == *"cgraf78/actions/.github/actions/infra-retry@$actions_sha"* ]] ||
   fail "infrastructure retry does not use the locked actions revision"
 
@@ -61,6 +72,12 @@ performance_job=$(awk '
   in_performance { print }
 ' "$workflow")
 
+performance_macos_job=$(awk '
+  /^  relay-performance-macos:$/ { in_performance = 1 }
+  in_performance && /^  [^ ]/ && $0 != "  relay-performance-macos:" { exit }
+  in_performance { print }
+' "$workflow")
+
 # These are literal GitHub expressions in the workflow contract.
 # shellcheck disable=SC2016
 for contract in \
@@ -68,10 +85,32 @@ for contract in \
   "if: \${{ github.event_name == 'pull_request' }}" \
   'runs-on: ubuntu-24.04' \
   'fetch-depth: 0' \
+  'name: Install Rust' \
+  'toolchain: stable' \
   'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
+  'TERMNAV_PERFORMANCE_BASELINE: HEAD' \
+  'TERMNAV_PERFORMANCE_SAMPLES: "2"' \
   'run: test/suites/relay-performance-test'; do
   [[ "$performance_job" == *"$contract"* ]] ||
     fail "Relay performance job is missing: $contract"
+done
+
+# The macOS job protects the procfs-free ancestry path, where each avoidable
+# process spawn is visible latency that Linux-only measurements would miss.
+# shellcheck disable=SC2016
+for contract in \
+  'name: Relay hot path / macOS' \
+  "if: \${{ github.event_name == 'pull_request' }}" \
+  'runs-on: macos-latest' \
+  'fetch-depth: 0' \
+  'name: Install Rust' \
+  'toolchain: stable' \
+  'name: Install tmux' \
+  'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
+  'TERMNAV_PERFORMANCE_SAMPLES: "20"' \
+  'run: test/suites/relay-performance-test'; do
+  [[ "$performance_macos_job" == *"$contract"* ]] ||
+    fail "macOS relay performance job is missing: $contract"
 done
 
 # These are literal GitHub and shell expressions in the workflow contract.
@@ -79,16 +118,19 @@ done
 for contract in \
   'name: Required' \
   'if: ${{ always() }}' \
-  'needs: [shell, eza-current, relay-performance]' \
-  'SHELL_RESULT: ${{ needs.shell.result }}' \
+  'needs: [rust, eza-current, relay-performance, relay-performance-macos]' \
+  'RUST_RESULT: ${{ needs.rust.result }}' \
   'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
   'RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}' \
-  'test "$SHELL_RESULT" = success' \
+  'RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}' \
+  'test "$RUST_RESULT" = success' \
   'test "$EZA_CURRENT_RESULT" = success' \
   'success | skipped) ;;' \
   '*) exit 1 ;;'; do
   [[ "$required_job" == *"$contract"* ]] ||
     fail "Required aggregate is missing: $contract"
 done
+[[ "$required_job" == *"case \"\$RELAY_PERFORMANCE_MACOS_RESULT\" in"* ]] ||
+  fail "Required aggregate does not validate the macOS performance result"
 
 printf 'ci-contract-test: ok\n'

@@ -9,9 +9,14 @@ root="${test_dir%/test}"
 # shellcheck source=../helpers.sh
 . "$test_dir/helpers.sh"
 
-relay="$root/bin/termnav-relay"
+relay_adapter=$(_tmpdir)/termnav-relay
+_termnav_command_adapter "$relay_adapter" \
+  "${TERMNAV_TEST_BINARY:-$root/target/release/termnav}" relay
+relay=$relay_adapter
 relay_server="$test_dir/support/relay-server.py"
-relay_ssh="$test_dir/support/relay-ssh.py"
+relay_ssh=$(_tmpdir)/termnav-ssh
+_termnav_command_adapter "$relay_ssh" \
+  "${TERMNAV_TEST_BINARY:-$root/target/release/termnav}" ssh
 tmp=$(_tmpdir)
 log="$tmp/route.log"
 socket="$tmp/parent.sock"
@@ -78,12 +83,12 @@ echo "=== relay protocol ==="
 python3 "$relay_server" --socket "$socket" --log "$log" &
 server_pid=$!
 _wait_for_unix_listener "$socket"
-TERMNAV_PARENT_RELAY="$socket" "$relay" send pane left
-TERMNAV_PARENT_RELAY="$socket" "$relay" send pane down
-TERMNAV_PARENT_RELAY="$socket" "$relay" send window next
-TERMNAV_PARENT_RELAY="$socket" "$relay" send window previous
-TERMNAV_PARENT_RELAY="$socket" "$relay" send move left
-TERMNAV_PARENT_RELAY="$socket" "$relay" send move right
+TERMNAV_PARENT_RELAY="$socket" "$relay" send pane-select left
+TERMNAV_PARENT_RELAY="$socket" "$relay" send pane-select down
+TERMNAV_PARENT_RELAY="$socket" "$relay" send tab-select next
+TERMNAV_PARENT_RELAY="$socket" "$relay" send tab-select previous
+TERMNAV_PARENT_RELAY="$socket" "$relay" send tab-move left
+TERMNAV_PARENT_RELAY="$socket" "$relay" send tab-move right
 socket_mode="$(stat -c %a "$socket" 2>/dev/null || stat -f %Lp "$socket")"
 kill "$server_pid"
 wait "$server_pid" 2>/dev/null || true
@@ -93,13 +98,13 @@ _assert_eq "relay: owner-only socket permissions" 600 "$socket_mode"
 _assert_eq "relay: removes its local socket on shutdown" false "$([[ -e "$socket" ]] && echo true || echo false)"
 
 set +e
-bad_output=$(TERMNAV_PARENT_RELAY="$socket" "$relay" send pane diagonal 2>&1)
+bad_output=$(TERMNAV_PARENT_RELAY="$socket" "$relay" send pane-select diagonal 2>&1)
 bad_rc=$?
-missing_output=$(env -u TERMNAV_PARENT_RELAY "$relay" send pane left 2>&1)
+missing_output=$(env -u TERMNAV_PARENT_RELAY "$relay" send pane-select left 2>&1)
 missing_rc=$?
 set -e
 _assert_exit "relay: rejects invalid directions" 2 "$bad_rc"
-_assert_contains "relay: invalid direction is actionable" "invalid pane direction" "$bad_output"
+_assert_contains "relay: invalid direction is actionable" "invalid pane-select direction" "$bad_output"
 _assert_exit "relay: absent parent fails silently" 3 "$missing_rc"
 _assert_eq "relay: absent parent emits nothing" "" "$missing_output"
 
@@ -116,9 +121,9 @@ env -u TMUX -u TMUX_PANE TERMNAV_PARENT_RELAY="$outer_socket" \
   "$relay" serve --socket "$inner_socket" &
 inner_pid=$!
 _wait_for_unix_listener "$inner_socket"
-TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send window previous
-TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send pane right
-TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send move left
+TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send tab-select previous
+TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send pane-select right
+TERMNAV_PARENT_RELAY="$inner_socket" "$relay" send tab-move left
 kill "$inner_pid" "$outer_pid"
 wait "$inner_pid" "$outer_pid" 2>/dev/null || true
 _assert_eq "relay: two arbitrary hops preserve forward and reverse operations" \
@@ -137,7 +142,7 @@ for payload in (b"not-json\n", b'{"v":2,"scope":"pane","direction":"left"}\n', b
         client.connect(sys.argv[1])
         client.sendall(payload)
 PY
-TERMNAV_PARENT_RELAY="$malformed_socket" "$relay" send pane up
+TERMNAV_PARENT_RELAY="$malformed_socket" "$relay" send pane-select up
 kill "$malformed_pid"
 wait "$malformed_pid" 2>/dev/null || true
 _assert_eq "relay: malformed and oversized messages cannot trigger routing" \
@@ -169,13 +174,13 @@ stalled.close()
 PY
 # With BUSY nonblocking try-lock, 12 parallel would get busy errors; run serially with gap
 for _ in {1..12}; do
-  TERMNAV_PARENT_RELAY="$concurrent_socket" "$relay" send window next
+  TERMNAV_PARENT_RELAY="$concurrent_socket" "$relay" send tab-select next
   sleep 0.02
 done
 _assert_eq "relay: stalled and concurrent clients cannot block valid fragmented requests" \
   12 "$(wc -l <"$concurrent_log" | tr -d ' ')" # v1 is now rejected (not counted) per v18 #1
 set +e
-TERMNAV_PARENT_RELAY="$concurrent_socket" "$relay" send pane left \
+TERMNAV_PARENT_RELAY="$concurrent_socket" "$relay" send pane-select left \
   --client-pid "$$" --client-tty /dev/definitely-not-this-tty >/dev/null 2>&1
 tty_mismatch_rc=$?
 set -e
@@ -189,7 +194,7 @@ env -u TMUX -u TMUX_PANE -u TERMNAV_PARENT_RELAY \
 negative_pid=$!
 _wait_for_unix_listener "$negative_socket"
 set +e
-TERMNAV_PARENT_RELAY="$negative_socket" "$relay" send pane left >/dev/null 2>&1
+TERMNAV_PARENT_RELAY="$negative_socket" "$relay" send pane-select left >/dev/null 2>&1
 negative_rc=$?
 set -e
 _assert_exit "relay: an unhandled request propagates a negative acknowledgement" 3 "$negative_rc"
@@ -198,7 +203,17 @@ wait "$negative_pid" 2>/dev/null || true
 
 echo
 echo "=== stale socket cleanup ==="
-portable_tmp=$(python3 -c 'import tempfile; print(tempfile.gettempdir())')
+# Explicit listener tests do not pass through Termnav's socket-path fallback,
+# so give them their own short, owner-only root on macOS. Using /tmp itself
+# would correctly fail Termnav's permission checks; the private child keeps the
+# security contract realistic while leaving enough sockaddr_un space. Termux
+# lacks /tmp and keeps using its application-private temporary root.
+if [[ -d /tmp && -w /tmp ]]; then
+  portable_tmp=$(mktemp -d /tmp/tnrelay.XXXXXX)
+  CLEANUP_DIRS+=("$portable_tmp")
+else
+  portable_tmp=$(python3 -c 'import tempfile; print(tempfile.gettempdir())')
+fi
 stale_socket="$portable_tmp/termnav-relay-test-stale-$$.sock"
 active_socket="$portable_tmp/termnav-relay-test-active-$$.sock"
 unrelated_file="$portable_tmp/termnav-relay-test-file-$$.sock"
@@ -223,7 +238,10 @@ import os
 import sys
 os.utime(sys.argv[1], (1, 1))
 PY
-"$relay" sweep
+# Point the sweeper at the same portable temporary root. Production discovers
+# this through its inherited TMPDIR; making that boundary explicit here keeps
+# the fixture independent of the host's much longer default macOS path.
+TMPDIR="$portable_tmp" "$relay" sweep
 _assert_eq "relay sweep: removes an old dead owner socket" false "$([[ -e "$stale_socket" ]] && echo true || echo false)"
 _assert_eq "relay sweep: preserves an old active socket" true "$([[ -S "$active_socket" ]] && echo true || echo false)"
 _assert_eq "relay sweep: preserves unrelated regular files" true "$([[ -f "$unrelated_file" ]] && echo true || echo false)"
@@ -235,7 +253,18 @@ rm -f "$unrelated_file" "$symlink_path"
 echo
 echo "=== arbitrary-host SSH integration ==="
 fake_bin="$tmp/bin"
+# This assertion specifically exercises the preferred XDG runtime branch, so
+# give it a path that is provably short even when macOS starts mktemp below its
+# long /var/folders hierarchy. Platforms without /tmp (notably Termux) retain
+# their application-private temporary root, which already fits there.
+if [[ -d /tmp && -w /tmp ]]; then
+  ssh_runtime=$(mktemp -d /tmp/tnssh.XXXXXX)
+  CLEANUP_DIRS+=("$ssh_runtime")
+else
+  ssh_runtime="$_TEST_TMP_ROOT"
+fi
 mkdir -p "$fake_bin"
+export XDG_RUNTIME_DIR="$ssh_runtime"
 cat >"$fake_bin/ssh-real" <<'EOF'
 #!/usr/bin/env bash
 if [[ ${1:-} == -G ]]; then
@@ -248,15 +277,25 @@ printf '<%s>\n' "$@" >"$TERMNAV_TEST_SSH_LOG"
 exit "${TERMNAV_TEST_SSH_RC:-0}"
 EOF
 chmod +x "$fake_bin/ssh-real"
+ln -s ssh-real "$fake_bin/ssh"
+PATH="$fake_bin:$PATH"
+export PATH
 
 for destination in arbitrary.example alice@host-with-alias '[2001:db8::7]'; do
   ssh_log="$tmp/ssh-${destination//[^a-zA-Z0-9]/_}.log"
   TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default' \
-    TERMNAV_TEST_STDIN_TTY=1 TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-    "$relay_ssh" -p 2222 "$destination"
+    TERMNAV_TEST_SSH_LOG="$ssh_log" \
+    "$relay_ssh" -t -p 2222 "$destination"
   ssh_args=$(cat "$ssh_log")
   _assert_contains "ssh relay: preserves arbitrary destination $destination" "<$destination>" "$ssh_args"
   _assert_contains "ssh relay: uses the original SSH process for forwarding" "<RemoteForward=" "$ssh_args"
+  forward=${ssh_args#*<RemoteForward=}
+  forward=${forward%%>*}
+  local_socket=${forward#*:}
+  _assert_eq "ssh relay: short fixture root exercises the primary runtime path" \
+    true "$([[ $local_socket == "$ssh_runtime"/termnav-*/* ]] && echo true || echo false)"
+  _assert_eq "ssh relay: generated local socket fits portable sockaddr_un" \
+    true "$([[ ${#local_socket} -le 103 ]] && echo true || echo false)"
   _assert_contains "ssh relay: requests per-session environment forwarding" \
     "<SendEnv=TERMNAV_PARENT_RELAY>" "$ssh_args"
   _assert_not_contains "ssh relay: does not pin metadata in ControlMaster configuration" \
@@ -267,8 +306,8 @@ done
 
 ssh_log="$tmp/option-separator.log"
 TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default' \
-  TERMNAV_TEST_STDIN_TTY=1 TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-  "$relay_ssh" -- option-like.example
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay_ssh" -t -- option-like.example
 separator_line=$(grep -n '^<-->$' "$ssh_log" | cut -d: -f1)
 forward_line=$(grep -n '^<RemoteForward=' "$ssh_log" | cut -d: -f1)
 _assert_eq "ssh relay: generated options stay before the option separator" \
@@ -279,21 +318,21 @@ _assert_contains "ssh relay: option separator preserves its destination" \
 for destination in -target.example -N-target.example; do
   ssh_log="$tmp/hostile-destination-${destination//[^a-zA-Z0-9]/_}.log"
   TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default' \
-    TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+    TERMNAV_TEST_SSH_LOG="$ssh_log" \
     "$relay_ssh" -- "$destination" </dev/null
   _assert_eq "ssh relay: option-like destination never implies tty mode" \
     $'<-->\n<'"$destination"'>' "$(cat "$ssh_log")"
 done
 
 ssh_log="$tmp/explicit.log"
-TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+TERMNAV_TEST_SSH_LOG="$ssh_log" \
   "$relay_ssh" other.example printf hello
 _assert_eq "ssh relay: explicit commands without a tty remain ordinary SSH" \
   $'<other.example>\n<printf>\n<hello>' "$(cat "$ssh_log")"
 
 ssh_log="$tmp/explicit-tty.log"
 TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
-  TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
   "$relay_ssh" -t other.example printf hello
 _assert_contains "ssh relay: explicit tty commands receive the relay forward" \
   "RemoteForward=" "$(cat "$ssh_log")"
@@ -305,26 +344,25 @@ _assert_eq "ssh relay: explicit tty commands preserve the explicit command argum
 for mode in '-N mode.example' '-Nf background.example' '-TN no-session.example' '-G config.example' '-O check control.example' '-W target:22 jump.example' '-T no-tty.example' '-f background-only.example'; do
   ssh_log="$tmp/mode-${mode//[^a-zA-Z0-9]/_}.log"
   # shellcheck disable=SC2086 # each fixture intentionally expands to argv.
-  TERMNAV_TEST_STDIN_TTY=1 TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-    "$relay_ssh" $mode
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
+    "$relay_ssh" -t $mode
   _assert_not_contains "ssh relay: control mode $mode is never enhanced" "RemoteForward=" "$(cat "$ssh_log")"
 done
 
 ssh_log="$tmp/redirected.log"
-TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+TERMNAV_TEST_SSH_LOG="$ssh_log" \
   "$relay_ssh" redirected.example </dev/null
 _assert_not_contains "ssh relay: redirected stdin remains an ordinary session" "RemoteForward=" "$(cat "$ssh_log")"
 
 ssh_log="$tmp/forced-tty.log"
-TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+TERMNAV_TEST_SSH_LOG="$ssh_log" \
   "$relay_ssh" -t forced.example </dev/null
 _assert_contains "ssh relay: explicit tty enables a redirected interactive login" "RemoteForward=" "$(cat "$ssh_log")"
 
 ssh_log="$tmp/attached-option.log"
-TERMNAV_TEST_STDIN_TTY=1 \
-  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
-  TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-  "$relay_ssh" -oRequestTTY=force attached-option.example
+TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty force\nsessiontype default' \
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay_ssh" -t -oRequestTTY=force attached-option.example
 _assert_contains "ssh relay: attached option values are not mistaken for flag clusters" \
   "RemoteForward=" "$(cat "$ssh_log")"
 _assert_not_contains "ssh relay: configured TTY policy needs no synthetic flag" \
@@ -332,23 +370,21 @@ _assert_not_contains "ssh relay: configured TTY policy needs no synthetic flag" 
 
 for remote_command in 'tmux attach' 'exec dashboard'; do
   ssh_log="$tmp/remote-command-${remote_command//[^a-zA-Z0-9]/_}.log"
-  TERMNAV_TEST_STDIN_TTY=1 \
-    TERMNAV_TEST_EFFECTIVE_CONFIG="requesttty auto
+  TERMNAV_TEST_EFFECTIVE_CONFIG="requesttty auto
 sessiontype default
 remotecommand $remote_command" \
-    TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-    "$relay_ssh" -oRemoteCommand="$remote_command" configured-command.example
+    TERMNAV_TEST_SSH_LOG="$ssh_log" \
+    "$relay_ssh" -t -oRemoteCommand="$remote_command" configured-command.example
   _assert_eq "ssh relay: configured RemoteCommand remains ordinary SSH" \
-    $'<-oRemoteCommand='"$remote_command"$'>\n<configured-command.example>' "$(cat "$ssh_log")"
+    $'<-t>\n<-oRemoteCommand='"$remote_command"$'>\n<configured-command.example>' "$(cat "$ssh_log")"
 done
 
 ssh_log="$tmp/strict-forward-failure.log"
-TERMNAV_TEST_STDIN_TTY=1 \
-  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\nexitonforwardfailure yes' \
-  TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-  "$relay_ssh" strict.example
+TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\nexitonforwardfailure yes' \
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay_ssh" -t strict.example
 _assert_eq "ssh relay: strict forwarding policy remains ordinary SSH" \
-  '<strict.example>' "$(cat "$ssh_log")"
+  $'<-t>\n<strict.example>' "$(cat "$ssh_log")"
 
 control_ssh="$fake_bin/ssh-control"
 cat >"$control_ssh" <<'EOF'
@@ -361,11 +397,11 @@ printf '%s\n' CALL >>"$TERMNAV_TEST_SSH_LOG"
 printf '<%s>\n' "$@" >>"$TERMNAV_TEST_SSH_LOG"
 EOF
 chmod +x "$control_ssh"
+ln -sfn ssh-control "$fake_bin/ssh"
 ssh_log="$tmp/control.log"
-TERMNAV_TEST_STDIN_TTY=1 \
-  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\ncontrolpath /tmp/TermNav-Control-Test' \
-  TERMNAV_SSH_BINARY="$control_ssh" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-  "$relay_ssh" multiplexed.example
+TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\ncontrolpath /tmp/TermNav-Control-Test' \
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay_ssh" -t multiplexed.example
 _assert_eq "ssh relay: a multiplexed login performs one session and one local control operation" \
   2 "$(grep -c '^CALL$' "$ssh_log")"
 _assert_contains "ssh relay: cancels the exact remote forward through the existing master" \
@@ -396,14 +432,13 @@ printf '%s\n' "${current:-}" >>"$TERMNAV_TEST_EXPECTED_RELAYS"
 printf '%s\n' "${TERMNAV_PARENT_RELAY:-}" >>"$TERMNAV_TEST_ACTUAL_RELAYS"
 EOF
 chmod +x "$session_env_ssh"
+ln -sfn ssh-session-env "$fake_bin/ssh"
 expected_relays="$tmp/expected-relays"
 actual_relays="$tmp/actual-relays"
 for _ in first second; do
-  TERMNAV_TEST_STDIN_TTY=1 \
-    TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\ncontrolpath /tmp/TermNav-Control-Test' \
-    TERMNAV_SSH_BINARY="$session_env_ssh" \
+  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\ncontrolpath /tmp/TermNav-Control-Test' \
     TERMNAV_TEST_EXPECTED_RELAYS="$expected_relays" TERMNAV_TEST_ACTUAL_RELAYS="$actual_relays" \
-    "$relay_ssh" multiplexed.example
+    "$relay_ssh" -t multiplexed.example
 done
 _assert_eq "ssh relay: each session pairs its current SendEnv value with its forward" \
   "$(cat "$expected_relays")" "$(cat "$actual_relays")"
@@ -411,30 +446,24 @@ _assert_eq "ssh relay: session environment regression exercises distinct relay p
   "$(wc -l <"$actual_relays" | tr -d ' ')" "$(sort -u "$actual_relays" | wc -l | tr -d ' ')"
 
 for effective_config in 'sessiontype none' 'sessiontype subsystem' $'sessiontype default\nrequesttty no'; do
+  ln -sfn ssh-real "$fake_bin/ssh"
   ssh_log="$tmp/config-mode-${RANDOM}.log"
-  TERMNAV_TEST_STDIN_TTY=1 TERMNAV_TEST_EFFECTIVE_CONFIG="$effective_config" \
-    TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
-    "$relay_ssh" configured.example
+  TERMNAV_TEST_EFFECTIVE_CONFIG="$effective_config" \
+    TERMNAV_TEST_SSH_LOG="$ssh_log" \
+    "$relay_ssh" -t configured.example
   _assert_not_contains "ssh relay: configured noninteractive mode is never enhanced" \
     "RemoteForward=" "$(cat "$ssh_log")"
 done
 
 ssh_log="$tmp/failure.log"
+ln -sfn ssh-real "$fake_bin/ssh"
 set +e
-TERMNAV_SSH_BINARY="$fake_bin/ssh-real" TERMNAV_TEST_SSH_LOG="$ssh_log" \
+TERMNAV_TEST_SSH_LOG="$ssh_log" \
   TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default' \
-  TERMNAV_TEST_STDIN_TTY=1 TERMNAV_TEST_SSH_RC=37 "$relay_ssh" random-host.example
+  TERMNAV_TEST_SSH_RC=37 "$relay_ssh" -t random-host.example
 ssh_rc=$?
 set -e
 _assert_exit "ssh relay: preserves the original SSH failure" 37 "$ssh_rc"
-
-echo
-echo "=== directive store ==="
-set +e
-python3 "$test_dir/support/relay_store_test.py"
-store_rc=$?
-set -e
-_assert_exit "relay store: prepared, committed, lost-response, and isolation cases pass" 0 "$store_rc"
 
 echo
 echo "=== SSH relay lifecycle ==="

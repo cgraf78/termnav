@@ -46,18 +46,6 @@ case ":${PATH:-}:" in
 esac
 export PATH
 
-# Warm the shared dispatcher without making shell startup wait for Python. The
-# resident service performs the old forwarded-socket sweep once while starting,
-# then removes interpreter startup from every later navigation and commit
-# gesture. Use the provider beside this asset so development and installed
-# generations never share implementation accidentally.
-# Repository tests source this integration under many disposable HOME values.
-# Their dedicated service suite owns lifecycle coverage; suppressing activation
-# here prevents test-only runtimes from leaving detached processes behind.
-if [[ "${REPO_TEST:-0}" != 1 && "${DOT_TEST:-0}" != 1 ]]; then
-  "$_termnav_root/bin/termnav-relay" warm >/dev/null 2>&1 || true
-fi
-
 # Prompt hooks share this cache in the current shell. Re-sourcing the integration
 # intentionally refreshes it, matching the low-level tmux-client cache.
 _termnav_wezterm_remote_link_host_cache_set=0
