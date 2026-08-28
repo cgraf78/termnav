@@ -37,7 +37,7 @@ _assert_contains "relay terminal: one-shot continuation preserves burst routing"
 _assert_contains "relay terminal: every canonical navigation action is exercised" \
   "test_window_move_commits_after_terminal_response" "$output"
 _assert_contains "relay terminal: pane DECRQM remains application-safe" \
-  "test_application_decrqm_response_is_preserved" "$output"
+  "APPLICATION_DECRQM_PRESERVED" "$output"
 _assert_contains "relay terminal: a one-window SSH hop reaches the outer terminal" \
   "test_one_window_tab_selection_reaches_the_outer_terminal" "$output"
 _assert_contains "relay terminal: remote bubbling reaches the VS Code window adapter" \
