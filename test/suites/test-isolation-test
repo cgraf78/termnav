@@ -36,19 +36,24 @@ for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION; do
 done
 
 timeout_fixture=$(_tmpdir)
+timeout_leader_pid=$timeout_fixture/leader.pid
 timeout_child_pid=$timeout_fixture/child.pid
 test_shell=$(command -v sh)
 test_sleep=$(command -v sleep)
 set +e
 (
-  # The single-quoted body is interpreted by the child shell, where $1, $2,
-  # and $$ deliberately refer to that isolated fixture process.
+  # The leader deliberately exits when TERM arrives while its forked child
+  # ignores TERM. Waiting only for the leader therefore leaks the exact process
+  # class that an outer suite deadline is supposed to contain.
   # shellcheck disable=SC2016
   _with_timeout 0.1s "$test_shell" -c '
-    trap "" TERM
+    trap "exit 0" TERM
+    "$3" -c '\''trap "" TERM; exec "$1" 60'\'' sh "$4" &
+    child=$!
     printf "%s\n" "$$" >"$1"
-    exec "$2" 60
-  ' sh "$timeout_child_pid" "$test_sleep"
+    printf "%s\n" "$child" >"$2"
+    wait "$child"
+  ' sh "$timeout_leader_pid" "$timeout_child_pid" "$test_shell" "$test_sleep"
 ) &
 timeout_runner=$!
 deadline=$((SECONDS + 3))
@@ -58,7 +63,7 @@ done
 if kill -0 "$timeout_runner" 2>/dev/null; then
   # This watchdog exists only to make a broken timeout regression fail quickly
   # instead of reproducing the same unbounded CI hang that the helper prevents.
-  [[ -s $timeout_child_pid ]] && kill -KILL "$(cat "$timeout_child_pid")" 2>/dev/null
+  [[ -s $timeout_leader_pid ]] && kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null
   kill -KILL "$timeout_runner" 2>/dev/null
   wait "$timeout_runner" 2>/dev/null
   timeout_status=255
@@ -70,9 +75,59 @@ set -e
 _assert_exit "test isolation: timeout returns its stable deadline status" 124 "$timeout_status"
 if [[ -s $timeout_child_pid ]] && kill -0 "$(cat "$timeout_child_pid")" 2>/dev/null; then
   _fail "test isolation: timeout left a stubborn descendant running"
-  kill -KILL "$(cat "$timeout_child_pid")" 2>/dev/null || true
+  [[ -s $timeout_leader_pid ]] && kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null || true
 else
   _pass "test isolation: timeout cleans up the complete fixture process group"
+fi
+
+# Signals delivered to the Python supervisor are another cancellation boundary.
+# The wrapper must tear down the owned command group before reporting the
+# conventional 128+signal status, even when both child generations ignore it.
+signal_fixture=$(_tmpdir)
+signal_supervisor_pid=$signal_fixture/supervisor.pid
+signal_leader_pid=$signal_fixture/leader.pid
+signal_child_pid=$signal_fixture/child.pid
+set +e
+(
+  # shellcheck disable=SC2016
+  _with_timeout 60s "$test_shell" -c '
+    trap "" INT TERM
+    "$4" -c '\''trap "" INT TERM; exec "$1" 60'\'' sh "$5" &
+    child=$!
+    printf "%s\n" "$PPID" >"$1"
+    printf "%s\n" "$$" >"$2"
+    printf "%s\n" "$child" >"$3"
+    wait "$child"
+  ' sh "$signal_supervisor_pid" "$signal_leader_pid" "$signal_child_pid" "$test_shell" "$test_sleep"
+) &
+signal_runner=$!
+deadline=$((SECONDS + 3))
+while [[ ! -s $signal_child_pid || ! -s $signal_supervisor_pid ]] && ((SECONDS < deadline)); do
+  sleep 0.02
+done
+if [[ -s $signal_supervisor_pid ]]; then
+  kill -TERM "$(cat "$signal_supervisor_pid")" 2>/dev/null
+fi
+deadline=$((SECONDS + 3))
+while kill -0 "$signal_runner" 2>/dev/null && ((SECONDS < deadline)); do
+  sleep 0.02
+done
+if kill -0 "$signal_runner" 2>/dev/null; then
+  [[ -s $signal_leader_pid ]] && kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null
+  kill -KILL "$signal_runner" 2>/dev/null
+  wait "$signal_runner" 2>/dev/null
+  signal_status=255
+else
+  wait "$signal_runner"
+  signal_status=$?
+fi
+set -e
+_assert_exit "test isolation: TERM returns the conventional signal status" 143 "$signal_status"
+if [[ -s $signal_child_pid ]] && kill -0 "$(cat "$signal_child_pid")" 2>/dev/null; then
+  _fail "test isolation: interrupted timeout supervisor left a descendant running"
+  [[ -s $signal_leader_pid ]] && kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null || true
+else
+  _pass "test isolation: interrupted timeout supervisor cleans up its process group"
 fi
 
 _test_summary

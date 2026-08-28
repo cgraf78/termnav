@@ -87,6 +87,15 @@ async function waitFor(predicate, description, timeoutMs = 3500) {
   throw new Error(`timed out waiting for ${description}`);
 }
 
+function assertPathAbsent(target, description) {
+  try {
+    const stat = fs.lstatSync(target);
+    assert.fail(`${description} survived cleanup as mode ${stat.mode.toString(8)}`);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
 async function controllerBehavior() {
   const token = "a".repeat(64);
   let now = 10;
@@ -182,11 +191,31 @@ async function activationCleanup() {
   await extension.activate(context);
   const bridge = context.subscriptions.at(-1);
   const socketPath = environment.get("TERMNAV_VSCODE_SOCKET");
+  const token = environment.get("TERMNAV_VSCODE_TOKEN");
+  const generationPath = path.join(path.dirname(socketPath), fs.readlinkSync(socketPath));
+  const claimPath = `${socketPath}.claim`;
   try {
-    assert.match(environment.get("TERMNAV_VSCODE_TOKEN"), /^[0-9a-f]{64}$/);
+    assert.match(token, /^[0-9a-f]{64}$/);
     assert.ok(fs.lstatSync(socketPath).isSymbolicLink(), "published socket is not a symlink");
+    assert.ok(fs.lstatSync(generationPath).isSocket(), "published generation is not a socket");
     assert.equal(collection.persistent, false);
     assert.equal(listeners.length, 3);
+
+    // Exercise the complete activation contract rather than testing the server
+    // and controller only as separately constructed units. The credentials
+    // exported to terminals must authenticate against the published symlink and
+    // drive the real focus controller through to VS Code's context command.
+    const focused = await request(
+      socketPath,
+      "/nvim-focus",
+      message(token, {
+        source: "activate",
+        observed: Number(process.hrtime.bigint() / 1000000n),
+      }),
+    );
+    assert.equal(focused.status, 200);
+    assert.equal(JSON.parse(focused.body).accepted, true);
+    assert.deepEqual(commands.at(-1), ["setContext", "termnav.nvimFocused", true]);
   } finally {
     // Assertion failures must still close the real server; otherwise Node would
     // retain the listener until the suite's outer timeout obscured the cause.
@@ -194,7 +223,12 @@ async function activationCleanup() {
   }
   assert.equal(environment.has("TERMNAV_VSCODE_SOCKET"), false);
   assert.equal(environment.has("TERMNAV_VSCODE_TOKEN"), false);
-  assert.equal(fs.existsSync(socketPath), false, "published socket survived adapter disposal");
+  // existsSync follows links and therefore reports false for a stale public
+  // symlink whose generation was removed. lstat proves all three namespace
+  // objects are gone, including that broken-link failure mode.
+  assertPathAbsent(socketPath, "published socket");
+  assertPathAbsent(generationPath, "generation socket");
+  assertPathAbsent(claimPath, "socket claim");
 }
 
 async function main() {

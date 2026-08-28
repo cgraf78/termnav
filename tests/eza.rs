@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -22,10 +23,20 @@ struct ChildCleanup(Child);
 impl Drop for ChildCleanup {
     fn drop(&mut self) {
         if self.0.try_wait().ok().flatten().is_none() {
+            if let Ok(group) = i32::try_from(self.0.id()) {
+                let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+            }
             let _ = self.0.kill();
         }
         let _ = self.0.wait();
     }
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 fn wait_for_file(path: &Path, child: &mut Child) {
@@ -135,6 +146,7 @@ exit 37
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .expect("start termnav eza"),
     );
@@ -195,4 +207,91 @@ exit 37
     let mut expected_stderr = early_stderr;
     expected_stderr.extend_from_slice(&stderr);
     assert_eq!(actual_stderr, expected_stderr);
+}
+
+#[test]
+fn downstream_write_failure_kills_the_complete_eza_process_group() {
+    let root = common::temporary_root("eza-write-failure");
+    fs::create_dir_all(&root).expect("create eza failure fixture root");
+    let _cleanup = Cleanup(root.clone());
+    let fake_eza = root.join("eza");
+    let ready_path = root.join("ready");
+    let release_path = root.join("release");
+    let pids_path = root.join("pids");
+    fs::write(
+        &fake_eza,
+        r#"#!/bin/sh
+if [ "${2-}" = "--version" ] || [ "${1-}" = "--version" ]; then
+  exit 0
+fi
+sh -c 'trap "" TERM; exec sleep 60' &
+child=$!
+printf '%s %s\n' "$$" "$child" >"$TERMNAV_TEST_EZA_PIDS"
+: >"$TERMNAV_TEST_EZA_READY"
+while [ ! -e "$TERMNAV_TEST_EZA_RELEASE" ]; do sleep 0.01; done
+printf '\033]8;;file:///tmp/failure\033\\failure\n'
+wait "$child"
+"#,
+    )
+    .expect("write failing-output eza fixture");
+    fs::set_permissions(&fake_eza, fs::Permissions::from_mode(0o700))
+        .expect("make failing-output eza executable");
+
+    let mut child = ChildCleanup(
+        Command::new(env!("CARGO_BIN_EXE_termnav"))
+            .args(["eza", "/tmp"])
+            .env("TERMNAV_EZA_BINARY", &fake_eza)
+            .env("TERMNAV_REMOTE_LINK_HOST", "remote.example")
+            .env("TERMNAV_TEST_EZA_PIDS", &pids_path)
+            .env("TERMNAV_TEST_EZA_READY", &ready_path)
+            .env("TERMNAV_TEST_EZA_RELEASE", &release_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("start termnav with a downstream pipe"),
+    );
+    wait_for_file(&ready_path, &mut child.0);
+    drop(
+        child
+            .0
+            .stdout
+            .take()
+            .expect("close downstream stdout reader"),
+    );
+    fs::write(&release_path, b"release\n").expect("release failing-output eza fixture");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("inspect failed eza adapter") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let pids = fs::read_to_string(&pids_path).unwrap_or_default();
+            for pid in pids
+                .split_whitespace()
+                .filter_map(|value| value.parse::<i32>().ok())
+            {
+                let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            panic!("termnav hung joining stderr after downstream write failure");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!status.success(), "downstream write failure was hidden");
+
+    let pids = fs::read_to_string(&pids_path).expect("read eza process identities");
+    let pids = pids
+        .split_whitespace()
+        .map(|value| value.parse::<u32>().expect("parse eza process identity"))
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while pids.iter().copied().any(process_alive) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        pids.iter().copied().all(|pid| !process_alive(pid)),
+        "downstream failure left an eza process alive: {pids:?}"
+    );
 }
