@@ -264,6 +264,62 @@ impl SystemBackend {
         ))
     }
 
+    fn move_pane(&self, scope: &Scope, direction: Direction) -> Outcome {
+        let (edge, target) = match direction {
+            Direction::Left => ("pane_at_left", "{left-of}"),
+            Direction::Down => ("pane_at_bottom", "{down-of}"),
+            Direction::Up => ("pane_at_top", "{up-of}"),
+            Direction::Right => ("pane_at_right", "{right-of}"),
+            _ => return Outcome::Error,
+        };
+        let Some(session) = scope.session.as_ref() else {
+            return Outcome::Error;
+        };
+        let swap = crate::shell::join(&[
+            "swap-pane".to_owned(),
+            "-d".to_owned(),
+            "-s".to_owned(),
+            scope.pane.clone(),
+            "-t".to_owned(),
+            format!("{session}:.{target}"),
+        ]);
+        let declined = crate::shell::join(&[
+            "display-message".to_owned(),
+            "-p".to_owned(),
+            DECLINED_MARKER.to_owned(),
+        ]);
+        let movable = crate::shell::join(&[
+            "if-shell".to_owned(),
+            "-F".to_owned(),
+            "-t".to_owned(),
+            scope.target(),
+            format!("#{{&&:#{{==:#{{window_zoomed_flag}},0}},#{{!=:#{{{edge}}},1}}}}"),
+            swap,
+            declined,
+        ]);
+        let inactive = crate::shell::join(&[
+            "display-message".to_owned(),
+            "-p".to_owned(),
+            DECLINED_MARKER.to_owned(),
+        ]);
+
+        // Resolve and mutate in one tmux command queue. The outer predicate
+        // revalidates exact active ownership immediately before swap-pane;
+        // `-d` keeps focus attached to the pane identity being moved.
+        Self::outcome(self.tmux(
+            scope,
+            &[
+                "if-shell".to_owned(),
+                "-F".to_owned(),
+                "-t".to_owned(),
+                scope.target(),
+                "#{&&:#{>:#{window_active_clients},0},#{pane_active}}".to_owned(),
+                movable,
+                inactive,
+            ],
+        ))
+    }
+
     /// Return whether a scope owns an action without mutating tmux state.
     ///
     /// Relay navigation must prepare its terminal commit path before the
@@ -271,6 +327,11 @@ impl SystemBackend {
     /// as [`Backend::execute`] so preparation cannot arm an unrelated pane.
     #[must_use]
     pub fn can_execute(&self, scope: &Scope, action: Action, direction: Direction) -> bool {
+        if action == Action::PaneMove {
+            // Pane movement is never prepared for a relay commit. Only the
+            // directly executing host may mutate its layout.
+            return false;
+        }
         if action == Action::PaneSelect {
             let edge = match direction {
                 Direction::Left => "pane_at_left",
@@ -449,6 +510,9 @@ impl Backend for SystemBackend {
     }
 
     fn execute(&mut self, scope: &Scope, action: Action, direction: Direction) -> Outcome {
+        if action == Action::PaneMove {
+            return self.move_pane(scope, direction);
+        }
         if action == Action::PaneSelect {
             let (edge, flag) = match direction {
                 Direction::Left => ("pane_at_left", "L"),
@@ -678,6 +742,7 @@ impl Backend for SystemBackend {
         }
         let scope = match action {
             Action::PaneSelect => "pane",
+            Action::PaneMove => return Outcome::Declined,
             Action::TabSelect => "window",
             Action::TabMove => "move",
         };
@@ -706,6 +771,12 @@ impl Backend for SystemBackend {
         action: Action,
         direction: Direction,
     ) -> Outcome {
+        if action == Action::PaneMove {
+            // Pane layout belongs to the current host. Keep this backend safe
+            // even if a future router change accidentally offers the action
+            // after local ancestry is exhausted.
+            return Outcome::Declined;
+        }
         let (pid, tty, termtype) = client.map_or_else(
             || {
                 (

@@ -126,6 +126,130 @@ test("outermost pane edge does not invent terminal pane navigation", function()
   equal(#streams, 0, "pane navigation should not target terminal panes implicitly")
 end)
 
+for _, case in ipairs({
+  { name = "right", split = "vsplit", source = "h", target = "l", direction = "right" },
+  { name = "left", split = "vsplit", source = "l", target = "h", direction = "left" },
+  { name = "down", split = "split", source = "k", target = "j", direction = "down" },
+  { name = "up", split = "split", source = "j", target = "k", direction = "up" },
+}) do
+  test("local split movement swaps one neighbor " .. case.name, function()
+    vim.cmd(case.split)
+    vim.cmd("wincmd " .. case.source)
+    local source = vim.api.nvim_get_current_win()
+    local source_buffer = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_win_set_buf(source, source_buffer)
+    vim.cmd("wincmd " .. case.target)
+    local neighbor = vim.api.nvim_get_current_win()
+    local neighbor_buffer = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_win_set_buf(neighbor, neighbor_buffer)
+    vim.api.nvim_set_current_win(source)
+    local ctx, commands, jobs = fake_context()
+
+    equal(ctx.pane_move(case.direction), true, "pane move should be handled")
+
+    equal(vim.api.nvim_get_current_win(), neighbor, "focus should follow the moved content")
+    equal(vim.api.nvim_win_get_buf(neighbor), source_buffer, "source content should move")
+    equal(vim.api.nvim_win_get_buf(source), neighbor_buffer, "neighbor content should swap")
+    equal(#commands, 0, "local pane move should not invoke tmux")
+    equal(#jobs, 0, "local pane move should not start the router")
+  end)
+end
+
+test("asymmetric local movement swaps only the directional neighbor", function()
+  vim.cmd("vsplit")
+  vim.cmd("wincmd l")
+  vim.cmd("split")
+  vim.cmd("wincmd j")
+  local source = vim.api.nvim_get_current_win()
+  local source_buffer = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_win_set_buf(source, source_buffer)
+  vim.cmd("wincmd h")
+  local neighbor = vim.api.nvim_get_current_win()
+  local neighbor_buffer = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_win_set_buf(neighbor, neighbor_buffer)
+  vim.api.nvim_set_current_win(source)
+  local ctx = fake_context()
+
+  equal(ctx.pane_move("left"), true, "asymmetric move should be handled")
+
+  equal(vim.api.nvim_get_current_win(), neighbor, "focus should follow asymmetric movement")
+  equal(vim.api.nvim_win_get_buf(neighbor), source_buffer, "source content should move left")
+  equal(vim.api.nvim_win_get_buf(source), neighbor_buffer, "neighbor content should move right")
+end)
+
+test("same-buffer movement carries the source view to its neighbor", function()
+  local buffer = vim.api.nvim_get_current_buf()
+  local lines = {}
+  for line = 1, 200 do
+    lines[line] = "line " .. line
+  end
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, lines)
+  vim.cmd("vsplit")
+  vim.cmd("wincmd h")
+  local source = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_cursor(source, { 10, 0 })
+  vim.api.nvim_win_call(source, function()
+    vim.cmd("normal! zt")
+  end)
+  vim.cmd("wincmd l")
+  local neighbor = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_cursor(neighbor, { 100, 0 })
+  vim.api.nvim_win_call(neighbor, function()
+    vim.cmd("normal! zt")
+  end)
+  vim.api.nvim_set_current_win(source)
+  local ctx = fake_context()
+
+  equal(ctx.pane_move("right"), true, "same-buffer move should be handled")
+
+  equal(vim.api.nvim_get_current_win(), neighbor, "focus should follow the source view")
+  equal(vim.api.nvim_win_get_cursor(neighbor)[1], 10, "source cursor should move right")
+  equal(vim.api.nvim_win_get_cursor(source)[1], 100, "neighbor cursor should move left")
+end)
+
+test("partial application collaborators decline unsupported local movement", function()
+  vim.cmd("vsplit")
+  vim.cmd("wincmd h")
+  local source = vim.api.nvim_get_current_win()
+  local ctx = fake_context({
+    application = {
+      tab_count = function()
+        return 1
+      end,
+    },
+  })
+
+  local ok, handled = pcall(ctx.pane_move, "right")
+
+  truthy(ok, "missing optional pane_move callback must not crash")
+  equal(handled, false, "partial collaborator should decline unsupported movement")
+  equal(vim.api.nvim_get_current_win(), source, "declined movement should preserve focus")
+end)
+
+test("pane movement at a nvim edge delegates only to the native router", function()
+  vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
+  vim.env.TMUX_PANE = "%7"
+  local ctx, commands, jobs = fake_context()
+
+  equal(ctx.pane_move("up"), true, "tmux boundary should accept pane move")
+
+  equal(#commands, 0, "nvim should not implement tmux pane movement")
+  equal(
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "pane-move", "up" },
+    "pane movement should reuse the typed router"
+  )
+end)
+
+test("outermost pane movement boundary is a process-free no-op", function()
+  local ctx, commands, jobs = fake_context()
+
+  equal(ctx.pane_move("left"), true, "outermost move should be consumed")
+
+  equal(#commands, 0, "outermost move should not invoke tmux")
+  equal(#jobs, 0, "outermost move must not reach a terminal boundary")
+end)
+
 test("application tab selection stays process free", function()
   local selected = {}
   local ctx, commands, jobs = fake_context({
@@ -381,7 +505,7 @@ end)
 
 test("setup installs direct mappings and netrw routing", function()
   vim.g.Netrw_UserMaps = nil
-  local ctx = fake_context({ mappings = true })
+  local ctx, _, jobs = fake_context({ mappings = true })
 
   ctx.setup()
 
@@ -398,6 +522,21 @@ test("setup installs direct mappings and netrw routing", function()
     local mapping = vim.fn.maparg(expected.key, "n", false, true)
     truthy(mapping.callback ~= nil, expected.key .. " should map a navigation callback")
     equal(mapping.desc, expected.desc, expected.key .. " mapping description")
+  end
+  for _, expected in ipairs({
+    { key = "<M-H>", desc = "Move pane left" },
+    { key = "<M-J>", desc = "Move pane down" },
+    { key = "<M-K>", desc = "Move pane up" },
+    { key = "<M-L>", desc = "Move pane right" },
+  }) do
+    local normal = vim.fn.maparg(expected.key, "n", false, true)
+    truthy(normal.callback ~= nil, expected.key .. " should map pane movement")
+    equal(normal.desc, expected.desc, expected.key .. " mapping description")
+    equal(
+      vim.fn.maparg(expected.key, "t", false, true).expr,
+      1,
+      expected.key .. " terminal pane-move map should be expr"
+    )
   end
   equal(vim.fn.maparg("<C-j>", "t", false, true).expr, 1, "terminal pane map should be expr")
   equal(
@@ -416,10 +555,33 @@ test("setup installs direct mappings and netrw routing", function()
     )
   end
   vim.bo.filetype = "fzf"
-  for _, key in ipairs({ "<C-Tab>", "<C-S-Tab>", "<M-{>", "<M-}>" }) do
+  for _, key in ipairs({
+    "<C-Tab>",
+    "<C-S-Tab>",
+    "<M-{>",
+    "<M-}>",
+    "<M-H>",
+    "<M-J>",
+    "<M-K>",
+    "<M-L>",
+  }) do
     local mapping = vim.fn.maparg(key, "t", false, true)
     equal(mapping.callback(), keycode(key), "fzf should receive raw " .. key)
   end
+  vim.bo.filetype = ""
+  vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
+  vim.env.TMUX_PANE = "%7"
+  local terminal_move = vim.fn.maparg("<M-H>", "t", false, true)
+  equal(
+    terminal_move.callback(),
+    keycode([[<C-\><C-n>]]),
+    "terminal pane movement should leave job mode"
+  )
+  equal(
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "pane-move", "left" },
+    "terminal pane movement should queue the typed action"
+  )
   equal(vim.g.Netrw_UserMaps[1][1], "<C-l>", "netrw should preserve right navigation")
   equal(
     vim.g.Netrw_UserMaps[1][2],

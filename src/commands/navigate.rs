@@ -12,8 +12,8 @@ const CONTINUATION_TTL: Duration = Duration::from_millis(250);
 
 const HELP: &str = r#"usage: termnav navigate [OPTIONS] ACTION DIRECTION
 
-actions: pane-select, tab-select, tab-move
-directions: pane-select=left|right|up|down; tab-select=previous|next; tab-move=left|right
+actions: pane-select, pane-move, tab-select, tab-move
+directions: pane-select|pane-move=left|down|up|right; tab-select=previous|next; tab-move=left|right
 
 options:
   --parent             start outside a tmux scope that already declined

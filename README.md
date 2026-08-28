@@ -5,9 +5,9 @@
 [![Bash Version](https://img.shields.io/badge/bash-%3E%3D3.2-blue.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-lightgrey.svg)](#)
 
-`termnav` owns terminal navigation helpers: nearest-scope tab routing,
-WezTerm link routing, tmux ctrl-click follow-through, OSC-8-aware `eza`
-links, and existing-session Neovim opens.
+`termnav` owns terminal navigation helpers: directional pane selection and
+movement, nearest-scope tab routing, WezTerm link routing, tmux ctrl-click
+follow-through, OSC-8-aware `eza` links, and existing-session Neovim opens.
 
 ## Installation
 
@@ -26,15 +26,17 @@ installation path to build, publish, update, and diagnose.
 
 `termnav` is the only compiled executable. Its stable command groups are:
 
-- `termnav navigate ACTION DIRECTION`: route pane selection, tab selection,
-  and tab movement through local tmux ancestry, SSH relays, and the originating
-  terminal.
+- `termnav navigate ACTION DIRECTION`: route pane selection, pane movement,
+  tab selection, and tab movement. `pane-move left|down|up|right` swaps the
+  active pane with one directional neighbor through local tmux ancestry only;
+  it never crosses SSH, WezTerm, VS Code, or another terminal boundary.
 - `termnav ssh SSH-ARG...`: supervise the user's one requested SSH session and
   its connection-scoped reverse relay. It never opens a second authenticated
   transport, including during cleanup or remote editor reuse.
 - `termnav relay send ACTION DIRECTION`: send one navigation request to the
   inherited relay using the same `pane-select`, `tab-select`, or `tab-move`
-  action names as `termnav navigate`. `serve`, `commit`, and `sweep` are
+  action names as `termnav navigate`. The host-local `pane-move` action is
+  rejected rather than serialized. `serve`, `commit`, and `sweep` are
   documented integration commands used by the SSH and tmux adapters rather
   than interactive entry points.
 - `termnav tmux context ...`: publish tmux ownership to one exact terminal
@@ -119,11 +121,13 @@ constructing protocol objects directly.
   `add_public_link_rules(rules)`.
 - `lib/termnav/nvim/setup.lua`: reusable Neovim-side setup for publishing the
   current editor socket, cwd, and remote context to WezTerm.
-- `lib/termnav/nvim/navigation.lua`: Neovim pane and tab navigation. Directional
-  pane edges and tab boundaries use bounded one-shot native jobs, while
-  Ctrl-backslash preserves the local
-  previous-split/previous-tmux-pane history expected from vim-tmux-navigator
-  without guessing at an ancestor's history.
+- `lib/termnav/nvim/navigation.lua`: Neovim pane and tab navigation. Its
+  `setup()` owns `<C-h/j/k/l>` selection and `<M-H/J/K/L>` movement mappings in
+  normal and terminal modes; terminal mappings preserve fzf input and own the
+  leave-job-mode/schedule/re-enter transition. Directional pane edges and tab
+  boundaries use bounded one-shot native jobs, while Ctrl-backslash preserves
+  the local previous-split/previous-tmux-pane history expected from
+  vim-tmux-navigator without guessing at an ancestor's history.
 - `lib/termnav/nvim/nvim-tmux-open.lua` and
   `lib/termnav/nvim/wezterm-vars.lua`: lower-level Neovim helpers used by the
   setup module and advanced consumers.
@@ -229,7 +233,26 @@ instead of interpreting metadata directly. There are no `DOT_*` aliases.
 `command`, `executable`, `mappings`, `notify`, `schedule`, and `spawn`.
 `vscode-focus.lua` accepts `command`, `interval_ms`, `observed`, and `source`.
 Defaults are production implementations; collaborator overrides exist for
-embedding and deterministic tests.
+embedding and deterministic tests. An overridden `application` may provide
+`pane_move(source_window, target_window)` and return whether it handled the
+local swap; omitting that callback makes local pane movement a safe decline.
+
+The Neovim navigation context exposes `pane_move("left"|"down"|"up"|"right")`.
+It swaps the current buffer and saved view with the directional neighbor and
+keeps focus on the moved content. At a Neovim edge it queues
+`termnav navigate pane-move DIRECTION`; no tmux means a process-free no-op.
+Consumers should not copy the terminal-mode transition or install duplicate
+Meta mappings when `mappings` is enabled. A tmux binding that has already
+decided it owns the chord should invoke `termnav navigate pane-move DIRECTION`
+in the foreground without `--parent`; the typed router probes the current scope
+and any same-host containing tmux scopes itself.
+
+Local Neovim movement starts no process. A tmux movement uses one Termnav
+process and one guarded mutation command for each attempted local scope;
+bounded client inspection and revalidation queries run only when session
+identity or outward traversal requires them. Routing is bounded by actual
+nesting depth, never starts a resident worker, and stops before relay or
+terminal I/O.
 
 The stable shell callbacks from `share/termnav/shell.sh` are
 `_termnav_wezterm_publish_link_context`, `_termnav_wezterm_preexec COMMAND`,

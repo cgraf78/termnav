@@ -4,6 +4,12 @@
 set -euo pipefail
 export NO_COLOR=1
 
+# This suite constructs its own complete tmux ancestry below. Inheriting the
+# developer's TMUX would silently add a real, unrelated parent scope to every
+# synthetic "direct terminal" client and make boundary assertions depend on
+# where the test runner happened to be launched.
+unset TMUX TMUX_PANE
+
 TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
@@ -26,6 +32,7 @@ invalid_rc=$?
 set -e
 _assert_exit "navigation CLI: help exits successfully" 0 "$help_rc"
 _assert_contains "navigation CLI: names the pane action" "pane-select" "$help_output"
+_assert_contains "navigation CLI: names the pane movement action" "pane-move" "$help_output"
 _assert_contains "navigation CLI: names the tab selection action" "tab-select" "$help_output"
 _assert_contains "navigation CLI: names the tab movement action" "tab-move" "$help_output"
 _assert_contains "navigation CLI: distinguishes a declined current scope" "--parent" "$help_output"
@@ -92,7 +99,10 @@ left_pane=$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')
 tmux -L "$socket_name" split-window -h -t "$left_pane"
 right_pane=$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')
 socket_path=$(tmux -L "$socket_name" display-message -p -t nav:panes '#{socket_path}')
-TERM=xterm-256color "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
+env -u TMUX -u TMUX_PANE TERM=xterm-256color \
+  TERMNAV_PARENT_RELAY=/tmp/termnav-must-not-relay.sock \
+  "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
+  --without-parent-scope \
   -L "$socket_name" attach-session -t nav >/dev/null 2>&1 &
 nav_client_launcher=$!
 for _attempt in $(seq 1 200); do
@@ -130,6 +140,121 @@ _assert_eq "navigation CLI: current pane handles an available left neighbor" \
   "$left_pane" \
   "$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')"
 
+pane_position() {
+  tmux -L "$socket_name" display-message -p -t "$1" \
+    '#{pane_left},#{pane_top},#{pane_width},#{pane_height}'
+}
+
+build_move_grid() {
+  tmux -L "$socket_name" kill-window -t nav:moves 2>/dev/null || true
+  move_top_left=$(tmux -L "$socket_name" new-window -t nav -n moves -P -F '#{pane_id}')
+  move_top_right=$(tmux -L "$socket_name" split-window -h -t "$move_top_left" -P -F '#{pane_id}')
+  move_bottom_left=$(tmux -L "$socket_name" split-window -v -t "$move_top_left" -P -F '#{pane_id}')
+  move_bottom_right=$(tmux -L "$socket_name" split-window -v -t "$move_top_right" -P -F '#{pane_id}')
+}
+
+assert_pane_move() {
+  local direction=$1 source=$2 neighbor=$3 source_before neighbor_before
+  source_before=$(pane_position "$source")
+  neighbor_before=$(pane_position "$neighbor")
+  tmux -L "$socket_name" select-pane -t "$source"
+  wait_for_client_panes "$source" 1 >/dev/null
+
+  # The synthetic client carries an unreachable inherited parent relay, as a
+  # remote-side tmux client would. Successful movement must remain local and
+  # must not require a graphical terminal or reachable relay endpoint.
+  TMUX="$socket_path,1,0" TMUX_PANE="$source" \
+    "$navigate" pane-move "$direction"
+
+  _assert_eq "pane move $direction: source takes the directional neighbor position" \
+    "$neighbor_before" "$(pane_position "$source")"
+  _assert_eq "pane move $direction: neighbor takes the source position" \
+    "$source_before" "$(pane_position "$neighbor")"
+  _assert_eq "pane move $direction: focus stays on the moved pane" \
+    "$source" \
+    "$(tmux -L "$socket_name" display-message -p -t nav:moves '#{pane_id}')"
+}
+
+for direction in right left down up; do
+  build_move_grid
+  case "$direction" in
+    right)
+      move_source=$move_top_left
+      move_neighbor=$move_top_right
+      ;;
+    left)
+      move_source=$move_top_right
+      move_neighbor=$move_top_left
+      ;;
+    down)
+      move_source=$move_top_left
+      move_neighbor=$move_bottom_left
+      ;;
+    up)
+      move_source=$move_bottom_left
+      move_neighbor=$move_top_left
+      ;;
+  esac
+  assert_pane_move "$direction" "$move_source" "$move_neighbor"
+done
+
+build_move_grid
+layout_before=$(tmux -L "$socket_name" list-panes -t nav:moves \
+  -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}')
+tmux -L "$socket_name" select-pane -t "$move_top_left"
+wait_for_client_panes "$move_top_left" 1 >/dev/null
+set +e
+TMUX="$socket_path,1,0" TMUX_PANE="$move_top_left" \
+  "$navigate" pane-move left
+edge_move_rc=$?
+set -e
+_assert_exit "pane move: an outer edge declines without mutation" 3 "$edge_move_rc"
+_assert_eq "pane move: outer edge preserves the layout" "$layout_before" \
+  "$(tmux -L "$socket_name" list-panes -t nav:moves \
+    -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}')"
+
+tmux -L "$socket_name" resize-pane -Z -t "$move_top_left"
+set +e
+TMUX="$socket_path,1,0" TMUX_PANE="$move_top_left" \
+  "$navigate" pane-move right
+zoom_move_rc=$?
+set -e
+_assert_exit "pane move: a zoomed layout declines" 3 "$zoom_move_rc"
+_assert_eq "pane move: zoom remains enabled after the no-op" 1 \
+  "$(tmux -L "$socket_name" display-message -p -t "$move_top_left" '#{window_zoomed_flag}')"
+tmux -L "$socket_name" resize-pane -Z -t "$move_top_left"
+
+tmux -L "$socket_name" select-pane -t "$move_top_right"
+wait_for_client_panes "$move_top_right" 1 >/dev/null
+inactive_layout=$(tmux -L "$socket_name" list-panes -t nav:moves \
+  -F '#{pane_id}|#{pane_left}|#{pane_top}')
+set +e
+TMUX="$socket_path,1,0" TMUX_PANE="$move_top_left" \
+  "$navigate" pane-move right
+inactive_move_rc=$?
+set -e
+_assert_exit "pane move: an inactive source declines" 3 "$inactive_move_rc"
+_assert_eq "pane move: inactive source cannot mutate the layout" "$inactive_layout" \
+  "$(tmux -L "$socket_name" list-panes -t nav:moves -F '#{pane_id}|#{pane_left}|#{pane_top}')"
+
+tmux -L "$socket_name" kill-window -t nav:moves
+move_left=$(tmux -L "$socket_name" new-window -t nav -n moves -P -F '#{pane_id}')
+move_top_right=$(tmux -L "$socket_name" split-window -h -t "$move_left" -P -F '#{pane_id}')
+move_bottom_right=$(tmux -L "$socket_name" split-window -v -t "$move_top_right" -P -F '#{pane_id}')
+assert_pane_move left "$move_bottom_right" "$move_left"
+
+single_pane=$(tmux -L "$socket_name" new-window -t nav -n move-single -P -F '#{pane_id}')
+wait_for_client_panes "$single_pane" 1 >/dev/null
+set +e
+TMUX="$socket_path,1,0" TMUX_PANE="$single_pane" \
+  "$navigate" pane-move down
+single_move_rc=$?
+set -e
+_assert_exit "pane move: a one-pane window declines" 3 "$single_move_rc"
+tmux -L "$socket_name" kill-window -t nav:moves
+tmux -L "$socket_name" kill-window -t nav:move-single
+tmux -L "$socket_name" select-window -t nav:panes
+
 tmux -L "$socket_name" new-window -d -t nav -n second
 first_window=$(tmux -L "$socket_name" list-windows -t nav -F '#{window_id}' | sed -n '1p')
 second_window=$(tmux -L "$socket_name" list-windows -t nav -F '#{window_id}' | sed -n '2p')
@@ -138,7 +263,9 @@ source_pane=$(tmux -L "$socket_name" display-message -p -t "$first_window" '#{pa
 
 # Local session-relative actions need no physical-client choice when several
 # direct terminals display the same logical tmux session.
-TERM=xterm-256color "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
+env -u TMUX -u TMUX_PANE TERM=xterm-256color \
+  "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
+  --without-parent-scope \
   -L "$socket_name" attach-session -t nav >/dev/null 2>&1 &
 shared_client_launcher=$!
 for _attempt in $(seq 1 200); do
@@ -157,6 +284,22 @@ _assert_eq "navigation CLI: second synthetic client reaches attached state" \
 source_client_count=$(wait_for_client_panes "$source_pane" 2)
 _assert_eq "navigation CLI: both clients finish initial pane selection" \
   2 "$source_client_count"
+
+shared_source_before=$(pane_position "$source_pane")
+shared_neighbor_before=$(pane_position "$right_pane")
+TMUX="$socket_path,1,0" TMUX_PANE="$source_pane" \
+  "$navigate" pane-move right
+_assert_eq "pane move: shared clients do not make a local move ambiguous" \
+  "$shared_neighbor_before" "$(pane_position "$source_pane")"
+_assert_eq "pane move: shared-client neighbor swaps exactly once" \
+  "$shared_source_before" "$(pane_position "$right_pane")"
+# Restore the fixture before the pre-existing parent-traversal assertions. Pane
+# identity deliberately follows the moved pane, so merely selecting the old
+# left ID would otherwise leave that ID at the right edge for later tests.
+TMUX="$socket_path,1,0" TMUX_PANE="$source_pane" \
+  "$navigate" pane-move left
+_assert_eq "pane move: shared-client fixture restores the source position" \
+  "$shared_source_before" "$(pane_position "$source_pane")"
 set +e
 TMUX="$socket_path,1,0" TMUX_PANE="$source_pane" \
   "$navigate" tab-select next
@@ -239,6 +382,23 @@ child_socket_path=$(tmux -L "$child_socket_name" display-message -p -t child '#{
   --source-pane "$child_pane" --source-session "$child_session"
 _assert_eq "navigation CLI: a local parent is visited before any relay" \
   "$right_pane" \
+  "$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')"
+
+tmux -L "$socket_name" select-pane -t "$left_pane"
+wait_for_client_panes "$left_pane" 2 >/dev/null
+nested_source_before=$(pane_position "$left_pane")
+nested_neighbor_before=$(pane_position "$right_pane")
+"$navigate" --parent pane-move right \
+  --client-pid "$parent_client_pid" --client-tty "$parent_client_tty" \
+  --client-created "$parent_client_created" \
+  --client-termtype xterm-256color --source-socket "$child_socket_path" \
+  --source-pane "$child_pane" --source-session "$child_session"
+_assert_eq "pane move: local nesting moves in the containing tmux" \
+  "$nested_neighbor_before" "$(pane_position "$left_pane")"
+_assert_eq "pane move: local nesting swaps the exact neighbor" \
+  "$nested_source_before" "$(pane_position "$right_pane")"
+_assert_eq "pane move: local nesting keeps focus on the moved pane" \
+  "$left_pane" \
   "$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')"
 kill "$parent_client_launcher" 2>/dev/null || true
 wait "$parent_client_launcher" 2>/dev/null || true

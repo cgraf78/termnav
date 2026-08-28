@@ -61,7 +61,8 @@ subcommands instead of reproducing routing policy.
 .TP
 .B navigate
 ACTION is
-.BR pane-select " with " left|right|up|down ,
+.BR pane-select " with " left|down|up|right ,
+.BR pane-move " with " left|down|up|right ,
 .BR tab-select " with " previous|next ,
 or
 .BR tab-move " with " left|right .
@@ -79,9 +80,11 @@ and
 .BR --continuation .
 .TP
 .B relay send
-Uses the navigation actions and directions and optionally the paired
+Uses pane-select, tab-select, and tab-move with their navigation directions and
+optionally the paired
 .B --client-pid PID --client-tty TTY
-identity.
+identity. Pane-move is host-local and is rejected rather than sent over a
+relay.
 .TP
 .B relay commit
 Requires
@@ -170,6 +173,25 @@ Valid navigation or relay-send request declined at this boundary.
 uses these for unavailable connection configuration, invalid host, SSH failure,
 and disallowed host. VS Code focus uses 10 when its adapter is unavailable.
 SSH and eza otherwise preserve child status.
+.SH PANE MOVEMENT
+.B termnav navigate pane-move DIRECTION
+swaps the exact active tmux source pane with its directional neighbor and keeps
+focus on the moved pane. It may continue through any number of same-host parent
+tmux scopes. It declines without mutation at an edge, in a one-pane or zoomed
+window, when client ownership is stale or ambiguous, or before an SSH, WezTerm,
+VS Code, or terminal boundary.
+.PP
+The Neovim navigation provider exposes
+.BR pane_move(direction) .
+With mappings enabled,
+.B navigation.setup()
+owns M-H, M-J, M-K, and M-L in normal and terminal modes. Local editor movement
+starts no process; a tmux movement starts one Termnav process and one guarded
+mutation command per attempted local scope. Bounded client inspection and
+revalidation queries run only when session identity or outward traversal needs
+them. Consumers should invoke the current-scope command without
+.B --parent
+unless they have already performed and declined that scope's operation.
 .SH WEZTERM PROTOCOL
 .B routes.setup()
 registers the open-uri router and handlers for

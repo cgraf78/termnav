@@ -216,6 +216,12 @@ pub fn send_navigation(
     client_tty: Option<&str>,
     parent_override: Option<&str>,
 ) -> i32 {
+    let Some(wire_scope) = wire_scope(action) else {
+        // Moving pane layout is deliberately host-local. Keep this guard in
+        // the transport API as well as the CLI so library callers cannot
+        // accidentally serialize it onto an SSH relay.
+        return 3;
+    };
     let mut parent = client_pid
         .and_then(|pid| process::environment(pid, "TERMNAV_PARENT_RELAY"))
         .filter(|value| !value.is_empty());
@@ -239,7 +245,7 @@ pub fn send_navigation(
         // Protocol v2 uses compact scope names. Keep that vocabulary isolated
         // at this boundary so mixed-version SSH paths interoperate without
         // exposing old names through the unified public command interface.
-        "scope": wire_scope(action),
+        "scope": wire_scope,
         "direction": direction.as_str(),
         "nonce": super::client::new_nonce(),
     });
@@ -782,11 +788,12 @@ fn wire_action(scope: &str, direction: &str) -> Option<(Action, Direction)> {
         .map(|direction| (action, direction))
 }
 
-fn wire_scope(action: Action) -> &'static str {
+fn wire_scope(action: Action) -> Option<&'static str> {
     match action {
-        Action::PaneSelect => "pane",
-        Action::TabSelect => "window",
-        Action::TabMove => "move",
+        Action::PaneSelect => Some("pane"),
+        Action::PaneMove => None,
+        Action::TabSelect => Some("window"),
+        Action::TabMove => Some("move"),
     }
 }
 
@@ -1180,9 +1187,10 @@ mod tests {
 
     #[test]
     fn wire_vocabulary_is_action_specific() {
-        assert_eq!(wire_scope(Action::PaneSelect), "pane");
-        assert_eq!(wire_scope(Action::TabSelect), "window");
-        assert_eq!(wire_scope(Action::TabMove), "move");
+        assert_eq!(wire_scope(Action::PaneSelect), Some("pane"));
+        assert_eq!(wire_scope(Action::PaneMove), None);
+        assert_eq!(wire_scope(Action::TabSelect), Some("window"));
+        assert_eq!(wire_scope(Action::TabMove), Some("move"));
         assert!(wire_action("pane", "left").is_some());
         assert!(wire_action("pane", "next").is_none());
         assert!(wire_action("window", "previous").is_some());

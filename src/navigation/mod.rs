@@ -33,6 +33,8 @@ pub enum Outcome {
 pub enum Action {
     /// Select an adjacent editor or tmux pane.
     PaneSelect,
+    /// Swap the active pane with one directional neighbor on this host.
+    PaneMove,
     /// Select the previous or next tab/window.
     TabSelect,
     /// Reorder the current tab/window.
@@ -49,6 +51,7 @@ impl Action {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
             "pane-select" => Ok(Self::PaneSelect),
+            "pane-move" => Ok(Self::PaneMove),
             "tab-select" => Ok(Self::TabSelect),
             "tab-move" => Ok(Self::TabMove),
             _ => Err(format!("invalid navigation action: {value}")),
@@ -60,6 +63,7 @@ impl Action {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PaneSelect => "pane-select",
+            Self::PaneMove => "pane-move",
             Self::TabSelect => "tab-select",
             Self::TabMove => "tab-move",
         }
@@ -97,7 +101,7 @@ impl Direction {
         };
 
         let valid = match action {
-            Action::PaneSelect => {
+            Action::PaneSelect | Action::PaneMove => {
                 matches!(direction, Self::Left | Self::Down | Self::Up | Self::Right)
             }
             Action::TabSelect => matches!(direction, Self::Next | Self::Previous),
@@ -342,7 +346,7 @@ where
 
         if let Some(scope) = continuing_scope {
             let Some(current) = self.backend.refresh_scope(&scope) else {
-                return RouteResult::error();
+                return RouteResult::uncertain(action, None);
             };
             if let Some(previous) = continuing_client {
                 client = self.backend.refresh_client(&previous);
@@ -350,7 +354,7 @@ where
                     .as_ref()
                     .is_none_or(|candidate| !client_displays(candidate, &current))
                 {
-                    return RouteResult::error();
+                    return RouteResult::uncertain(action, client);
                 }
             }
             let (outcome, current, selected) = self.enter_scope(
@@ -371,11 +375,11 @@ where
                 };
             }
             if client.is_none() {
-                return RouteResult::error();
+                return RouteResult::uncertain(action, None);
             }
         } else if let Some(previous) = continuing_client {
             let Some(selected) = self.backend.refresh_client(&previous) else {
-                return RouteResult::error();
+                return RouteResult::uncertain(action, None);
             };
             let current = Scope {
                 socket: selected.socket.clone(),
@@ -418,11 +422,18 @@ where
                 };
             }
             if client.is_none() {
-                return RouteResult::error();
+                return RouteResult::uncertain(action, None);
             }
         }
 
         let Some(mut selected) = client else {
+            if action == Action::PaneMove {
+                return RouteResult {
+                    outcome: Outcome::Declined,
+                    client: None,
+                    scope: None,
+                };
+            }
             return RouteResult {
                 outcome: self.backend.terminal(None, action, direction),
                 client: None,
@@ -435,7 +446,7 @@ where
             // outward boundary so a delayed gesture cannot follow a different
             // terminal merely because the same tmux server is still alive.
             if !self.backend.validate_client(&selected, started_at) {
-                return RouteResult::error();
+                return RouteResult::uncertain(action, Some(selected));
             }
             if let Some(parent) = self.backend.parent_scope(&selected) {
                 let (outcome, parent, parent_client) = self.enter_scope(
@@ -455,10 +466,22 @@ where
                     };
                 }
                 let Some(parent_client) = parent_client else {
-                    return RouteResult::error();
+                    return RouteResult::uncertain(action, None);
                 };
                 selected = parent_client;
                 continue;
+            }
+
+            // Pane layout is host-local state. Crossing an SSH relay or asking
+            // a terminal application to reinterpret the gesture could move a
+            // different host's UI, so exhaustion of local tmux ancestry is a
+            // definitive decline rather than an outward-routing opportunity.
+            if action == Action::PaneMove {
+                return RouteResult {
+                    outcome: Outcome::Declined,
+                    client: Some(selected),
+                    scope: None,
+                };
             }
 
             if !self.backend.validate_client(&selected, started_at) {
@@ -500,7 +523,12 @@ where
             let (resolved, discovered) = self.backend.inspect_scope(&scope, started_at);
             inspected = true;
             let Some(resolved) = resolved else {
-                return (Outcome::Error, scope, None);
+                let outcome = if action == Action::PaneMove {
+                    Outcome::Declined
+                } else {
+                    Outcome::Error
+                };
+                return (outcome, scope, None);
             };
             if client.is_none() {
                 client = discovered;
@@ -548,6 +576,21 @@ impl RouteResult {
             outcome: Outcome::Error,
             client: None,
             scope: None,
+        }
+    }
+
+    fn uncertain(action: Action, client: Option<Client>) -> Self {
+        if action == Action::PaneMove {
+            // Movement changes layout, so uncertainty owns a quiet no-op. In
+            // contrast, selection requests preserve the long-standing error
+            // signal callers use to detect stale route identity.
+            Self {
+                outcome: Outcome::Declined,
+                client,
+                scope: None,
+            }
+        } else {
+            Self::error()
         }
     }
 }

@@ -31,7 +31,9 @@ require("termnav").setup()
 The wrapper finds Termnav's provider-owned setup module through
 `termnav asset-path`. Pass a
 `termnav_options` table only when you need to change the provider's documented
-events or collaborators.
+events or collaborators. The provider installs `<M-H>`, `<M-J>`, `<M-K>`, and
+`<M-L>` for directional pane movement in normal and terminal modes; consumers
+should not duplicate its terminal job-mode transitions.
 
 ## tmux
 
@@ -43,7 +45,10 @@ source-file ~/.config/tmux/termnav.conf
 
 It provides a deliberately small starting point: Ctrl-Tab ownership across
 tmux layers and safe Ctrl-click forwarding. More elaborate foreground-process
-policy still belongs in the consuming tmux config.
+policy still belongs in the consuming tmux config. Once that policy assigns a
+Meta-direction chord to tmux, invoke `termnav navigate pane-move DIRECTION` in
+the foreground without `--parent`; Termnav owns current-scope probing and
+same-host parent traversal.
 
 ## Custom Ctrl-click tokens
 
