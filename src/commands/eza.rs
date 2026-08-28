@@ -1,8 +1,9 @@
 //! `termnav eza` hyperlink adapter.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use crate::process;
 
@@ -39,19 +40,48 @@ pub fn run(
         }
     }
     eza_arguments.extend_from_slice(arguments);
-    let output = Command::new(binary)
+    let mut child = Command::new(binary)
         .args(eza_arguments)
         .env("TERMNAV_REMOTE_LINK_HOST", &host)
         .stdin(Stdio::inherit())
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("eza stdout pipe is unavailable"))?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("eza stderr pipe is unavailable"))?;
+
+    // stdout must remain interactive even though Termnav has to inspect it.
+    // Drain stderr concurrently so a diagnostic larger than the pipe capacity
+    // cannot deadlock eza while this thread incrementally rewrites stdout.
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        child_stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
 
     // eza emits only one hostless file URI prefix. Rewriting bytes avoids a
     // UTF-8 assumption about filenames and preserves every ANSI byte exactly.
+    // The matcher retains only a possible partial prefix between reads, so a
+    // large directory begins rendering before eza exits without missing a
+    // prefix split across two kernel pipe reads.
     let pattern = b"\x1b]8;;file:///";
     let replacement = format!("\x1b]8;;file://{host}/").into_bytes();
-    stdout.write_all(&replace_all(&output.stdout, pattern, &replacement))?;
-    stderr.write_all(&output.stderr)?;
-    Ok(process::status_code(output.status))
+    let rewrite_result = rewrite_stream(&mut child_stdout, stdout, pattern, &replacement);
+    if rewrite_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let stderr_bytes = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("eza stderr reader panicked"))??;
+    stderr.write_all(&stderr_bytes)?;
+    rewrite_result?;
+    Ok(process::status_code(status?))
 }
 
 fn hyperlink_argument(binary: &OsStr) -> OsString {
@@ -111,27 +141,66 @@ fn has_layout_argument(arguments: &[OsString]) -> bool {
     false
 }
 
-fn replace_all(input: &[u8], pattern: &[u8], replacement: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(input.len());
-    let mut offset = 0;
-    while let Some(relative) = input[offset..]
-        .windows(pattern.len())
-        .position(|window| window == pattern)
-    {
-        let index = offset + relative;
-        output.extend_from_slice(&input[offset..index]);
-        output.extend_from_slice(replacement);
-        offset = index + pattern.len();
+fn rewrite_stream(
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    pattern: &[u8],
+    replacement: &[u8],
+) -> io::Result<()> {
+    debug_assert!(!pattern.is_empty());
+    let mut pending = Vec::with_capacity(16 * 1024 + pattern.len());
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            output.write_all(&pending)?;
+            output.flush()?;
+            return Ok(());
+        }
+        pending.extend_from_slice(&buffer[..count]);
+
+        while let Some(index) = pending
+            .windows(pattern.len())
+            .position(|window| window == pattern)
+        {
+            output.write_all(&pending[..index])?;
+            output.write_all(replacement)?;
+            pending.drain(..index + pattern.len());
+        }
+
+        // Bytes that cannot begin a future match are safe to publish now. Keep
+        // only the longest suffix that is also a prefix of the search pattern.
+        let retained = (1..pattern.len())
+            .rev()
+            .find(|length| pending.ends_with(&pattern[..*length]))
+            .unwrap_or(0);
+        let ready = pending.len().saturating_sub(retained);
+        output.write_all(&pending[..ready])?;
+        pending.drain(..ready);
+        output.flush()?;
     }
-    output.extend_from_slice(&input[offset..]);
-    output
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
 
-    use super::{has_layout_argument, replace_all};
+    use std::io::{self, Read};
+
+    use super::{has_layout_argument, rewrite_stream};
+
+    struct Chunks(Vec<Vec<u8>>);
+
+    impl Read for Chunks {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.0.remove(0);
+            output[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
 
     #[test]
     fn combined_short_layout_flags_are_detected() {
@@ -143,14 +212,16 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_rewrite_is_binary_safe() {
-        assert_eq!(
-            replace_all(
-                b"a\x1b]8;;file:///tmp/x\xff",
-                b"\x1b]8;;file:///",
-                b"\x1b]8;;file://host/"
-            ),
-            b"a\x1b]8;;file://host/tmp/x\xff"
-        );
+    fn hyperlink_rewrite_is_binary_safe_across_input_chunks() {
+        let mut input = Chunks(vec![b"a\x1b]8;;fi".to_vec(), b"le:///tmp/x\xff".to_vec()]);
+        let mut output = Vec::new();
+        rewrite_stream(
+            &mut input,
+            &mut output,
+            b"\x1b]8;;file:///",
+            b"\x1b]8;;file://host/",
+        )
+        .unwrap();
+        assert_eq!(output, b"a\x1b]8;;file://host/tmp/x\xff");
     }
 }
