@@ -1045,8 +1045,8 @@ class RelayTerminalTest(unittest.TestCase):
 
         self.harness.send(relay_socket, "tab-select", "next")
 
-        payload = terminal.read_until(b"]1337;SetUserVar=DOT_SWITCH_TAB=")
-        self.assertIn(b"\x1b]1337;SetUserVar=DOT_SWITCH_TAB=", payload)
+        payload = terminal.read_until(b"]1337;SetUserVar=TERMNAV_TAB_SELECT=")
+        self.assertIn(b"\x1b]1337;SetUserVar=TERMNAV_TAB_SELECT=", payload)
 
     def test_relay_started_before_focus_switch_targets_the_live_client(self) -> None:
         tmux_socket, _, _, first, relay_socket = self.top_level()
@@ -1062,8 +1062,8 @@ class RelayTerminalTest(unittest.TestCase):
 
         self.harness.send(relay_socket, "tab-select", "next")
 
-        second.read_until(b"]1337;SetUserVar=DOT_SWITCH_TAB=")
-        self.assertNotIn(b"]1337;SetUserVar=DOT_SWITCH_TAB=", first.drain())
+        second.read_until(b"]1337;SetUserVar=TERMNAV_TAB_SELECT=")
+        self.assertNotIn(b"]1337;SetUserVar=TERMNAV_TAB_SELECT=", first.drain())
 
     def test_one_window_tab_selection_reaches_the_vscode_window_adapter(self) -> None:
         socket_path = self.harness.root / "vscode.sock"

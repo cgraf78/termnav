@@ -16,6 +16,10 @@ manifest="$TERMNAV_ROOT/share/termnav/vscode/termnav-0.3.0/package.json"
 echo "=== VS Code adapter contract ==="
 _assert_file_exists "focus adapter: versioned manifest is shipped" "$manifest"
 _assert_file_exists "focus adapter: implementation is shipped" "$extension"
+for retired in termnav-0.1.0 termnav-0.2.0; do
+  _assert_eq "focus adapter: retired payload is not shipped: $retired" false \
+    "$([[ -e "$TERMNAV_ROOT/share/termnav/vscode/$retired" ]] && echo true || echo false)"
+done
 content=$(cat "$extension")
 _assert_not_contains "focus adapter: sandbox does not inspect host procfs" \
   '/proc/' "$content"

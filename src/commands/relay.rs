@@ -8,10 +8,15 @@ use std::path::Path;
 use crate::navigation::{Action, Direction};
 use crate::relay::server;
 
-const HELP: &str = "usage: termnav relay <send|serve|commit|sweep> [arguments]\n\
-\n\
-send: termnav relay send ACTION DIRECTION [options]\n\
-      ACTION is pane-select, tab-select, or tab-move\n";
+const HELP: &str = r#"usage: termnav relay <send|serve|commit|sweep> [arguments]
+
+send:   termnav relay send ACTION DIRECTION [--client-pid PID --client-tty TTY]
+        ACTION is pane-select, tab-select, or tab-move
+serve:  termnav relay serve --socket PATH [--owner-fd FD]
+commit: termnav relay commit --tmux-socket PATH --client-tty TTY
+        --client-pid PID --client-created N [--passthrough-decrqm N] [--pane ID]
+sweep:  termnav relay sweep
+"#;
 
 /// Parse and execute relay transport and commit operations.
 pub fn run(

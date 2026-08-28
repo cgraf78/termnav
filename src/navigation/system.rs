@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,57 @@ const TMUX_TIMEOUT: Duration = Duration::from_secs(2);
 /// live client/process state is deliberately re-read at every safety boundary.
 pub struct SystemBackend {
     environment: HashMap<String, String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct McpConfig {
+    address: String,
+    path: String,
+    token_file: PathBuf,
+    method: String,
+    tool: String,
+    previous_command: String,
+    next_command: String,
+}
+
+impl McpConfig {
+    fn from_environment(environment: &HashMap<String, String>) -> Option<Self> {
+        // Termnav owns the generic VS Code/MCP semantics; the consumer supplies
+        // only deployment secrets and overrides. Requiring an explicit token
+        // path avoids reaching into a consumer-specific state tree, while
+        // loopback validation preserves the original trust boundary.
+        let value = |name: &str| {
+            environment
+                .get(name)
+                .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+                .cloned()
+        };
+        let address =
+            value("TERMNAV_VSCODE_MCP_ADDRESS").unwrap_or_else(|| "127.0.0.1:9876".to_owned());
+        let socket = address.parse::<std::net::SocketAddr>().ok()?;
+        if !socket.ip().is_loopback() {
+            return None;
+        }
+        let path = value("TERMNAV_VSCODE_MCP_PATH").unwrap_or_else(|| "/mcp".to_owned());
+        if !path.starts_with('/') {
+            return None;
+        }
+        let token_file = PathBuf::from(value("TERMNAV_VSCODE_MCP_TOKEN_FILE")?);
+        if !token_file.is_absolute() {
+            return None;
+        }
+        Some(Self {
+            address,
+            path,
+            token_file,
+            method: value("TERMNAV_VSCODE_MCP_METHOD").unwrap_or_else(|| "tools/call".to_owned()),
+            tool: value("TERMNAV_VSCODE_MCP_TOOL").unwrap_or_else(|| "execute_command".to_owned()),
+            previous_command: value("TERMNAV_VSCODE_MCP_PREVIOUS_COMMAND")
+                .unwrap_or_else(|| "workbench.action.terminal.focusPrevious".to_owned()),
+            next_command: value("TERMNAV_VSCODE_MCP_NEXT_COMMAND")
+                .unwrap_or_else(|| "workbench.action.terminal.focusNext".to_owned()),
+        })
+    }
 }
 
 impl SystemBackend {
@@ -292,20 +343,10 @@ impl SystemBackend {
     }
 
     fn vscode_mcp(&self, direction: Direction) -> bool {
-        let state = self
-            .environment
-            .get("XDG_STATE_HOME")
-            .filter(|value| Path::new(value).is_absolute())
-            .cloned()
-            .or_else(|| {
-                self.environment
-                    .get("HOME")
-                    .map(|home| format!("{home}/.local/state"))
-            });
-        let Some(state) = state else {
+        let Some(config) = McpConfig::from_environment(&self.environment) else {
             return false;
         };
-        let Ok(token) = fs::read_to_string(format!("{state}/dot/vscode-mcp-auth-token")) else {
+        let Ok(token) = fs::read_to_string(&config.token_file) else {
             return false;
         };
         let token = token.trim_end_matches('\n');
@@ -313,20 +354,20 @@ impl SystemBackend {
             return false;
         }
         let command = if direction == Direction::Previous {
-            "workbench.action.terminal.focusPrevious"
+            &config.previous_command
         } else {
-            "workbench.action.terminal.focusNext"
+            &config.next_command
         };
         let call = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "tools/call",
+            "method": &config.method,
             "params": {
-                "name": "execute_command",
+                "name": &config.tool,
                 "arguments": { "command": command },
             },
         });
-        let Some(response) = self.vscode_mcp_post(&call, token) else {
+        let Some(response) = self.vscode_mcp_post(&config, &call, token) else {
             return false;
         };
         if response.get("error").is_none() {
@@ -342,28 +383,24 @@ impl SystemBackend {
             "method": "initialize",
             "params": { "protocolVersion": "2024-11-05", "capabilities": {} },
         });
-        let Some(initialized) = self.vscode_mcp_post(&initialize, token) else {
+        let Some(initialized) = self.vscode_mcp_post(&config, &initialize, token) else {
             return false;
         };
         initialized.get("error").is_none()
             && self
-                .vscode_mcp_post(&call, token)
+                .vscode_mcp_post(&config, &call, token)
                 .is_some_and(|reply| reply.get("error").is_none())
     }
 
-    fn vscode_mcp_post(&self, payload: &Value, token: &str) -> Option<Value> {
-        let port = self
-            .environment
-            .get("VSCODE_MCP_PORT")
-            .map_or("9876", String::as_str);
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).ok()?;
+    fn vscode_mcp_post(&self, config: &McpConfig, payload: &Value, token: &str) -> Option<Value> {
+        let mut stream = TcpStream::connect(&config.address).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         stream
             .set_write_timeout(Some(Duration::from_secs(2)))
             .ok()?;
         let body = payload.to_string();
         let request = http_request(
-            "/mcp",
+            &config.path,
             &body,
             &[("Authorization", &format!("Bearer {token}"))],
         );
@@ -645,8 +682,8 @@ impl Backend for SystemBackend {
             Action::TabMove => "move",
         };
         let request = json!({
-            "v": 2,
-            "op": "navigate",
+            "v": crate::relay::protocol::VERSION,
+            "op": crate::relay::protocol::operation::NAVIGATE,
             "scope": scope,
             "direction": direction.as_str(),
             "nonce": new_nonce(),
@@ -655,8 +692,10 @@ impl Backend for SystemBackend {
             return Outcome::Error;
         };
         match reply.get("result").and_then(Value::as_str) {
-            Some("armed" | "emitted") => Outcome::Handled,
-            Some("declined") => Outcome::Declined,
+            Some(
+                crate::relay::protocol::result::ARMED | crate::relay::protocol::result::EMITTED,
+            ) => Outcome::Handled,
+            Some(crate::relay::protocol::result::DECLINED) => Outcome::Declined,
             _ => Outcome::Error,
         }
     }
@@ -707,9 +746,9 @@ impl Backend for SystemBackend {
             return Outcome::Handled;
         }
         let name = if action == Action::TabSelect {
-            "DOT_SWITCH_TAB"
+            "TERMNAV_TAB_SELECT"
         } else {
-            "DOT_MOVE_TAB"
+            "TERMNAV_TAB_MOVE"
         };
         if Self::write_wezterm_var(&tty, name, direction) {
             Outcome::Handled
@@ -828,7 +867,10 @@ impl ReadWrite for TcpStream {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_clients;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    use super::{McpConfig, parse_clients};
 
     #[test]
     fn client_parser_preserves_route_identity() {
@@ -842,5 +884,76 @@ mod tests {
         assert!(clients[0].focused);
         assert!(!clients[0].control);
         assert_eq!(clients[0].created, 80);
+    }
+
+    #[test]
+    fn mcp_configuration_requires_only_the_deployment_token_path() {
+        assert!(McpConfig::from_environment(&HashMap::new()).is_none());
+
+        let defaults = McpConfig::from_environment(&HashMap::from([(
+            "TERMNAV_VSCODE_MCP_TOKEN_FILE".to_owned(),
+            "/tmp/token".to_owned(),
+        )]))
+        .expect("token path enables generic MCP defaults");
+        assert_eq!(defaults.address, "127.0.0.1:9876");
+        assert_eq!(defaults.path, "/mcp");
+        assert_eq!(defaults.method, "tools/call");
+        assert_eq!(defaults.tool, "execute_command");
+        assert_eq!(
+            defaults.previous_command,
+            "workbench.action.terminal.focusPrevious"
+        );
+        assert_eq!(defaults.next_command, "workbench.action.terminal.focusNext");
+
+        let environment = HashMap::from([
+            (
+                "TERMNAV_VSCODE_MCP_ADDRESS".to_owned(),
+                "127.0.0.1:1234".to_owned(),
+            ),
+            (
+                "TERMNAV_VSCODE_MCP_PATH".to_owned(),
+                "/custom-mcp".to_owned(),
+            ),
+            (
+                "TERMNAV_VSCODE_MCP_TOKEN_FILE".to_owned(),
+                "/tmp/token".to_owned(),
+            ),
+            (
+                "TERMNAV_VSCODE_MCP_METHOD".to_owned(),
+                "custom/call".to_owned(),
+            ),
+            (
+                "TERMNAV_VSCODE_MCP_TOOL".to_owned(),
+                "run_command".to_owned(),
+            ),
+            (
+                "TERMNAV_VSCODE_MCP_PREVIOUS_COMMAND".to_owned(),
+                "editor.previous".to_owned(),
+            ),
+            (
+                "TERMNAV_VSCODE_MCP_NEXT_COMMAND".to_owned(),
+                "editor.next".to_owned(),
+            ),
+        ]);
+        let config = McpConfig::from_environment(&environment).expect("complete MCP config");
+        assert_eq!(config.address, "127.0.0.1:1234");
+        assert_eq!(config.path, "/custom-mcp");
+        assert_eq!(config.token_file, Path::new("/tmp/token"));
+        assert_eq!(config.method, "custom/call");
+        assert_eq!(config.tool, "run_command");
+        assert_eq!(config.previous_command, "editor.previous");
+        assert_eq!(config.next_command, "editor.next");
+
+        for (name, value) in [
+            ("TERMNAV_VSCODE_MCP_ADDRESS", "192.0.2.1:9876"),
+            ("TERMNAV_VSCODE_MCP_TOKEN_FILE", "relative/token"),
+        ] {
+            let mut invalid = HashMap::from([(
+                "TERMNAV_VSCODE_MCP_TOKEN_FILE".to_owned(),
+                "/tmp/token".to_owned(),
+            )]);
+            invalid.insert(name.to_owned(), value.to_owned());
+            assert!(McpConfig::from_environment(&invalid).is_none(), "{name}");
+        }
     }
 }

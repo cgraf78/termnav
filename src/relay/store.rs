@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::protocol::VERSION;
+
 const PREPARE_STALE: Duration = Duration::from_secs(30);
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(6);
 const COMMIT_POLL: Duration = Duration::from_millis(10);
@@ -88,7 +90,7 @@ impl Directive {
     /// Validate the complete action-specific schema before publication/claim.
     #[must_use]
     pub fn valid(&self) -> bool {
-        if self.v != 2
+        if self.v != VERSION
             || !valid_nonce(&self.nonce)
             || self.tmux_socket.is_empty()
             || self.session.is_empty()

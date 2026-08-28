@@ -5,6 +5,7 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 workflow="$root/.github/workflows/test.yml"
 retry_workflow="$root/.github/workflows/retry-infrastructure.yml"
+release_workflow="$root/.github/workflows/release.yml"
 lock_file="$root/.github/cgraf78-actions.lock"
 performance_suite="$root/test/suites/relay-performance-test"
 performance_harness="$root/test/relay-performance.py"
@@ -27,6 +28,7 @@ fi
 
 content=$(<"$workflow")
 retry_content=$(<"$retry_workflow")
+release_content=$(<"$release_workflow")
 [[ "$content" == *'branches: [main]'* ]] ||
   fail "push CI does not target only the maintained main branch"
 [[ "$content" == *'cron: "57 8 * * *"'* ]] ||
@@ -45,6 +47,10 @@ retry_content=$(<"$retry_workflow")
   fail "Rust CI does not run the native and integration suites together"
 [[ "$retry_content" == *"cgraf78/actions/.github/actions/infra-retry@$actions_sha"* ]] ||
   fail "infrastructure retry does not use the locked actions revision"
+[[ "$release_content" == *'android-aarch64: true'* ]] ||
+  fail "release workflow does not publish supported Android aarch64"
+[[ "$release_content" != *'android-x86_64:'* ]] ||
+  fail "release workflow publishes Android x86_64 that the installer rejects"
 
 actions_sync_job=$(awk '
   /^  actions-sync:$/ { in_sync = 1 }

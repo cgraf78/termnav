@@ -1,7 +1,7 @@
 # Termnav examples
 
 These examples compose Termnav's public APIs without copying its routing
-protocols or assuming where Shdeps installed the repository. They use only
+protocols or assuming which installer activated the repository. They use only
 reserved `example.com` names and contain no deployment-specific host policy.
 
 ## WezTerm
@@ -28,7 +28,8 @@ Copy [`nvim.lua`](nvim.lua) into your Neovim config and call:
 require("termnav").setup()
 ```
 
-The wrapper finds Termnav's provider-owned setup module through Shdeps. Pass a
+The wrapper finds Termnav's provider-owned setup module through
+`termnav asset-path`. Pass a
 `termnav_options` table only when you need to change the provider's documented
 events or collaborators.
 
@@ -59,7 +60,7 @@ claims a token, so malformed values continue through Termnav's normal routing.
 Load the provider-owned shell integration directly; no wrapper file is needed:
 
 ```sh
-. "$(shdeps dep-file cgraf78/termnav share/termnav/shell.sh)"
+. "$(termnav asset-path share/termnav/shell.sh)"
 ```
 
 Hook that loader into the shell framework you already use. Termnav exposes the
@@ -74,11 +75,11 @@ attached-tmux-client classification.
 ## Neovim command launcher
 
 Consumers that wrap `nvim` can source
-`lib/termnav/nvim-open/launcher.sh` through Shdeps and try the reusable route
+`lib/termnav/nvim-open/launcher.sh` through `termnav asset-path` and try the reusable route
 before resolving their real editor:
 
 ```bash
-. "$(shdeps dep-file cgraf78/termnav lib/termnav/nvim-open/launcher.sh)"
+. "$(termnav asset-path lib/termnav/nvim-open/launcher.sh)"
 if termnav_nvim_try_reuse "$@"; then
   exit 0
 fi

@@ -194,7 +194,7 @@ if [[ -z "$_TEST_TMP_ROOT" || ! -d "$_TEST_TMP_ROOT" ]]; then
 fi
 CLEANUP_DIRS+=("$_TEST_TMP_ROOT")
 
-# A managed dotfiles installation exposes `nvim` through a HOME-aware launcher.
+# A managed installation may expose `nvim` through a HOME-aware launcher.
 # Resolve its real payload before replacing HOME, so repository tests remain
 # isolated without accidentally turning the user's launcher into the test
 # subject. Distribution CI already resolves directly to its packaged binary.

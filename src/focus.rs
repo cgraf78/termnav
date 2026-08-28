@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::navigation::{Backend, SystemBackend};
 use crate::process;
 use crate::relay::client::{new_nonce, send};
+use crate::relay::protocol;
 
 const FOCUS_OPTION: &str = "@termnav_child_focus";
 const CLIENT_UNFOCUSED_OPTION: &str = "@termnav_client_unfocused";
@@ -327,7 +328,7 @@ pub fn handle_relay(request: &Value) -> Value {
 
     if state == "release" {
         return if release(&current.socket, &current.pane, token) {
-            reply("released")
+            reply(protocol::result::RELEASED)
         } else {
             reply("error")
         };
@@ -339,7 +340,7 @@ pub fn handle_relay(request: &Value) -> Value {
         let _ = release(&current.socket, &current.pane, token);
         return reply("error");
     }
-    reply("claimed")
+    reply(protocol::result::CLAIMED)
 }
 
 /// Ask the parent tmux server to own the deduplicated expiry helper.
@@ -700,8 +701,8 @@ fn update_parent(parent: &Parent, state: &str, token: &str, lease_ms: u64) -> Op
         }
         Parent::Relay(path) => {
             let mut request = json!({
-                "v": 2,
-                "op": "focus",
+                "v": protocol::VERSION,
+                "op": protocol::operation::FOCUS,
                 "state": state,
                 "token": token,
             });
@@ -927,7 +928,7 @@ fn install_watch_signals() {
 }
 
 fn reply(result: &str) -> Value {
-    json!({"v": 2, "result": result})
+    json!({"v": crate::relay::protocol::VERSION, "result": result})
 }
 
 #[cfg(test)]

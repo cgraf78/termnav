@@ -2,12 +2,22 @@
 
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::terminal::{self, TmuxMode};
 
-const HELP: &str = "usage: termnav tmux <context|focus|follow-click> [arguments]\n";
+const HELP: &str = r#"usage:
+  termnav tmux context --tty TTY --client-termname TERM [--control-mode 0|1]
+  termnav tmux focus claim --parent-tmux PATH --parent-pane ID --token TOKEN --lease-ms N
+  termnav tmux focus release --parent-tmux PATH --parent-pane ID --token TOKEN
+  termnav tmux focus expire --parent-tmux PATH --parent-pane ID
+  termnav tmux focus watch --tmux-socket PATH --client-pid PID --client-tty TTY
+       [--lease-ms N] [--interval-ms N]
+  termnav tmux focus stop|sync --tmux-socket PATH --client-pid PID --client-tty TTY
+  termnav tmux follow-click [--stdin | [HYPERLINK WORD LINE X CWD TTY PANE Y TOP LEFT SOCKET]]
+"#;
+const FOLLOW_CLICK_STDIN_LIMIT: u64 = 64 * 1024;
 
 /// Parse and execute tmux integration commands.
 pub fn run(
@@ -43,13 +53,24 @@ pub fn run(
 
 fn follow_click(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32> {
     let fields = if arguments.first().map(String::as_str) == Some("--stdin") {
-        let mut input = String::new();
-        io::Read::read_to_string(&mut io::stdin(), &mut input)?;
-        input
-            .lines()
-            .take(11)
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
+        if arguments.len() != 1 {
+            return usage(stderr, "--stdin cannot be combined with positional fields");
+        }
+        let mut input = Vec::new();
+        io::stdin()
+            .take(FOLLOW_CLICK_STDIN_LIMIT + 1)
+            .read_to_end(&mut input)?;
+        if input.len() as u64 > FOLLOW_CLICK_STDIN_LIMIT {
+            return usage(stderr, "follow-click stdin exceeds 64 KiB");
+        }
+        let Ok(input) = String::from_utf8(input) else {
+            return usage(stderr, "follow-click stdin must be valid UTF-8");
+        };
+        let fields = input.lines().map(str::to_owned).collect::<Vec<_>>();
+        if fields.len() > 11 {
+            return usage(stderr, "follow-click stdin contains more than eleven lines");
+        }
+        fields
     } else {
         arguments.to_vec()
     };
@@ -80,9 +101,7 @@ fn focus(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -
         return usage(stderr, "focus requires a command");
     };
     if matches!(command, "-h" | "--help" | "help") {
-        stdout.write_all(
-            b"usage: termnav tmux focus <claim|release|expire|watch|stop|sync> [options]\n",
-        )?;
+        stdout.write_all(HELP.as_bytes())?;
         return Ok(0);
     }
     let options = match FocusOptions::parse(&arguments[1..]) {

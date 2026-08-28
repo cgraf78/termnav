@@ -19,6 +19,9 @@ end
 
 function M.new(options)
   options = options or {}
+  -- Public embedding options are command, interval_ms, observed, and source.
+  -- Tests commonly inject time/source, while production consumers normally
+  -- keep the defaults so lease ordering remains one Termnav-owned policy.
   local ctx = {
     command = options.command or default_command(),
     interval_ms = options.interval_ms or 1000,

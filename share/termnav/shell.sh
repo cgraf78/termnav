@@ -3,7 +3,7 @@
 #
 # Source this file from an interactive shell to publish terminal-navigation
 # context for WezTerm, tmux, SSH, and remote file-link helpers:
-#   . "$(shdeps dep-file cgraf78/termnav share/termnav/shell.sh)"
+#   . "$(termnav asset-path share/termnav/shell.sh)"
 
 # shellcheck disable=SC2034 # public marker for callers that verify the loader ran.
 TERMNAV_SHELL_LOADED=1

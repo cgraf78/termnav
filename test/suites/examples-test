@@ -43,18 +43,17 @@ local registered = {}
 local wezterm = {
   hostname = function() return "example-host" end,
   on = function(name, callback) registered[name] = callback end,
+  run_child_process = function(arguments)
+    assert(arguments[1] == "termnav path with 'quotes' $HOME $(false) `false`")
+    assert(arguments[2] == "asset-path")
+    return true, root .. "/" .. arguments[3] .. "\n", ""
+  end,
 }
-local shdeps = {}
-function shdeps.dep_file(dependency, asset)
-  assert(dependency == "cgraf78/termnav")
-  return root .. "/" .. asset
-end
-
 local example = dofile(root .. "/examples/wezterm.lua")
 local config = { hyperlink_rules = { { regex = "existing", format = "$0" } } }
 local integration = example.apply({
   wezterm = wezterm,
-  shdeps = shdeps,
+  termnav_command = "termnav path with 'quotes' $HOME $(false) `false`",
   config = config,
 })
 
@@ -79,16 +78,19 @@ fi
 if command -v nvim >/dev/null 2>&1; then
   _td=${_td:-$(_tmpdir)}
   _nvim_test="$_td/nvim-example-test.lua"
+  _weird_termnav="$_td/termnav command ' \$HOME \$(false) \`false\`"
+  cat >"$_weird_termnav" <<'SH'
+#!/bin/sh
+if [ "$#" -ne 2 ] || [ "$1" != asset-path ] || \
+    [ "$2" != lib/termnav/nvim/setup.lua ]; then
+  exit 91
+fi
+printf '%s/%s\n' "${TERMNAV_ROOT:?}" "$2"
+SH
+  chmod +x "$_weird_termnav"
   cat >"$_nvim_test" <<'LUA'
 local root = assert(os.getenv("TERMNAV_ROOT"))
-local resolved = false
-local shdeps = {}
-function shdeps.dep_file(dependency, asset)
-  assert(dependency == "cgraf78/termnav")
-  assert(asset == "lib/termnav/nvim/setup.lua")
-  resolved = true
-  return root .. "/" .. asset
-end
+local termnav_command = assert(os.getenv("TERMNAV_WEIRD_COMMAND"))
 
 local opener = {
   setup = function() end,
@@ -108,7 +110,7 @@ local navigation = { setup = function() end }
 
 local example = dofile(root .. "/examples/nvim.lua")
 local context = example.setup({
-  shdeps = shdeps,
+  termnav_command = termnav_command,
   termnav_options = {
     opener = opener,
     navigation = navigation,
@@ -119,13 +121,13 @@ local context = example.setup({
   },
 })
 
-assert(resolved)
 assert(type(context.publish) == "function")
 assert(context.group_name == "termnav_example_test")
 print("termnav Neovim example passed")
 LUA
   set +e
   output=$(TERMNAV_ROOT="$TERMNAV_ROOT" \
+    TERMNAV_WEIRD_COMMAND="$_weird_termnav" \
     PATH="$TERMNAV_BINARY_DIR:$PATH" \
     nvim --headless --clean -n -u NONE -i NONE -l "$_nvim_test" 2>&1)
   rc=$?
@@ -211,7 +213,7 @@ import sys
 from pathlib import Path
 
 payload = Path(sys.argv[1]).read_bytes()
-match = re.search(rb"SetUserVar=term_open_url=([A-Za-z0-9+/=]+)", payload)
+match = re.search(rb"SetUserVar=TERMNAV_OPEN_URL=([A-Za-z0-9+/=]+)", payload)
 assert match, payload
 assert base64.b64decode(match.group(1)) == b"https://issues.example.com/TICKET-42"
 PY

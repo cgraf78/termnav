@@ -2,55 +2,184 @@
 .SH NAME
 termnav \- route terminal navigation, focus, links, and editor opens
 .SH SYNOPSIS
-.B termnav
-.I command
-.RI [ arguments ]
+.B termnav navigate
+.RI [ options ] " ACTION DIRECTION"
+.br
+.B termnav relay send
+.I ACTION DIRECTION
+.RI [ options ]
+.br
+.B termnav relay serve --socket
+.I PATH
+.RI [ --owner-fd " FD" ]
+.br
+.B termnav relay commit
+.I options
+.br
+.B termnav relay sweep
+.br
+.B termnav ssh
+.RI [ SSH-ARG ...]
+.br
+.B termnav link-host
+.br
+.B termnav tmux context
+.I options
+.br
+.B termnav tmux focus
+.I claim|release|expire|watch|stop|sync options
+.br
+.B termnav tmux follow-click
+.RI [ --stdin | " FIELD ..." ]
+.br
+.B termnav nvim open cli
+.I FILE
+.RI [ CWD ]
+.br
+.B termnav nvim open link|tmux-link
+.RI [ TARGET " [" CWD " [" SOURCE " [" CONTEXT " [" ROUTE-KIND " [" ROUTE-SCOPE " [" PANE "]]]]]]]" ]
+.br
+.B termnav nvim ssh-open
+.I HOST TARGET
+.br
+.B termnav vscode focus claim|release
+.I SOURCE CYCLE SEQUENCE OBSERVED
+.br
+.B termnav eza
+.RI [ EZA-ARG ...]
+.br
+.B termnav asset-path
+.I RELATIVE-PATH
+.br
+.B termnav version
 .SH DESCRIPTION
 .B termnav
 is one native command for navigation across Neovim, tmux, SSH, WezTerm, and
 VS Code terminal boundaries. Integrations should invoke the structured
-subcommands below instead of reproducing routing policy.
-.SH COMMANDS
+subcommands instead of reproducing routing policy.
+.SH COMMAND SYNTAX
 .TP
 .B navigate
-Route pane selection, tab selection, or tab movement through the nearest
-available scope.
+ACTION is
+.BR pane-select " with " left|right|up|down ,
+.BR tab-select " with " previous|next ,
+or
+.BR tab-move " with " left|right .
+Options are
+.BR --parent ,
+.BR --client-pid ,
+.BR --client-tty ,
+.BR --client-created ,
+.BR --client-termtype ,
+.BR --source-socket ,
+.BR --source-pane ,
+.BR --source-session ,
+.BR --emit-continuation ,
+and
+.BR --continuation .
 .TP
-.B relay
-Send or serve the connection-scoped Unix relay protocol. The send form uses
-the same pane-select, tab-select, and tab-move actions as navigate. Serve and
-commit forms are internal integration interfaces.
+.B relay send
+Uses the navigation actions and directions and optionally the paired
+.B --client-pid PID --client-tty TTY
+identity.
 .TP
-.B ssh
-Run one requested SSH session with its reverse-forward relay. Termnav never
-opens a second authenticated transport connection.
-.TP
-.B link-host
-Print the host represented by the current terminal context for semantic links.
+.B relay commit
+Requires
+.BR --tmux-socket ,
+.BR --client-tty ,
+.BR --client-pid ,
+and
+.BR --client-created ;
+it accepts optional
+.B --passthrough-decrqm
+and
+.BR --pane .
 .TP
 .B tmux context
-Publish tmux ownership metadata to one exact terminal client.
+Requires
+.B --tty TTY --client-termname TERM
+and accepts
+.BR --control-mode " 0|1" .
 .TP
 .B tmux focus
-Publish and maintain hierarchical focus leases between adjacent tmux layers.
+.B claim
+requires parent tmux, parent pane, token, and lease options;
+.B release
+requires parent and token;
+.B expire
+requires parent;
+.B watch,
+.B stop,
+and
+.B sync
+require tmux socket, client PID, and client tty. Watch also accepts lease and
+interval options. Command-group help prints the exact option names.
 .TP
 .B tmux follow-click
-Resolve tmux mouse metadata to a browser URL or Neovim file target.
+Accepts at most eleven positional fields in this order: HYPERLINK, WORD, LINE,
+X, CWD, TTY, PANE, Y, TOP, LEFT, SOCKET. With
+.BR --stdin ,
+the same fields are newline-delimited; input is limited to eleven lines and 64
+KiB.
+.SH ENVIRONMENT
 .TP
-.B nvim open
-Open a local or remote target in the narrowest eligible Neovim scope.
+.B TERMNAV_ASSET_ROOT
+Development/staging override for the installed provider root used by
+.BR asset-path .
 .TP
+.B TERMNAV_PARENT_RELAY
+Connection-scoped Unix relay inherited through an SSH session.
+.TP
+.B TERMNAV_REMOTE_TOOL_PATH
+Colon-separated remote command directories appended after inherited PATH.
+The default is
+$HOME/.local/bin:$HOME/.local/share/mise/shims:/opt/homebrew/bin:/usr/local/bin.
+The invoking Termnav embeds this policy in the existing SSH command, so it does
+not depend on sshd AcceptEnv.
+.TP
+.B TERMNAV_VSCODE_FALLBACK_BACKEND=mcp
+Enable the MCP fallback. It requires an absolute
+.B TERMNAV_VSCODE_MCP_TOKEN_FILE
+and accepts optional ADDRESS, PATH, METHOD, TOOL, PREVIOUS_COMMAND, and
+NEXT_COMMAND variables with the
+.B TERMNAV_VSCODE_MCP_
+prefix. The endpoint must remain loopback.
+.TP
+.B TERMNAV_SSH_CONTROL_HOSTS
+Comma-separated allowlist for
+.BR "nvim ssh-open" .
+.TP
+.B TERMNAV_TMUX_FOLLOW_EXTENSION_DIR
+Override the directory of optional Ctrl-click token detector scripts.
+.SH EXIT STATUS
+.TP
+.B 0
+Handled or successful.
+.TP
+.B 1
+Operational failure.
+.TP
+.B 2
+Invalid syntax.
+.TP
+.B 3
+Valid navigation or relay-send request declined at this boundary.
+.TP
+.B 10, 11, 12, 13
 .B nvim ssh-open
-Reuse one exact existing SSH ControlMaster without network fallback.
-.TP
-.B vscode focus
-Publish an authenticated, ordered Neovim focus lease to a VS Code window.
-.TP
-.B eza
-Run eza with remote-aware OSC-8 file hyperlinks.
-.TP
-.B version
-Print the timestamp and commit identity embedded at build time.
+uses these for unavailable connection configuration, invalid host, SSH failure,
+and disallowed host. VS Code focus uses 10 when its adapter is unavailable.
+SSH and eza otherwise preserve child status.
+.SH WEZTERM PROTOCOL
+.B routes.setup()
+registers the open-uri router and handlers for
+.BR TERMNAV_TAB_SELECT ,
+.BR TERMNAV_TAB_MOVE ,
+and
+.BR TERMNAV_OPEN_URL .
+Pane metadata uses IS_NVIM, NVIM_OPEN_SOCKET, NVIM_LINK_CWD,
+NVIM_REMOTE_LINK_HOST, NVIM_REMOTE_CWD, NVIM_REMOTE_TMUX, and TERMNAV_TMUX.
+There are no DOT_* aliases.
 .SH FILES
 .TP
 .I $XDG_RUNTIME_DIR/termnav-UID

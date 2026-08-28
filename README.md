@@ -11,7 +11,7 @@ links, and existing-session Neovim opens.
 
 ## Installation
 
-Install the latest signed-by-checksum release archive with:
+Install the latest checksum-verified release archive with:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cgraf78/termnav/main/install.sh | bash
@@ -49,13 +49,21 @@ installation path to build, publish, update, and diagnose.
   ownership to the VS Code window displaying the exact terminal client.
 - `termnav eza ...`: run eza with remote-aware OSC-8 file links.
 - `termnav version`: print the timestamp/commit build identity.
+- `termnav asset-path RELATIVE_PATH`: print the canonical path of an existing
+  provider asset. Paths must stay below the installed Termnav root.
+
+Complete leaf syntax is available from command-group help and the manpage.
+Exit status `0` means handled/success, `1` means operational failure, and `2`
+means invalid syntax. Navigation and relay-send use `3` for a valid request
+declined at the current boundary. `nvim ssh-open` additionally uses `10` for
+unavailable connection configuration, `11` for an invalid host, `12` for SSH
+failure, and `13` for a disallowed host. `vscode focus` uses `10` when no
+adapter is available. Passthrough commands otherwise preserve child status.
 
 Ripgrep's `--hostname-bin` accepts an executable name but cannot pass arguments.
-The sole dotfiles consumer owns its tiny `ripgrep-link-host` wrapper and
-delegates to the explicit `termnav link-host` command; Termnav therefore
-needs no alternate executable name or argv[0] dispatch. The wrapper is named
-for the ripgrep interface it adapts rather than for any current implementation
-detail inside Termnav. The private
+A consumer can provide a tiny `ripgrep-link-host` wrapper that delegates to the
+explicit `termnav link-host` command; Termnav therefore needs no alternate
+executable name or argv[0] dispatch. The private
 `share/termnav/shims/ssh` adapter is required for PATH interception and contains
 only enough policy to execute `termnav ssh`. It passes its exact runtime
 directory to the native resolver because checkout and installed shim copies can
@@ -68,19 +76,6 @@ public command names are not installed.
 There is intentionally no source-checkout installer. Shdeps consumers use the
 ordinary `cgraf78/termnav github` dependency form, which prefers a published
 release archive and falls back according to Shdeps' generic provider policy.
-
-### One-time single-binary cutover
-
-The release that removes the historical command files must be coordinated with
-its sole dotfiles consumer. Pause scheduled updates, land the shared Actions
-change, Termnav, and dotfiles in that order without an intervening fleet update,
-publish and smoke the Termnav release, then run `dot update -f` before resuming
-scheduled updates. Restart or re-exec existing login shells so their PATH names
-the newly activated provider tree, restart existing Neovim processes because
-they retain loaded Lua command tables, and reload or restart any non-default
-tmux servers; the default server is reloaded by dotfiles. Reconnect existing
-SSH sessions so the new connection-scoped supervisor owns their relay lifetime;
-no compatibility daemon or retirement path remains in the release.
 
 ## Code organization
 
@@ -95,12 +90,22 @@ status. Reusable behavior lives behind focused library interfaces:
 - `nvim` owns target parsing, registry selection, RPC, exact-pane transport
   fallback, and mux-only remote reuse;
 - `click` owns mouse-text recognition and returns typed URL/file targets;
+- `assets` owns installed provider-root discovery;
 - `terminal`, `process`, `runtime`, and `links` isolate operating-system and
   terminal-protocol boundaries shared by those domains.
 
 Public Rust items use rustdoc to describe ownership, security, persistence, and
 performance contracts. Non-obvious implementation comments explain why a
 boundary exists; command adapters intentionally contain little policy.
+
+The SSH relay is a newline-delimited JSON v2 protocol on an owner-only Unix
+socket. Requests carry `v: 2`, an `op` from `navigate`, `prepare-path`,
+`abort-path`, `commit-path`, or `focus`, and operation-specific fields. Replies
+carry `v: 2` and a bounded `result` vocabulary (`armed`, `emitted`, `declined`,
+`claimed`, `released`, or `error`). Rust vocabulary lives in
+`src/relay/protocol.rs`; the frozen Python peer in tests is the cross-version
+interoperability oracle. Consumers should invoke `termnav relay` rather than
+constructing protocol objects directly.
 
 ## Integration assets
 
@@ -135,39 +140,41 @@ boundary exists; command adapters intentionally contain little policy.
   `termnav_file_links_need_plain_output` returns success for plain output.
 - `share/termnav/vscode/termnav-0.3.0`: local VS Code extension that
   owns and publishes each window's tab-switch socket and capability. New
-  integrations use the latest versioned directory declared by the consuming
-  dotfiles.
+  integrations use the latest versioned directory declared by their consuming
+  configuration.
 - `share/termnav/shell.sh`: sourceable interactive shell loader for inherited
   SSH relay interposition, WezTerm pane context publishing, and file-link mode
   classification. It prepends a private Termnav shim directory rather than
   defining an `ssh()` shell function, so child processes use the same route.
 
-Source non-binary assets through shdeps so install locations stay under the
-dependency manager's contract:
+Discover non-binary assets through the standalone command so consumers do not
+depend on a particular installer or activation root:
 
 ```bash
-. "$(shdeps dep-file cgraf78/termnav share/termnav/shell.sh)"
+. "$(termnav asset-path share/termnav/shell.sh)"
 ```
 
-`shdeps` installs the release artifact and exposes its `termnav` binary.
 Consumers own keybindings, terminal config, and environment-specific extension
 files; this repo owns reusable route parsing and open-through behavior.
 
 The adapter directory is versioned because VS Code records that directory in
 its extension registry. Adapter releases must bump the manifest version, the
-directory name, and the dotfiles local-extension source row together.
+directory name, and the consuming local-extension configuration together.
 
 ## Examples
 
 [`examples/`](examples/) contains tested, copyable composition for WezTerm,
 Neovim, tmux, and an XDG token-detector extension. The examples keep terminal
 and editor policy in the consumer while loading Termnav-owned implementations
-through Shdeps.
+through `termnav asset-path`.
 
 ## Dependencies
 
-- The prebuilt `termnav` binary for the current Linux, macOS, or Android
-  architecture. Building from source requires Rust 1.88 or newer.
+- The prebuilt `termnav` binary for Linux, macOS, or Android aarch64. Android
+  x86_64 is not published because the standalone installer does not support it.
+  Building a Git checkout requires Rust 1.88 or newer plus Bash. Source archive
+  builds must provide `TERMNAV_BUILD_COMMIT`, because build identity cannot be
+  recovered without Git metadata. The crate is not published to crates.io.
 - Bash only for sourceable shell integration and optional click-detector
   extensions; navigation gestures do not start a shell or Python interpreter.
 - `tmux` for `termnav tmux follow-click`, pane capture, mouse forwarding, and
@@ -186,9 +193,13 @@ through Shdeps.
   the same transport without product-specific CLI discovery.
 - `nabheet.vscode-ide-mcp` is required only when
   `TERMNAV_VSCODE_FALLBACK_BACKEND=mcp` selects the devserver fallback. Its
-  auth token follows the dotfiles
-  `vscode.sh` contract under an absolute
-  `$XDG_STATE_HOME/dot` or the `$HOME/.local/state/dot` fallback.
+  deployment must set the absolute `TERMNAV_VSCODE_MCP_TOKEN_FILE`. Termnav
+  defaults to `127.0.0.1:9876/mcp`, `tools/call`, `execute_command`, and VS
+  Code's terminal previous/next command IDs. Consumers may override those with
+  `TERMNAV_VSCODE_MCP_ADDRESS`, `TERMNAV_VSCODE_MCP_PATH`,
+  `TERMNAV_VSCODE_MCP_METHOD`, `TERMNAV_VSCODE_MCP_TOOL`,
+  `TERMNAV_VSCODE_MCP_PREVIOUS_COMMAND`, and
+  `TERMNAV_VSCODE_MCP_NEXT_COMMAND`; non-loopback addresses are rejected.
 `termnav tmux follow-click` loads environment-specific token detectors from
 an absolute `$XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d/*.sh`, falling
 back to `$HOME/.config/termnav/tmux-follow/extensions.d/*.sh` when the XDG value
@@ -205,10 +216,34 @@ transport already knows the remote host identity that file links should carry.
 test harnesses that need to exercise TTY-restoration behavior while stdout is
 piped.
 
-The `IS_NVIM`, `NVIM_*`, and `TERMNAV_TMUX` WezTerm user variables are
-termnav's private cross-process protocol between shell/Neovim publishers and
-WezTerm route consumers. Configure integrations through the modules above
-instead of setting or reading those names directly.
+The WezTerm protocol consists of `IS_NVIM`, `NVIM_OPEN_SOCKET`,
+`NVIM_LINK_CWD`, `NVIM_REMOTE_LINK_HOST`, `NVIM_REMOTE_CWD`,
+`NVIM_REMOTE_TMUX`, and `TERMNAV_TMUX` pane metadata plus the
+`TERMNAV_TAB_SELECT`, `TERMNAV_TAB_MOVE`, and `TERMNAV_OPEN_URL` requests.
+`routes.setup()` owns the request handlers; consumers should use route helpers
+instead of interpreting metadata directly. There are no `DOT_*` aliases.
+
+`lib/termnav/nvim/setup.lua` accepts `group_name`, `opener`, `navigation`,
+`wezterm_vars`, `vscode_focus`, `publish_delay_ms`, `publish_events`,
+`refresh_events`, and `clear_events`. `navigation.lua` accepts `application`,
+`command`, `executable`, `mappings`, `notify`, `schedule`, and `spawn`.
+`vscode-focus.lua` accepts `command`, `interval_ms`, `observed`, and `source`.
+Defaults are production implementations; collaborator overrides exist for
+embedding and deterministic tests.
+
+The stable shell callbacks from `share/termnav/shell.sh` are
+`_termnav_wezterm_publish_link_context`, `_termnav_wezterm_preexec COMMAND`,
+`_termnav_wezterm_precmd`, and `termnav_file_links_need_plain_output`. The first
+three are hook callbacks despite their leading underscore; callers must not use
+other `_termnav_*` functions.
+
+Remote typed-command fallbacks append the generic user command directories
+`$HOME/.local/bin`, `$HOME/.local/share/mise/shims`, `/opt/homebrew/bin`, and
+`/usr/local/bin` after inherited PATH. Set `TERMNAV_REMOTE_TOOL_PATH` in the
+environment that launches Termnav to replace that append-only list. Termnav
+embeds the selected paths in the existing ControlMaster command, rebasing paths
+below the local home onto remote `$HOME`; it does not require sshd `AcceptEnv`
+or open another authenticated transport.
 
 The file-link classifier keeps semantic links for an identified WezTerm router,
 uses plain paths in VS Code and otherwise unmarked WSL terminals, and inspects

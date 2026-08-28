@@ -6,6 +6,7 @@ rust-version = "1.88"
 license = "MIT"
 description = "Unified navigation across editors, tmux, SSH, and terminal applications"
 build = "build.rs"
+publish = false
 
 [lib]
 name = "termnav"

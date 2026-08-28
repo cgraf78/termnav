@@ -550,7 +550,7 @@ fn hostname(flag: &str) -> Option<String> {
 }
 
 fn open_url(url: &str, explicit_tty: &str) -> io::Result<()> {
-    let escape = terminal::user_var("term_open_url", url, TmuxMode::Raw);
+    let escape = terminal::user_var("TERMNAV_OPEN_URL", url, TmuxMode::Raw);
     if write_tty(explicit_tty, &escape).is_ok() {
         return Ok(());
     }

@@ -1,3 +1,6 @@
+-- selene: allow(undefined_variable)
+local vim = vim
+
 -- Load Termnav's Neovim setup without pinning an installation directory.
 --
 -- The provider module owns socket publication, focus leases, and terminal
@@ -6,42 +9,26 @@
 
 local M = {}
 
-local function required(value, name)
-  if type(value) ~= "string" or value == "" then
-    error("termnav Neovim example requires options." .. name, 3)
+local function asset_path(options, relative_path)
+  if type(options.asset_path) == "function" then
+    return options.asset_path(relative_path)
   end
-  return value
-end
-
-local function shdeps_api(options)
-  if type(options.shdeps) == "table" then
-    return options.shdeps
+  local command = options.termnav_command or "termnav"
+  -- List-form system() bypasses the shell entirely. Configuration paths often
+  -- contain spaces or shell metacharacters, and an example intended for
+  -- copy/paste must not turn either the executable path or asset name into
+  -- shell syntax.
+  local output = vim.fn.systemlist({ command, "asset-path", relative_path })
+  local path = output[1]
+  if vim.v.shell_error ~= 0 or not path or path == "" then
+    error("termnav could not resolve asset " .. relative_path, 2)
   end
-
-  local home = options.home or os.getenv("HOME")
-  local lua_dir = options.shdeps_lua_dir or os.getenv("SHDEPS_LUA_DIR")
-  if not lua_dir then
-    lua_dir = required(home, "home") .. "/.local/lib/shdeps"
-  end
-
-  local bootstrap = dofile(lua_dir .. "/shdeps/bootstrap.lua")
-  return bootstrap.new({
-    home = home,
-    conf_dir = options.shdeps_conf_dir,
-    bin = options.shdeps_bin,
-    bin_dir = options.shdeps_bin_dir,
-    root = options.shdeps_root,
-    env = options.shdeps_env,
-  })
+  return path
 end
 
 function M.setup(options)
   options = options or {}
-  local api = shdeps_api(options)
-  local path = api.dep_file("cgraf78/termnav", "lib/termnav/nvim/setup.lua")
-  if not path then
-    error("Shdeps could not resolve Termnav's Neovim setup module", 2)
-  end
+  local path = asset_path(options, "lib/termnav/nvim/setup.lua")
 
   return dofile(path).setup(options.termnav_options)
 end

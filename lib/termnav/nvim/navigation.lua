@@ -66,6 +66,10 @@ end
 function M.new(options)
   options = options or {}
 
+  -- Public embedding options: application, command, executable, mappings,
+  -- notify, schedule, and spawn. The defaults own native Termnav behavior;
+  -- consumers replace a collaborator only when their host API requires it.
+
   local ctx = {
     application = options.application or default_application(),
     command = options.command or default_command,

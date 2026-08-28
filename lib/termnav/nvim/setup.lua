@@ -70,6 +70,12 @@ end
 function M.new(options)
   options = options or {}
 
+  -- Public embedding options: group_name and event lists name editor policy;
+  -- publish_delay_ms bounds startup publication; opener, navigation,
+  -- wezterm_vars, and vscode_focus replace whole collaborators. Keeping
+  -- collaborator injection at this boundary avoids exposing protocol internals
+  -- as dozens of partially-overridable callbacks.
+
   local ctx = {
     group_name = options.group_name or "termnav_nvim",
     opener = options.opener or default_opener(),

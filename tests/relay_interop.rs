@@ -104,6 +104,27 @@ fn assert_delayed_request_survives(socket: &Path) {
 }
 
 #[test]
+fn rust_dispatch_keeps_the_frozen_v2_envelope() {
+    // The relay constants are about to move behind one Rust vocabulary module.
+    // Lock the external JSON envelope first so that cleanup cannot accidentally
+    // create a protocol version that only the Rust half of an SSH hop speaks.
+    assert_eq!(
+        termnav::relay::server::dispatch(&serde_json::json!({
+            "v": 1,
+            "op": "readiness-probe",
+        })),
+        serde_json::json!({"v": 2, "result": "error"})
+    );
+    assert_eq!(
+        termnav::relay::server::dispatch(&serde_json::json!({
+            "v": 2,
+            "op": "readiness-probe",
+        })),
+        serde_json::json!({"v": 2, "result": "error"})
+    );
+}
+
+#[test]
 fn rust_client_understands_the_python_v2_server() {
     let socket = temp_socket("python-server");
     let mut command = Command::new("python3");

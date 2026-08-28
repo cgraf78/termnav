@@ -83,7 +83,7 @@ symlink_usage=$("$termnav" nvim open 2>&1)
 symlink_rc=$?
 _assert_exit "nvim open: validates its mode" 2 "$symlink_rc"
 _assert_contains "nvim open: usage comes from the unified binary" \
-  "usage: termnav nvim" "$symlink_usage"
+  "termnav nvim open cli FILE" "$symlink_usage"
 
 symlink_eza=$(PATH="$mock_bin:$PATH" "$termnav" eza --all)
 _assert_eq "eza: unified command renders hyperlink output" \
@@ -208,7 +208,7 @@ EOF
 chmod +x "$shell_tmux_mock/hostname"
 shell_auto_nested=$(
   TMUX=/tmp/tmux-test,1,0 PATH="$shell_tmux_mock:$PATH" bash -c \
-    ". '$shell_vars'; termnav_wezterm_user_var_sequence DOT_SWITCH_TAB next auto"
+    ". '$shell_vars'; termnav_wezterm_user_var_sequence TERMNAV_TAB_SELECT next auto"
 )
 shell_auto_count=$(printf '%s' "$shell_auto_nested" | python3 -c 'import sys; data=sys.stdin.buffer.read(); print(data.count(b"\x1bPtmux;"))')
 _assert_eq "shell wezterm vars: auto double-wraps nested tmux clients" \
@@ -824,6 +824,8 @@ local child_success = false
 local timers = {}
 local toasts = {}
 local errors = {}
+local handlers = {}
+local opened_urls = {}
 local wezterm = {
   hostname = function()
     return "macbook"
@@ -843,8 +845,19 @@ local wezterm = {
       table.insert(timers, { delay = delay, cb = cb })
     end,
   },
-  on = function(_, cb)
-    _G.open_uri_handler = cb
+  action = {
+    ActivateTabRelative = function(relative)
+      return { kind = "activate", relative = relative }
+    end,
+    MoveTabRelative = function(relative)
+      return { kind = "move", relative = relative }
+    end,
+  },
+  open_with = function(url)
+    table.insert(opened_urls, url)
+  end,
+  on = function(name, cb)
+    handlers[name] = cb
   end,
 }
 
@@ -1024,7 +1037,30 @@ local function flush_timers()
 end
 
 routes.setup()
-check("setup registers open-uri handler", type(_G.open_uri_handler) == "function")
+check("setup registers open-uri handler", type(handlers["open-uri"]) == "function")
+check("setup registers user-var handler", type(handlers["user-var-changed"]) == "function")
+
+local actions = {}
+local event_window = {
+  perform_action = function(_, action, event_pane)
+    table.insert(actions, { action = action, pane = event_pane })
+  end,
+}
+local event_pane = {}
+handlers["user-var-changed"](event_window, event_pane, "TERMNAV_TAB_SELECT", "previous:nonce")
+handlers["user-var-changed"](event_window, event_pane, "TERMNAV_TAB_MOVE", "right:nonce")
+handlers["user-var-changed"](event_window, event_pane, "TERMNAV_OPEN_URL", "https://example.com")
+handlers["user-var-changed"](event_window, event_pane, "DOT_SWITCH_TAB", "next")
+check(
+  "setup owns the Termnav tab-select protocol",
+  actions[1].action.kind == "activate" and actions[1].action.relative == -1
+)
+check(
+  "setup owns the Termnav tab-move protocol",
+  actions[2].action.kind == "move" and actions[2].action.relative == 1
+)
+check("setup owns the Termnav open-url protocol", opened_urls[1] == "https://example.com")
+check("setup does not retain DOT aliases", #actions == 2)
 
 calls = {}
 child_calls = {}
@@ -1528,9 +1564,6 @@ test_home="$tmp/home"
 mkdir -p "$test_home/.local/state/nvim-tmux-open/panes"
 xdg_state_home="$tmp/xdg-state"
 mkdir -p "$xdg_state_home/nvim-tmux-open/panes"
-mkdir -p "$test_home/.local/share/mise/shims"
-ln -s "$mock_bin/nvim" "$test_home/.local/share/mise/shims/nvim"
-ln -s "$mock_bin/tmux" "$test_home/.local/share/mise/shims/tmux"
 socket_one="$tmp/one.sock"
 socket_two="$tmp/two.sock"
 socket_three="$tmp/three.sock"

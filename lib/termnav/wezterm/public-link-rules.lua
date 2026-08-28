@@ -1,6 +1,6 @@
 -- Public link rules adapted to WezTerm's hyperlink_rules format.
 --
--- Dotfiles decides where these rules fit in the full WezTerm config, but the
+-- The consumer decides where these rules fit in the full WezTerm config, but the
 -- reusable token definitions live here with the tmux ctrl-click detectors that
 -- recognize the same public terminal shapes.
 

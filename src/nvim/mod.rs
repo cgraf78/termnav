@@ -2,3 +2,4 @@
 
 pub mod open;
 pub mod remote;
+pub(crate) mod tool_path;

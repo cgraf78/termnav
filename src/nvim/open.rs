@@ -101,12 +101,11 @@ fn augmented_tool_paths(
     mut paths: Vec<PathBuf>,
     platform_prefix: Option<&Path>,
 ) -> Vec<PathBuf> {
-    let fallbacks = [
-        home.join(".local/bin"),
-        home.join(".local/share/mise/shims"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-    ];
+    // Local process discovery and remote command construction deliberately
+    // have separate override surfaces. A path chosen for the remote account
+    // may not exist locally, and letting that policy replace local fallbacks
+    // would make an otherwise healthy local Neovim or tmux undiscoverable.
+    let fallbacks = super::tool_path::defaults(home);
     let platform_bin = platform_prefix.map(|prefix| prefix.join("bin"));
     let mut insertion = paths
         .iter()
@@ -728,6 +727,24 @@ mod tests {
                 std::path::PathBuf::from("/opt/homebrew/bin"),
                 std::path::PathBuf::from("/usr/local/bin"),
                 std::path::PathBuf::from("/data/data/com.termux/files/usr/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn local_tool_paths_always_use_local_fallbacks() {
+        assert_eq!(
+            augmented_tool_paths(
+                std::path::Path::new("/home/test"),
+                vec![std::path::PathBuf::from("/usr/bin")],
+                None,
+            ),
+            vec![
+                std::path::PathBuf::from("/home/test/.local/bin"),
+                std::path::PathBuf::from("/home/test/.local/share/mise/shims"),
+                std::path::PathBuf::from("/opt/homebrew/bin"),
+                std::path::PathBuf::from("/usr/local/bin"),
+                std::path::PathBuf::from("/usr/bin"),
             ]
         );
     }
