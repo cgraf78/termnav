@@ -2,8 +2,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
-use std::thread;
 
 use crate::process;
 
@@ -11,7 +11,7 @@ use crate::process;
 pub fn run(
     arguments: &[OsString],
     stdout: &mut dyn Write,
-    stderr: &mut (dyn Write + Send),
+    stderr: &mut dyn Write,
 ) -> io::Result<i32> {
     let binary = std::env::var_os("TERMNAV_EZA_BINARY").unwrap_or_else(|| OsString::from("eza"));
     let hyperlink = hyperlink_argument(&binary);
@@ -40,13 +40,14 @@ pub fn run(
         }
     }
     eza_arguments.extend_from_slice(arguments);
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(eza_arguments)
         .env("TERMNAV_REMOTE_LINK_HOST", &host)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = process::spawn_owned_group(&mut command)?;
     let mut child_stdout = child
         .stdout
         .take()
@@ -56,33 +57,32 @@ pub fn run(
         .take()
         .ok_or_else(|| io::Error::other("eza stderr pipe is unavailable"))?;
 
-    // stdout must remain interactive even though Termnav has to inspect it.
-    // Drain stderr directly on a scoped worker so diagnostics stream without an
-    // unbounded capture buffer and cannot fill their pipe while this thread
-    // incrementally rewrites stdout. The scope proves both borrows end before
-    // `run` returns, without weakening the CLI's ordinary writer abstraction.
-    thread::scope(|scope| {
-        let stderr_reader = scope.spawn(|| copy_stream(&mut child_stderr, stderr));
-
-        // eza emits only one hostless file URI prefix. Rewriting bytes avoids a
-        // UTF-8 assumption about filenames and preserves every ANSI byte
-        // exactly. The matcher retains only a possible partial prefix between
-        // reads, so a large directory begins rendering before eza exits without
-        // missing a prefix split across two kernel pipe reads.
-        let pattern = b"\x1b]8;;file:///";
-        let replacement = format!("\x1b]8;;file://{host}/").into_bytes();
-        let rewrite_result = rewrite_stream(&mut child_stdout, stdout, pattern, &replacement);
-        if rewrite_result.is_err() {
-            let _ = child.kill();
+    // Poll both pipes on this thread. This keeps stderr streaming without
+    // imposing Send on the caller's writer and, unlike a scoped reader thread,
+    // gives a downstream write failure one place to kill the complete eza
+    // process group before any pipe drain can wait on a surviving descendant.
+    let pattern = b"\x1b]8;;file:///";
+    let replacement = format!("\x1b]8;;file://{host}/").into_bytes();
+    if let Err(error) = stream_output(
+        &mut child_stdout,
+        &mut child_stderr,
+        stdout,
+        stderr,
+        pattern,
+        &replacement,
+    ) {
+        process::kill_owned_group(&mut child);
+        let _ = child.wait();
+        return Err(error);
+    }
+    match child.wait() {
+        Ok(status) => Ok(process::status_code(status)),
+        Err(error) => {
+            process::kill_owned_group(&mut child);
+            let _ = child.wait();
+            Err(error)
         }
-        let status = child.wait();
-        let stderr_result = stderr_reader
-            .join()
-            .map_err(|_| io::Error::other("eza stderr reader panicked"))?;
-        rewrite_result?;
-        stderr_result?;
-        Ok(process::status_code(status?))
-    })
+    }
 }
 
 fn hyperlink_argument(binary: &OsStr) -> OsString {
@@ -142,75 +142,140 @@ fn has_layout_argument(arguments: &[OsString]) -> bool {
     false
 }
 
+#[cfg(test)]
 fn rewrite_stream(
     input: &mut dyn Read,
     output: &mut dyn Write,
     pattern: &[u8],
     replacement: &[u8],
 ) -> io::Result<()> {
-    debug_assert!(!pattern.is_empty());
-    let mut pending = Vec::with_capacity(16 * 1024 + pattern.len());
+    let mut rewriter = Rewriter::new(pattern, replacement);
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         let count = input.read(&mut buffer)?;
         if count == 0 {
-            output.write_all(&pending)?;
-            output.flush()?;
-            return Ok(());
+            return rewriter.finish(output);
         }
-        pending.extend_from_slice(&buffer[..count]);
+        rewriter.push(&buffer[..count], output)?;
+    }
+}
+
+struct Rewriter<'a> {
+    pattern: &'a [u8],
+    replacement: &'a [u8],
+    pending: Vec<u8>,
+}
+
+impl<'a> Rewriter<'a> {
+    fn new(pattern: &'a [u8], replacement: &'a [u8]) -> Self {
+        debug_assert!(!pattern.is_empty());
+        Self {
+            pattern,
+            replacement,
+            pending: Vec::with_capacity(16 * 1024 + pattern.len()),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8], output: &mut dyn Write) -> io::Result<()> {
+        self.pending.extend_from_slice(bytes);
 
         let mut consumed = 0;
-        while let Some(relative) = pending[consumed..]
-            .windows(pattern.len())
-            .position(|window| window == pattern)
+        while let Some(relative) = self.pending[consumed..]
+            .windows(self.pattern.len())
+            .position(|window| window == self.pattern)
         {
             let index = consumed + relative;
-            output.write_all(&pending[consumed..index])?;
-            output.write_all(replacement)?;
-            consumed = index + pattern.len();
+            output.write_all(&self.pending[consumed..index])?;
+            output.write_all(self.replacement)?;
+            consumed = index + self.pattern.len();
         }
 
         // Bytes that cannot begin a future match are safe to publish now. Keep
         // only the longest suffix that is also a prefix of the search pattern.
-        let unmatched = &pending[consumed..];
-        let retained = (1..pattern.len())
+        let unmatched = &self.pending[consumed..];
+        let retained = (1..self.pattern.len())
             .rev()
-            .find(|length| unmatched.ends_with(&pattern[..*length]))
+            .find(|length| unmatched.ends_with(&self.pattern[..*length]))
             .unwrap_or(0);
-        let ready = pending.len().saturating_sub(retained);
-        output.write_all(&pending[consumed..ready])?;
+        let ready = self.pending.len().saturating_sub(retained);
+        output.write_all(&self.pending[consumed..ready])?;
         if retained > 0 {
-            pending.copy_within(ready.., 0);
+            self.pending.copy_within(ready.., 0);
         }
-        pending.truncate(retained);
+        self.pending.truncate(retained);
         output.flush()?;
+        Ok(())
+    }
+
+    fn finish(&mut self, output: &mut dyn Write) -> io::Result<()> {
+        output.write_all(&self.pending)?;
+        self.pending.clear();
+        output.flush()
     }
 }
 
-fn copy_stream(input: &mut dyn Read, output: &mut dyn Write) -> io::Result<()> {
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut first_error = None;
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            if first_error.is_none()
-                && let Err(error) = output.flush()
-            {
-                first_error = Some(error);
+fn stream_output(
+    stdout: &mut (impl Read + AsRawFd),
+    stderr: &mut (impl Read + AsRawFd),
+    stdout_writer: &mut dyn Write,
+    stderr_writer: &mut dyn Write,
+    pattern: &[u8],
+    replacement: &[u8],
+) -> io::Result<()> {
+    let mut rewriter = Rewriter::new(pattern, replacement);
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_buffer = [0_u8; 16 * 1024];
+    let mut stderr_buffer = [0_u8; 16 * 1024];
+    while stdout_open || stderr_open {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: if stdout_open { stdout.as_raw_fd() } else { -1 },
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stderr_open { stderr.as_raw_fd() } else { -1 },
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-            return first_error.map_or(Ok(()), Err);
+            return Err(error);
         }
-        if first_error.is_none() {
-            if let Err(error) = output.write_all(&buffer[..count]) {
-                first_error = Some(error);
-            } else if let Err(error) = output.flush() {
-                first_error = Some(error);
+
+        if stdout_open && descriptors[0].revents != 0 {
+            if descriptors[0].revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::other("eza stdout pipe became invalid"));
+            }
+            let count = stdout.read(&mut stdout_buffer)?;
+            if count == 0 {
+                stdout_open = false;
+                rewriter.finish(stdout_writer)?;
+            } else {
+                rewriter.push(&stdout_buffer[..count], stdout_writer)?;
             }
         }
-        // If the destination fails, continue draining the child pipe. Returning
-        // early here could block eza forever before the main thread can reap it.
+        if stderr_open && descriptors[1].revents != 0 {
+            if descriptors[1].revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::other("eza stderr pipe became invalid"));
+            }
+            let count = stderr.read(&mut stderr_buffer)?;
+            if count == 0 {
+                stderr_open = false;
+                stderr_writer.flush()?;
+            } else {
+                stderr_writer.write_all(&stderr_buffer[..count])?;
+                stderr_writer.flush()?;
+            }
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

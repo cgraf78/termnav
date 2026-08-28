@@ -334,6 +334,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 
 def seconds(value: str) -> float:
@@ -343,21 +344,76 @@ def seconds(value: str) -> float:
     return float(value)
 
 
-process = subprocess.Popen(
-    sys.argv[2:],
-    stdin=subprocess.DEVNULL,
-    start_new_session=True,
-)
-try:
-    raise SystemExit(process.wait(timeout=seconds(sys.argv[1])))
-except subprocess.TimeoutExpired:
-    os.killpg(process.pid, signal.SIGTERM)
+class SupervisorSignal(Exception):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+def interrupted(signum: int, _frame: object) -> None:
+    raise SupervisorSignal(signum)
+
+
+def group_alive(group: int) -> bool:
     try:
-        process.wait(timeout=1.0)
+        os.killpg(group, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def signal_group(group: int, signum: int) -> None:
+    try:
+        os.killpg(group, signum)
+    except ProcessLookupError:
+        pass
+
+
+def stop_group(process: subprocess.Popen[bytes], first_signal: int) -> None:
+    # Once cleanup starts, a second terminal signal must not interrupt the only
+    # code responsible for the child group. The group identifier remains valid
+    # while any descendant survives, even after the direct leader exits.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal_group(process.pid, first_signal)
+    deadline = time.monotonic() + 1.0
+    while group_alive(process.pid) and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.01)
+    if group_alive(process.pid):
+        signal_group(process.pid, signal.SIGKILL)
+    process.wait()
+
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+process = None
+try:
+    blocked = {signal.SIGINT, signal.SIGTERM}
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    try:
+        process = subprocess.Popen(
+            sys.argv[2:],
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    finally:
+        # A pending signal is delivered only after `process` owns the new group,
+        # closing the otherwise unavoidable spawn-before-assignment leak window.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    try:
+        raise SystemExit(process.wait(timeout=seconds(sys.argv[1])))
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    raise SystemExit(124)
+        stop_group(process, signal.SIGTERM)
+        raise SystemExit(124)
+    except SupervisorSignal as caught:
+        stop_group(process, caught.signum)
+        raise SystemExit(128 + caught.signum)
+except SupervisorSignal as caught:
+    if process is not None:
+        stop_group(process, caught.signum)
+    raise SystemExit(128 + caught.signum)
 PY
       return 0
     else
