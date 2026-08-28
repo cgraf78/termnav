@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@92508d3ea7b6d5e074785afb1d47263497e967cf
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@7906c35e00d07304674f4955f2046045693fea44
     with:
       matrix-set: full
       msrv-toolchain: "1.88"
@@ -56,7 +56,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@92508d3ea7b6d5e074785afb1d47263497e967cf
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@7906c35e00d07304674f4955f2046045693fea44
 
   relay-performance:
     name: Relay hot path / Ubuntu
