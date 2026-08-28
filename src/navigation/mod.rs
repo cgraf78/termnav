@@ -403,7 +403,26 @@ where
                     scope: Some(current),
                 };
             }
-        } else if include_current && let Some(current) = self.backend.current_scope() {
+        } else if include_current {
+            let current = if let Some(source) = client.as_ref().filter(|source| source.exact) {
+                // A tmux binding can name the physical client and logical pane
+                // that generated a gesture. Treat that complete identity as
+                // the authoritative current scope, but revalidate it before a
+                // layout mutation so a delayed command cannot act after the
+                // client moved, detached, or reused its PID/tty.
+                if !self.backend.validate_client(source, started_at) {
+                    return RouteResult::uncertain(action, client);
+                }
+                Scope {
+                    socket: source.socket.clone(),
+                    pane: source.pane.clone(),
+                    session: (!source.session.is_empty()).then(|| source.session.clone()),
+                }
+            } else if let Some(current) = self.backend.current_scope() {
+                current
+            } else {
+                return self.finish_without_current(action, direction, client);
+            };
             let (outcome, current, selected) = self.enter_scope(
                 current,
                 action,
@@ -504,6 +523,26 @@ where
                 client: Some(selected),
                 scope: None,
             };
+        }
+    }
+
+    fn finish_without_current(
+        &mut self,
+        action: Action,
+        direction: Direction,
+        client: Option<Client>,
+    ) -> RouteResult {
+        if action == Action::PaneMove {
+            return RouteResult {
+                outcome: Outcome::Declined,
+                client,
+                scope: None,
+            };
+        }
+        RouteResult {
+            outcome: self.backend.terminal(client.as_ref(), action, direction),
+            client,
+            scope: None,
         }
     }
 

@@ -86,6 +86,18 @@ local function default_application()
   }
 end
 
+local function application_with_defaults(overrides)
+  local application = default_application()
+  -- Application integrations usually override only the tab abstraction (for
+  -- example, Bufferline instead of native tabpages). Merge that partial policy
+  -- over provider defaults so adding a new independent primitive cannot make
+  -- an older, otherwise valid consumer silently lose local behavior.
+  for name, callback in pairs(overrides or {}) do
+    application[name] = callback
+  end
+  return application
+end
+
 local function tmux_context()
   local value = vim.env.TMUX or ""
   local socket = value:match("^(.*),%d+,%d+$")
@@ -104,7 +116,7 @@ function M.new(options)
   -- consumers replace a collaborator only when their host API requires it.
 
   local ctx = {
-    application = options.application or default_application(),
+    application = application_with_defaults(options.application),
     command = options.command or default_command,
     executable = options.executable or "termnav",
     mappings = options.mappings ~= false,
@@ -297,10 +309,10 @@ function M.new(options)
       -- Exchange the two buffers and their views instead: this moves the
       -- user-visible pane one directional step without reshaping unrelated
       -- windows, then follows that content into its new slot.
-      if ctx.application.pane_move == nil then
-        -- Application collaborators are intentionally partial: consumers may
-        -- override only tab behavior. A missing pane primitive therefore
-        -- declines locally instead of crashing or moving an outer tmux pane.
+      if type(ctx.application.pane_move) ~= "function" then
+        -- Consumers may explicitly disable a primitive by replacing it with a
+        -- non-function. Decline locally instead of crashing or unexpectedly
+        -- moving an outer tmux pane.
         return false
       end
       return ctx.application.pane_move(source, neighbor)

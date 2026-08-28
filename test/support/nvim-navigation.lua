@@ -207,23 +207,33 @@ test("same-buffer movement carries the source view to its neighbor", function()
   equal(vim.api.nvim_win_get_cursor(source)[1], 100, "neighbor cursor should move left")
 end)
 
-test("partial application collaborators decline unsupported local movement", function()
+test("partial application collaborators retain default local movement", function()
   vim.cmd("vsplit")
   vim.cmd("wincmd h")
   local source = vim.api.nvim_get_current_win()
+  local source_buffer = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_win_set_buf(source, source_buffer)
+  vim.cmd("wincmd l")
+  local neighbor = vim.api.nvim_get_current_win()
+  local neighbor_buffer = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_win_set_buf(neighbor, neighbor_buffer)
+  vim.api.nvim_set_current_win(source)
   local ctx = fake_context({
     application = {
       tab_count = function()
-        return 1
+        return 7
       end,
     },
   })
 
   local ok, handled = pcall(ctx.pane_move, "right")
 
-  truthy(ok, "missing optional pane_move callback must not crash")
-  equal(handled, false, "partial collaborator should decline unsupported movement")
-  equal(vim.api.nvim_get_current_win(), source, "declined movement should preserve focus")
+  truthy(ok, "partial application override must not remove provider defaults")
+  equal(handled, true, "default pane movement should remain available")
+  equal(ctx.application_count(), 7, "the consumer tab-count override should remain active")
+  equal(vim.api.nvim_get_current_win(), neighbor, "focus should follow the moved content")
+  equal(vim.api.nvim_win_get_buf(neighbor), source_buffer, "source content should move")
+  equal(vim.api.nvim_win_get_buf(source), neighbor_buffer, "neighbor content should swap")
 end)
 
 test("pane movement at a nvim edge delegates only to the native router", function()

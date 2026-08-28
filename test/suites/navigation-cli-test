@@ -198,6 +198,51 @@ for direction in right left down up; do
   assert_pane_move "$direction" "$move_source" "$move_neighbor"
 done
 
+# tmux key bindings pass the originating physical client even though pane
+# movement begins in the current scope. Exercise that exact public invocation
+# without inherited TMUX variables so the explicit source identity is proven
+# sufficient rather than merely accepted by the parser.
+build_move_grid
+tmux -L "$socket_name" select-pane -t "$move_top_left"
+wait_for_client_panes "$move_top_left" 1 >/dev/null
+client_record=$(tmux -L "$socket_name" list-clients \
+  -F '#{client_pid}|#{client_tty}|#{client_created}|#{client_termtype}|#{session_id}|#{pane_id}' |
+  awk -F '|' -v pane="$move_top_left" '$6 == pane { print; exit }')
+IFS='|' read -r exact_pid exact_tty exact_created exact_termtype exact_session exact_pane \
+  <<<"$client_record"
+exact_source_before=$(pane_position "$move_top_left")
+exact_neighbor_before=$(pane_position "$move_top_right")
+env -u TMUX -u TMUX_PANE "$navigate" pane-move right \
+  --client-pid "$exact_pid" \
+  --client-tty "$exact_tty" \
+  --client-created "$exact_created" \
+  --client-termtype "$exact_termtype" \
+  --source-socket "$socket_path" \
+  --source-pane "$exact_pane" \
+  --source-session "$exact_session"
+_assert_eq "pane move: exact current-scope source moves to its neighbor" \
+  "$exact_neighbor_before" "$(pane_position "$move_top_left")"
+_assert_eq "pane move: exact current-scope neighbor takes the source position" \
+  "$exact_source_before" "$(pane_position "$move_top_right")"
+
+stale_layout=$(tmux -L "$socket_name" list-panes -t nav:moves \
+  -F '#{pane_id}|#{pane_left}|#{pane_top}')
+set +e
+env -u TMUX -u TMUX_PANE "$navigate" pane-move left \
+  --client-pid "$exact_pid" \
+  --client-tty "$exact_tty" \
+  --client-created "$((exact_created + 1))" \
+  --client-termtype "$exact_termtype" \
+  --source-socket "$socket_path" \
+  --source-pane "$exact_pane" \
+  --source-session "$exact_session"
+stale_exact_rc=$?
+set -e
+_assert_exit "pane move: stale exact current-scope identity declines safely" 3 "$stale_exact_rc"
+_assert_eq "pane move: stale exact identity cannot mutate the layout" \
+  "$stale_layout" \
+  "$(tmux -L "$socket_name" list-panes -t nav:moves -F '#{pane_id}|#{pane_left}|#{pane_top}')"
+
 build_move_grid
 layout_before=$(tmux -L "$socket_name" list-panes -t nav:moves \
   -F '#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}')
