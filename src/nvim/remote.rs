@@ -21,7 +21,15 @@ pub fn ssh_open(host: &str, target: &str) -> io::Result<i32> {
     if !allowed_host(host) {
         return Ok(13);
     }
-    let binary = crate::ssh::real_ssh()?;
+    let binary = match crate::ssh::real_ssh() {
+        Ok(binary) => binary,
+        // No process has started yet, so this failure is definitive: it is
+        // safe for the link router to try the explicitly configured transport
+        // without risking a duplicate remote open. Once ssh has started,
+        // status_timeout errors remain indeterminate and are not collapsed
+        // into this fallback code.
+        Err(_) => return Ok(10),
+    };
     let arguments = vec![OsString::from(host)];
     let settings = match crate::ssh::effective_config(&binary, &arguments) {
         Ok(settings) => settings,
@@ -61,7 +69,10 @@ pub fn configured_open(
 ) -> io::Result<i32> {
     let valid_identity = match kind {
         "tmux" => !scope.is_empty() && !pane.is_empty(),
-        "wezterm" => scope.is_empty() && !pane.is_empty(),
+        // A pane number is only unique inside one WezTerm mux server. Require
+        // its opaque socket/instance scope so helpers never guess when several
+        // GUI classes or mux servers reuse the same pane ID.
+        "wezterm" => !scope.is_empty() && !pane.is_empty(),
         _ => false,
     };
     if !valid_host(host) || !valid_identity {

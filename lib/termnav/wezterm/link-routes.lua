@@ -19,6 +19,7 @@ local user_vars = {
 -- it. Consumers still read this state only through route helpers.
 local shell_user_vars = {
   tmux = "TERMNAV_TMUX",
+  scope = "TERMNAV_WEZTERM_SCOPE",
 }
 
 function M.new(wezterm)
@@ -236,6 +237,17 @@ function M.new(wezterm)
     return ""
   end
 
+  function routes.pane_scope(pane)
+    if not pane or type(pane.get_user_vars) ~= "function" then
+      return ""
+    end
+    -- pane_id() is unique only inside one WezTerm mux server. The shell
+    -- publishes WEZTERM_UNIX_SOCKET (or an explicit equivalent) as an opaque
+    -- scope so an external helper can address this exact instance without
+    -- Termnav assuming how the helper selects WezTerm transports.
+    return pane:get_user_vars()[shell_user_vars.scope] or ""
+  end
+
   function routes.open_in_nvim(window, pane, path_info)
     routes.run_nvim_helper(window, {
       routes.helper_command("termnav"),
@@ -264,7 +276,7 @@ function M.new(wezterm)
       "remote",
       remote_host,
       "wezterm",
-      "",
+      routes.pane_scope(pane),
       routes.pane_id(pane),
     }, "No nvim session found for " .. remote_host .. ": " .. path_info)
   end
