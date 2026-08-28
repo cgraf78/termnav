@@ -80,6 +80,22 @@ else
   _pass "test isolation: timeout cleans up the complete fixture process group"
 fi
 
+# Blocking terminal signals around fork closes the supervisor's ownership race,
+# but that mask must be restored in the command before exec. Otherwise every
+# process in a wrapped suite silently inherits blocked INT/TERM and lifecycle
+# assertions test a different signal contract than production.
+set +e
+_with_timeout 2s python3 -c '
+import signal
+import sys
+
+blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+raise SystemExit(1 if signal.SIGINT in blocked or signal.SIGTERM in blocked else 0)
+'
+signal_mask_status=$?
+set -e
+_assert_exit "test isolation: child inherits an unblocked terminal signal mask" 0 "$signal_mask_status"
+
 # Signals delivered to the Python supervisor are another cancellation boundary.
 # The wrapper must tear down the owned command group before reporting the
 # conventional 128+signal status, even when both child generations ignore it.
