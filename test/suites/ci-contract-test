@@ -7,6 +7,7 @@ workflow="$root/.github/workflows/test.yml"
 retry_workflow="$root/.github/workflows/retry-infrastructure.yml"
 lock_file="$root/.github/cgraf78-actions.lock"
 performance_suite="$root/test/suites/relay-performance-test"
+performance_harness="$root/test/relay-performance.py"
 relay_suite="$root/test/suites/relay-test"
 terminal_suite="$root/test/suites/relay-terminal-test"
 focus_suite="$root/test/suites/tmux-focus-test"
@@ -150,5 +151,17 @@ grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/relay-terminal.py\"" "$
   fail "relay terminal suite has no bounded outer deadline"
 grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/tmux-focus.py\"" "$focus_suite" ||
   fail "tmux focus suite has no bounded outer deadline"
+
+performance_content=$(<"$performance_harness")
+for contract in \
+  '"baseline_median_ms": tmux_before_median' \
+  '"candidate_median_ms": tmux_after_median' \
+  'if tmux_after_median > 75:' \
+  'if tmux_after_p95 > 100:' \
+  'if tmux_after_median > tmux_before_median * 1.20 + 5:' \
+  'navigation tmux route did not select'; do
+  [[ "$performance_content" == *"$contract"* ]] ||
+    fail "local tmux performance contract is missing: $contract"
+done
 
 printf 'ci-contract-test: ok\n'
