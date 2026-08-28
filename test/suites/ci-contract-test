@@ -6,6 +6,10 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 workflow="$root/.github/workflows/test.yml"
 retry_workflow="$root/.github/workflows/retry-infrastructure.yml"
 lock_file="$root/.github/cgraf78-actions.lock"
+performance_suite="$root/test/suites/relay-performance-test"
+relay_suite="$root/test/suites/relay-test"
+terminal_suite="$root/test/suites/relay-terminal-test"
+focus_suite="$root/test/suites/tmux-focus-test"
 
 fail() {
   printf 'ci-contract-test: %s\n' "$*" >&2
@@ -84,6 +88,7 @@ for contract in \
   'name: Relay hot path / Ubuntu' \
   "if: \${{ github.event_name == 'pull_request' }}" \
   'runs-on: ubuntu-24.04' \
+  'timeout-minutes: 20' \
   'fetch-depth: 0' \
   'name: Install Rust' \
   'toolchain: stable' \
@@ -102,6 +107,7 @@ for contract in \
   'name: Relay hot path / macOS' \
   "if: \${{ github.event_name == 'pull_request' }}" \
   'runs-on: macos-latest' \
+  'timeout-minutes: 20' \
   'fetch-depth: 0' \
   'name: Install Rust' \
   'toolchain: stable' \
@@ -132,5 +138,17 @@ for contract in \
 done
 [[ "$required_job" == *"case \"\$RELAY_PERFORMANCE_MACOS_RESULT\" in"* ]] ||
   fail "Required aggregate does not validate the macOS performance result"
+
+# Process-heavy integration fixtures intentionally own subprocess trees. Keep
+# their outer deadline in the portable process-group wrapper so a child that
+# defeats an inner protocol timeout cannot occupy a CI worker indefinitely.
+grep -Fq "_with_timeout 15m python3 \"\$test_dir/relay-performance.py\"" "$performance_suite" ||
+  fail "relay performance suite has no bounded outer deadline"
+grep -Fq "_with_timeout 5m python3 \"\$test_dir/support/relay_lifecycle_test.py\"" "$relay_suite" ||
+  fail "relay lifecycle suite has no bounded outer deadline"
+grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/relay-terminal.py\"" "$terminal_suite" ||
+  fail "relay terminal suite has no bounded outer deadline"
+grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/tmux-focus.py\"" "$focus_suite" ||
+  fail "tmux focus suite has no bounded outer deadline"
 
 printf 'ci-contract-test: ok\n'
