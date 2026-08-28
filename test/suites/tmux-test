@@ -203,19 +203,43 @@ def run_bounded(arguments, pid_file, extra_env):
         raise SystemExit(f"timed-out child unexpectedly succeeded: {' '.join(arguments)}")
     with open(pid_file, encoding="utf-8") as stream:
         child_pids = [int(value) for value in stream.read().split()]
+
+    def process_running(pid):
+        # kill(pid, 0) also succeeds for a zombie. Container PID 1 processes
+        # do not consistently reap orphaned fixture grandchildren promptly, so
+        # treating that already-dead state as running makes the lifecycle test
+        # depend on the CI image rather than Termnav's process-group cleanup.
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+                stat = stream.read()
+            state = stat[stat.rfind(")") + 2 :].split(maxsplit=1)[0]
+            return state != "Z"
+        except (FileNotFoundError, OSError, IndexError):
+            pass
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(pid)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            state = result.stdout.strip()
+            return result.returncode == 0 and bool(state) and not state.startswith("Z")
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+
     deadline = time.monotonic() + 1
     while True:
-        alive = []
-        for child_pid in child_pids:
-            try:
-                os.kill(child_pid, 0)
-                alive.append(child_pid)
-            except ProcessLookupError:
-                pass
-        if not alive:
+        running = [child_pid for child_pid in child_pids if process_running(child_pid)]
+        if not running:
             return
         if time.monotonic() >= deadline:
-            raise SystemExit(f"timed-out child processes remain alive: {alive}")
+            raise SystemExit(f"timed-out child processes remain running: {running}")
         time.sleep(0.01)
 
 run_bounded(
@@ -245,6 +269,6 @@ try:
 finally:
     server.close()
 PY
-_assert_exit "native opener: SSH and nvim children are bounded, killed, and reaped" 0 "$?"
+_assert_exit "native opener: SSH and nvim process groups are bounded and stopped" 0 "$?"
 
 _test_summary
