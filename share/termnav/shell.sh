@@ -38,12 +38,45 @@ _termnav_ssh_shim_dir="$_termnav_root/share/termnav/shims"
 
 # A shell function affects only commands parsed by that shell. PATH is the
 # process-level interface, so unrelated descendant launchers inherit the same
-# SSH route without knowing about Termnav. Keep activation idempotent because
-# dotfiles and other consumers may reload this file in place.
-case ":${PATH:-}:" in
-  *":$_termnav_ssh_shim_dir:"*) ;;
-  *) PATH="$_termnav_ssh_shim_dir${PATH:+:$PATH}" ;;
-esac
+# SSH route without knowing about Termnav. macOS path_helper can promote system
+# directories ahead of an inherited shim before this integration is reloaded,
+# so idempotency must restore priority as well as remove duplicate entries.
+_termnav_shell_prepend_ssh_shim() {
+  local component last_component=0 path_rest="${PATH-}" path_tail='' path_tail_set=0
+
+  if [[ -n "$path_rest" ]]; then
+    while :; do
+      case "$path_rest" in
+        *:*)
+          component=${path_rest%%:*}
+          path_rest=${path_rest#*:}
+          ;;
+        *)
+          component=$path_rest
+          path_rest=
+          last_component=1
+          ;;
+      esac
+
+      if [[ "$component" != "$_termnav_ssh_shim_dir" ]]; then
+        if [[ "$path_tail_set" -eq 0 ]]; then
+          path_tail=$component
+          path_tail_set=1
+        else
+          path_tail="$path_tail:$component"
+        fi
+      fi
+      [[ "$last_component" -eq 0 ]] || break
+    done
+  fi
+
+  PATH=$_termnav_ssh_shim_dir
+  if [[ "$path_tail_set" -eq 1 ]]; then
+    PATH="$PATH:$path_tail"
+  fi
+}
+_termnav_shell_prepend_ssh_shim
+unset -f _termnav_shell_prepend_ssh_shim
 export PATH
 
 # Prompt hooks share this cache in the current shell. Re-sourcing the integration
