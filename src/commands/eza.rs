@@ -11,7 +11,7 @@ use crate::process;
 pub fn run(
     arguments: &[OsString],
     stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stderr: &mut (dyn Write + Send),
 ) -> io::Result<i32> {
     let binary = std::env::var_os("TERMNAV_EZA_BINARY").unwrap_or_else(|| OsString::from("eza"));
     let hyperlink = hyperlink_argument(&binary);
@@ -57,31 +57,32 @@ pub fn run(
         .ok_or_else(|| io::Error::other("eza stderr pipe is unavailable"))?;
 
     // stdout must remain interactive even though Termnav has to inspect it.
-    // Drain stderr concurrently so a diagnostic larger than the pipe capacity
-    // cannot deadlock eza while this thread incrementally rewrites stdout.
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        child_stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    // Drain stderr directly on a scoped worker so diagnostics stream without an
+    // unbounded capture buffer and cannot fill their pipe while this thread
+    // incrementally rewrites stdout. The scope proves both borrows end before
+    // `run` returns, without weakening the CLI's ordinary writer abstraction.
+    thread::scope(|scope| {
+        let stderr_reader = scope.spawn(|| copy_stream(&mut child_stderr, stderr));
 
-    // eza emits only one hostless file URI prefix. Rewriting bytes avoids a
-    // UTF-8 assumption about filenames and preserves every ANSI byte exactly.
-    // The matcher retains only a possible partial prefix between reads, so a
-    // large directory begins rendering before eza exits without missing a
-    // prefix split across two kernel pipe reads.
-    let pattern = b"\x1b]8;;file:///";
-    let replacement = format!("\x1b]8;;file://{host}/").into_bytes();
-    let rewrite_result = rewrite_stream(&mut child_stdout, stdout, pattern, &replacement);
-    if rewrite_result.is_err() {
-        let _ = child.kill();
-    }
-    let status = child.wait();
-    let stderr_bytes = stderr_reader
-        .join()
-        .map_err(|_| io::Error::other("eza stderr reader panicked"))??;
-    stderr.write_all(&stderr_bytes)?;
-    rewrite_result?;
-    Ok(process::status_code(status?))
+        // eza emits only one hostless file URI prefix. Rewriting bytes avoids a
+        // UTF-8 assumption about filenames and preserves every ANSI byte
+        // exactly. The matcher retains only a possible partial prefix between
+        // reads, so a large directory begins rendering before eza exits without
+        // missing a prefix split across two kernel pipe reads.
+        let pattern = b"\x1b]8;;file:///";
+        let replacement = format!("\x1b]8;;file://{host}/").into_bytes();
+        let rewrite_result = rewrite_stream(&mut child_stdout, stdout, pattern, &replacement);
+        if rewrite_result.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait();
+        let stderr_result = stderr_reader
+            .join()
+            .map_err(|_| io::Error::other("eza stderr reader panicked"))?;
+        rewrite_result?;
+        stderr_result?;
+        Ok(process::status_code(status?))
+    })
 }
 
 fn hyperlink_argument(binary: &OsStr) -> OsString {
@@ -159,25 +160,56 @@ fn rewrite_stream(
         }
         pending.extend_from_slice(&buffer[..count]);
 
-        while let Some(index) = pending
+        let mut consumed = 0;
+        while let Some(relative) = pending[consumed..]
             .windows(pattern.len())
             .position(|window| window == pattern)
         {
-            output.write_all(&pending[..index])?;
+            let index = consumed + relative;
+            output.write_all(&pending[consumed..index])?;
             output.write_all(replacement)?;
-            pending.drain(..index + pattern.len());
+            consumed = index + pattern.len();
         }
 
         // Bytes that cannot begin a future match are safe to publish now. Keep
         // only the longest suffix that is also a prefix of the search pattern.
+        let unmatched = &pending[consumed..];
         let retained = (1..pattern.len())
             .rev()
-            .find(|length| pending.ends_with(&pattern[..*length]))
+            .find(|length| unmatched.ends_with(&pattern[..*length]))
             .unwrap_or(0);
         let ready = pending.len().saturating_sub(retained);
-        output.write_all(&pending[..ready])?;
-        pending.drain(..ready);
+        output.write_all(&pending[consumed..ready])?;
+        if retained > 0 {
+            pending.copy_within(ready.., 0);
+        }
+        pending.truncate(retained);
         output.flush()?;
+    }
+}
+
+fn copy_stream(input: &mut dyn Read, output: &mut dyn Write) -> io::Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut first_error = None;
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            if first_error.is_none()
+                && let Err(error) = output.flush()
+            {
+                first_error = Some(error);
+            }
+            return first_error.map_or(Ok(()), Err);
+        }
+        if first_error.is_none() {
+            if let Err(error) = output.write_all(&buffer[..count]) {
+                first_error = Some(error);
+            } else if let Err(error) = output.flush() {
+                first_error = Some(error);
+            }
+        }
+        // If the destination fails, continue draining the child pipe. Returning
+        // early here could block eza forever before the main thread can reap it.
     }
 }
 

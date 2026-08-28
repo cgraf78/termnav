@@ -17,7 +17,11 @@ commands:\n\
   version   print the embedded build identity\n";
 
 /// Run the CLI and return its process exit status.
-pub fn run<I, S>(arguments: I, stdout: &mut dyn Write, stderr: &mut dyn Write) -> io::Result<i32>
+pub fn run<I, S>(
+    arguments: I,
+    stdout: &mut dyn Write,
+    stderr: &mut (dyn Write + Send),
+) -> io::Result<i32>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
