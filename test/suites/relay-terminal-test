@@ -21,6 +21,21 @@ output=$(_with_timeout 10m python3 "$test_dir/support/relay-terminal.py" \
 rc=$?
 set -e
 printf '%s\n' "$output"
+if [[ $output == *"platform forbids reopening the synthetic tmux client PTY"* ]]; then
+  if ((rc != 0)); then
+    # A skip message cannot hide setup errors or partial execution failures.
+    _assert_exit "relay terminal: real tmux/PTY integration passes" 0 "$rc"
+    _test_summary
+    exit 1
+  fi
+  # Android/Termux can deny reopening the pseudoterminal that represents the
+  # synthetic tmux client. unittest then reports every dependent case as a
+  # supported platform skip. Stop here so method names in those skip lines are
+  # not mislabeled as executed coverage by the assertions below.
+  echo "  SKIP: relay terminal: platform cannot reopen the synthetic tmux client PTY"
+  _test_summary
+  exit 0
+fi
 _assert_exit "relay terminal: real tmux/PTY integration passes" 0 "$rc"
 _assert_contains "relay terminal: all five DECRQM states are exercised" \
   "test_all_decrqm_states_commit_pane_navigation" "$output"
