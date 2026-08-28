@@ -392,11 +392,20 @@ process = None
 try:
     blocked = {signal.SIGINT, signal.SIGTERM}
     previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+
+    def restore_child_mask() -> None:
+        # Popen inherits the caller's signal mask across exec. This supervisor
+        # is deliberately single-threaded, so a small pre-exec hook is safe and
+        # keeps the ownership race closed without changing the wrapped suite's
+        # signal semantics.
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
     try:
         process = subprocess.Popen(
             sys.argv[2:],
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            preexec_fn=restore_child_mask,
         )
     finally:
         # A pending signal is delivered only after `process` owns the new group,
