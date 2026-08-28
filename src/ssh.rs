@@ -11,7 +11,7 @@ use std::env;
 use std::ffi::CStr;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -27,6 +27,11 @@ const SOCKET_WAIT: Duration = Duration::from_secs(1);
 const CHILD_POLL: Duration = Duration::from_millis(10);
 const SIGNAL_GRACE: Duration = Duration::from_millis(75);
 const SIGNAL_KILL_GRACE: Duration = Duration::from_secs(1);
+const SSH_SHIM_ACTIVE_ENV: &str = "TERMNAV_SSH_SHIM_ACTIVE";
+const SSH_SHIM_DIR_ENV: &str = "TERMNAV_SSH_SHIM_DIR";
+const SSH_SHIM_MARKER: &[u8] = b"# termnav-ssh-shim-v1";
+const LEGACY_SSH_SHIM_MARKER: &[u8] = b"# Keep SSH interposition inherited by child processes";
+const SSH_SHIM_ORIGINAL_PATH_ENV: &str = "TERMNAV_SSH_ORIGINAL_PATH";
 
 /// Run SSH, enriching only an interactive session Termnav can safely own.
 pub fn run(arguments: &[OsString]) -> io::Result<i32> {
@@ -104,7 +109,7 @@ pub fn run(arguments: &[OsString]) -> io::Result<i32> {
     }
 
     let enhanced = enhanced_arguments(arguments, destination, &local_socket, &remote_socket);
-    let mut child = match Command::new(&binary)
+    let mut child = match ssh_command(&binary)
         .args(&enhanced)
         .env("TERMNAV_PARENT_RELAY", &remote_socket)
         .spawn()
@@ -148,27 +153,24 @@ pub fn run(arguments: &[OsString]) -> io::Result<i32> {
 }
 
 fn run_plain(binary: &Path, arguments: &[OsString]) -> io::Result<i32> {
-    Command::new(binary)
+    ssh_command(binary)
         .args(arguments)
         .status()
         .map(process::status_code)
 }
 
 pub(crate) fn real_ssh() -> io::Result<PathBuf> {
-    let installed_shim = env::current_exe()
-        .ok()
-        .and_then(|binary| installed_shim_for(&binary));
-    let source_shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("share/termnav/shims");
+    let invoking_shim = env::var_os(SSH_SHIM_DIR_ENV).map(PathBuf::from);
     for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
-        if same_path(&directory, &source_shim)
-            || installed_shim
+        if is_termnav_shim_dir(&directory)
+            || invoking_shim
                 .as_ref()
                 .is_some_and(|shim| same_path(&directory, shim))
         {
             continue;
         }
         let candidate = directory.join("ssh");
-        if candidate.is_file() {
+        if candidate.is_file() && !is_termnav_shim(&candidate) {
             return Ok(candidate);
         }
     }
@@ -178,17 +180,45 @@ pub(crate) fn real_ssh() -> io::Result<PathBuf> {
     ))
 }
 
-fn installed_shim_for(binary: &Path) -> Option<PathBuf> {
-    // `current_exe` may report the public symlink spelling on some platforms.
-    // Resolve it before deriving the release root; otherwise `termnav ssh`
-    // can mistake its own private PATH adapter for the real OpenSSH binary and
-    // recurse. Failure remains conservative for source/test binaries, whose
-    // separately known source shim is still filtered below.
-    let binary = fs::canonicalize(binary).unwrap_or_else(|_| binary.to_owned());
-    binary
-        .parent()?
-        .parent()
-        .map(|prefix| prefix.join("share/termnav/shims"))
+fn ssh_command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    // These variables describe only the shim-to-Termnav handoff. Never leak
+    // them into OpenSSH or commands launched by the remote login: a later SSH
+    // from that environment must begin a fresh, independent resolution.
+    if let Some(path) = env::var_os(SSH_SHIM_ORIGINAL_PATH_ENV) {
+        command.env("PATH", path);
+    }
+    command
+        .env_remove(SSH_SHIM_ACTIVE_ENV)
+        .env_remove(SSH_SHIM_DIR_ENV)
+        .env_remove(SSH_SHIM_ORIGINAL_PATH_ENV);
+    command
+}
+
+fn is_termnav_shim_dir(directory: &Path) -> bool {
+    // Every source, staged, and installed Termnav shim lives below this
+    // provider-owned suffix. Inspect the canonical spelling as well so a PATH
+    // symlink cannot disguise another shim as a real SSH client. This catches
+    // all coexisting release copies without coupling resolution to whichever
+    // binary happened to start the current process.
+    let canonical = fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
+    canonical.ends_with(Path::new("share/termnav/shims"))
+}
+
+fn is_termnav_shim(candidate: &Path) -> bool {
+    // The directory convention covers every managed installation. The marker
+    // additionally protects copied or relocated shims. The descriptive header
+    // is shared by both earlier single-binary releases, so mixed-version fleets
+    // remain bounded without parsing shell syntax or comparing whole files.
+    let mut prefix = [0_u8; 1024];
+    File::open(candidate)
+        .and_then(|mut file| file.read(&mut prefix))
+        .is_ok_and(|length| {
+            let prefix = &prefix[..length];
+            [SSH_SHIM_MARKER, LEGACY_SSH_SHIM_MARKER]
+                .into_iter()
+                .any(|marker| prefix.windows(marker.len()).any(|window| window == marker))
+        })
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -202,7 +232,7 @@ pub(crate) fn effective_config(
     binary: &Path,
     arguments: &[OsString],
 ) -> io::Result<HashMap<String, String>> {
-    let mut command = Command::new(binary);
+    let mut command = ssh_command(binary);
     command.arg("-G").args(arguments);
     let output = process::output_timeout(&mut command, Duration::from_secs(2))?;
     if !output.status.success() {
@@ -343,7 +373,7 @@ fn cancel_forward(
     // overrides make the safety property structural: if the exact socket has
     // vanished, OpenSSH runs `/bin/false` instead of consulting a configured
     // proxy, DNS, network socket, or authentication provider.
-    let _ = Command::new(binary)
+    let _ = ssh_command(binary)
         .args([
             OsStr::new("-S"),
             OsStr::new(control_path),
@@ -454,12 +484,9 @@ fn tty_name(descriptor: i32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{control_mode, destination_index, interactive, resolved_tty};
     use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::fs;
-    use std::os::unix::fs::symlink;
-
-    use super::{control_mode, destination_index, installed_shim_for, interactive, resolved_tty};
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -498,29 +525,5 @@ mod tests {
             0,
             true
         ));
-    }
-
-    #[test]
-    fn installed_shim_resolution_follows_the_public_binary_symlink() {
-        let root =
-            std::env::temp_dir().join(format!("termnav-installed-shim-{}", std::process::id()));
-        let release = root.join("release");
-        let public = root.join("public");
-        fs::create_dir_all(release.join("bin")).expect("create release bin");
-        fs::create_dir_all(release.join("share/termnav/shims")).expect("create shim dir");
-        fs::create_dir_all(&public).expect("create public bin");
-        fs::write(release.join("bin/termnav"), b"binary").expect("create binary");
-        symlink(release.join("bin/termnav"), public.join("termnav"))
-            .expect("create public command link");
-
-        // macOS exposes temporary paths through both /var and /private/var.
-        // Compare filesystem identity instead of the caller-visible spelling.
-        let expected = release
-            .join("share/termnav/shims")
-            .canonicalize()
-            .expect("canonicalize shim dir");
-
-        assert_eq!(installed_shim_for(&public.join("termnav")), Some(expected));
-        fs::remove_dir_all(root).expect("remove symlink fixture");
     }
 }
