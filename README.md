@@ -233,9 +233,12 @@ instead of interpreting metadata directly. There are no `DOT_*` aliases.
 `command`, `executable`, `mappings`, `notify`, `schedule`, and `spawn`.
 `vscode-focus.lua` accepts `command`, `interval_ms`, `observed`, and `source`.
 Defaults are production implementations; collaborator overrides exist for
-embedding and deterministic tests. An overridden `application` may provide
+embedding and deterministic tests. A partial `application` table is merged
+over those defaults, so a consumer can replace its tab abstraction without
+silently removing provider-owned pane movement. It may override
 `pane_move(source_window, target_window)` and return whether it handled the
-local swap; omitting that callback makes local pane movement a safe decline.
+local swap; an explicit non-function value disables that primitive and makes
+local pane movement a safe decline.
 
 The Neovim navigation context exposes `pane_move("left"|"down"|"up"|"right")`.
 It swaps the current buffer and saved view with the directional neighbor and
