@@ -118,32 +118,47 @@ _termnav_wezterm_set_user_var() {
   case "$1" in
     IS_NVIM)
       [[ "${_termnav_wezterm_sent_IS_NVIM:-0}" == 1 && "${_termnav_wezterm_last_IS_NVIM-}" == "$2" ]] && return
+      ;;
+    NVIM_LINK_CWD)
+      [[ "${_termnav_wezterm_sent_NVIM_LINK_CWD:-0}" == 1 && "${_termnav_wezterm_last_NVIM_LINK_CWD-}" == "$2" ]] && return
+      ;;
+    NVIM_REMOTE_LINK_HOST)
+      [[ "${_termnav_wezterm_sent_NVIM_REMOTE_LINK_HOST:-0}" == 1 && "${_termnav_wezterm_last_NVIM_REMOTE_LINK_HOST-}" == "$2" ]] && return
+      ;;
+    NVIM_REMOTE_CWD)
+      [[ "${_termnav_wezterm_sent_NVIM_REMOTE_CWD:-0}" == 1 && "${_termnav_wezterm_last_NVIM_REMOTE_CWD-}" == "$2" ]] && return
+      ;;
+    NVIM_REMOTE_TMUX)
+      [[ "${_termnav_wezterm_sent_NVIM_REMOTE_TMUX:-0}" == 1 && "${_termnav_wezterm_last_NVIM_REMOTE_TMUX-}" == "$2" ]] && return
+      ;;
+  esac
+
+  # Classification and OSC generation are one publication transaction. Cache
+  # only after the bytes were produced successfully; otherwise a transient
+  # attach-time tmux query failure would suppress every retry of the same value.
+  termnav_wezterm_user_var_sequence "$1" "$2" auto || return
+  case "$1" in
+    IS_NVIM)
       _termnav_wezterm_sent_IS_NVIM=1
       _termnav_wezterm_last_IS_NVIM="$2"
       ;;
     NVIM_LINK_CWD)
-      [[ "${_termnav_wezterm_sent_NVIM_LINK_CWD:-0}" == 1 && "${_termnav_wezterm_last_NVIM_LINK_CWD-}" == "$2" ]] && return
       _termnav_wezterm_sent_NVIM_LINK_CWD=1
       _termnav_wezterm_last_NVIM_LINK_CWD="$2"
       ;;
     NVIM_REMOTE_LINK_HOST)
-      [[ "${_termnav_wezterm_sent_NVIM_REMOTE_LINK_HOST:-0}" == 1 && "${_termnav_wezterm_last_NVIM_REMOTE_LINK_HOST-}" == "$2" ]] && return
       _termnav_wezterm_sent_NVIM_REMOTE_LINK_HOST=1
       _termnav_wezterm_last_NVIM_REMOTE_LINK_HOST="$2"
       ;;
     NVIM_REMOTE_CWD)
-      [[ "${_termnav_wezterm_sent_NVIM_REMOTE_CWD:-0}" == 1 && "${_termnav_wezterm_last_NVIM_REMOTE_CWD-}" == "$2" ]] && return
       _termnav_wezterm_sent_NVIM_REMOTE_CWD=1
       _termnav_wezterm_last_NVIM_REMOTE_CWD="$2"
       ;;
     NVIM_REMOTE_TMUX)
-      [[ "${_termnav_wezterm_sent_NVIM_REMOTE_TMUX:-0}" == 1 && "${_termnav_wezterm_last_NVIM_REMOTE_TMUX-}" == "$2" ]] && return
       _termnav_wezterm_sent_NVIM_REMOTE_TMUX=1
       _termnav_wezterm_last_NVIM_REMOTE_TMUX="$2"
       ;;
   esac
-
-  termnav_wezterm_user_var_sequence "$1" "$2" auto
 }
 
 _termnav_wezterm_publish_tmux_context() {
@@ -200,6 +215,7 @@ _termnav_wezterm_remote_link_host_get() {
     # still publish the same host identity that local link routing uses. Read
     # client classification in the same call and prime its ordinary TTL cache.
     _termnav_wezterm_tmux_publish_observation_key="${TMUX:-}"
+    _termnav_wezterm_tmux_publish_observation_known=0
     _termnav_wezterm_tmux_publish_observation_nested=""
     fields=$(tmux display-message -p 't#{client_termname}' \; show-environment -g TERMNAV_REMOTE_LINK_HOST 2>/dev/null) || true
     case "$fields" in
@@ -214,6 +230,7 @@ _termnav_wezterm_remote_link_host_get() {
             tmux* | screen*) nested=1 ;;
           esac
           _termnav_wezterm_tmux_publish_observation_nested=$nested
+          _termnav_wezterm_tmux_publish_observation_known=1
           if [[ -n "$now" ]]; then
             _termnav_wezterm_tmux_client_cache_set=1
             _termnav_wezterm_tmux_client_cache_key="${TMUX:-}"
@@ -244,17 +261,20 @@ _termnav_wezterm_remote_link_host_get() {
 
 _termnav_wezterm_remote_link_host() {
   _termnav_wezterm_tmux_publish_observation_key=""
+  _termnav_wezterm_tmux_publish_observation_known=0
   _termnav_wezterm_remote_link_host_get
   if [[ -n "$_termnav_wezterm_remote_link_host_result" ]]; then
     printf '%s\n' "$_termnav_wezterm_remote_link_host_result"
   fi
   _termnav_wezterm_tmux_publish_observation_key=""
+  _termnav_wezterm_tmux_publish_observation_known=0
   return 0
 }
 
 _termnav_wezterm_publish_link_context() {
   local publish_tmux_context="${1:-}" remote_host
   _termnav_wezterm_tmux_publish_observation_key=""
+  _termnav_wezterm_tmux_publish_observation_known=0
   _termnav_wezterm_remote_link_host_get
   remote_host="$_termnav_wezterm_remote_link_host_result"
   # Hyperlink-aware tools run as shell children, so export the same host that
@@ -280,8 +300,8 @@ _termnav_wezterm_publish_link_context() {
   if [[ -n "$remote_host" ]]; then
     _termnav_wezterm_set_user_var NVIM_REMOTE_CWD "$PWD"
     if [[ -n "${TMUX:-}" ]]; then
-      # Direct pane routing sends a tmux command through the visible terminal.
-      # Advertise that only when the remote producer is actually inside tmux.
+      # Pane ownership remains useful to navigation consumers even though file
+      # opening itself no longer injects tmux commands through terminal bytes.
       _termnav_wezterm_set_user_var NVIM_REMOTE_TMUX true
     else
       _termnav_wezterm_set_user_var NVIM_REMOTE_TMUX ""
@@ -297,6 +317,7 @@ _termnav_wezterm_publish_link_context() {
     _termnav_wezterm_publish_tmux_context
   fi
   _termnav_wezterm_tmux_publish_observation_key=""
+  _termnav_wezterm_tmux_publish_observation_known=0
 }
 
 _termnav_wezterm_preexec() {

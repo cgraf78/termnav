@@ -158,6 +158,10 @@ if command -v tmux >/dev/null 2>&1; then
     "run-shell -b" "$(grep 'termnav navigate' "$TMUX_EXAMPLE")"
   _assert_contains "examples: tmux config wires Ctrl-click" \
     "termnav tmux follow-click" "$_tmux_keys"
+  _assert_contains "examples: tmux click identity includes its exact server socket" \
+    '#{socket_path}' "$_tmux_keys"
+  _assert_contains "examples: tmux click identity uses the event pane" \
+    '#{mouse_pane}' "$_tmux_keys"
   _tmux_focus_hooks=$(tmux -L "$_socket" show-hooks -g client-focus-in)
   _assert_contains "examples: tmux config publishes nested focus" \
     "termnav tmux focus watch" "$_tmux_focus_hooks"
@@ -212,5 +216,41 @@ assert match, payload
 assert base64.b64decode(match.group(1)) == b"https://issues.example.com/TICKET-42"
 PY
 _assert_exit "examples: custom detector registers and routes its token" 0 "$?"
+
+# A detector is optional user policy running on the click hot path. Treat it as
+# an untrusted availability boundary: a script that never stops writing must be
+# killed and reaped by Termnav rather than wedging the tmux mouse binding.
+_bounded_detector_dir="$_td/bounded-detectors"
+mkdir -p "$_bounded_detector_dir"
+cat >"$_bounded_detector_dir/loop.sh" <<'SH'
+tmux_follow_register_token_detector termnav_test_unbounded_detector
+termnav_test_unbounded_detector() {
+  while :; do printf '0123456789abcdef'; done
+}
+SH
+
+python3 - "$TERMNAV_BINARY" "$_bounded_detector_dir" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+env = os.environ.copy()
+env["TERMNAV_TMUX_FOLLOW_EXTENSION_DIR"] = sys.argv[2]
+process = subprocess.Popen(
+    [sys.argv[1], "tmux", "follow-click", "", "CUSTOM-1", "", "0", "/tmp", ""],
+    env=env,
+    start_new_session=True,
+)
+try:
+    code = process.wait(timeout=2)
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+    raise SystemExit("click detector exceeded its bounded execution contract")
+if code != 0:
+    raise SystemExit(f"bounded click detector returned {code}")
+PY
+_assert_exit "examples: unbounded detector output is terminated and reaped" 0 "$?"
 
 _test_summary

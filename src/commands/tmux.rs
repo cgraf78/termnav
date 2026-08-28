@@ -47,14 +47,14 @@ fn follow_click(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
         io::Read::read_to_string(&mut io::stdin(), &mut input)?;
         input
             .lines()
-            .take(10)
+            .take(11)
             .map(str::to_owned)
             .collect::<Vec<_>>()
     } else {
         arguments.to_vec()
     };
-    if fields.len() > 10 {
-        return usage(stderr, "follow-click accepts at most ten fields");
+    if fields.len() > 11 {
+        return usage(stderr, "follow-click accepts at most eleven fields");
     }
     let field = |index: usize| fields.get(index).cloned().unwrap_or_default();
     let number = |index: usize| fields.get(index).and_then(|value| value.parse().ok());
@@ -69,6 +69,7 @@ fn follow_click(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
         y: number(7),
         pane_top: number(8),
         pane_left: number(9),
+        tmux_socket: field(10),
     };
     crate::click::follow(&input)?;
     Ok(0)

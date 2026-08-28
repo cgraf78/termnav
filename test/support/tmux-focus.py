@@ -1290,11 +1290,22 @@ class NestedFocusTest(unittest.TestCase):
         )
         client_one.focus()
         client_two.focus()
+
+        def both_claimed() -> bool:
+            # A real terminal continuously drains tmux output while focus
+            # changes propagate through the nested clients. Keep both
+            # synthetic PTYs moving during the condition wait; otherwise a
+            # slow platform can leave the focus event behind pending terminal
+            # negotiation even though extending the wall-clock timeout cannot
+            # make progress.
+            client_one.pump(0.02)
+            client_two.pump(0.02)
+            return bool(self.pane_claim(outer_one, pane_one)) and bool(
+                self.pane_claim(outer_two, pane_two)
+            )
+
         wait_until(
-            lambda: (
-                bool(self.pane_claim(outer_one, pane_one))
-                and bool(self.pane_claim(outer_two, pane_two))
-            ),
+            both_claimed,
             "independent claims from two clients of one inner session",
         )
         self.assertEqual("bg=#222222", self.pane_active_style(outer_one, pane_one))
@@ -1304,12 +1315,18 @@ class NestedFocusTest(unittest.TestCase):
         self.assertEqual(2, focused_clients)
 
         client_one.blur()
-        wait_until(
-            lambda: (
+
+        def one_claimed() -> bool:
+            client_one.pump(0.02)
+            client_two.pump(0.02)
+            return (
                 self.pane_claim(outer_one, pane_one) == ""
                 and bool(self.pane_claim(outer_two, pane_two))
                 and self.pane_active_style(outer_one, pane_one) == "bg=#222222"
-            ),
+            )
+
+        wait_until(
+            one_claimed,
             "one attachment becoming inactive without disturbing the other",
         )
         inner_pane = self.tmux(inner, "display-message", "-p", "#{pane_id}")
@@ -1321,13 +1338,7 @@ class NestedFocusTest(unittest.TestCase):
         self.assertEqual(1, focused_clients)
 
         client_one.focus()
-        wait_until(
-            lambda: (
-                bool(self.pane_claim(outer_one, pane_one))
-                and bool(self.pane_claim(outer_two, pane_two))
-            ),
-            "released attachment reclaiming independently",
-        )
+        wait_until(both_claimed, "released attachment reclaiming independently")
 
     def test_publisher_crash_expires_then_next_focus_recovers(self) -> None:
         inner = self.new_server("crash-inner", "sleep 30")

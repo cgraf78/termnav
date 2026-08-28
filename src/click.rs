@@ -10,7 +10,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 
 use regex::Regex;
@@ -34,6 +34,8 @@ pub struct Input {
     pub client_tty: String,
     /// Clicked pane identifier.
     pub pane: String,
+    /// Exact tmux server socket containing the clicked pane.
+    pub tmux_socket: String,
     /// Vertical click coordinate.
     pub y: Option<usize>,
     /// Pane top offset within the window.
@@ -70,10 +72,19 @@ pub fn follow(input: &Input) -> io::Result<()> {
             source,
             context,
         } => {
-            let mut arguments = vec![target, input.cwd.clone(), source];
-            if !context.is_empty() {
-                arguments.push(context);
-            }
+            // Pane identity is part of the routing authority, not optional
+            // diagnostic context. Preserve the exact clicked pane even across
+            // remote fallback so two connections to the same host can never be
+            // selected by global pane enumeration order.
+            let arguments = vec![
+                target,
+                input.cwd.clone(),
+                source,
+                context,
+                "tmux".to_owned(),
+                input.tmux_socket.clone(),
+                input.pane.clone(),
+            ];
             // tmux run-shell prints a failed command verbatim. TmuxLink owns
             // user-visible failure translation, so the mouse hook itself must
             // always complete successfully after dispatch.
@@ -582,7 +593,8 @@ for detector in "${tmux_follow_token_detectors[@]}"; do
 done
 exit 1
 "#;
-    let output = Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .args([
             "--noprofile",
             "--norc",
@@ -592,10 +604,16 @@ exit 1
             token,
             original,
         ])
-        .arg(&directory)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+        .arg(&directory);
+    // Optional shell extensions run synchronously on a click. Bound both time
+    // and captured bytes so one broken detector cannot wedge tmux or exhaust
+    // the long-lived terminal process's memory.
+    let output = crate::process::output_timeout_limited(
+        &mut command,
+        std::time::Duration::from_millis(500),
+        16 * 1024,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

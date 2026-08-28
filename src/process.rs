@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,6 +54,7 @@ pub fn pipe(nonblocking: bool) -> io::Result<(OwnedFd, OwnedFd)> {
 /// entire large process environment and uses the draining variant below.
 pub fn output_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
     command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -63,19 +65,57 @@ pub fn output_timeout(command: &mut Command, timeout: Duration) -> io::Result<Ou
     }
 }
 
+/// Run a child to completion behind a hard deadline without capturing output.
+///
+/// UI-triggered helpers must never inherit an unbounded wait from an external
+/// program. On every timeout or wait failure this function kills and reaps the
+/// exact child before returning, so callers cannot leak detached work while
+/// reporting a failed gesture.
+pub(crate) fn status_timeout(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    match wait_for_child(&mut child, timeout)? {
+        Some(status) => Ok(status),
+        None => Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out")),
+    }
+}
+
+/// Capture a subprocess behind both a hard deadline and a combined byte cap.
+///
+/// Extension hooks are user-controlled code. A time limit alone is not enough:
+/// a child can produce output faster than the timeout and exhaust the parent.
+/// Draining both pipes while the child runs also avoids the wait-before-read
+/// deadlock inherent in `Command::output` for pipe-sized output.
+pub(crate) fn output_timeout_limited(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+) -> io::Result<Output> {
+    output_timeout_draining_limited(command, timeout, max_bytes)
+}
+
 fn output_timeout_draining(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+    output_timeout_draining_limited(command, timeout, usize::MAX)
+}
+
+fn output_timeout_draining_limited(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: usize,
+) -> io::Result<Output> {
     command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
+        kill_child_group(&mut child);
         let _ = child.wait();
         return Err(io::Error::other("child stdout pipe is unavailable"));
     };
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill();
+        kill_child_group(&mut child);
         let _ = child.wait();
         return Err(io::Error::other("child stderr pipe is unavailable"));
     };
@@ -95,12 +135,20 @@ fn output_timeout_draining(command: &mut Command, timeout: Duration) -> io::Resu
         let mut status = None;
         loop {
             if let Some(pipe) = stdout.as_mut()
-                && !drain_available(pipe, &mut stdout_bytes)?
+                && !drain_available(
+                    pipe,
+                    &mut stdout_bytes,
+                    max_bytes.saturating_sub(stderr_bytes.len()),
+                )?
             {
                 stdout = None;
             }
             if let Some(pipe) = stderr.as_mut()
-                && !drain_available(pipe, &mut stderr_bytes)?
+                && !drain_available(
+                    pipe,
+                    &mut stderr_bytes,
+                    max_bytes.saturating_sub(stdout_bytes.len()),
+                )?
             {
                 stderr = None;
             }
@@ -125,9 +173,10 @@ fn output_timeout_draining(command: &mut Command, timeout: Duration) -> io::Resu
     })();
     if result.is_err() {
         // Every setup, read, wait, and timeout failure owns the same exact
-        // child. Kill and reap it here so future changes cannot accidentally
-        // add an early-return path that leaks a helper process.
-        let _ = child.kill();
+        // process group. Kill the full group and reap its leader here so future
+        // changes cannot accidentally add an early-return path that leaks a
+        // helper descendant.
+        kill_child_group(&mut child);
         let _ = child.wait();
     }
     result
@@ -142,7 +191,11 @@ fn set_nonblocking(descriptor: &impl AsRawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn drain_available(pipe: &mut impl Read, output: &mut Vec<u8>) -> io::Result<bool> {
+fn drain_available(
+    pipe: &mut impl Read,
+    output: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<bool> {
     const MAX_BYTES_PER_TURN: usize = 64 * 1024;
 
     let mut buffer = [0_u8; 8192];
@@ -151,6 +204,12 @@ fn drain_available(pipe: &mut impl Read, output: &mut Vec<u8>) -> io::Result<boo
         match pipe.read(&mut buffer) {
             Ok(0) => return Ok(false),
             Ok(count) => {
+                if count > max_bytes.saturating_sub(output.len()) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "command output exceeded limit",
+                    ));
+                }
                 output.extend_from_slice(&buffer[..count]);
                 drained += count;
                 // A continuously writing or replaced `ps` must not monopolize
@@ -178,7 +237,7 @@ fn wait_for_child(
             Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
+                kill_child_group(child);
                 let _ = child.wait();
                 return Err(error);
             }
@@ -187,12 +246,23 @@ fn wait_for_child(
             // A timeout is an uncertainty boundary. Kill and reap the exact
             // child before returning so a failed UI gesture never accumulates
             // helper processes in the background.
-            let _ = child.kill();
+            kill_child_group(child);
             child.wait()?;
             return Ok(None);
         }
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+fn kill_child_group(child: &mut std::process::Child) {
+    // Every bounded command starts a fresh process group. Killing that owned
+    // group closes the common shell-wrapper leak where the direct child exits
+    // but a grandchild retains pipes, sockets, or remote work. Keep Child::kill
+    // as a defensive fallback if the platform rejects the group operation.
+    if let Ok(group) = i32::try_from(child.id()) {
+        let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
 }
 
 /// Return one process environment value through procfs or the macOS `ps` form.

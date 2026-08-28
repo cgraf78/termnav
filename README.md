@@ -92,8 +92,8 @@ status. Reusable behavior lives behind focused library interfaces:
   store;
 - `ssh` owns exactly one SSH child and its reverse-forward lifecycle;
 - `focus` owns one-hop tmux leases and pane-style restoration;
-- `nvim` owns target parsing, registry selection, RPC, pane fallback, and
-  mux-only remote reuse;
+- `nvim` owns target parsing, registry selection, RPC, exact-pane transport
+  fallback, and mux-only remote reuse;
 - `click` owns mouse-text recognition and returns typed URL/file targets;
 - `terminal`, `process`, `runtime`, and `links` isolate operating-system and
   terminal-protocol boundaries shared by those domains.
@@ -189,9 +189,6 @@ through Shdeps.
   auth token follows the dotfiles
   `vscode.sh` contract under an absolute
   `$XDG_STATE_HOME/dot` or the `$HOME/.local/state/dot` fallback.
-- `nvim-remote-pane-host` is an optional extension command for custom
-  remote-pane workflows.
-
 `termnav tmux follow-click` loads environment-specific token detectors from
 an absolute `$XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d/*.sh`, falling
 back to `$HOME/.config/termnav/tmux-follow/extensions.d/*.sh` when the XDG value
@@ -348,6 +345,24 @@ that `termnav nvim ssh-open` may contact through an existing SSH
 ControlMaster connection. The helper fails closed when the variable is unset
 or the target host is not listed, so reusable installs do not inherit private
 host policy from this repo.
+
+Non-OpenSSH transports may set `TERMNAV_REMOTE_OPEN_HELPER` to an executable
+that accepts `KIND SCOPE PANE HOST TARGET` and exits zero only after accepting
+the request. `KIND=tmux` carries the exact tmux `#{socket_path}` and `%pane` in
+`SCOPE` and `PANE`; `KIND=wezterm` carries a callback-local WezTerm mux scope
+and pane ID. Pane IDs can repeat across GUI classes and mux servers, so a
+missing WezTerm scope fails closed. Supply the opaque scope as
+`remote_open_scope` to `link-routes.lua`'s `new()` function, or in the WezTerm
+process environment as `TERMNAV_WEZTERM_SCOPE` or `WEZTERM_UNIX_SOCKET`.
+Never derive it from pane shell metadata, which may be shared by several
+attached terminal clients. Termnav invokes this capability only after
+existing-ControlMaster reuse is definitively unavailable or declines the
+request, gives it a bounded lifetime, and otherwise fails closed. An
+indeterminate timed-out SSH request is never retried through a second
+transport. Termnav never guesses among same-host panes or types tmux prefix
+keys into a terminal stream.
+Install the new binary before reloading the tmux and WezTerm integrations that
+publish this identity; those files are the sole coordinated consumers.
 
 `termnav ssh` sends each relay path through OpenSSH's per-session
 environment channel, including sessions carried by an existing ControlMaster.

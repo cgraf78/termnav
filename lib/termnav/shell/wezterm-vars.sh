@@ -10,6 +10,7 @@ _termnav_wezterm_tmux_client_cache_at=0
 # Remote-host discovery may classify the client first. Keep that observation
 # only for the surrounding publish, including failed and clockless queries.
 _termnav_wezterm_tmux_publish_observation_key=""
+_termnav_wezterm_tmux_publish_observation_known=0
 _termnav_wezterm_tmux_publish_observation_nested=""
 
 termnav_wezterm_base64() {
@@ -39,14 +40,15 @@ termnav_wezterm_tmux_client_is_nested() {
   # Do not immediately repeat a query already attempted by this publish. Empty
   # means failed or unknown and remains uncached after the publish boundary.
   if [[ "${_termnav_wezterm_tmux_publish_observation_key-}" == "$tmux_key" ]]; then
+    [[ "${_termnav_wezterm_tmux_publish_observation_known:-0}" == 1 ]] || return 2
     [[ "${_termnav_wezterm_tmux_publish_observation_nested-}" == 1 ]]
     return
   fi
 
   # A failed or empty query is not client state. Leave it uncached so a tmux
   # server or client that is still attaching can recover on the next publish.
-  termname=$(tmux display-message -p "#{client_termname}" 2>/dev/null) || return 1
-  [[ -n "$termname" ]] || return 1
+  termname=$(tmux display-message -p "#{client_termname}" 2>/dev/null) || return 2
+  [[ -n "$termname" ]] || return 2
   case "$termname" in
     tmux* | screen*) nested=1 ;;
   esac
@@ -76,7 +78,7 @@ termnav_wezterm_tmux_passthrough() {
 
 termnav_wezterm_user_var_sequence() {
   local name="$1" value="${2:-}" mode="${3:-auto}"
-  local encoded raw sequence
+  local encoded nested_status raw sequence
 
   encoded=$(termnav_wezterm_base64 "$value")
   raw=$(printf '\033]1337;SetUserVar=%s=%s\007' "$name" "$encoded")
@@ -92,10 +94,15 @@ termnav_wezterm_user_var_sequence() {
       if [[ -n "${TMUX:-}" ]]; then
         sequence=$(termnav_wezterm_tmux_passthrough "$raw")
         if termnav_wezterm_tmux_client_is_nested; then
-          termnav_wezterm_tmux_passthrough "$sequence"
+          nested_status=0
         else
-          printf '%s' "$sequence"
+          nested_status=$?
         fi
+        case "$nested_status" in
+          0) termnav_wezterm_tmux_passthrough "$sequence" ;;
+          1) printf '%s' "$sequence" ;;
+          *) return 1 ;;
+        esac
       else
         printf '%s' "$raw"
       fi
