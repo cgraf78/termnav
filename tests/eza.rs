@@ -32,7 +32,26 @@ impl Drop for ChildCleanup {
     }
 }
 
-fn process_alive(pid: u32) -> bool {
+fn process_running(pid: u32) -> bool {
+    // kill(pid, 0) reports zombies as present. Minimal container PID 1
+    // implementations may leave an orphaned fixture grandchild in that
+    // already-dead state, so inspect process state before falling back to the
+    // portable existence probe. The production contract is that no helper can
+    // continue running or retain IO after the owned group is killed.
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next())
+            .is_some_and(|state| state != 'Z');
+    }
+    if let Ok(output) = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        && output.status.success()
+    {
+        let state = String::from_utf8_lossy(&output.stdout);
+        return !state.trim().is_empty() && !state.trim_start().starts_with('Z');
+    }
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };
@@ -210,7 +229,7 @@ exit 37
 }
 
 #[test]
-fn downstream_write_failure_kills_the_complete_eza_process_group() {
+fn downstream_write_failure_stops_the_complete_eza_process_group() {
     let root = common::temporary_root("eza-write-failure");
     fs::create_dir_all(&root).expect("create eza failure fixture root");
     let _cleanup = Cleanup(root.clone());
@@ -287,11 +306,11 @@ wait "$child"
         .map(|value| value.parse::<u32>().expect("parse eza process identity"))
         .collect::<Vec<_>>();
     let deadline = Instant::now() + Duration::from_secs(1);
-    while pids.iter().copied().any(process_alive) && Instant::now() < deadline {
+    while pids.iter().copied().any(process_running) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(
-        pids.iter().copied().all(|pid| !process_alive(pid)),
-        "downstream failure left an eza process alive: {pids:?}"
+        pids.iter().copied().all(|pid| !process_running(pid)),
+        "downstream failure left an eza process running: {pids:?}"
     );
 }
