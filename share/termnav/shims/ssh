@@ -3,4 +3,50 @@
 # global command named ssh. The shell integration adds only this private
 # directory to PATH. The native SSH supervisor skips this directory while
 # resolving the real client, so normal PATH lookup cannot recurse.
-exec termnav ssh "$@"
+termnav_path=$(command -v termnav 2>/dev/null || true)
+if [ -n "$termnav_path" ] && [ -x "$termnav_path" ]; then
+  exec "$termnav_path" ssh "$@"
+fi
+
+# A repository update can replace this shim before the dependency installer
+# activates the matching Termnav release. Keep that upgrade self-hosting by
+# falling through to the next real SSH client for only that bounded interval.
+# Canonical directory comparison prevents the PATH search from selecting this
+# shim again through the directory spelling used by the shell integration.
+case "$0" in
+  */*) shim_parent=${0%/*} ;;
+  *) shim_parent=. ;;
+esac
+shim_dir=$(CDPATH='' cd -P -- "$shim_parent" 2>/dev/null && pwd)
+
+old_ifs=$IFS
+IFS=:
+search_path=${PATH-/usr/bin:/bin}
+last_component=0
+while :; do
+  case "$search_path" in
+    *:*)
+      directory=${search_path%%:*}
+      search_path=${search_path#*:}
+      ;;
+    *)
+      directory=$search_path
+      search_path=
+      last_component=1
+      ;;
+  esac
+  [ -n "$directory" ] || directory=.
+  if candidate_dir=$(CDPATH='' cd -P -- "$directory" 2>/dev/null && pwd); then
+    if [ "$candidate_dir" != "$shim_dir" ] \
+      && [ -f "$candidate_dir/ssh" ] \
+      && [ -x "$candidate_dir/ssh" ]; then
+      IFS=$old_ifs
+      exec "$candidate_dir/ssh" "$@"
+    fi
+  fi
+  [ "$last_component" -eq 1 ] && break
+done
+IFS=$old_ifs
+
+printf '%s\n' 'termnav ssh shim: neither termnav nor ssh is available' >&2
+exit 127
