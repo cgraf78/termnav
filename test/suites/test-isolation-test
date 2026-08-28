@@ -35,4 +35,44 @@ for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION; do
   fi
 done
 
+timeout_fixture=$(_tmpdir)
+timeout_child_pid=$timeout_fixture/child.pid
+test_shell=$(command -v sh)
+test_sleep=$(command -v sleep)
+set +e
+(
+  # The single-quoted body is interpreted by the child shell, where $1, $2,
+  # and $$ deliberately refer to that isolated fixture process.
+  # shellcheck disable=SC2016
+  _with_timeout 0.1s "$test_shell" -c '
+    trap "" TERM
+    printf "%s\n" "$$" >"$1"
+    exec "$2" 60
+  ' sh "$timeout_child_pid" "$test_sleep"
+) &
+timeout_runner=$!
+deadline=$((SECONDS + 3))
+while kill -0 "$timeout_runner" 2>/dev/null && ((SECONDS < deadline)); do
+  sleep 0.02
+done
+if kill -0 "$timeout_runner" 2>/dev/null; then
+  # This watchdog exists only to make a broken timeout regression fail quickly
+  # instead of reproducing the same unbounded CI hang that the helper prevents.
+  [[ -s $timeout_child_pid ]] && kill -KILL "$(cat "$timeout_child_pid")" 2>/dev/null
+  kill -KILL "$timeout_runner" 2>/dev/null
+  wait "$timeout_runner" 2>/dev/null
+  timeout_status=255
+else
+  wait "$timeout_runner"
+  timeout_status=$?
+fi
+set -e
+_assert_exit "test isolation: timeout returns its stable deadline status" 124 "$timeout_status"
+if [[ -s $timeout_child_pid ]] && kill -0 "$(cat "$timeout_child_pid")" 2>/dev/null; then
+  _fail "test isolation: timeout left a stubborn descendant running"
+  kill -KILL "$(cat "$timeout_child_pid")" 2>/dev/null || true
+else
+  _pass "test isolation: timeout cleans up the complete fixture process group"
+fi
+
 _test_summary
