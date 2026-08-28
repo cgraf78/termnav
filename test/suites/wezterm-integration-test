@@ -472,29 +472,6 @@ for test_shell in bash zsh; do
     "host=remote.example" "$warm_publish_output"
 done
 
-# The scope names the exact WezTerm mux instance for optional remote-open
-# helpers. Reassert it at every local prompt because a nested/remote child can
-# publish pane-scoped variables without sharing this shell's in-memory cache.
-wezterm_scope_output=$(
-  TERM_PROGRAM=WezTerm \
-    WEZTERM_UNIX_SOCKET=/tmp/wezterm-exact.sock \
-    SHELL_INTEGRATION="$shell_integration" \
-    bash --noprofile --norc -c '
-      source "$SHELL_INTEGRATION" >/dev/null
-      termnav_wezterm_user_var_sequence() {
-        printf "%s=%s\n" "$1" "$2"
-      }
-      _termnav_wezterm_publish_link_context
-      unset TERMNAV_WEZTERM_SCOPE WEZTERM_UNIX_SOCKET
-      _termnav_wezterm_publish_link_context
-      WEZTERM_UNIX_SOCKET=/tmp/wezterm-exact.sock
-      _termnav_wezterm_publish_link_context
-    '
-)
-_assert_eq "shell integration: exact WezTerm scope is reasserted but never cleared remotely" \
-  $'TERMNAV_WEZTERM_SCOPE=/tmp/wezterm-exact.sock\nTERMNAV_WEZTERM_SCOPE=/tmp/wezterm-exact.sock' \
-  "$(printf '%s\n' "$wezterm_scope_output" | grep '^TERMNAV_WEZTERM_SCOPE=')"
-
 remote_refresh_output=$(
   TMUX=/tmp/tmux-remote-a,1,0 \
     TMUX_MOCK_REMOTE_LINK_HOST=remote-a.example \
@@ -871,7 +848,9 @@ local wezterm = {
   end,
 }
 
-local routes = dofile(route_path).new(wezterm)
+local route_module = dofile(route_path)
+local routes = route_module.new(wezterm, { remote_open_scope = "/tmp/wezterm-a.sock" })
+local routes_b = route_module.new(wezterm, { remote_open_scope = "/tmp/wezterm-b.sock" })
 
 local function check(name, ok)
   if not ok then
@@ -1107,7 +1086,6 @@ handled = routes.open_uri(nil, pane({
   NVIM_REMOTE_LINK_HOST = "remote.example",
   NVIM_REMOTE_CWD = "/remote/repo",
   NVIM_REMOTE_TMUX = "true",
-  TERMNAV_WEZTERM_SCOPE = "/tmp/wezterm-exact.sock",
 }, { host = "", file_path = "/local" }, {
   foreground = "dev",
   send_text = true,
@@ -1118,9 +1096,21 @@ check("controlmaster remote nvim-open uses unified opener", calls[1][1]:match("t
 check("controlmaster remote nvim-open passes host", calls[1][8] == "remote.example")
 check("controlmaster remote nvim-open passes resolved target", calls[1][5] == "/remote/repo/src/main.lua:12")
 check("controlmaster remote nvim-open types the pane identity", calls[1][9] == "wezterm")
-check("controlmaster remote nvim-open passes exact mux scope", calls[1][10] == "/tmp/wezterm-exact.sock")
+check("controlmaster remote nvim-open passes callback mux scope", calls[1][10] == "/tmp/wezterm-a.sock")
 check("controlmaster remote nvim-open passes exact pane", calls[1][11] == "17")
 check("controlmaster remote nvim-open skips pane send", #sent_text == 0)
+
+calls = {}
+handled = routes_b.open_uri(nil, pane({
+  NVIM_REMOTE_LINK_HOST = "remote.example",
+  NVIM_REMOTE_CWD = "/remote/repo",
+  NVIM_REMOTE_TMUX = "true",
+}, { host = "", file_path = "/local" }, {
+  pane_id = 17,
+}), "nvim-open://src/main.lua:12")
+check("second mux remote nvim-open handled", handled == false)
+check("same pane ID uses the second callback mux scope", calls[1][10] == "/tmp/wezterm-b.sock")
+check("same pane ID remains exact inside its callback mux", calls[1][11] == "17")
 
 calls = {}
 sent_text = {}

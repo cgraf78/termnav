@@ -349,14 +349,18 @@ host policy from this repo.
 Non-OpenSSH transports may set `TERMNAV_REMOTE_OPEN_HELPER` to an executable
 that accepts `KIND SCOPE PANE HOST TARGET` and exits zero only after accepting
 the request. `KIND=tmux` carries the exact tmux `#{socket_path}` and `%pane` in
-`SCOPE` and `PANE`; `KIND=wezterm` carries the exact WezTerm mux socket (or an
-explicit `TERMNAV_WEZTERM_SCOPE`) and pane ID. Pane IDs can repeat across GUI
-classes and mux servers, so a missing WezTerm scope fails closed. Termnav
-invokes this capability only after existing-ControlMaster reuse is definitively
-unavailable or declines the request, gives it a bounded lifetime, and otherwise
-fails closed. An indeterminate timed-out SSH request is never retried through a
-second transport. Termnav never guesses among same-host panes or types tmux
-prefix keys into a terminal stream.
+`SCOPE` and `PANE`; `KIND=wezterm` carries a callback-local WezTerm mux scope
+and pane ID. Pane IDs can repeat across GUI classes and mux servers, so a
+missing WezTerm scope fails closed. Supply the opaque scope as
+`remote_open_scope` to `link-routes.lua`'s `new()` function, or in the WezTerm
+process environment as `TERMNAV_WEZTERM_SCOPE` or `WEZTERM_UNIX_SOCKET`.
+Never derive it from pane shell metadata, which may be shared by several
+attached terminal clients. Termnav invokes this capability only after
+existing-ControlMaster reuse is definitively unavailable or declines the
+request, gives it a bounded lifetime, and otherwise fails closed. An
+indeterminate timed-out SSH request is never retried through a second
+transport. Termnav never guesses among same-host panes or types tmux prefix
+keys into a terminal stream.
 Install the new binary before reloading the tmux and WezTerm integrations that
 publish this identity; those files are the sole coordinated consumers.
 

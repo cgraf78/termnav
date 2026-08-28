@@ -175,19 +175,6 @@ _termnav_wezterm_publish_tmux_context() {
   fi
 }
 
-_termnav_wezterm_publish_scope() {
-  local scope="${TERMNAV_WEZTERM_SCOPE:-${WEZTERM_UNIX_SOCKET:-}}"
-  [[ -n "$scope" ]] || return 0
-
-  # WezTerm pane IDs are allocated by a mux server and can repeat in another
-  # GUI class or server. Publish the exact server scope alongside the pane ID
-  # so an optional transport helper never has to guess. Do not cache or clear
-  # this value: a nested remote shell cannot know the local socket, and the
-  # resumed local shell must reassert it after that child may have changed
-  # pane-scoped metadata.
-  _termnav_wezterm_set_user_var TERMNAV_WEZTERM_SCOPE "$scope"
-}
-
 _termnav_wezterm_remote_link_host_get() {
   local age fields nested=0 now="${SECONDS-}" parsed termname
 
@@ -310,7 +297,6 @@ _termnav_wezterm_publish_link_context() {
   # cwd is not reliable once tmux, SSH, or nvim is involved.
   _termnav_wezterm_set_user_var NVIM_LINK_CWD "$PWD"
   _termnav_wezterm_set_user_var NVIM_REMOTE_LINK_HOST "$remote_host"
-  _termnav_wezterm_publish_scope
   if [[ -n "$remote_host" ]]; then
     _termnav_wezterm_set_user_var NVIM_REMOTE_CWD "$PWD"
     if [[ -n "${TMUX:-}" ]]; then

@@ -19,11 +19,20 @@ local user_vars = {
 -- it. Consumers still read this state only through route helpers.
 local shell_user_vars = {
   tmux = "TERMNAV_TMUX",
-  scope = "TERMNAV_WEZTERM_SCOPE",
 }
 
-function M.new(wezterm)
+function M.new(wezterm, options)
+  options = options or {}
   local routes = {}
+  -- Pane metadata belongs to the child process and can be shared by several
+  -- terminal clients attached to one tmux session. Instance identity must
+  -- instead come from the WezTerm process handling this callback. An explicit
+  -- setup value is easiest for named GUI classes; the environment fallbacks
+  -- support mux sockets injected into that GUI's launch environment.
+  local remote_open_scope = options.remote_open_scope
+    or os.getenv("TERMNAV_WEZTERM_SCOPE")
+    or os.getenv("WEZTERM_UNIX_SOCKET")
+    or ""
 
   function routes.uri_decode(s)
     return (s:gsub("%%(%x%x)", function(hex)
@@ -237,15 +246,8 @@ function M.new(wezterm)
     return ""
   end
 
-  function routes.pane_scope(pane)
-    if not pane or type(pane.get_user_vars) ~= "function" then
-      return ""
-    end
-    -- pane_id() is unique only inside one WezTerm mux server. The shell
-    -- publishes WEZTERM_UNIX_SOCKET (or an explicit equivalent) as an opaque
-    -- scope so an external helper can address this exact instance without
-    -- Termnav assuming how the helper selects WezTerm transports.
-    return pane:get_user_vars()[shell_user_vars.scope] or ""
+  function routes.pane_scope(_)
+    return remote_open_scope
   end
 
   function routes.open_in_nvim(window, pane, path_info)
