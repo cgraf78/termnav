@@ -86,10 +86,39 @@ _assert_contains "native opener: remote diagnostic names the host" \
 remote_helper="$tmp/remote-open-helper"
 remote_helper_log="$tmp/remote-open-helper.log"
 cat >"$remote_helper" <<'MOCK'
-#!/usr/bin/env bash
+#!/bin/sh
 printf '<%s>\n' "$@" >"${TERMNAV_REMOTE_OPEN_TEST_LOG:?}"
 MOCK
 chmod +x "$remote_helper"
+
+# A configured transport is the explicit fallback when this installation has
+# no usable OpenSSH binary. Keep PATH free of ssh entirely: this regression is
+# about the local transport being definitively unavailable, not a remote mux
+# failure after an SSH request may already have started.
+no_ssh_bin="$tmp/no-ssh-bin"
+mkdir -p "$no_ssh_bin"
+: >"$remote_helper_log"
+PATH="$no_ssh_bin" \
+  TERMNAV_SSH_CONTROL_HOSTS=remote.example \
+  TERMNAV_REMOTE_OPEN_HELPER="$remote_helper" \
+  TERMNAV_REMOTE_OPEN_TEST_LOG="$remote_helper_log" \
+  "$termnav" nvim open link /home/alex/.zshrc '' remote remote.example \
+  tmux /tmp/termnav-test.sock %9
+_assert_exit "native opener: unavailable OpenSSH falls back to configured transport" 0 "$?"
+_assert_eq "native opener: unavailable OpenSSH preserves exact route identity" \
+  $'<tmux>\n</tmp/termnav-test.sock>\n<%9>\n<remote.example>\n</home/alex/.zshrc>' \
+  "$(cat "$remote_helper_log")"
+
+: >"$remote_helper_log"
+PATH="$no_ssh_bin" \
+  TERMNAV_SSH_CONTROL_HOSTS=remote.example \
+  TERMNAV_REMOTE_OPEN_HELPER="$remote_helper" \
+  TERMNAV_REMOTE_OPEN_TEST_LOG="$remote_helper_log" \
+  "$termnav" nvim open link /home/alex/.zshrc '' remote remote.example \
+  wezterm '' 17
+_assert_exit "native opener: ambiguous WezTerm route fails closed" 1 "$?"
+_assert_eq "native opener: ambiguous WezTerm route never invokes helper" \
+  "" "$(cat "$remote_helper_log")"
 
 : >"$log"
 TMUX="/tmp/termnav-test.sock,1,0" \
@@ -198,7 +227,7 @@ run_bounded(
 run_bounded(
     [
         "nvim", "open", "link", "/tmp/file.lua:1", "", "remote",
-        "remote.example", "wezterm", "", "17",
+        "remote.example", "wezterm", "/tmp/wezterm-exact.sock", "17",
     ],
     root + "/remote-helper-child.pid",
     {"TERMNAV_REMOTE_OPEN_HELPER": root + "/hanging-remote-open-helper"},
