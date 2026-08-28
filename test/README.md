@@ -41,7 +41,9 @@ Suite ownership follows the integration boundary:
 - `tmux-focus-test` covers hierarchical focus ownership, leases, nested tmux,
   shared sessions, and pane-style restoration.
 - `tmux-test` covers tmux command behavior and context publication.
-- `vscode-adapter-test` covers the authenticated VS Code focus adapter.
+- `vscode-adapter-test` drives the shipped VS Code controller and Unix-socket
+  server through authentication, ordering, tab dispatch, focus transitions,
+  lease expiry, idle-client timeout, activation, and cleanup.
 - `wezterm-integration-test` covers WezTerm link routing, semantic eza links,
   shell integration, and Neovim opener edge cases.
 
@@ -49,5 +51,7 @@ Prefer fake terminal commands and fixture files over depending on an active
 tmux, Neovim, SSH, or WezTerm session.
 
 The VS Code socket-adapter runtime assertions use `node` when it is available;
-the manifest, shell backend, and router coverage still run without it. The
-extension itself uses the Node runtime bundled with VS Code.
+local minimal environments may skip them, while the required dedicated Ubuntu
+job guarantees they run in CI. The manifest, shell backend, and router coverage
+still run without Node. The extension itself uses the runtime bundled with VS
+Code.
