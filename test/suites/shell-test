@@ -438,7 +438,11 @@ _assert_file_exists "ssh shim: provider-owned executable exists" "$ssh_shim"
 _assert_eq "ssh shim: provider-owned command is executable" true \
   "$([[ -x "$ssh_shim" ]] && printf true || printf false)"
 
-for test_shell in bash zsh; do
+ssh_test_shells=(bash zsh)
+if [[ -x /bin/bash && "$BASH" != /bin/bash ]]; then
+  ssh_test_shells+=(bash-3.2)
+fi
+for test_shell in "${ssh_test_shells[@]}"; do
   if [[ "$test_shell" == zsh ]] && ! command -v zsh >/dev/null 2>&1; then
     echo "  - skipping inherited SSH interposition in zsh (zsh unavailable)"
     continue
@@ -446,10 +450,74 @@ for test_shell in bash zsh; do
   if [[ "$test_shell" == bash ]]; then
     test_shell_path="$BASH"
     test_shell_args=(--noprofile --norc)
+  elif [[ "$test_shell" == bash-3.2 ]]; then
+    test_shell_path=/bin/bash
+    test_shell_args=(--noprofile --norc)
   else
     test_shell_path=$(command -v zsh)
     test_shell_args=(-f)
   fi
+
+  ssh_priority_output=$(
+    # shellcheck disable=SC2016 # The selected child shell expands the fixture.
+    env -i \
+      HOME="$HOME" \
+      PATH="/usr/bin:${ssh_shim%/ssh}:/bin:${ssh_shim%/ssh}:$ssh_probe_bin:" \
+      SHELL_INTEGRATION="$shell_integration" \
+      "$test_shell_path" "${test_shell_args[@]}" -c '
+        source "$SHELL_INTEGRATION"
+        printf "ssh=%s\n" "$(command -v ssh)"
+        printf "path=%s\n" "$PATH"
+      '
+  )
+  _assert_contains "ssh shim: $test_shell restores inherited shim priority" \
+    "ssh=$ssh_shim" "$ssh_priority_output"
+  _assert_contains "ssh shim: $test_shell preserves unrelated PATH order" \
+    "path=${ssh_shim%/ssh}:/usr/bin:/bin:$ssh_probe_bin:" \
+    "$ssh_priority_output"
+
+  ssh_only_output=$(
+    # shellcheck disable=SC2016 # The selected child shell expands the fixture.
+    env -i \
+      HOME="$HOME" \
+      PATH="${ssh_shim%/ssh}:${ssh_shim%/ssh}" \
+      SHELL_INTEGRATION="$shell_integration" \
+      "$test_shell_path" "${test_shell_args[@]}" -c '
+        source "$SHELL_INTEGRATION"
+        source "$SHELL_INTEGRATION"
+        printf "path=%s\n" "$PATH"
+        if typeset -f _termnav_shell_prepend_ssh_shim >/dev/null 2>&1; then
+          printf "helper=present\n"
+        else
+          printf "helper=absent\n"
+        fi
+      '
+  )
+  _assert_eq "ssh shim: $test_shell all-shim PATH stays exact" \
+    $'path='"${ssh_shim%/ssh}"$'\nhelper=absent' "$ssh_only_output"
+
+  ssh_empty_path_output=$(
+    # shellcheck disable=SC2016 # The selected child shell expands the fixture.
+    env -i \
+      HOME="$HOME" \
+      PATH="${BASH%/*}:/usr/bin:/bin" \
+      SHELL_INTEGRATION="$shell_integration" \
+      SHIM_DIR="${ssh_shim%/ssh}" \
+      "$test_shell_path" "${test_shell_args[@]}" -c '
+        unset PATH
+        source "$SHELL_INTEGRATION"
+        printf "unset=%s\n" "$PATH"
+        PATH=
+        source "$SHELL_INTEGRATION"
+        printf "empty=%s\n" "$PATH"
+        PATH=":$SHIM_DIR::/usr/bin:$SHIM_DIR:"
+        source "$SHELL_INTEGRATION"
+        printf "components=%s\n" "$PATH"
+      '
+  )
+  _assert_eq "ssh shim: $test_shell preserves empty PATH components" \
+    $'unset='"${ssh_shim%/ssh}"$'\nempty='"${ssh_shim%/ssh}"$'\ncomponents='"${ssh_shim%/ssh}"$':::/usr/bin:' \
+    "$ssh_empty_path_output"
 
   ssh_tty_log="$ssh_probe/$test_shell-tty-command.log"
   ssh_plain_log="$ssh_probe/$test_shell-plain-command.log"
