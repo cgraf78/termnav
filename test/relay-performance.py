@@ -91,8 +91,17 @@ def measure(
     return baseline_values, candidate_values
 
 
-def tmux_navigation_samples(navigator: Path, root: Path, samples: int) -> list[float]:
-    """Measure the native local-tmux path against a real attached client."""
+def tmux_navigation_samples(
+    baseline: Path,
+    candidate: Path,
+    baseline_prefix: list[str],
+    baseline_action: str,
+    baseline_environment: dict[str, str],
+    candidate_environment: dict[str, str],
+    root: Path,
+    samples: int,
+) -> tuple[list[float], list[float]]:
+    """Compare the native local-tmux path against a real attached client."""
 
     name = f"termnav-performance-{os.getpid()}"
     subprocess.run(
@@ -114,11 +123,24 @@ def tmux_navigation_samples(navigator: Path, root: Path, samples: int) -> list[f
             capture_output=True,
             check=True,
         ).stdout.strip()
-        subprocess.run(
-            ["tmux", "-L", name, "split-window", "-h", "-d", "-t", "perf"],
+        right = subprocess.run(
+            [
+                "tmux",
+                "-L",
+                name,
+                "split-window",
+                "-h",
+                "-d",
+                "-t",
+                "perf",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ],
+            text=True,
             check=True,
             capture_output=True,
-        )
+        ).stdout.strip()
         client_environment = os.environ.copy()
         client_environment.pop("TMUX", None)
         client_environment.pop("TMUX_PANE", None)
@@ -150,23 +172,58 @@ def tmux_navigation_samples(navigator: Path, root: Path, samples: int) -> list[f
         else:
             raise RuntimeError("tmux-backed navigation client did not attach")
 
-        environment = os.environ.copy()
-        environment.update({"TMUX": f"{socket},0,0", "TMUX_PANE": left})
-        values = []
-        for _ in range(samples):
+        baseline_environment = {
+            **baseline_environment,
+            "TMUX": f"{socket},0,0",
+            "TMUX_PANE": left,
+        }
+        candidate_environment = {
+            **candidate_environment,
+            "TMUX": f"{socket},0,0",
+            "TMUX_PANE": left,
+        }
+
+        def one_sample(
+            executable: Path,
+            arguments: list[str],
+            environment: dict[str, str],
+        ) -> float:
             subprocess.run(
                 ["tmux", "-L", name, "select-pane", "-t", left],
                 check=True,
                 capture_output=True,
             )
-            values.append(
-                invoke(
-                    [str(navigator), "navigate", "pane-select", "right"],
-                    environment,
-                    0,
+            elapsed = invoke([str(executable), *arguments], environment, 0)
+            active = subprocess.run(
+                ["tmux", "-L", name, "display-message", "-p", "#{pane_id}"],
+                text=True,
+                check=True,
+                capture_output=True,
+            ).stdout.strip()
+            if active != right:
+                raise RuntimeError(
+                    "navigation tmux route did not select the expected pane: "
+                    f"expected={right!r} actual={active!r} command={arguments!r}"
                 )
+            return elapsed
+
+        baseline_arguments = [*baseline_prefix, baseline_action, "right"]
+        candidate_arguments = ["navigate", "pane-select", "right"]
+        for _ in range(5):
+            one_sample(baseline, baseline_arguments, baseline_environment)
+            one_sample(candidate, candidate_arguments, candidate_environment)
+        before: list[float] = []
+        after: list[float] = []
+        for index in range(samples):
+            order = (
+                (baseline, baseline_arguments, baseline_environment, before),
+                (candidate, candidate_arguments, candidate_environment, after),
             )
-        return values
+            if index % 2:
+                order = tuple(reversed(order))
+            for executable, arguments, environment, values in order:
+                values.append(one_sample(executable, arguments, environment))
+        return before, after
     finally:
         if client is not None:
             client.terminate()
@@ -726,18 +783,48 @@ def main() -> int:
         if navigation_p95 > 75:
             raise RuntimeError("navigation boundary: p95 exceeds 75ms")
 
-        tmux_values = tmux_navigation_samples(candidate, root, args.samples)
-        tmux_median = statistics.median(tmux_values)
-        tmux_p95 = percentile(tmux_values, 0.95)
-        print(f"navigation tmux route: median={tmux_median:.1f}ms p95={tmux_p95:.1f}ms")
+        tmux_before, tmux_after = tmux_navigation_samples(
+            baseline_navigator,
+            candidate,
+            baseline_prefix,
+            baseline_pane_action,
+            baseline_env,
+            candidate_env,
+            root,
+            args.samples,
+        )
+        tmux_before_median = statistics.median(tmux_before)
+        tmux_before_p95 = percentile(tmux_before, 0.95)
+        tmux_after_median = statistics.median(tmux_after)
+        tmux_after_p95 = percentile(tmux_after, 0.95)
+        print(
+            f"navigation tmux route: baseline median={tmux_before_median:.1f}ms "
+            f"p95={tmux_before_p95:.1f}ms; candidate median={tmux_after_median:.1f}ms "
+            f"p95={tmux_after_p95:.1f}ms"
+        )
         report["scenarios"]["navigation tmux route"] = {
-            "candidate_median_ms": tmux_median,
-            "candidate_p95_ms": tmux_p95,
+            "baseline_median_ms": tmux_before_median,
+            "baseline_p95_ms": tmux_before_p95,
+            "candidate_median_ms": tmux_after_median,
+            "candidate_p95_ms": tmux_after_p95,
         }
-        if tmux_median > 250:
-            raise RuntimeError("navigation tmux route: median exceeds 250ms")
-        if tmux_p95 > 500:
-            raise RuntimeError("navigation tmux route: p95 exceeds 500ms")
+        # The direct local route is the ordinary Ctrl-hjkl path. Keep its
+        # absolute ceiling consistent with the deeper nested route below, and
+        # compare alternating samples so host load cannot hide a regression.
+        if tmux_after_median > 75:
+            raise RuntimeError("navigation tmux route: median exceeds 75ms")
+        if tmux_after_p95 > 100:
+            raise RuntimeError("navigation tmux route: p95 exceeds 100ms")
+        if tmux_after_median > tmux_before_median * 1.20 + 5:
+            raise RuntimeError("navigation tmux route: median regression exceeds budget")
+        if tmux_after_p95 > tmux_before_p95 * 1.20 + 5:
+            raise RuntimeError("navigation tmux route: p95 regression exceeds budget")
+        if (
+            old_baseline
+            and sys.platform != "darwin"
+            and tmux_after_median > tmux_before_median * 0.75
+        ):
+            raise RuntimeError("navigation tmux route: median improvement is below 25%")
 
         boundary_before, boundary_after = tmux_boundary_samples(
             baseline_navigator,
