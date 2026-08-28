@@ -18,6 +18,32 @@ export SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22'
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
 
+_process_running() {
+  local pid=$1 stat state
+
+  # `kill -0` also succeeds for a zombie. Minimal container PID 1 processes
+  # do not consistently reap orphaned fixture grandchildren promptly, so an
+  # existence-only probe makes the cleanup assertion depend on the CI image.
+  # The contract under test is that no descendant can still execute or retain
+  # IO after its owned process group is killed; a zombie has already met it.
+  if [[ -r /proc/$pid/stat ]]; then
+    stat=$(<"/proc/$pid/stat") || return 1
+    stat=${stat##*) }
+    state=${stat%% *}
+    [[ $state != Z ]]
+    return
+  fi
+
+  # macOS has no procfs. Its BSD `ps` exposes the same state field, while the
+  # final signal probe preserves compatibility with an unusual ps lacking it.
+  if state=$(ps -o stat= -p "$pid" 2>/dev/null); then
+    state=${state#"${state%%[![:space:]]*}"}
+    [[ -n $state && $state != Z* ]]
+    return
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+
 case "$HOME" in
   "$_TEST_TMP_ROOT"/*) _pass "test isolation: HOME is invocation-owned" ;;
   *) _fail "test isolation: HOME escaped the invocation root ($HOME)" ;;
@@ -73,7 +99,7 @@ else
 fi
 set -e
 _assert_exit "test isolation: timeout returns its stable deadline status" 124 "$timeout_status"
-if [[ -s $timeout_child_pid ]] && kill -0 "$(cat "$timeout_child_pid")" 2>/dev/null; then
+if [[ -s $timeout_child_pid ]] && _process_running "$(cat "$timeout_child_pid")"; then
   _fail "test isolation: timeout left a stubborn descendant running"
   if [[ -s $timeout_leader_pid ]]; then
     kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null || true
@@ -141,7 +167,7 @@ else
 fi
 set -e
 _assert_exit "test isolation: TERM returns the conventional signal status" 143 "$signal_status"
-if [[ -s $signal_child_pid ]] && kill -0 "$(cat "$signal_child_pid")" 2>/dev/null; then
+if [[ -s $signal_child_pid ]] && _process_running "$(cat "$signal_child_pid")"; then
   _fail "test isolation: interrupted timeout supervisor left a descendant running"
   if [[ -s $signal_leader_pid ]]; then
     kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null || true
