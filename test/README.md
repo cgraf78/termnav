@@ -30,8 +30,9 @@ Suite ownership follows the integration boundary:
 - `relay-performance-test` keeps production `send`, `commit`, and tmux-boundary
   dispatch on the lightweight path. Set `TERMNAV_PERFORMANCE_BASELINE` to a Git
   revision to compare alternating subprocess samples and enforce calibrated
-  median and p95 non-regression budgets; pull-request CI compares against the
-  explicit PR base revision automatically.
+  median non-regression budgets plus absolute median and p95 responsiveness
+  ceilings; pull-request CI compares against the explicit PR base revision
+  automatically.
 - `relay-terminal-test` covers the terminal barrier, mixed-version relay paths,
   arbitrary nesting depth, burst preservation, and VS Code terminal handoff.
 - `shell-test` covers direct and attached-client file-link classification plus
