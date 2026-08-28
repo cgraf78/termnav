@@ -75,7 +75,9 @@ set -e
 _assert_exit "test isolation: timeout returns its stable deadline status" 124 "$timeout_status"
 if [[ -s $timeout_child_pid ]] && kill -0 "$(cat "$timeout_child_pid")" 2>/dev/null; then
   _fail "test isolation: timeout left a stubborn descendant running"
-  [[ -s $timeout_leader_pid ]] && kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null || true
+  if [[ -s $timeout_leader_pid ]]; then
+    kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null || true
+  fi
 else
   _pass "test isolation: timeout cleans up the complete fixture process group"
 fi
@@ -141,7 +143,9 @@ set -e
 _assert_exit "test isolation: TERM returns the conventional signal status" 143 "$signal_status"
 if [[ -s $signal_child_pid ]] && kill -0 "$(cat "$signal_child_pid")" 2>/dev/null; then
   _fail "test isolation: interrupted timeout supervisor left a descendant running"
-  [[ -s $signal_leader_pid ]] && kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null || true
+  if [[ -s $signal_leader_pid ]]; then
+    kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null || true
+  fi
 else
   _pass "test isolation: interrupted timeout supervisor cleans up its process group"
 fi
