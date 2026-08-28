@@ -5,8 +5,8 @@ use std::io::{self, Write};
 
 const HELP: &str = r#"usage:
   termnav nvim open cli FILE [CWD]
-  termnav nvim open link [TARGET [CWD [SOURCE [CONTEXT]]]]
-  termnav nvim open tmux-link [TARGET [CWD [SOURCE [CONTEXT]]]]
+  termnav nvim open link [TARGET [CWD [SOURCE [CONTEXT [ROUTE-KIND [ROUTE-SCOPE [PANE]]]]]]]
+  termnav nvim open tmux-link [TARGET [CWD [SOURCE [CONTEXT [ROUTE-KIND [ROUTE-SCOPE [PANE]]]]]]]
   termnav nvim ssh-open HOST TARGET
 "#;
 
@@ -48,6 +48,12 @@ pub fn run(
             };
             if mode == crate::nvim::open::Mode::Cli && arguments.len() - 2 > 2 {
                 return usage(stderr, "open cli accepts at most FILE and optional CWD");
+            }
+            if mode != crate::nvim::open::Mode::Cli && arguments.len() - 2 > 7 {
+                return usage(
+                    stderr,
+                    "open link modes accept at most TARGET, CWD, SOURCE, CONTEXT, ROUTE-KIND, ROUTE-SCOPE, and PANE",
+                );
             }
             crate::nvim::open::open(mode, &arguments[2..])
         }

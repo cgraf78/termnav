@@ -37,7 +37,7 @@ termnav \- route terminal navigation, focus, links, and editor opens
 .RI [ CWD ]
 .br
 .B termnav nvim open link|tmux-link
-.RI [ TARGET " [" CWD " [" SOURCE " [" CONTEXT "]]]]" ]
+.RI [ TARGET " [" CWD " [" SOURCE " [" CONTEXT " [" ROUTE-KIND " [" ROUTE-SCOPE " [" PANE "]]]]]]]" ]
 .br
 .B termnav nvim ssh-open
 .I HOST TARGET
@@ -116,10 +116,11 @@ require tmux socket, client PID, and client tty. Watch also accepts lease and
 interval options. Command-group help prints the exact option names.
 .TP
 .B tmux follow-click
-Accepts at most ten positional fields in this order: HYPERLINK, WORD, LINE, X,
-CWD, TTY, PANE, Y, TOP, LEFT. With
+Accepts at most eleven positional fields in this order: HYPERLINK, WORD, LINE,
+X, CWD, TTY, PANE, Y, TOP, LEFT, SOCKET. With
 .BR --stdin ,
-the same fields are newline-delimited; input is limited to ten lines and 64 KiB.
+the same fields are newline-delimited; input is limited to eleven lines and 64
+KiB.
 .SH ENVIRONMENT
 .TP
 .B TERMNAV_ASSET_ROOT

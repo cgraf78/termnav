@@ -200,9 +200,6 @@ through `termnav asset-path`.
   `TERMNAV_VSCODE_MCP_METHOD`, `TERMNAV_VSCODE_MCP_TOOL`,
   `TERMNAV_VSCODE_MCP_PREVIOUS_COMMAND`, and
   `TERMNAV_VSCODE_MCP_NEXT_COMMAND`; non-loopback addresses are rejected.
-- `nvim-remote-pane-host` is an optional extension command for custom
-  remote-pane workflows.
-
 `termnav tmux follow-click` loads environment-specific token detectors from
 an absolute `$XDG_CONFIG_HOME/termnav/tmux-follow/extensions.d/*.sh`, falling
 back to `$HOME/.config/termnav/tmux-follow/extensions.d/*.sh` when the XDG value

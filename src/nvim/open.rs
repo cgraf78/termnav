@@ -92,14 +92,7 @@ fn current_tool_paths() -> Vec<PathBuf> {
     #[cfg(not(target_os = "android"))]
     let platform_prefix: Option<PathBuf> = None;
     env::var_os("HOME").map_or(paths.clone(), |home| {
-        augmented_tool_paths(
-            Path::new(&home),
-            paths,
-            platform_prefix.as_deref(),
-            env::var_os("TERMNAV_REMOTE_TOOL_PATH")
-                .filter(|value| !value.is_empty())
-                .as_deref(),
-        )
+        augmented_tool_paths(Path::new(&home), paths, platform_prefix.as_deref())
     })
 }
 
@@ -107,9 +100,12 @@ fn augmented_tool_paths(
     home: &Path,
     mut paths: Vec<PathBuf>,
     platform_prefix: Option<&Path>,
-    configured: Option<&OsStr>,
 ) -> Vec<PathBuf> {
-    let fallbacks = super::tool_path::fallbacks(home, configured);
+    // Local process discovery and remote command construction deliberately
+    // have separate override surfaces. A path chosen for the remote account
+    // may not exist locally, and letting that policy replace local fallbacks
+    // would make an otherwise healthy local Neovim or tmux undiscoverable.
+    let fallbacks = super::tool_path::defaults(home);
     let platform_bin = platform_prefix.map(|prefix| prefix.join("bin"));
     let mut insertion = paths
         .iter()
@@ -695,7 +691,7 @@ mod tests {
         ];
 
         assert_eq!(
-            augmented_tool_paths(home, paths, None, None),
+            augmented_tool_paths(home, paths, None),
             vec![
                 std::path::PathBuf::from("/tmp/caller-tools"),
                 std::path::PathBuf::from("/home/test/.local/bin"),
@@ -721,7 +717,6 @@ mod tests {
                 home,
                 paths,
                 Some(std::path::Path::new("/data/data/com.termux/files/usr")),
-                None,
             ),
             vec![
                 std::path::PathBuf::from("/tmp/caller-tools"),
@@ -737,18 +732,18 @@ mod tests {
     }
 
     #[test]
-    fn configured_remote_tool_path_replaces_generic_fallbacks() {
-        let configured = std::ffi::OsStr::new("/managed/bin:/managed/shims");
+    fn local_tool_paths_always_use_local_fallbacks() {
         assert_eq!(
             augmented_tool_paths(
                 std::path::Path::new("/home/test"),
                 vec![std::path::PathBuf::from("/usr/bin")],
                 None,
-                Some(configured),
             ),
             vec![
-                std::path::PathBuf::from("/managed/bin"),
-                std::path::PathBuf::from("/managed/shims"),
+                std::path::PathBuf::from("/home/test/.local/bin"),
+                std::path::PathBuf::from("/home/test/.local/share/mise/shims"),
+                std::path::PathBuf::from("/opt/homebrew/bin"),
+                std::path::PathBuf::from("/usr/local/bin"),
                 std::path::PathBuf::from("/usr/bin"),
             ]
         );

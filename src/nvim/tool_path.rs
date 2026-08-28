@@ -1,4 +1,4 @@
-//! One tool-search policy shared by local and ControlMaster editor routing.
+//! Tool-search policy shared by local and ControlMaster editor routing.
 
 use std::env;
 use std::ffi::OsStr;
@@ -7,15 +7,17 @@ use std::path::{Path, PathBuf};
 const USER_DEFAULTS: &[&str] = &[".local/bin", ".local/share/mise/shims"];
 const SYSTEM_DEFAULTS: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 
-pub(crate) fn fallbacks(home: &Path, configured: Option<&OsStr>) -> Vec<PathBuf> {
+pub(crate) fn defaults(home: &Path) -> Vec<PathBuf> {
+    USER_DEFAULTS
+        .iter()
+        .map(|path| home.join(path))
+        .chain(SYSTEM_DEFAULTS.iter().map(PathBuf::from))
+        .collect()
+}
+
+fn remote_fallbacks(home: &Path, configured: Option<&OsStr>) -> Vec<PathBuf> {
     configured.map_or_else(
-        || {
-            USER_DEFAULTS
-                .iter()
-                .map(|path| home.join(path))
-                .chain(SYSTEM_DEFAULTS.iter().map(PathBuf::from))
-                .collect()
-        },
+        || defaults(home),
         |value| {
             env::split_paths(value)
                 .filter(|path| !path.as_os_str().is_empty())
@@ -33,12 +35,20 @@ pub(crate) fn remote_assignment() -> String {
 }
 
 fn remote_assignment_for(home: &Path, configured: Option<&OsStr>) -> String {
-    let rendered = fallbacks(home, configured)
+    let rendered = remote_fallbacks(home, configured)
         .iter()
         .map(|path| remote_path(path, home))
         .collect::<Vec<_>>()
         .join(":");
-    format!("PATH=\"$PATH\":{rendered}; export PATH")
+    // An explicit list containing only empty PATH components means "append
+    // nothing". Never leave a trailing colon: POSIX interprets it as the
+    // remote working directory, which would silently broaden executable
+    // lookup beyond the configured policy.
+    if rendered.is_empty() {
+        "PATH=\"$PATH\"; export PATH".to_owned()
+    } else {
+        format!("PATH=\"$PATH\":{rendered}; export PATH")
+    }
 }
 
 fn remote_path(path: &Path, home: &Path) -> String {
@@ -58,7 +68,7 @@ fn remote_path(path: &Path, home: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fallbacks, remote_assignment_for, remote_path};
+    use super::{defaults, remote_assignment_for, remote_fallbacks, remote_path};
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -66,7 +76,7 @@ mod tests {
     fn defaults_and_remote_rendering_share_one_policy() {
         let home = Path::new("/home/local");
         assert_eq!(
-            fallbacks(home, None),
+            defaults(home),
             vec![
                 PathBuf::from("/home/local/.local/bin"),
                 PathBuf::from("/home/local/.local/share/mise/shims"),
@@ -79,7 +89,7 @@ mod tests {
             "\"$HOME\"/'.local/bin'"
         );
         assert_eq!(
-            fallbacks(home, Some(OsStr::new("/managed/bin:/managed/shims"))),
+            remote_fallbacks(home, Some(OsStr::new("/managed/bin:/managed/shims"))),
             vec![
                 PathBuf::from("/managed/bin"),
                 PathBuf::from("/managed/shims")
@@ -93,6 +103,10 @@ mod tests {
                 )),
             ),
             "PATH=\"$PATH\":\"$HOME\"/'.local/bin':\"$HOME\"/'.local/share/mise/shims'; export PATH"
+        );
+        assert_eq!(
+            remote_assignment_for(home, Some(OsStr::new(":"))),
+            "PATH=\"$PATH\"; export PATH"
         );
     }
 }

@@ -6,15 +6,17 @@
 
 local M = {}
 
-local function asset_path(options, relative_path)
+local function asset_path(options, wezterm, relative_path)
   if type(options.asset_path) == "function" then
     return options.asset_path(relative_path)
   end
   local command = options.termnav_command or "termnav"
-  local pipe = assert(io.popen(string.format("%q asset-path %q", command, relative_path), "r"))
-  local path = pipe:read("*l")
-  local ok = pipe:close()
-  if not ok or not path or path == "" then
+  -- WezTerm's argv-form child API preserves executable and argument boundaries
+  -- without involving a shell. This matters for managed installation paths
+  -- containing spaces, quotes, dollar signs, or command-substitution tokens.
+  local ok, stdout = wezterm.run_child_process({ command, "asset-path", relative_path })
+  local path = ok and stdout and stdout:match("([^\r\n]+)") or nil
+  if not path or path == "" then
     error("termnav could not resolve asset " .. relative_path, 3)
   end
   return path
@@ -25,8 +27,10 @@ function M.apply(options)
   local wezterm = options.wezterm or require("wezterm")
   local config = options.config
     or (type(wezterm.config_builder) == "function" and wezterm.config_builder() or {})
-  local routes = dofile(asset_path(options, "lib/termnav/wezterm/link-routes.lua")).new(wezterm)
-  local public_rules = dofile(asset_path(options, "lib/termnav/wezterm/public-link-rules.lua"))
+  local routes =
+    dofile(asset_path(options, wezterm, "lib/termnav/wezterm/link-routes.lua")).new(wezterm)
+  local public_rules =
+    dofile(asset_path(options, wezterm, "lib/termnav/wezterm/public-link-rules.lua"))
 
   -- Preserve caller rules and append fresh Termnav-owned copies. A caller may
   -- reorder the result afterward without mutating the provider's definitions.

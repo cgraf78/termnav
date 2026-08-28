@@ -22,6 +22,19 @@ for contract in asset-path TERMNAV_REMOTE_TOOL_PATH TERMNAV_VSCODE_MCP_TOKEN_FIL
 done
 _assert_not_contains "manpage does not document a zero-argument integration mode" \
   "With no arguments" "$termnav_page"
+_assert_contains "manpage documents all eleven click identity fields" \
+  "LEFT, SOCKET" "$termnav_page"
+_assert_contains "manpage documents complete Neovim route identity" \
+  "ROUTE-KIND" "$termnav_page"
+
+readme=$(cat "$TERMNAV_REPO_ROOT/README.md")
+_assert_not_contains "README omits nonexistent remote-pane extension" \
+  "nvim-remote-pane-host" "$readme"
+shell_loader=$(cat "$TERMNAV_REPO_ROOT/share/termnav/shell.sh")
+_assert_contains "shell loader uses the provider-owned asset resolver" \
+  'termnav asset-path share/termnav/shell.sh' "$shell_loader"
+_assert_not_contains "shell loader omits the retired shdeps path contract" \
+  "shdeps dep-file" "$shell_loader"
 
 while IFS= read -r command; do
   page="$TERMNAV_REPO_ROOT/man/man1/$command.1"
