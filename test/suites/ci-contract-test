@@ -83,6 +83,12 @@ performance_macos_job=$(awk '
   in_performance { print }
 ' "$workflow")
 
+vscode_job=$(awk '
+  /^  vscode-adapter:$/ { in_vscode = 1 }
+  in_vscode && /^  [^ ]/ && $0 != "  vscode-adapter:" { exit }
+  in_vscode { print }
+' "$workflow")
+
 # These are literal GitHub expressions in the workflow contract.
 # shellcheck disable=SC2016
 for contract in \
@@ -99,6 +105,16 @@ for contract in \
   'run: test/suites/relay-performance-test'; do
   [[ "$performance_job" == *"$contract"* ]] ||
     fail "Relay performance job is missing: $contract"
+done
+
+for contract in \
+  'name: VS Code adapter / Ubuntu' \
+  'runs-on: ubuntu-24.04' \
+  'timeout-minutes: 5' \
+  'node --version' \
+  'test/suites/vscode-adapter-test'; do
+  [[ "$vscode_job" == *"$contract"* ]] ||
+    fail "required VS Code adapter job is missing: $contract"
 done
 
 # The macOS job protects the procfs-free ancestry path, where each avoidable
@@ -125,12 +141,14 @@ done
 for contract in \
   'name: Required' \
   'if: ${{ always() }}' \
-  'needs: [rust, eza-current, relay-performance, relay-performance-macos]' \
+  'needs: [rust, vscode-adapter, eza-current, relay-performance, relay-performance-macos]' \
   'RUST_RESULT: ${{ needs.rust.result }}' \
+  'VSCODE_ADAPTER_RESULT: ${{ needs.vscode-adapter.result }}' \
   'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
   'RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}' \
   'RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}' \
   'test "$RUST_RESULT" = success' \
+  'test "$VSCODE_ADAPTER_RESULT" = success' \
   'test "$EZA_CURRENT_RESULT" = success' \
   'success | skipped) ;;' \
   '*) exit 1 ;;'; do
