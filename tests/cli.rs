@@ -54,9 +54,14 @@ fn asset_path_resolves_only_existing_assets_below_the_provider_root() {
         .output()
         .expect("resolve installed asset");
     assert!(output.status.success());
+    // The provider intentionally returns a canonical path so consumers cannot
+    // escape the configured asset root through symlinks. macOS exposes its
+    // temporary directory through `/var` while canonicalization resolves that
+    // prefix to `/private/var`, so compare canonical paths on every platform.
+    let expected_asset = asset.canonicalize().expect("canonicalize asset path");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        asset.display().to_string()
+        expected_asset.display().to_string()
     );
 
     for relative in ["../outside", "/tmp/outside", "missing"] {
