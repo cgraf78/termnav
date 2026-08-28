@@ -408,7 +408,11 @@ pub fn status_code(status: ExitStatus) -> i32 {
 mod tests {
     use std::os::fd::AsRawFd;
     use std::process::Command;
+    #[cfg(target_os = "macos")]
+    use std::thread;
     use std::time::Duration;
+    #[cfg(target_os = "macos")]
+    use std::time::Instant;
 
     #[cfg(target_os = "macos")]
     use super::environment_from_ps;
@@ -488,7 +492,19 @@ mod tests {
             ])
             .spawn()
             .expect("start process with a final relay environment value");
-        let value = environment_from_ps(child.id(), "TERMNAV_PARENT_RELAY");
+        // `Command::spawn` returns after fork but does not guarantee that the
+        // child has completed env's exec into sleep. Querying during that
+        // window finds the assignment in env's argv and legitimately includes
+        // `/bin/sleep 5` in the apparent value. Wait for the observable value
+        // produced by the final process instead of guessing at exec timing.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let value = loop {
+            let value = environment_from_ps(child.id(), "TERMNAV_PARENT_RELAY");
+            if value.as_deref() == Some("/tmp/termnav-parent.sock") || Instant::now() >= deadline {
+                break value;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
         let _ = child.kill();
         let _ = child.wait();
 
