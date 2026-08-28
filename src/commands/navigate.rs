@@ -12,8 +12,8 @@ const CONTINUATION_TTL: Duration = Duration::from_millis(250);
 
 const HELP: &str = r#"usage: termnav navigate [OPTIONS] ACTION DIRECTION
 
-actions: pane-select, tab-select, tab-move
-directions: pane-select=left|right|up|down; tab-select=previous|next; tab-move=left|right
+actions: pane-select, pane-move, tab-select, tab-move
+directions: pane-select|pane-move=left|down|up|right; tab-select=previous|next; tab-move=left|right
 
 options:
   --parent             start outside a tmux scope that already declined
@@ -223,17 +223,31 @@ fn exact_client(options: &Options) -> Result<Option<Client>, &'static str> {
         options.client_termtype.is_some(),
         options.source_socket.is_some(),
         options.source_pane.is_some(),
+        options.source_session.is_some(),
     ];
-    if !options.parent {
-        if identity_present.into_iter().any(|present| present) {
-            return Err("exact client options require --parent");
+    if !identity_present.into_iter().any(|present| present) {
+        if options.parent {
+            return Err(
+                "--client-pid, --client-tty, --client-created, --client-termtype, \
+                 --source-socket, and --source-pane are required with --parent",
+            );
         }
         return Ok(None);
     }
-    if identity_present.into_iter().any(|present| !present) {
+    if [
+        options.client_pid.is_some(),
+        options.client_tty.is_some(),
+        options.client_created.is_some(),
+        options.client_termtype.is_some(),
+        options.source_socket.is_some(),
+        options.source_pane.is_some(),
+    ]
+    .into_iter()
+    .any(|present| !present)
+    {
         return Err(
-            "--client-pid, --client-tty, --client-created, --client-termtype, \
-             --source-socket, and --source-pane are required with --parent",
+            "exact source identity requires --client-pid, --client-tty, \
+             --client-created, --client-termtype, --source-socket, and --source-pane",
         );
     }
 

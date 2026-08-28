@@ -227,6 +227,25 @@ fn legacy_navigation_action_names_are_not_public_commands() {
 }
 
 #[test]
+fn pane_move_is_a_cardinal_only_public_action() {
+    let valid = termnav()
+        .args(["navigate", "pane-move", "left"])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("run pane move");
+    assert_eq!(valid.status.code(), Some(3));
+
+    for direction in ["next", "previous", "diagonal"] {
+        let output = termnav()
+            .args(["navigate", "pane-move", direction])
+            .output()
+            .expect("reject invalid pane-move direction");
+        assert_eq!(output.status.code(), Some(2), "direction={direction}");
+    }
+}
+
+#[test]
 fn navigation_continuations_round_trip_and_fail_closed() {
     let initial = termnav()
         .args(["navigate", "--emit-continuation", "pane-select", "left"])

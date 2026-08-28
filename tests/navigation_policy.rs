@@ -191,3 +191,149 @@ fn cycle_is_an_error_instead_of_repeating_a_gesture() {
 
     assert_eq!(outcome, Outcome::Error);
 }
+
+#[test]
+fn pane_move_bubbles_through_arbitrary_local_tmux_nesting() {
+    let mut backend = FakeBackend::default();
+    let scopes = (0..32)
+        .map(|depth| scope(&format!("level-{depth}")))
+        .collect::<Vec<_>>();
+    backend.current = scopes.first().cloned();
+    for (depth, pair) in scopes.windows(2).enumerate() {
+        let route = client(10 + depth as u32);
+        backend
+            .clients
+            .insert(pair[0].identity(), Some(route.clone()));
+        backend.parents.insert(route.pid, Some(pair[1].clone()));
+    }
+    backend.results.insert(
+        scopes.last().expect("outer scope").identity(),
+        Outcome::Handled,
+    );
+
+    let outcome = Navigator::new(&mut backend, || 100).navigate(
+        Action::PaneMove,
+        Direction::Right,
+        true,
+        None,
+    );
+
+    assert_eq!(outcome, Outcome::Handled);
+    assert_eq!(
+        backend
+            .events
+            .iter()
+            .filter(|event| event.starts_with("execute:"))
+            .count(),
+        scopes.len()
+    );
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("relay:"))
+    );
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("terminal:"))
+    );
+}
+
+#[test]
+fn pane_move_stops_before_ssh_relay_and_terminal_boundaries() {
+    let mut backend = FakeBackend::default();
+    let inner = scope("inner");
+    let origin = client(10);
+    backend.current = Some(inner.clone());
+    backend
+        .clients
+        .insert(inner.identity(), Some(origin.clone()));
+    backend.parents.insert(origin.pid, None);
+    backend.relays.insert(origin.pid, Outcome::Handled);
+
+    let outcome = Navigator::new(&mut backend, || 100).navigate(
+        Action::PaneMove,
+        Direction::Left,
+        true,
+        None,
+    );
+
+    assert_eq!(outcome, Outcome::Declined);
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("relay:"))
+    );
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("terminal:"))
+    );
+}
+
+#[test]
+fn pane_move_without_a_tmux_scope_is_a_boundary_noop() {
+    let mut backend = FakeBackend::default();
+
+    let outcome =
+        Navigator::new(&mut backend, || 100).navigate(Action::PaneMove, Direction::Up, true, None);
+
+    assert_eq!(outcome, Outcome::Declined);
+    assert_eq!(backend.events, vec!["current"]);
+}
+
+#[test]
+fn pane_move_declines_when_client_identity_is_ambiguous() {
+    let mut backend = FakeBackend {
+        current: Some(scope("ambiguous")),
+        ..FakeBackend::default()
+    };
+
+    let outcome = Navigator::new(&mut backend, || 100).navigate(
+        Action::PaneMove,
+        Direction::Down,
+        true,
+        None,
+    );
+
+    assert_eq!(outcome, Outcome::Declined);
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("relay:"))
+    );
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("terminal:"))
+    );
+}
+
+#[test]
+fn pane_move_declines_when_selected_client_turns_stale() {
+    let mut backend = FakeBackend::default();
+    let current = scope("stale");
+    let selected = client(42);
+    backend.current = Some(current.clone());
+    backend
+        .clients
+        .insert(current.identity(), Some(selected.clone()));
+    backend.valid.insert(selected.pid, false);
+
+    let outcome =
+        Navigator::new(&mut backend, || 100).navigate(Action::PaneMove, Direction::Up, true, None);
+
+    assert_eq!(outcome, Outcome::Declined);
+    assert!(
+        !backend
+            .events
+            .iter()
+            .any(|event| event.starts_with("parent:"))
+    );
+}

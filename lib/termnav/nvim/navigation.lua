@@ -7,10 +7,10 @@ local declined_marker = "__TERMNAV_DECLINED__"
 local error_marker = "__TERMNAV_ERROR__"
 
 local pane_directions = {
-  left = { window = "h", tmux = "L", edge = "left", key = "<C-h>" },
-  down = { window = "j", tmux = "D", edge = "bottom", key = "<C-j>" },
-  up = { window = "k", tmux = "U", edge = "top", key = "<C-k>" },
-  right = { window = "l", tmux = "R", edge = "right", key = "<C-l>" },
+  left = { window = "h", tmux = "L", edge = "left", key = "<C-h>", move_key = "<M-H>" },
+  down = { window = "j", tmux = "D", edge = "bottom", key = "<C-j>", move_key = "<M-J>" },
+  up = { window = "k", tmux = "U", edge = "top", key = "<C-k>", move_key = "<M-K>" },
+  right = { window = "l", tmux = "R", edge = "right", key = "<C-l>", move_key = "<M-L>" },
 }
 
 local function default_command(arguments)
@@ -40,6 +40,12 @@ local function default_spawn(arguments, on_exit)
 end
 
 local function default_application()
+  local function view(window)
+    return vim.api.nvim_win_call(window, function()
+      return vim.fn.winsaveview()
+    end)
+  end
+
   return {
     tab_count = function()
       return #vim.api.nvim_list_tabpages()
@@ -50,7 +56,46 @@ local function default_application()
     tab_move = function(direction)
       vim.cmd(direction == "left" and "tabmove -1" or "tabmove +1")
     end,
+    pane_move = function(source, target)
+      local source_buffer = vim.api.nvim_win_get_buf(source)
+      local target_buffer = vim.api.nvim_win_get_buf(target)
+      local source_view = view(source)
+      local target_view = view(target)
+      if source_buffer ~= target_buffer then
+        local first = pcall(vim.api.nvim_win_set_buf, source, target_buffer)
+        local second = first and pcall(vim.api.nvim_win_set_buf, target, source_buffer)
+        if not second then
+          if first then
+            pcall(vim.api.nvim_win_set_buf, source, source_buffer)
+          end
+          return false
+        end
+      end
+      -- Cursor and viewport are window-local even when both windows display
+      -- one buffer. Swap them unconditionally so the user's visible pane,
+      -- rather than only its buffer identity, follows the movement.
+      pcall(vim.api.nvim_win_call, source, function()
+        vim.fn.winrestview(target_view)
+      end)
+      pcall(vim.api.nvim_win_call, target, function()
+        vim.fn.winrestview(source_view)
+      end)
+      vim.api.nvim_set_current_win(target)
+      return true
+    end,
   }
+end
+
+local function application_with_defaults(overrides)
+  local application = default_application()
+  -- Application integrations usually override only the tab abstraction (for
+  -- example, Bufferline instead of native tabpages). Merge that partial policy
+  -- over provider defaults so adding a new independent primitive cannot make
+  -- an older, otherwise valid consumer silently lose local behavior.
+  for name, callback in pairs(overrides or {}) do
+    application[name] = callback
+  end
+  return application
 end
 
 local function tmux_context()
@@ -71,7 +116,7 @@ function M.new(options)
   -- consumers replace a collaborator only when their host API requires it.
 
   local ctx = {
-    application = options.application or default_application(),
+    application = application_with_defaults(options.application),
     command = options.command or default_command,
     executable = options.executable or "termnav",
     mappings = options.mappings ~= false,
@@ -249,6 +294,36 @@ function M.new(options)
     return true
   end
 
+  function ctx.pane_move(direction)
+    local spec = pane_directions[direction]
+    if spec == nil then
+      error("invalid pane-move direction: " .. tostring(direction))
+    end
+
+    local source = vim.api.nvim_get_current_win()
+    local ok = pcall(vim.cmd, "wincmd " .. spec.window)
+    local neighbor = vim.api.nvim_get_current_win()
+    vim.api.nvim_set_current_win(source)
+    if ok and neighbor ~= source then
+      -- Neovim cannot reparent arbitrary nodes in an asymmetric split tree.
+      -- Exchange the two buffers and their views instead: this moves the
+      -- user-visible pane one directional step without reshaping unrelated
+      -- windows, then follows that content into its new slot.
+      if type(ctx.application.pane_move) ~= "function" then
+        -- Consumers may explicitly disable a primitive by replacing it with a
+        -- non-function. Decline locally instead of crashing or unexpectedly
+        -- moving an outer tmux pane.
+        return false
+      end
+      return ctx.application.pane_move(source, neighbor)
+    end
+
+    if tmux_context() == nil then
+      return true
+    end
+    return ctx.route("pane-move", direction)
+  end
+
   function ctx.previous()
     local current = tmux_context()
     if tmux_was_last and current ~= nil then
@@ -347,6 +422,7 @@ function M.new(options)
 
     for direction, spec in pairs(pane_directions) do
       local selected_direction = direction
+      local move_key = spec.move_key
       local plug = "<Plug>(TermnavPane" .. direction:gsub("^%l", string.upper) .. ")"
       vim.keymap.set("n", plug, function()
         ctx.pane(selected_direction)
@@ -357,6 +433,17 @@ function M.new(options)
       vim.keymap.set("t", spec.key, function()
         return ctx.terminal_key(selected_direction)
       end, { desc = "Navigate " .. selected_direction, expr = true, silent = true })
+      vim.keymap.set("n", move_key, function()
+        ctx.pane_move(selected_direction)
+      end, { desc = "Move pane " .. selected_direction, silent = true })
+      vim.keymap.set("t", move_key, function()
+        -- Keep terminal mode ownership here rather than making consumers
+        -- duplicate the leave/schedule/re-enter sequence. In particular, fzf
+        -- must receive the original Meta chord instead of an editor command.
+        return terminal_action(move_key, function()
+          ctx.pane_move(selected_direction)
+        end)
+      end, { desc = "Move pane " .. selected_direction, expr = true, silent = true })
     end
 
     vim.keymap.set("n", "<C-\\>", function()

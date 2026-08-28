@@ -99,6 +99,9 @@ fn send_command(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
         Ok(action) => action,
         Err(message) => return usage(stderr, &message),
     };
+    if action == Action::PaneMove {
+        return usage(stderr, "pane-move is local-only and cannot use a relay");
+    }
     let direction = match Direction::parse(action, &positional[1]) {
         Ok(direction) => direction,
         Err(message) => return usage(stderr, &message),

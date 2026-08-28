@@ -100,11 +100,16 @@ _assert_eq "relay: removes its local socket on shutdown" false "$([[ -e "$socket
 set +e
 bad_output=$(TERMNAV_PARENT_RELAY="$socket" "$relay" send pane-select diagonal 2>&1)
 bad_rc=$?
+pane_move_output=$(TERMNAV_PARENT_RELAY="$socket" "$relay" send pane-move left 2>&1)
+pane_move_rc=$?
 missing_output=$(env -u TERMNAV_PARENT_RELAY "$relay" send pane-select left 2>&1)
 missing_rc=$?
 set -e
 _assert_exit "relay: rejects invalid directions" 2 "$bad_rc"
 _assert_contains "relay: invalid direction is actionable" "invalid pane-select direction" "$bad_output"
+_assert_exit "relay: pane movement cannot cross an SSH boundary" 2 "$pane_move_rc"
+_assert_contains "relay: local-only pane movement is actionable" \
+  "pane-move is local-only" "$pane_move_output"
 _assert_exit "relay: absent parent fails silently" 3 "$missing_rc"
 _assert_eq "relay: absent parent emits nothing" "" "$missing_output"
 
