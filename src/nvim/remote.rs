@@ -3,6 +3,9 @@
 use std::ffi::OsString;
 use std::io;
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Open a target remotely without permission to establish a new connection.
 ///
@@ -32,12 +35,49 @@ pub fn ssh_open(host: &str, target: &str) -> io::Result<i32> {
     };
 
     let remote_command = remote_nvim_command(&["link", target, "", "terminal"]);
-    let status = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .args(mux_only_options(control_path))
         .arg(host)
         .arg(remote_command)
-        .stdin(Stdio::null())
-        .status()?;
+        .stdin(Stdio::null());
+    let status = crate::process::status_timeout(&mut command, OPEN_TIMEOUT)?;
+    Ok(if status.success() { 0 } else { 12 })
+}
+
+/// Ask an explicitly configured transport to open a target in one exact pane.
+///
+/// There is no generic, acknowledged way to enter an arbitrary remote tmux
+/// command prompt through a terminal byte stream. Consumers that own another
+/// transport may opt in with an executable; its exit status is the acknowledgement.
+/// Without that capability Termnav fails closed instead of guessing a pane or
+/// injecting keystrokes into an unknown foreground application.
+pub fn configured_open(
+    kind: &str,
+    scope: &str,
+    pane: &str,
+    host: &str,
+    target: &str,
+) -> io::Result<i32> {
+    let valid_identity = match kind {
+        "tmux" => !scope.is_empty() && !pane.is_empty(),
+        "wezterm" => scope.is_empty() && !pane.is_empty(),
+        _ => false,
+    };
+    if !valid_host(host) || !valid_identity {
+        return Ok(12);
+    }
+    let Some(helper) = std::env::var_os("TERMNAV_REMOTE_OPEN_HELPER") else {
+        return Ok(12);
+    };
+    if helper.is_empty() {
+        return Ok(12);
+    }
+    let mut command = Command::new(helper);
+    command
+        .args([kind, scope, pane, host, target])
+        .stdin(Stdio::null());
+    let status = crate::process::status_timeout(&mut command, OPEN_TIMEOUT)?;
     Ok(if status.success() { 0 } else { 12 })
 }
 

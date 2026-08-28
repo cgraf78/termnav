@@ -212,14 +212,6 @@ function M.new(wezterm)
     return basename(name)
   end
 
-  function routes.shell_quote(value)
-    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
-  end
-
-  function routes.tmux_double_quote(value)
-    return '"' .. tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
-  end
-
   function routes.helper_command(name)
     local bin_dir = os.getenv("TERMNAV_BIN_DIR")
     if bin_dir and bin_dir ~= "" then
@@ -228,105 +220,20 @@ function M.new(wezterm)
     return name
   end
 
-  function routes.remote_path_command()
-    return 'PATH="$PATH:$HOME/.local/bin:$HOME/.local/share/mise/shims:'
-      .. '/opt/homebrew/bin:/usr/local/bin"; export PATH'
-  end
-
-  function routes.remote_tmux_open_command(path_info)
-    local shell_command = routes.remote_path_command()
-      .. "; command termnav nvim open tmux-link "
-      .. routes.shell_quote(path_info)
-    return "run-shell " .. routes.tmux_double_quote(shell_command)
-  end
-
-  function routes.show_open_error(window, message)
-    if window and type(window.toast_notification) == "function" then
-      pcall(function()
-        window:toast_notification("nvim open", message, nil, 4000)
-      end)
-    end
-    if type(wezterm.log_error) == "function" then
-      wezterm.log_error(message)
-    end
-  end
-
-  function routes.run_nvim_helper(window, argv, failure_message)
-    -- open-uri handlers normally lose background stderr. When WezTerm gives us
-    -- a window, run the helper synchronously so users get a toast with the
-    -- actual opener error. Headless/test contexts keep the background path.
-    if window and type(wezterm.run_child_process) == "function" then
-      local ok, stdout, stderr = wezterm.run_child_process(argv)
-      if ok == true then
-        return true
-      end
-
-      local detail = tostring(stderr or stdout or ""):match("[^\r\n]+")
-      routes.show_open_error(window, detail or failure_message)
-      return false
-    end
-
+  function routes.run_nvim_helper(_, argv)
+    -- WezTerm invokes open-uri on its GUI event loop. Never wait there for SSH,
+    -- Neovim RPC, or a consumer transport: the native helper owns their hard
+    -- deadlines and cleanup, while this callback only acknowledges successful
+    -- process creation.
     wezterm.background_child_process(argv)
     return true
   end
 
-  function routes.remote_tmux_pane(pane)
-    if not pane or type(pane.get_user_vars) ~= "function" then
-      return false
+  function routes.pane_id(pane)
+    if pane and type(pane.pane_id) == "function" then
+      return tostring(pane:pane_id())
     end
-    return pane:get_user_vars()[user_vars.remote_tmux] == "true"
-  end
-
-  function routes.open_remote_via_controlmaster(remote_host, path_info)
-    if type(wezterm.run_child_process) ~= "function" then
-      return false
-    end
-
-    local ok = wezterm.run_child_process({
-      routes.helper_command("termnav"),
-      "nvim",
-      "ssh-open",
-      remote_host,
-      path_info,
-    })
-    return ok == true
-  end
-
-  function routes.send_remote_tmux_open(pane, path_info)
-    if
-      not pane
-      or type(pane.send_text) ~= "function"
-      or not wezterm.time
-      or type(wezterm.time.call_after) ~= "function"
-    then
-      return false
-    end
-
-    local foreground = routes.foreground_basename(pane)
-    if
-      not routes.remote_tmux_pane(pane)
-      or not foreground
-      or foreground == ""
-      or foreground == "tmux"
-    then
-      return false
-    end
-
-    -- Without a local tmux client, there is no local pane for the helper to
-    -- target. Send the command to the remote tmux client already visible in
-    -- this WezTerm pane. The producing shell/nvim must publish that the remote
-    -- side is actually inside tmux; foreground process names alone only tell us
-    -- this is not local tmux. tmux needs a tick to enter command mode after the
-    -- prefix; sending the whole sequence at once can leave `run-shell` at the
-    -- shell prompt instead of in tmux's command prompt.
-    pane:send_text("\002:")
-    wezterm.time.call_after(0.15, function()
-      -- The pane may have closed while the timer was pending.
-      pcall(function()
-        pane:send_text(routes.remote_tmux_open_command(path_info) .. "\r")
-      end)
-    end)
-    return true
+    return ""
   end
 
   function routes.open_in_nvim(window, pane, path_info)
@@ -343,21 +250,10 @@ function M.new(wezterm)
   end
 
   function routes.open_remote_in_nvim(window, pane, remote_host, path_info)
-    -- SSH ControlMaster is the least invasive route when it exists: it does not
-    -- depend on visible pane focus or tmux prefix state. Non-OpenSSH transports
-    -- may not expose a ControlPath, so keep pane routing as the fallback for
-    -- those sessions.
-    if routes.open_remote_via_controlmaster(remote_host, path_info) then
-      return
-    end
-
-    if routes.send_remote_tmux_open(pane, path_info) then
-      return
-    end
-
-    -- Let the helper use tmux pane APIs for remote SSH panes. Sending prefix
-    -- bytes directly through a local tmux pane would be consumed locally
-    -- instead of reaching the remote tmux session.
+    -- The native opener first reuses an authenticated ControlMaster and then,
+    -- if configured, asks one explicit transport helper to act on this exact
+    -- pane. A raw terminal byte stream cannot acknowledge tmux command mode, so
+    -- this module deliberately never synthesizes prefix keys or timed typing.
     routes.run_nvim_helper(window, {
       routes.helper_command("termnav"),
       "nvim",
@@ -367,11 +263,17 @@ function M.new(wezterm)
       "",
       "remote",
       remote_host,
+      "wezterm",
+      "",
+      routes.pane_id(pane),
     }, "No nvim session found for " .. remote_host .. ": " .. path_info)
   end
 
   function routes.open_uri(window, pane, uri)
     local path_info = uri:match("^nvim%-open://(.+)$")
+    if path_info then
+      path_info = routes.uri_decode(path_info)
+    end
     local lazygit_path_info = uri:match("^lazygit%-edit://(.+)$")
     if lazygit_path_info then
       path_info = routes.uri_decode(lazygit_path_info)

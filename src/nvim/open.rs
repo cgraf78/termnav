@@ -3,7 +3,7 @@
 //! Registry parsing and transport selection live here so terminal links, tmux
 //! clicks, and shell launchers share one routing policy. Every fallback narrows
 //! scope: an exact socket first, then the current tmux window, then (only for a
-//! remote-origin link) an existing ControlMaster or matching remote pane.
+//! remote-origin link) an existing ControlMaster or explicit transport helper.
 
 use std::collections::HashSet;
 use std::env;
@@ -13,7 +13,6 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::thread;
 use std::time::{Duration, SystemTime};
 
 /// User-facing invocation mode.
@@ -57,7 +56,10 @@ pub fn open(mode: Mode, arguments: &[String]) -> io::Result<i32> {
             let cwd = arguments.get(1).map(String::as_str).unwrap_or_default();
             let source = arguments.get(2).map(String::as_str).unwrap_or("terminal");
             let context = arguments.get(3).map(String::as_str).unwrap_or_default();
-            let result = open_link(input, cwd, source, context);
+            let route_kind = arguments.get(4).map(String::as_str).unwrap_or_default();
+            let route_scope = arguments.get(5).map(String::as_str).unwrap_or_default();
+            let pane = arguments.get(6).map(String::as_str).unwrap_or_default();
+            let result = open_link(input, cwd, source, context, route_kind, route_scope, pane);
             if mode == Mode::Link || result == 0 {
                 return Ok(result);
             }
@@ -239,7 +241,15 @@ fn expand_home(file: &str, home: Option<&OsStr>) -> String {
     file.to_owned()
 }
 
-fn open_link(input: &str, cwd: &str, source: &str, context: &str) -> i32 {
+fn open_link(
+    input: &str,
+    cwd: &str,
+    source: &str,
+    context: &str,
+    route_kind: &str,
+    route_scope: &str,
+    pane: &str,
+) -> i32 {
     if input.is_empty() {
         return 0;
     }
@@ -269,10 +279,9 @@ fn open_link(input: &str, cwd: &str, source: &str, context: &str) -> i32 {
             Err(_) => return 1,
         }
     }
-    if remote_tmux_fallback(context, input) {
-        0
-    } else {
-        1
+    match crate::nvim::remote::configured_open(route_kind, route_scope, pane, context, input) {
+        Ok(0) => 0,
+        Ok(_) | Err(_) => 1,
     }
 }
 
@@ -514,7 +523,8 @@ fn open_socket(socket: &Path, target: &Target, cwd: &str, source: &str) -> bool 
         vim_quote(cwd),
         vim_quote(source)
     );
-    tool_command("nvim")
+    let mut command = tool_command("nvim");
+    command
         .args([
             "--server",
             &socket.to_string_lossy(),
@@ -523,8 +533,8 @@ fn open_socket(socket: &Path, target: &Target, cwd: &str, source: &str) -> bool 
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    crate::process::status_timeout(&mut command, Duration::from_secs(3))
         .is_ok_and(|status| status.success())
 }
 
@@ -612,222 +622,6 @@ fn tmux_edit_command(target: &Target, cwd: &str) -> String {
     )
 }
 
-fn remote_tmux_fallback(expected_host: &str, input: &str) -> bool {
-    let Some(output) = tmux_output(&[
-        "list-panes",
-        "-a",
-        "-F",
-        "#{pane_id}\t#{pane_current_command}\t#{pane_start_command}\t#{pane_pid}",
-    ]) else {
-        return false;
-    };
-    let pane = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            let mut fields = line.splitn(4, '\t');
-            let pane = fields.next()?;
-            let command = fields.next()?;
-            let start = fields.next()?;
-            let pid = fields.next()?.parse().ok()?;
-            remote_pane_matches(command, start, pid, expected_host).then(|| pane.to_owned())
-        });
-    let Some(pane) = pane else {
-        return false;
-    };
-    if !tmux_status(&["send-keys", "-t", &pane, "C-b", ":"]) {
-        return false;
-    }
-    thread::sleep(Duration::from_millis(150));
-    let command = crate::nvim::remote::remote_nvim_command(&["tmux-link", input]);
-    let quoted = tmux_quote(&command);
-    tmux_status(&[
-        "send-keys",
-        "-t",
-        &pane,
-        "-l",
-        &format!("run-shell {quoted}"),
-    ]) && tmux_status(&["send-keys", "-t", &pane, "Enter"])
-}
-
-fn remote_pane_matches(command: &str, start: &str, pid: u32, expected: &str) -> bool {
-    let actual = remote_host(command, start, pid);
-    if expected.is_empty() {
-        return is_remote_command(command) && actual.is_some();
-    }
-    actual.is_some_and(|actual| hosts_match(&actual, expected))
-}
-
-fn remote_host(command: &str, start: &str, pane_pid: u32) -> Option<String> {
-    if is_remote_command(command) {
-        parse_remote_command(command, start).or_else(|| {
-            foreground_command(pane_pid, command)
-                .as_deref()
-                .and_then(|line| parse_remote_command(command, line))
-        })
-    } else {
-        extension_remote_host(command, start).or_else(|| {
-            foreground_command(pane_pid, command)
-                .as_deref()
-                .and_then(|line| extension_remote_host(command, line))
-        })
-    }
-}
-
-fn parse_remote_command(command: &str, value: &str) -> Option<String> {
-    let mut words = value.split_whitespace();
-    if words.next()?.rsplit('/').next()? != command {
-        return None;
-    }
-    let mut skip = false;
-    for token in words {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if token == "--" {
-            continue;
-        }
-        if option_takes_value(command, token) {
-            skip = true;
-            continue;
-        }
-        if token.starts_with('-') {
-            continue;
-        }
-        return normalize_remote(token);
-    }
-    None
-}
-
-fn option_takes_value(command: &str, option: &str) -> bool {
-    if command == "et" {
-        matches!(
-            option,
-            "-c" | "-i" | "-l" | "-o" | "-p" | "-r" | "-S" | "-s" | "-t"
-        )
-    } else {
-        matches!(
-            option,
-            "-B" | "-b"
-                | "-c"
-                | "-D"
-                | "-E"
-                | "-e"
-                | "-F"
-                | "-I"
-                | "-i"
-                | "-J"
-                | "-L"
-                | "-l"
-                | "-m"
-                | "-O"
-                | "-o"
-                | "-p"
-                | "-Q"
-                | "-R"
-                | "-S"
-                | "-W"
-                | "-w"
-        )
-    }
-}
-
-fn normalize_remote(candidate: &str) -> Option<String> {
-    let candidate = candidate.rsplit('@').next().unwrap_or(candidate);
-    let candidate = candidate
-        .strip_prefix("HostName=")
-        .unwrap_or(candidate)
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    (!candidate.is_empty()).then(|| candidate.to_owned())
-}
-
-fn is_remote_command(command: &str) -> bool {
-    matches!(command, "ssh" | "mosh" | "et")
-}
-
-fn extension_remote_host(command: &str, start: &str) -> Option<String> {
-    let output = tool_command("nvim-remote-pane-host")
-        .args([command, start])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn foreground_command(root: u32, wanted: &str) -> Option<String> {
-    let output = tool_command("ps")
-        .args([
-            "-axww", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "tpgid=", "-o", "comm=",
-            "-o", "args=",
-        ])
-        .output()
-        .ok()?;
-    foreground_from_snapshot(&String::from_utf8_lossy(&output.stdout), root, wanted)
-}
-
-fn foreground_from_snapshot(snapshot: &str, root: u32, wanted: &str) -> Option<String> {
-    let rows = snapshot
-        .lines()
-        .filter_map(parse_process_row)
-        .collect::<Vec<_>>();
-    rows.iter()
-        .filter(|row| row.executable == wanted && row.foreground > 0 && row.group == row.foreground)
-        .filter_map(|row| depth(row.pid, root, &rows).map(|depth| (depth, row.pid, &row.arguments)))
-        .max_by_key(|(depth, pid, _)| (*depth, *pid))
-        .map(|(_, _, arguments)| arguments.clone())
-}
-
-fn parse_process_row(line: &str) -> Option<ProcessRow> {
-    let mut rest = line.trim_start();
-    let mut fields = Vec::with_capacity(5);
-    for _ in 0..5 {
-        let end = rest.find(char::is_whitespace)?;
-        fields.push(&rest[..end]);
-        rest = rest[end..].trim_start();
-    }
-    if rest.is_empty() {
-        return None;
-    }
-    Some(ProcessRow {
-        pid: fields[0].parse().ok()?,
-        parent: fields[1].parse().ok()?,
-        group: fields[2].parse().ok()?,
-        foreground: fields[3].parse().ok()?,
-        executable: fields[4].rsplit('/').next().unwrap_or(fields[4]).to_owned(),
-        arguments: rest.to_owned(),
-    })
-}
-
-struct ProcessRow {
-    pid: u32,
-    parent: u32,
-    group: i32,
-    foreground: i32,
-    executable: String,
-    arguments: String,
-}
-
-fn depth(mut pid: u32, root: u32, rows: &[ProcessRow]) -> Option<usize> {
-    for depth in 0..=rows.len() {
-        if pid == root {
-            return Some(depth);
-        }
-        pid = rows.iter().find(|row| row.pid == pid)?.parent;
-    }
-    None
-}
-
-fn hosts_match(actual: &str, expected: &str) -> bool {
-    actual == expected
-        || actual.split('.').next() == Some(expected)
-        || expected.split('.').next() == Some(actual)
-}
-
 fn show_message(message: &str) {
     if std::env::var_os("TMUX").is_some() {
         let popup = format!(
@@ -870,16 +664,10 @@ fn vim_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn tmux_quote(value: &str) -> String {
-    let value = crate::shell::escape_tmux_format(value);
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Target, augmented_tool_paths, executable, foreground_from_snapshot, hosts_match,
-        pane_key_for, parse_remote_command, resolve_tool, tmux_edit_command, tmux_quote,
+        Target, augmented_tool_paths, executable, pane_key_for, resolve_tool, tmux_edit_command,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -945,14 +733,6 @@ mod tests {
     }
 
     #[test]
-    fn tmux_command_quote_preserves_literal_format_markers() {
-        assert_eq!(
-            tmux_quote("open /tmp/#{session_name}/#(printf unsafe)"),
-            "\"open /tmp/##{session_name}/##(printf unsafe)\""
-        );
-    }
-
-    #[test]
     fn tool_resolution_skips_an_inaccessible_shadow() {
         let root = tool_test_root();
         let shadow = root.join("shadow");
@@ -1007,20 +787,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_command_parser_skips_transport_options() {
-        assert_eq!(
-            parse_remote_command("ssh", "ssh -p 22 user@example.test"),
-            Some("example.test".to_owned())
-        );
-        assert_eq!(
-            parse_remote_command("ssh", "ssh -t dev1 tmux attach"),
-            Some("dev1".to_owned())
-        );
-        assert_eq!(parse_remote_command("ssh", "exec /usr/bin/zsh -l"), None);
-        assert!(hosts_match("dev.example.test", "dev"));
-    }
-
-    #[test]
     fn pane_registry_keys_keep_server_and_socket_identity() {
         let comma = pane_key_for("/tmp/tmux,comma.sock,101,0", "%1");
         assert_ne!(comma, pane_key_for("/tmp/tmux,comma.sock,202,0", "%1"));
@@ -1030,35 +796,6 @@ mod tests {
             pane_key_for("/tmp/a/b,101,0", "%1")
         );
         assert!(comma.split('/').all(|component| component.len() <= 123));
-    }
-
-    #[test]
-    fn foreground_transport_selection_is_order_independent_and_cycle_safe() {
-        let ordered = "999 1 999 999 ssh ssh unrelated.example\n\
-201 100 201 210 ssh ssh background.example\n\
-211 210 210 210 sleep sleep 30\n\
-210 100 210 210 /usr/bin/ssh ssh dev1\n\
-100 1 100 210 zsh -zsh\n";
-        let shuffled = "210 100 210 210 /usr/bin/ssh ssh dev1\n\
-100 1 100 210 zsh -zsh\n\
-201 100 201 210 ssh ssh background.example\n\
-999 1 999 999 ssh ssh unrelated.example\n";
-        assert_eq!(
-            foreground_from_snapshot(ordered, 100, "ssh"),
-            Some("ssh dev1".to_owned())
-        );
-        assert_eq!(
-            foreground_from_snapshot(shuffled, 100, "ssh"),
-            Some("ssh dev1".to_owned())
-        );
-        assert_eq!(
-            foreground_from_snapshot(
-                "300 301 300 300 ssh ssh cycle.example\n301 300 300 300 zsh zsh\n",
-                100,
-                "ssh",
-            ),
-            None
-        );
     }
 
     #[test]
