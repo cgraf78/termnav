@@ -180,12 +180,18 @@ async function activationCleanup() {
   };
   const context = { environmentVariableCollection: collection, subscriptions: [] };
   await extension.activate(context);
+  const bridge = context.subscriptions.at(-1);
   const socketPath = environment.get("TERMNAV_VSCODE_SOCKET");
-  assert.match(environment.get("TERMNAV_VSCODE_TOKEN"), /^[0-9a-f]{64}$/);
-  assert.ok(fs.lstatSync(socketPath).isSymbolicLink(), "published socket is not a symlink");
-  assert.equal(collection.persistent, false);
-  assert.equal(listeners.length, 3);
-  await context.subscriptions.at(-1).dispose();
+  try {
+    assert.match(environment.get("TERMNAV_VSCODE_TOKEN"), /^[0-9a-f]{64}$/);
+    assert.ok(fs.lstatSync(socketPath).isSymbolicLink(), "published socket is not a symlink");
+    assert.equal(collection.persistent, false);
+    assert.equal(listeners.length, 3);
+  } finally {
+    // Assertion failures must still close the real server; otherwise Node would
+    // retain the listener until the suite's outer timeout obscured the cause.
+    await bridge.dispose();
+  }
   assert.equal(environment.has("TERMNAV_VSCODE_SOCKET"), false);
   assert.equal(environment.has("TERMNAV_VSCODE_TOKEN"), false);
   assert.equal(fs.existsSync(socketPath), false, "published socket survived adapter disposal");

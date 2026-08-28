@@ -17,6 +17,17 @@ impl Drop for Cleanup {
     }
 }
 
+struct ChildCleanup(Child);
+
+impl Drop for ChildCleanup {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
 fn wait_for_file(path: &Path, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -110,23 +121,25 @@ exit 37
         .expect("make fake eza executable");
 
     let host = "remote.example";
-    let mut child = Command::new(env!("CARGO_BIN_EXE_termnav"))
-        .args(["eza", "/tmp"])
-        .env("TERMNAV_EZA_BINARY", &fake_eza)
-        .env("TERMNAV_REMOTE_LINK_HOST", host)
-        .env("TERMNAV_TEST_EZA_EARLY", &early_path)
-        .env("TERMNAV_TEST_EZA_EARLY_STDERR", &early_stderr_path)
-        .env("TERMNAV_TEST_EZA_PAYLOAD", &payload_path)
-        .env("TERMNAV_TEST_EZA_STDERR", &stderr_path)
-        .env("TERMNAV_TEST_EZA_READY", &ready_path)
-        .env("TERMNAV_TEST_EZA_RELEASE", &release_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start termnav eza");
-    let mut stdout = child.stdout.take().expect("capture termnav stdout");
-    let mut stderr_pipe = child.stderr.take().expect("capture termnav stderr");
+    let mut child = ChildCleanup(
+        Command::new(env!("CARGO_BIN_EXE_termnav"))
+            .args(["eza", "/tmp"])
+            .env("TERMNAV_EZA_BINARY", &fake_eza)
+            .env("TERMNAV_REMOTE_LINK_HOST", host)
+            .env("TERMNAV_TEST_EZA_EARLY", &early_path)
+            .env("TERMNAV_TEST_EZA_EARLY_STDERR", &early_stderr_path)
+            .env("TERMNAV_TEST_EZA_PAYLOAD", &payload_path)
+            .env("TERMNAV_TEST_EZA_STDERR", &stderr_path)
+            .env("TERMNAV_TEST_EZA_READY", &ready_path)
+            .env("TERMNAV_TEST_EZA_RELEASE", &release_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start termnav eza"),
+    );
+    let mut stdout = child.0.stdout.take().expect("capture termnav stdout");
+    let mut stderr_pipe = child.0.stderr.take().expect("capture termnav stderr");
     let expected_early = rewritten(early, host);
     let early_length = expected_early.len();
     let (early_sender, early_receiver) = mpsc::channel();
@@ -159,11 +172,11 @@ exit 37
         output
     });
 
-    wait_for_file(&ready_path, &mut child);
+    wait_for_file(&ready_path, &mut child.0);
     let streamed = early_receiver.recv_timeout(Duration::from_secs(1));
     let streamed_stderr = stderr_receiver.recv_timeout(Duration::from_secs(1));
     fs::write(&release_path, b"release\n").expect("release fake eza");
-    let status = wait_for_exit(&mut child);
+    let status = wait_for_exit(&mut child.0);
     let stdout = stdout_reader.join().expect("join stdout reader");
     let actual_stderr = stderr_reader.join().expect("join stderr reader");
 
