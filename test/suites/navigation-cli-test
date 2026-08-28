@@ -63,6 +63,8 @@ child_socket_name="termnav-navigation-child-test-$$"
 parent_client_launcher=""
 nav_client_launcher=""
 shared_client_launcher=""
+nav_client_log=$(_tmpdir)/nav-client.log
+shared_client_log=$(_tmpdir)/shared-client.log
 cleanup_navigation_cli_test() {
   if [[ -n "$parent_client_launcher" ]]; then
     kill "$parent_client_launcher" 2>/dev/null || true
@@ -89,9 +91,33 @@ wait_for_client_panes() {
     actual=$(tmux -L "$socket_name" list-clients -F '#{pane_id}' |
       awk -v expected="$expected_pane" '$0 == expected { count++ } END { print count + 0 }')
     [[ "$actual" -eq "$expected_count" ]] && break
-    read -r -t 0.02 _ </dev/null || true
+    # Reading with a timeout from /dev/null returns EOF immediately and turns
+    # this bounded poll into a tight race. Sleep between observations so slow
+    # tmux clients get the intended four-second readiness window.
+    sleep 0.02
   done
   printf '%s\n' "$actual"
+}
+
+report_client_state() {
+  # CI cannot be inspected after teardown, so preserve enough state to tell a
+  # slow attachment from a launcher that exited or a client that detached.
+  printf 'navigation CLI: client readiness diagnostics (tmux %s)\n' "$(tmux -V)" >&2
+  tmux -L "$socket_name" list-clients -F \
+    'client=#{client_pid} tty=#{client_tty} session=#{session_id} pane=#{pane_id} flags=#{client_flags}' \
+    >&2 || true
+  local launcher
+  for launcher in "$nav_client_launcher" "$shared_client_launcher"; do
+    if [[ -n $launcher ]]; then
+      ps -o pid=,ppid=,stat=,args= -p "$launcher" >&2 || true
+    fi
+  done
+  local log
+  for log in "$nav_client_log" "$shared_client_log"; do
+    if [[ -r $log ]]; then
+      sed -n '1,120p' "$log" >&2 || true
+    fi
+  done
 }
 
 tmux -L "$socket_name" new-session -d -s nav -n panes
@@ -103,14 +129,17 @@ env -u TMUX -u TMUX_PANE TERM=xterm-256color \
   TERMNAV_PARENT_RELAY=/tmp/termnav-must-not-relay.sock \
   "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
   --without-parent-scope \
-  -L "$socket_name" attach-session -t nav >/dev/null 2>&1 &
+  -L "$socket_name" attach-session -t nav >"$nav_client_log" 2>&1 &
 nav_client_launcher=$!
 for _attempt in $(seq 1 200); do
   initial_client_count=$(tmux -L "$socket_name" list-clients -F '#{client_pid}' \
     2>/dev/null | wc -l | tr -d '[:space:]')
   [[ "$initial_client_count" -eq 1 ]] && break
-  read -r -t 0.02 _ </dev/null || true
+  sleep 0.02
 done
+if [[ "$initial_client_count" -ne 1 ]]; then
+  report_client_state
+fi
 _assert_eq "navigation CLI: synthetic client reaches attached state" \
   1 "$initial_client_count"
 tmux -L "$socket_name" select-pane -t "$left_pane"
@@ -311,14 +340,17 @@ source_pane=$(tmux -L "$socket_name" display-message -p -t "$first_window" '#{pa
 env -u TMUX -u TMUX_PANE TERM=xterm-256color \
   "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
   --without-parent-scope \
-  -L "$socket_name" attach-session -t nav >/dev/null 2>&1 &
+  -L "$socket_name" attach-session -t nav >"$shared_client_log" 2>&1 &
 shared_client_launcher=$!
 for _attempt in $(seq 1 200); do
   client_count=$(tmux -L "$socket_name" list-clients -F '#{client_pid}' \
     2>/dev/null | wc -l | tr -d '[:space:]')
   [[ "$client_count" -eq 2 ]] && break
-  read -r -t 0.02 _ </dev/null || true
+  sleep 0.02
 done
+if [[ "$client_count" -ne 2 ]]; then
+  report_client_state
+fi
 _assert_eq "navigation CLI: second synthetic client reaches attached state" \
   2 "$client_count"
 
@@ -327,6 +359,9 @@ _assert_eq "navigation CLI: second synthetic client reaches attached state" \
 # so wait for the observable ready state rather than racing Alpine's faster
 # client registration against its terminal setup.
 source_client_count=$(wait_for_client_panes "$source_pane" 2)
+if [[ "$source_client_count" -ne 2 ]]; then
+  report_client_state
+fi
 _assert_eq "navigation CLI: both clients finish initial pane selection" \
   2 "$source_client_count"
 
@@ -371,6 +406,9 @@ _assert_eq "navigation CLI: current session owns tab selection with two windows"
 # without inserting a synchronization gap between actions.
 last_pane=$(tmux -L "$socket_name" display-message -p -t "$second_window" '#{pane_id}')
 visible_client_count=$(wait_for_client_panes "$last_pane" 2)
+if [[ "$visible_client_count" -ne 2 ]]; then
+  report_client_state
+fi
 _assert_eq "navigation CLI: both attached clients observe the selected tab" \
   2 "$visible_client_count"
 
@@ -415,7 +453,7 @@ for _attempt in $(seq 1 200); do
     -F '#{client_pid} #{client_tty} #{client_created} #{session_id} #{pane_id}' \
     2>/dev/null || true)
   [[ -n "$child_client" ]] && break
-  read -r -t 0.02 _ </dev/null || true
+  sleep 0.02
 done
 read -r parent_client_pid parent_client_tty parent_client_created child_session \
   child_pane <<<"$child_client"

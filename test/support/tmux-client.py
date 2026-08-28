@@ -6,6 +6,7 @@ import os
 import pty
 import select
 import signal
+import subprocess
 import sys
 import time
 
@@ -33,11 +34,18 @@ def run_client(arguments: list[str]) -> int:
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     pending = b""
+    transcript = b""
     try:
         while True:
             waited, status = os.waitpid(child, os.WNOHANG)
             if waited == child:
-                return os.waitstatus_to_exitcode(status)
+                code = os.waitstatus_to_exitcode(status)
+                if code != 0 and transcript:
+                    # tmux writes startup diagnostics to its controlling PTY,
+                    # not the wrapper's stderr. Preserve the tail when a test
+                    # client dies early so CI explains why it never attached.
+                    os.write(2, transcript)
+                return code
 
             ready, _, _ = select.select([descriptor], [], [], 0.05)
             if not ready:
@@ -56,12 +64,46 @@ def run_client(arguments: list[str]) -> int:
             # redraws on platforms with small PTY buffers. Also answer tmux's
             # terminal-capability probe; leaving a test client half-initialized
             # makes its visible pane lag later session changes.
+            transcript = (transcript + payload)[-4096:]
             pending = (pending + payload)[-64:]
             if b"\x1b[?996n" in pending:
                 os.write(descriptor, b"\x1b[?997;1n")
                 pending = b""
     finally:
         os.close(descriptor)
+
+
+def process_running(pid: int) -> bool:
+    """Return whether a detached fixture process can still execute."""
+
+    # A minimal container's PID 1 may retain an orphaned zombie indefinitely.
+    # `kill(pid, 0)` reports that already-dead process as present, which would
+    # make the launcher wait forever during suite cleanup.
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as stream:
+            stat = stream.read()
+        state = stat[stat.rfind(")") + 2 :].split(maxsplit=1)[0]
+        return state != "Z"
+    except (FileNotFoundError, OSError, IndexError):
+        pass
+
+    # macOS has no procfs but provides the process state through BSD ps.
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        state = result.stdout.strip()
+        return result.returncode == 0 and bool(state) and not state.startswith("Z")
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
 
 
 def run_without_parent_scope(arguments: list[str]) -> int:
@@ -71,6 +113,11 @@ def run_without_parent_scope(arguments: list[str]) -> int:
     intermediate = os.fork()
     if intermediate == 0:
         os.close(read_descriptor)
+        # Capture our identity before the second fork. If the short-lived
+        # intermediate exits before the daemon first runs, asking getppid()
+        # there would already return the platform reaper and the daemon would
+        # wait forever for that stable PID to change instead of attaching.
+        intermediate_pid = os.getpid()
         daemon = os.fork()
         if daemon != 0:
             os.write(write_descriptor, str(daemon).encode())
@@ -80,7 +127,6 @@ def run_without_parent_scope(arguments: list[str]) -> int:
         # tmux client. This makes the daemon's parent the platform reaper rather
         # than the shell running the suite, whose own TMUX may describe an
         # unrelated developer session even after the variable is unset.
-        intermediate_pid = os.getppid()
         while os.getppid() == intermediate_pid:
             time.sleep(0.001)
         os.close(write_descriptor)
@@ -100,12 +146,9 @@ def run_without_parent_scope(arguments: list[str]) -> int:
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    while True:
-        try:
-            os.kill(daemon, 0)
-        except ProcessLookupError:
-            return 0
+    while process_running(daemon):
         time.sleep(0.05)
+    return 0
 
 
 def main() -> int:
