@@ -58,6 +58,23 @@ jobs:
       # single reviewed dependency decision.
       - uses: cgraf78/actions/.github/actions/verify-consumer-sync@7906c35e00d07304674f4955f2046045693fea44
 
+  vscode-adapter:
+    name: VS Code adapter / Ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The broad shell matrix may omit Node in minimal containers. This
+      # required host job makes the shipped extension's runtime behavior a hard
+      # contract instead of accepting its documented optional skip.
+      - name: Exercise the production VS Code adapter
+        run: |
+          node --version
+          test/suites/vscode-adapter-test
+
   relay-performance:
     name: Relay hot path / Ubuntu
     if: ${{ github.event_name == 'pull_request' }}
@@ -146,10 +163,11 @@ jobs:
   required:
     name: Required
     if: ${{ always() }}
-    needs: [rust, eza-current, relay-performance, relay-performance-macos]
+    needs: [rust, vscode-adapter, eza-current, relay-performance, relay-performance-macos]
     runs-on: ubuntu-24.04
     env:
       RUST_RESULT: ${{ needs.rust.result }}
+      VSCODE_ADAPTER_RESULT: ${{ needs.vscode-adapter.result }}
       EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}
       RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}
       RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}
@@ -158,11 +176,13 @@ jobs:
         shell: bash
         run: |-
           printf 'Rust CI: %s\n' "$RUST_RESULT"
+          printf 'VS Code adapter: %s\n' "$VSCODE_ADAPTER_RESULT"
           printf 'Current eza: %s\n' "$EZA_CURRENT_RESULT"
           printf 'Relay performance: %s\n' "$RELAY_PERFORMANCE_RESULT"
           printf 'Relay performance macOS: %s\n' "$RELAY_PERFORMANCE_MACOS_RESULT"
 
           test "$RUST_RESULT" = success
+          test "$VSCODE_ADAPTER_RESULT" = success
           test "$EZA_CURRENT_RESULT" = success
           case "$RELAY_PERFORMANCE_RESULT" in
             success | skipped) ;;
