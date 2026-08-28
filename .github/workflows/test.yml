@@ -62,6 +62,10 @@ jobs:
     name: Relay hot path / Ubuntu
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
+    # The harness has bounded protocol waits, but it deliberately executes both
+    # the PR and its base revision. A historical binary deadlock must not retain
+    # a hosted runner until GitHub's much larger platform default expires.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -91,6 +95,8 @@ jobs:
     name: Relay hot path / macOS
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: macos-latest
+    # Keep the same outer failure contract on the slower procfs-free path.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -14,7 +14,7 @@ relay_adapter=$(_tmpdir)/termnav-relay
 _termnav_command_adapter "$relay_adapter" \
   "${TERMNAV_TEST_BINARY:-$root/target/release/termnav}" relay
 set +e
-output=$(python3 "$test_dir/support/relay-terminal.py" \
+output=$(_with_timeout 10m python3 "$test_dir/support/relay-terminal.py" \
   --relay "$relay_adapter" \
   --python-relay "$test_dir/support/python-peer/relay.py" \
   --termnav "${TERMNAV_TEST_BINARY:-$root/target/release/termnav}" 2>&1)

@@ -318,22 +318,18 @@ _termnav_command_adapter() {
 }
 
 # ---------------------------------------------------------------------------
-# Portable timeout wrapper — `timeout` is GNU coreutils and is absent on
-# macOS by default. Falls back to `gtimeout` (installed by `brew install
-# coreutils`), then to Python's process supervision. The Python path terminates
-# the whole fixture process group so a timed-out shell cannot strand an SSH
-# child or relay and poison a later test.
+# Portable timeout wrapper. Python owns a new process group and escalates TERM
+# to KILL, giving every supported CI platform the same exit status and cleanup
+# contract. GNU timeout remains a bootstrap fallback for environments without
+# Python, but it also needs an explicit kill-after bound: TERM alone can leave a
+# deliberately stubborn fixture alive forever.
 # ---------------------------------------------------------------------------
 
 _with_timeout() {
   local secs="$1"
   shift
-  if command -v timeout &>/dev/null; then
-    timeout "$secs" "$@"
-  elif command -v gtimeout &>/dev/null; then
-    gtimeout "$secs" "$@"
-  elif command -v python3 &>/dev/null; then
-    python3 - "$secs" "$@" <<'PY'
+  if command -v python3 &>/dev/null; then
+    if python3 - "$secs" "$@" <<'PY'; then
 import os
 import signal
 import subprocess
@@ -363,6 +359,26 @@ except subprocess.TimeoutExpired:
         process.wait()
     raise SystemExit(124)
 PY
+      return 0
+    else
+      return $?
+    fi
+  elif command -v timeout &>/dev/null; then
+    if timeout --kill-after=1s "$secs" "$@"; then
+      return 0
+    else
+      local status=$?
+      [[ $status -eq 137 ]] && return 124
+      return "$status"
+    fi
+  elif command -v gtimeout &>/dev/null; then
+    if gtimeout --kill-after=1s "$secs" "$@"; then
+      return 0
+    else
+      local status=$?
+      [[ $status -eq 137 ]] && return 124
+      return "$status"
+    fi
   else
     printf 'test timeout requires timeout, gtimeout, or python3\n' >&2
     return 127
