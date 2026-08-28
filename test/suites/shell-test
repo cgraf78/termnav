@@ -292,59 +292,141 @@ mkdir -p "$ssh_fallback_bin"
 printf '#!%s\n' "$BASH" >"$ssh_fallback_bin/ssh"
 cat >>"$ssh_fallback_bin/ssh" <<'SH'
 printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
+exit 88
 SH
 chmod +x "$ssh_fallback_bin/ssh"
 TERMNAV_TEST_COMMAND_LOG="$ssh_fallback_log" \
   PATH="${ssh_shim%/ssh}:$ssh_fallback_bin:${BASH%/*}:/usr/bin:/bin" \
-  _with_timeout 5s "$ssh_shim" bootstrap.example printf hello \
+  _with_timeout 5s "$ssh_shim" -V \
   >/dev/null 2>&1
 ssh_fallback_status=$?
-_assert_exit "ssh shim: missing termnav falls back without recursion" \
+_assert_exit "ssh shim: missing termnav uses the system utility path" \
   0 "$ssh_fallback_status"
-_assert_eq "ssh shim: fallback preserves the exact command" \
-  $'<bootstrap.example>\n<printf>\n<hello>' "$(cat "$ssh_fallback_log" 2>/dev/null)"
+_assert_eq "ssh shim: bootstrap never selects a PATH shim" \
+  '' "$(cat "$ssh_fallback_log" 2>/dev/null)"
 
-ssh_fallback_cwd="$ssh_probe/fallback-cwd"
-ssh_fallback_cwd_log="$ssh_probe/fallback-cwd.log"
-mkdir -p "$ssh_fallback_cwd"
-printf '#!%s\n' "$BASH" >"$ssh_fallback_cwd/ssh"
-cat >>"$ssh_fallback_cwd/ssh" <<'SH'
+# A checkout and an installed release can both contribute a copy of this shim
+# during an update. Re-entering either copy must stop immediately: the native
+# supervisor waits for its SSH child, so an unbounded shim -> termnav -> shim
+# cycle grows one waiting process per turn instead of merely spinning one PID.
+ssh_recursive_bin="$ssh_probe/recursive-bin"
+ssh_recursive_shim="$ssh_probe/recursive/share/termnav/shims"
+ssh_recursive_count="$ssh_probe/recursive-count"
+ssh_recursive_real="$ssh_probe/recursive-real"
+ssh_recursive_log="$ssh_probe/recursive-real.log"
+mkdir -p "$ssh_recursive_bin" "$ssh_recursive_shim" "$ssh_recursive_real"
+cp "$ssh_shim" "$ssh_recursive_shim/ssh"
+cat >"$ssh_recursive_bin/termnav" <<'SH'
+#!/usr/bin/env bash
+count=$(cat "$TERMNAV_TEST_RECURSION_COUNT" 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s\n' "$count" >"$TERMNAV_TEST_RECURSION_COUNT"
+# Bound the broken implementation without relying on the host process limit.
+((count < 3)) || exit 99
+shift
+exec ssh "$@"
+SH
+printf '#!%s\n' "$BASH" >"$ssh_recursive_real/ssh"
+cat >>"$ssh_recursive_real/ssh" <<'SH'
 printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
 SH
-chmod +x "$ssh_fallback_cwd/ssh"
-(
-  cd "$ssh_fallback_cwd" || exit 1
-  TERMNAV_TEST_COMMAND_LOG="$ssh_fallback_cwd_log" \
-    _with_timeout 5s env \
-    PATH="${ssh_shim%/ssh}:" \
-    "$BASH" "$ssh_shim" current-dir.example true \
-    >/dev/null 2>&1
-)
-ssh_fallback_cwd_status=$?
-_assert_exit "ssh shim: trailing empty PATH component searches the current directory" \
-  0 "$ssh_fallback_cwd_status"
-_assert_eq "ssh shim: current-directory fallback preserves the exact command" \
-  $'<current-dir.example>\n<true>' "$(cat "$ssh_fallback_cwd_log" 2>/dev/null)"
-
-ssh_fallback_glob="$ssh_probe/fallback-[x]"
-ssh_fallback_expansion="$ssh_probe/fallback-x"
-ssh_fallback_glob_log="$ssh_probe/fallback-glob.log"
-mkdir -p "$ssh_fallback_glob" "$ssh_fallback_expansion"
-printf '#!%s\n' "$BASH" >"$ssh_fallback_glob/ssh"
-cat >>"$ssh_fallback_glob/ssh" <<'SH'
-printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
-SH
-printf '#!%s\nexit 9\n' "$BASH" >"$ssh_fallback_expansion/ssh"
-chmod +x "$ssh_fallback_glob/ssh" "$ssh_fallback_expansion/ssh"
-TERMNAV_TEST_COMMAND_LOG="$ssh_fallback_glob_log" \
-  PATH="${ssh_shim%/ssh}:$ssh_fallback_glob:${BASH%/*}:/usr/bin:/bin" \
-  _with_timeout 5s "$ssh_shim" literal-path.example true \
+chmod +x "$ssh_recursive_bin/termnav" "$ssh_recursive_real/ssh"
+TERMNAV_TEST_RECURSION_COUNT="$ssh_recursive_count" \
+  TERMNAV_TEST_COMMAND_LOG="$ssh_recursive_log" \
+  PATH="$ssh_recursive_bin:$ssh_recursive_shim:$ssh_recursive_real:${BASH%/*}:/usr/bin:/bin" \
+  _with_timeout 5s "$ssh_recursive_shim/ssh" recursion.example true \
   >/dev/null 2>&1
-ssh_fallback_glob_status=$?
-_assert_exit "ssh shim: glob characters in PATH remain literal" \
-  0 "$ssh_fallback_glob_status"
-_assert_eq "ssh shim: literal PATH fallback preserves the exact command" \
-  $'<literal-path.example>\n<true>' "$(cat "$ssh_fallback_glob_log" 2>/dev/null)"
+ssh_recursive_status=$?
+_assert_exit "ssh shim: new shim works through an older binary" 0 \
+  "$ssh_recursive_status"
+_assert_eq "ssh shim: mixed-version handoff invokes termnav only once" 1 \
+  "$(cat "$ssh_recursive_count" 2>/dev/null)"
+_assert_eq "ssh shim: mixed-version handoff reaches real SSH" \
+  $'<recursion.example>\n<true>' "$(cat "$ssh_recursive_log" 2>/dev/null)"
+
+TERMNAV_SSH_SHIM_ACTIVE=1 \
+  _with_timeout 5s "$ssh_recursive_shim/ssh" recursion.example true \
+  >/dev/null 2>&1
+_assert_exit "ssh shim: recursive re-entry fails closed" 126 "$?"
+
+# The shim tells the native supervisor exactly which PATH entry invoked it.
+# This cannot be inferred from the release binary: a source checkout has a
+# different path from both the build-time source tree and installed release.
+ssh_invoking_shim="$ssh_probe/checkout/share/termnav/shims"
+ssh_installed_shim="$ssh_probe/release/share/termnav/shims"
+ssh_integration_count="$ssh_probe/integration-count"
+ssh_real_bin="$ssh_probe/real-bin"
+ssh_real_log="$ssh_probe/real.log"
+mkdir -p "$ssh_invoking_shim" "$ssh_installed_shim" "$ssh_real_bin"
+cp "$ssh_shim" "$ssh_invoking_shim/ssh"
+cp "$ssh_shim" "$ssh_installed_shim/ssh"
+# Keep this regression safe even if a future resolver change reintroduces the
+# process chain. Each fixture shim gets a test-only fuse before the production
+# body; the fourth entry fails instead of relying on a timeout to contain it.
+for fixture_shim in "$ssh_invoking_shim/ssh" "$ssh_installed_shim/ssh"; do
+  # shellcheck disable=SC2016 # Inserted variables expand in the fixture process.
+  sed -i.bak '2i\
+count=$(cat "$TERMNAV_TEST_INTEGRATION_COUNT" 2>/dev/null || printf 0)\
+count=$((count + 1))\
+printf "%s\\n" "$count" >"$TERMNAV_TEST_INTEGRATION_COUNT"\
+[ "$count" -lt 4 ] || exit 99
+' "$fixture_shim"
+  rm -f "$fixture_shim.bak"
+done
+printf '#!%s\n' "$BASH" >"$ssh_real_bin/ssh"
+cat >>"$ssh_real_bin/ssh" <<'SH'
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
+printf 'active=%s\n' "${TERMNAV_SSH_SHIM_ACTIVE-}" >>"$TERMNAV_TEST_COMMAND_LOG"
+printf 'dir=%s\n' "${TERMNAV_SSH_SHIM_DIR-}" >>"$TERMNAV_TEST_COMMAND_LOG"
+printf 'path=%s\n' "$PATH" >>"$TERMNAV_TEST_COMMAND_LOG"
+SH
+chmod +x "$ssh_invoking_shim/ssh" "$ssh_real_bin/ssh"
+TERMNAV_TEST_INTEGRATION_COUNT="$ssh_integration_count" \
+  TERMNAV_TEST_COMMAND_LOG="$ssh_real_log" \
+  PATH="${TERMNAV_TEST_BINARY%/termnav}:$ssh_invoking_shim:$ssh_installed_shim:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin" \
+  _with_timeout 5s "$ssh_invoking_shim/ssh" -V \
+  >/dev/null 2>&1
+ssh_invoking_status=$?
+_assert_exit "ssh resolver: invoking shim directory is never selected" 0 \
+  "$ssh_invoking_status"
+_assert_eq "ssh resolver: invoking shim delegates to the next real SSH" \
+  $'<-V>\nactive=\ndir=\npath='"${TERMNAV_TEST_BINARY%/termnav}:$ssh_invoking_shim:$ssh_installed_shim:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin" \
+  "$(cat "$ssh_real_log" 2>/dev/null)"
+_assert_eq "ssh resolver: two-shim integration invokes one shim" 1 \
+  "$(cat "$ssh_integration_count" 2>/dev/null)"
+
+ssh_copied_shim="$ssh_probe/copied-shim"
+ssh_copied_shim_two="$ssh_probe/copied-shim-two"
+ssh_copied_count="$ssh_probe/copied-count"
+mkdir -p "$ssh_copied_shim" "$ssh_copied_shim_two"
+cp "$ssh_shim" "$ssh_copied_shim/ssh"
+cp "$ssh_shim" "$ssh_copied_shim_two/ssh"
+# A count fuse keeps this real-binary regression safe if both the directory
+# and file-marker defenses are accidentally removed in a future change.
+for fixture_shim in "$ssh_copied_shim/ssh" "$ssh_copied_shim_two/ssh"; do
+  # shellcheck disable=SC2016 # Inserted variables expand in the fixture process.
+  sed -i.bak '3i\
+count=$(cat "$TERMNAV_TEST_COPIED_COUNT" 2>/dev/null || printf 0)\
+count=$((count + 1))\
+printf "%s\\n" "$count" >"$TERMNAV_TEST_COPIED_COUNT"\
+[ "$count" -lt 4 ] || exit 99
+' "$fixture_shim"
+  rm -f "$fixture_shim.bak"
+done
+rm -f "$ssh_real_log"
+TERMNAV_TEST_COPIED_COUNT="$ssh_copied_count" \
+  TERMNAV_TEST_COMMAND_LOG="$ssh_real_log" \
+  PATH="$ssh_copied_shim:$ssh_copied_shim_two:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin" \
+  _with_timeout 5s "$TERMNAV_TEST_BINARY" ssh -V \
+  >/dev/null 2>&1
+ssh_copied_status=$?
+_assert_exit "ssh resolver: relocated marked shim is never selected" 0 \
+  "$ssh_copied_status"
+_assert_eq "ssh resolver: relocated shim reaches the real SSH" \
+  $'<-V>\nactive=\ndir=\npath='"$ssh_copied_shim:$ssh_copied_shim_two:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin" \
+  "$(cat "$ssh_real_log" 2>/dev/null)"
+_assert_eq "ssh resolver: relocated shims are never invoked" '' \
+  "$(cat "$ssh_copied_count" 2>/dev/null)"
 
 cat >"$ssh_probe_bin/termnav" <<'SH'
 #!/usr/bin/env bash

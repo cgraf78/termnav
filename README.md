@@ -57,10 +57,13 @@ needs no alternate executable name or argv[0] dispatch. The wrapper is named
 for the ripgrep interface it adapts rather than for any current implementation
 detail inside Termnav. The private
 `share/termnav/shims/ssh` adapter is required for PATH interception and contains
-only enough policy to execute `termnav ssh`. During a staged upgrade where the
-shim arrives before the binary, it temporarily falls through to the next real
-`ssh` on PATH so repository synchronization can finish. Historical public
-command names are not installed.
+only enough policy to execute `termnav ssh`. It passes its exact runtime
+directory to the native resolver because checkout and installed shim copies can
+coexist during an update; recursive shim entry is rejected before another
+process can be created. During the bounded stage where the shim arrives before
+the binary, it uses a trusted platform OpenSSH path rather than the inherited
+shim-bearing PATH so repository synchronization can finish safely. Historical
+public command names are not installed.
 
 There is intentionally no source-checkout installer. Shdeps consumers use the
 ordinary `cgraf78/termnav github` dependency form, which prefers a published
