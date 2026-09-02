@@ -22,7 +22,10 @@ COMMIT_KEY = b"\x1b[777009u"
 COMMIT_QUERY = b"\x1b[?2004$p"
 DECRQM_RESPONSES = tuple(f"\x1b[?2004;{state}$y".encode() for state in range(5))
 SENTINEL_KEY = b"\x07"
-MIXED_PEER_TIMEOUT = 10.0
+# Multi-hop requests may consume the relay's eight-second RPC allowance before
+# the outer query is observable. Keep their test deadline aligned with the
+# asynchronous sender's ten-second completion bound.
+RELAY_TRANSACTION_TIMEOUT = 10.0
 
 
 def wait_for(getter, description: str, timeout: float = 4.0):
@@ -831,7 +834,7 @@ class RelayTerminalTest(unittest.TestCase):
                     self.harness.relay_for(implementations[0]),
                 )
                 try:
-                    terminal.read_until(COMMIT_QUERY, timeout=MIXED_PEER_TIMEOUT)
+                    terminal.read_until(COMMIT_QUERY, timeout=RELAY_TRANSACTION_TIMEOUT)
                 except AssertionError as error:
                     raise AssertionError(f"{error}\n{self.harness.diagnostics()}") from error
                 terminal.send(DECRQM_RESPONSES[1])
@@ -871,7 +874,7 @@ class RelayTerminalTest(unittest.TestCase):
                     wait_for(
                         lambda: prepared_count() == 3,
                         "three mixed prepared hops",
-                        timeout=MIXED_PEER_TIMEOUT,
+                        timeout=RELAY_TRANSACTION_TIMEOUT,
                     )
                 except AssertionError as error:
                     raise AssertionError(f"{error}\n{self.harness.diagnostics()}") from error
@@ -1261,7 +1264,7 @@ class RelayTerminalTest(unittest.TestCase):
         # The inner server can handle this request. The outer server therefore
         # consumes the terminal reply and forwards User8 into the nested client.
         request = self.harness.start_send(inner_relay, "pane-select", "right")
-        terminal.read_until(COMMIT_QUERY)
+        terminal.read_until(COMMIT_QUERY, timeout=RELAY_TRANSACTION_TIMEOUT)
         terminal.send(DECRQM_RESPONSES[4])
         self.harness.finish_send(request, "pane-select", "right")
         wait_for(
@@ -1278,7 +1281,7 @@ class RelayTerminalTest(unittest.TestCase):
         self.harness.tmux(inner_socket, "kill-pane", "-t", inner_right)
         terminal.drain()
         request = self.harness.start_send(inner_relay, "pane-select", "right")
-        terminal.read_until(COMMIT_QUERY)
+        terminal.read_until(COMMIT_QUERY, timeout=RELAY_TRANSACTION_TIMEOUT)
         terminal.send(DECRQM_RESPONSES[0])
         self.harness.finish_send(request, "pane-select", "right")
         wait_for(
@@ -1344,7 +1347,7 @@ class RelayTerminalTest(unittest.TestCase):
         inner_relay = self.harness.start_relay("deep-inner", inner_socket, inner_left)
 
         request = self.harness.start_send(inner_relay, "pane-select", "right")
-        terminal.read_until(COMMIT_QUERY)
+        terminal.read_until(COMMIT_QUERY, timeout=RELAY_TRANSACTION_TIMEOUT)
         self.assertEqual(inner_left, self.harness.active_pane(inner_socket, "inner"))
         self.assertEqual(middle_pane, self.harness.active_pane(middle_socket, "middle"))
         self.assertEqual(outer_pane, self.harness.active_pane(outer_socket, "outer"))
