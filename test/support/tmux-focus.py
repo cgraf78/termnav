@@ -943,7 +943,8 @@ class NestedFocusTest(unittest.TestCase):
             """Recognize both the rollout alias and the unified Rust CLI."""
             legacy = (str(self.focus), command)
             unified = ("tmux", "focus", command)
-            pairs = zip(arguments, arguments[1:], strict=False)
+            # CentOS Stream 9's default Python predates itertools.pairwise().
+            pairs = zip(arguments, arguments[1:])  # noqa: B905, RUF007
             if legacy in pairs:
                 return True
             return any(
