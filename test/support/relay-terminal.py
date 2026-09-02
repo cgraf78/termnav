@@ -98,13 +98,18 @@ class TerminalClient:
     def _finish_initialization(self) -> None:
         # New tmux versions probe for terminal capability passthrough with DSR
         # ?996, while older releases do not. The bound sentinel is the portable
-        # readiness contract; answer capability probes while waiting for it.
+        # readiness contract. tmux 3.2 can list a client before its input path
+        # honors key bindings, so retry the harmless probe while answering
+        # capability queries instead of depending on one precisely timed key.
         payload = bytearray()
         self.harness.sentinel.unlink(missing_ok=True)
-        os.write(self.master, SENTINEL_KEY)
         deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline:
-            chunk = self._read(0.05)
+        next_probe = 0.0
+        while (now := time.monotonic()) < deadline:
+            if now >= next_probe:
+                os.write(self.master, SENTINEL_KEY)
+                next_probe = now + 0.1
+            chunk = self._read(min(0.05, deadline - now))
             if chunk:
                 payload.extend(chunk)
                 self._answer_tmux_queries(chunk)
