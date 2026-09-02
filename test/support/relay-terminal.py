@@ -54,10 +54,14 @@ class TerminalClient:
             )
 
         listing = wait_for(self._identity, "tmux client attachment")
-        self.tty, listed_pid = listing.split()
+        self.tty, listed_pid, pane = listing.split()
         if int(listed_pid) != self.pid:
             raise AssertionError(f"tmux reported client pid {listed_pid}, expected {self.pid}")
         self._finish_initialization()
+        wait_for(
+            lambda: harness.navigation_ready(tmux_socket, pane, self.pid),
+            "tmux client navigation readiness",
+        )
         try:
             fd = os.open(self.tty, os.O_WRONLY | os.O_NOCTTY | os.O_APPEND)
         except PermissionError as exc:
@@ -73,12 +77,12 @@ class TerminalClient:
             self.tmux_socket,
             "list-clients",
             "-F",
-            "#{client_tty} #{client_pid}",
+            "#{client_tty} #{client_pid} #{pane_id}",
             check=False,
         )
         for line in result.stdout.splitlines():
             fields = line.split()
-            if len(fields) == 2 and fields[1] == str(self.pid):
+            if len(fields) == 3 and fields[1] == str(self.pid):
                 return line
         return None
 
@@ -98,13 +102,18 @@ class TerminalClient:
     def _finish_initialization(self) -> None:
         # New tmux versions probe for terminal capability passthrough with DSR
         # ?996, while older releases do not. The bound sentinel is the portable
-        # readiness contract; answer capability probes while waiting for it.
+        # readiness contract. tmux 3.2 can list a client before its input path
+        # honors key bindings, so retry the harmless probe while answering
+        # capability queries instead of depending on one precisely timed key.
         payload = bytearray()
         self.harness.sentinel.unlink(missing_ok=True)
-        os.write(self.master, SENTINEL_KEY)
         deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline:
-            chunk = self._read(0.05)
+        next_probe = 0.0
+        while (now := time.monotonic()) < deadline:
+            if now >= next_probe:
+                os.write(self.master, SENTINEL_KEY)
+                next_probe = now + 0.1
+            chunk = self._read(min(0.05, deadline - now))
             if chunk:
                 payload.extend(chunk)
                 self._answer_tmux_queries(chunk)
@@ -699,10 +708,6 @@ class RelayTerminalTest(unittest.TestCase):
             source_pane = pane_ids[0]
         self.harness.configure_commits(tmux_socket, terminal_replies=True)
         terminal = self.harness.attach(tmux_socket, "top")
-        wait_for(
-            lambda: self.harness.navigation_ready(tmux_socket, source_pane, terminal.pid),
-            "top-level tmux navigation readiness",
-        )
         relay_socket = self.harness.start_relay(
             "top",
             tmux_socket,

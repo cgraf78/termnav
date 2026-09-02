@@ -436,12 +436,26 @@ _assert_eq "navigation CLI: linked pane selects a tab in the attached session" \
 _assert_eq "navigation CLI: linked pane leaves the other session selected tab unchanged" \
   "$linked_before" \
   "$(tmux -L "$socket_name" display-message -p -t linked '#{window_id}')"
+# The next section tests local parent traversal, not linked-window routing.
+# Retire this section's linked session so older tmux releases do not resolve
+# directional pane targets against an unrelated session containing the window.
+tmux -L "$socket_name" kill-session -t linked
 
 echo
 echo "=== exact-client local parent traversal ==="
 
 tmux -L "$socket_name" select-window -t nav:panes
 tmux -L "$socket_name" select-pane -t "$left_pane"
+# Selecting the session's window and pane updates the server immediately, but
+# older tmux clients can publish their visible pane one redraw later. Parent
+# traversal validates that live client view, so wait for the observable state
+# instead of racing the redraw on slower releases such as tmux 3.2.
+visible_client_count=$(wait_for_client_panes "$left_pane" 2)
+if [[ "$visible_client_count" -ne 2 ]]; then
+  report_client_state
+fi
+_assert_eq "navigation CLI: both clients return to the containing pane" \
+  2 "$visible_client_count"
 tmux -L "$child_socket_name" new-session -d -s child
 TERM=xterm-256color TMUX="$socket_path,1,0" TMUX_PANE="$left_pane" \
   "$python_bin" "$TERMNAV_TEST_DIR/support/tmux-client.py" \
@@ -458,11 +472,16 @@ done
 read -r parent_client_pid parent_client_tty parent_client_created child_session \
   child_pane <<<"$child_client"
 child_socket_path=$(tmux -L "$child_socket_name" display-message -p -t child '#{socket_path}')
+set +e
 "$navigate" --parent pane-select right \
   --client-pid "$parent_client_pid" --client-tty "$parent_client_tty" \
   --client-created "$parent_client_created" \
   --client-termtype xterm-256color --source-socket "$child_socket_path" \
   --source-pane "$child_pane" --source-session "$child_session"
+parent_select_rc=$?
+set -e
+_assert_exit "navigation CLI: local parent traversal succeeds" \
+  0 "$parent_select_rc"
 _assert_eq "navigation CLI: a local parent is visited before any relay" \
   "$right_pane" \
   "$(tmux -L "$socket_name" display-message -p -t nav:panes '#{pane_id}')"
@@ -471,11 +490,15 @@ tmux -L "$socket_name" select-pane -t "$left_pane"
 wait_for_client_panes "$left_pane" 2 >/dev/null
 nested_source_before=$(pane_position "$left_pane")
 nested_neighbor_before=$(pane_position "$right_pane")
+set +e
 "$navigate" --parent pane-move right \
   --client-pid "$parent_client_pid" --client-tty "$parent_client_tty" \
   --client-created "$parent_client_created" \
   --client-termtype xterm-256color --source-socket "$child_socket_path" \
   --source-pane "$child_pane" --source-session "$child_session"
+parent_move_rc=$?
+set -e
+_assert_exit "pane move: local parent traversal succeeds" 0 "$parent_move_rc"
 _assert_eq "pane move: local nesting moves in the containing tmux" \
   "$nested_neighbor_before" "$(pane_position "$left_pane")"
 _assert_eq "pane move: local nesting swaps the exact neighbor" \

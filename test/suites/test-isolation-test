@@ -61,6 +61,39 @@ for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION; do
   fi
 done
 
+if command -v nvim >/dev/null 2>&1 && nvim --version >/dev/null 2>&1; then
+  nvim_fixture_dir=$(_tmpdir)
+  nvim_fixture=$nvim_fixture_dir/runner.lua
+  cat >"$nvim_fixture" <<'LUA'
+if arg[1] == "fail" then
+  error({kind = "non-string"})
+end
+print(arg[1], arg[2])
+LUA
+
+  set +e
+  nvim_output=$(_run_nvim_lua "$nvim_fixture" "left value" "right:value" 2>&1)
+  nvim_status=$?
+  set -e
+  _assert_exit "test isolation: Neovim Lua runner returns success" 0 "$nvim_status"
+  _assert_eq "test isolation: Neovim Lua runner preserves arguments and output" \
+    $'left value\tright:value' "$nvim_output"
+
+  set +e
+  nvim_output=$(_run_nvim_lua "$nvim_fixture" fail 2>&1)
+  nvim_status=$?
+  set -e
+  if [[ $nvim_status -eq 0 || $nvim_status -eq 124 ]]; then
+    _fail "test isolation: Neovim Lua runner reports non-string errors promptly"
+  else
+    _pass "test isolation: Neovim Lua runner reports non-string errors promptly"
+  fi
+  _assert_contains "test isolation: Neovim Lua runner renders non-string errors" \
+    "table:" "$nvim_output"
+else
+  _test_style dim "  - skipping Neovim Lua runner checks (nvim unavailable)"
+fi
+
 timeout_fixture=$(_tmpdir)
 timeout_leader_pid=$timeout_fixture/leader.pid
 timeout_child_pid=$timeout_fixture/child.pid

@@ -27,9 +27,7 @@ _run_lua() {
     return
   fi
   if command -v nvim >/dev/null 2>&1; then
-    # Neovim's -l mode writes Lua print() output to stderr, unlike standalone
-    # lua. Capture both streams in callers for stable assertions.
-    nvim --headless -u NONE -n -l "$@" 2>&1
+    _run_nvim_lua "$@" 2>&1
     return
   fi
   return 127
