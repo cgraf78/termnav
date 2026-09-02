@@ -1062,6 +1062,7 @@ class NestedFocusTest(unittest.TestCase):
         self,
     ) -> None:
         inner = self.new_server("inner", "sleep 30")
+        self.require_client_focus_hooks(inner)
         inner_active = self.tmux(inner, "display-message", "-p", "#{pane_id}")
         self.tmux(inner, "split-window", "-d", "sleep 30")
         outer = self.new_server(
@@ -1087,10 +1088,6 @@ class NestedFocusTest(unittest.TestCase):
             "focused child claim on its parent pane",
         )
         self.assertEqual("", self.pane_claim(outer, sibling_pane))
-
-        # tmux 3.2 can publish the initial claim through client-attached, but
-        # it has no client-focus-in/out hooks for the transitions below.
-        self.require_client_focus_hooks(inner)
 
         self.tmux(outer, "select-pane", "-t", sibling_pane)
         wait_until(
