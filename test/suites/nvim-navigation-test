@@ -18,8 +18,7 @@ fi
 output=$(
   TERMNAV_NAVIGATION_MODULE="$TERMNAV_ROOT/lib/termnav/nvim/navigation.lua" \
     TERMNAV_SETUP_MODULE="$TERMNAV_ROOT/lib/termnav/nvim/setup.lua" \
-    nvim --headless --noplugin -u NONE -i NONE \
-    -l "$TERMNAV_ROOT/test/support/nvim-navigation.lua" 2>&1
+    _run_nvim_lua "$TERMNAV_ROOT/test/support/nvim-navigation.lua" 2>&1
 )
 status=$?
 

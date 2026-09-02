@@ -28,7 +28,7 @@ _run_lua() {
   if command -v lua >/dev/null 2>&1; then
     lua "$@"
   elif command -v nvim >/dev/null 2>&1; then
-    nvim --headless --clean -n -u NONE -i NONE -l "$@" 2>&1
+    _run_nvim_lua "$@" 2>&1
   else
     return 127
   fi
@@ -125,11 +125,14 @@ assert(type(context.publish) == "function")
 assert(context.group_name == "termnav_example_test")
 print("termnav Neovim example passed")
 LUA
+  # CentOS Stream ships Neovim 0.8, which predates `nvim -l`. Drive the Lua
+  # fixture through the older public command API and choose an explicit exit
+  # for both outcomes so an assertion cannot be hidden by the final quit.
   set +e
   output=$(TERMNAV_ROOT="$TERMNAV_ROOT" \
     TERMNAV_WEIRD_COMMAND="$_weird_termnav" \
     PATH="$TERMNAV_BINARY_DIR:$PATH" \
-    nvim --headless --clean -n -u NONE -i NONE -l "$_nvim_test" 2>&1)
+    _run_nvim_lua "$_nvim_test" 2>&1)
   rc=$?
   set -e
   _assert_exit "examples: Neovim composition loads" 0 "$rc"
@@ -164,12 +167,36 @@ if command -v tmux >/dev/null 2>&1; then
     '#{socket_path}' "$_tmux_keys"
   _assert_contains "examples: tmux click identity uses the event pane" \
     '#{mouse_pane}' "$_tmux_keys"
-  _tmux_focus_hooks=$(tmux -L "$_socket" show-hooks -g client-focus-in)
-  _assert_contains "examples: tmux config publishes nested focus" \
-    "termnav tmux focus watch" "$_tmux_focus_hooks"
-  _assert_contains "examples: tmux focus excludes control clients" \
-    '#{==:#{client_control_mode},0}' "$_tmux_focus_hooks"
-  _tmux_focus_sync_hook=$(tmux -L "$_socket" show-hooks -g after-select-pane)
+  # tmux 3.2 accepts these hooks but cannot filter `show-hooks` by one hook
+  # name. Inspect the complete global table, as with the root key table above,
+  # so the example stays testable on the oldest supported distro package.
+  _tmux_hooks=$(tmux -L "$_socket" show-hooks -g)
+  _tmux_focus_hooks=$(printf '%s\n' "$_tmux_hooks" |
+    awk '$1 ~ /^client-focus-in(\[[^]]+\])?$/')
+  _tmux_attach_hooks=$(printf '%s\n' "$_tmux_hooks" |
+    awk '$1 ~ /^client-attached(\[[^]]+\])?$/')
+  _tmux_focus_sync_hook=$(printf '%s\n' "$_tmux_hooks" |
+    awk '$1 ~ /^after-select-pane(\[[^]]+\])?$/')
+  if [[ -n $_tmux_focus_hooks ]]; then
+    _assert_contains "examples: tmux config registers client focus" \
+      "client-focus-in" "$_tmux_focus_hooks"
+    _assert_contains "examples: tmux config publishes nested focus" \
+      "termnav tmux focus watch" "$_tmux_focus_hooks"
+    _assert_contains "examples: tmux focus excludes control clients" \
+      '#{==:#{client_control_mode},0}' "$_tmux_focus_hooks"
+  else
+    # tmux 3.2 accepts the newer hook in a config but does not expose it in the
+    # supported hook table. Preserve coverage through the attach hook instead
+    # of claiming that terminal focus transitions exist on that release.
+    _assert_contains "examples: old tmux registers client attachment" \
+      "client-attached" "$_tmux_attach_hooks"
+    _assert_contains "examples: old tmux publishes initial nested focus" \
+      "termnav tmux focus watch" "$_tmux_attach_hooks"
+    _assert_contains "examples: old tmux attachment excludes control clients" \
+      '#{==:#{client_control_mode},0}' "$_tmux_attach_hooks"
+  fi
+  _assert_contains "examples: tmux config registers pane focus repair" \
+    "after-select-pane" "$_tmux_focus_sync_hook"
   _assert_contains "examples: stale pane dimming is repaired on selection" \
     'termnav tmux focus sync' "$_tmux_focus_sync_hook"
   _assert_contains "examples: ordinary pane selection remains process-free" \

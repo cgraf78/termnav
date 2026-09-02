@@ -360,7 +360,8 @@ def serve(path: str) -> int:
         while not STOP.is_set():
             try:
                 connection, _ = listener.accept()
-            except TimeoutError:
+            # Python 3.9 does not reliably alias this to builtin TimeoutError.
+            except socket.timeout:  # noqa: UP041
                 continue
             threading.Thread(target=handle_connection, args=(connection,), daemon=True).start()
     finally:

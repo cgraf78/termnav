@@ -329,7 +329,7 @@ _with_timeout() {
   local secs="$1"
   shift
   if command -v python3 &>/dev/null; then
-    if python3 - "$secs" "$@" <<'PY'; then
+    if python3 - "$secs" "$@" <<'PY'
 import os
 import signal
 import subprocess
@@ -424,6 +424,7 @@ except SupervisorSignal as caught:
         stop_group(process, caught.signum)
     raise SystemExit(128 + caught.signum)
 PY
+    then
       return 0
     else
       return $?
@@ -448,6 +449,42 @@ PY
     printf 'test timeout requires timeout, gtimeout, or python3\n' >&2
     return 127
   fi
+}
+
+# Run one Lua script through Neovim's command API rather than `nvim -l`, which
+# is unavailable before Neovim 0.9. Recreate standalone Lua's `arg` table so
+# fixtures can share the same entry point under either interpreter.
+_run_nvim_lua() {
+  local script=$1 argument driver output status index=1
+  local -a environment
+  shift
+
+  environment=("TERMNAV_NVIM_TEST=$script" "TERMNAV_NVIM_ARGC=$#")
+  for argument in "$@"; do
+    environment+=("TERMNAV_NVIM_ARG_$index=$argument")
+    index=$((index + 1))
+  done
+
+  driver='local script = assert(vim.env.TERMNAV_NVIM_TEST); '
+  driver+='local argc = tonumber(vim.env.TERMNAV_NVIM_ARGC or "0") or 0; '
+  driver+='_G.arg = { [0] = script }; '
+  driver+='for i = 1, argc do _G.arg[i] = vim.env["TERMNAV_NVIM_ARG_" .. i] end; '
+  driver+='_G.print = function(...) local values = {}; '
+  driver+='for i = 1, select("#", ...) do values[i] = tostring(select(i, ...)) end; '
+  driver+='io.stdout:write(table.concat(values, "\t"), "\n"); io.stdout:flush() end; '
+  driver+='local ok, err = pcall(dofile, script); '
+  driver+='if ok then vim.cmd("qa!") else vim.api.nvim_err_writeln(tostring(err)); vim.cmd("cquit") end'
+
+  if output=$(_with_timeout 30s env "${environment[@]}" \
+    nvim --headless --clean -n -u NONE -i NONE -c "lua $driver" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  # Older Neovim command-mode output uses terminal CRLF endings. Normalize it
+  # to standalone Lua's line format so interpreter choice cannot alter tests.
+  printf '%s\n' "$output" | tr -d '\r'
+  return "$status"
 }
 
 # Wait until an AF_UNIX stream socket accepts connections. A socket path exists
