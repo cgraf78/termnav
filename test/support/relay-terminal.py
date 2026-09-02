@@ -54,10 +54,14 @@ class TerminalClient:
             )
 
         listing = wait_for(self._identity, "tmux client attachment")
-        self.tty, listed_pid = listing.split()
+        self.tty, listed_pid, pane = listing.split()
         if int(listed_pid) != self.pid:
             raise AssertionError(f"tmux reported client pid {listed_pid}, expected {self.pid}")
         self._finish_initialization()
+        wait_for(
+            lambda: harness.navigation_ready(tmux_socket, pane, self.pid),
+            "tmux client navigation readiness",
+        )
         try:
             fd = os.open(self.tty, os.O_WRONLY | os.O_NOCTTY | os.O_APPEND)
         except PermissionError as exc:
@@ -73,12 +77,12 @@ class TerminalClient:
             self.tmux_socket,
             "list-clients",
             "-F",
-            "#{client_tty} #{client_pid}",
+            "#{client_tty} #{client_pid} #{pane_id}",
             check=False,
         )
         for line in result.stdout.splitlines():
             fields = line.split()
-            if len(fields) == 2 and fields[1] == str(self.pid):
+            if len(fields) == 3 and fields[1] == str(self.pid):
                 return line
         return None
 
@@ -704,10 +708,6 @@ class RelayTerminalTest(unittest.TestCase):
             source_pane = pane_ids[0]
         self.harness.configure_commits(tmux_socket, terminal_replies=True)
         terminal = self.harness.attach(tmux_socket, "top")
-        wait_for(
-            lambda: self.harness.navigation_ready(tmux_socket, source_pane, terminal.pid),
-            "top-level tmux navigation readiness",
-        )
         relay_socket = self.harness.start_relay(
             "top",
             tmux_socket,
