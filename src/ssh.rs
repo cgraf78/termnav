@@ -13,6 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, sync_channel};
@@ -153,10 +154,10 @@ pub fn run(arguments: &[OsString]) -> io::Result<i32> {
 }
 
 fn run_plain(binary: &Path, arguments: &[OsString]) -> io::Result<i32> {
-    ssh_command(binary)
-        .args(arguments)
-        .status()
-        .map(process::status_code)
+    // A bypassed call must be indistinguishable from launching OpenSSH
+    // directly. Replacing this process preserves the PID and lets supervisors
+    // signal and reap the transport they selected instead of a waiting parent.
+    Err(ssh_command(binary).args(arguments).exec())
 }
 
 pub(crate) fn real_ssh() -> io::Result<PathBuf> {

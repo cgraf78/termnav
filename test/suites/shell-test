@@ -275,7 +275,7 @@ for clock_shell in bash zsh; do
 done
 
 echo
-echo "=== inherited SSH interposition ==="
+echo "=== SSH routing boundaries ==="
 
 shell_integration="$TERMNAV_ROOT/share/termnav/shell.sh"
 ssh_shim="$TERMNAV_ROOT/share/termnav/shims/ssh"
@@ -454,7 +454,11 @@ cat >"$ssh_probe_bin/termnav" <<'SH'
 #!/usr/bin/env bash
 printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
 SH
-chmod +x "$ssh_probe_bin/termnav"
+cat >"$ssh_probe_bin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_COMMAND_LOG"
+SH
+chmod +x "$ssh_probe_bin/termnav" "$ssh_probe_bin/ssh"
 
 _assert_file_exists "ssh shim: provider-owned executable exists" "$ssh_shim"
 _assert_eq "ssh shim: provider-owned command is executable" true \
@@ -484,7 +488,7 @@ for test_shell in "${ssh_test_shells[@]}"; do
     # shellcheck disable=SC2016 # The selected child shell expands the fixture.
     env -i \
       HOME="$HOME" \
-      PATH="/usr/bin:${ssh_shim%/ssh}:/bin:${ssh_shim%/ssh}:$ssh_probe_bin:" \
+      PATH="/usr/bin:${ssh_shim%/ssh}:/bin:$ssh_probe/old/share/termnav/shims:${ssh_shim%/ssh}:$ssh_probe_bin:" \
       SHELL_INTEGRATION="$shell_integration" \
       "$test_shell_path" "${test_shell_args[@]}" -c '
         source "$SHELL_INTEGRATION"
@@ -492,10 +496,10 @@ for test_shell in "${ssh_test_shells[@]}"; do
         printf "path=%s\n" "$PATH"
       '
   )
-  _assert_contains "ssh shim: $test_shell restores inherited shim priority" \
-    "ssh=$ssh_shim" "$ssh_priority_output"
-  _assert_contains "ssh shim: $test_shell preserves unrelated PATH order" \
-    "path=${ssh_shim%/ssh}:/usr/bin:/bin:$ssh_probe_bin:" \
+  _assert_contains "ssh routing: $test_shell resolves the shell function" \
+    "ssh=ssh" "$ssh_priority_output"
+  _assert_contains "ssh routing: $test_shell removes inherited shim entries" \
+    "path=/usr/bin:/bin:$ssh_probe_bin:" \
     "$ssh_priority_output"
 
   ssh_only_output=$(
@@ -508,15 +512,15 @@ for test_shell in "${ssh_test_shells[@]}"; do
         source "$SHELL_INTEGRATION"
         source "$SHELL_INTEGRATION"
         printf "path=%s\n" "$PATH"
-        if typeset -f _termnav_shell_prepend_ssh_shim >/dev/null 2>&1; then
+        if typeset -f _termnav_shell_remove_ssh_shim >/dev/null 2>&1; then
           printf "helper=present\n"
         else
           printf "helper=absent\n"
         fi
       '
   )
-  _assert_eq "ssh shim: $test_shell all-shim PATH stays exact" \
-    $'path='"${ssh_shim%/ssh}"$'\nhelper=absent' "$ssh_only_output"
+  _assert_eq "ssh routing: $test_shell removes an all-shim PATH" \
+    $'path=\nhelper=absent' "$ssh_only_output"
 
   ssh_empty_path_output=$(
     # shellcheck disable=SC2016 # The selected child shell expands the fixture.
@@ -537,8 +541,8 @@ for test_shell in "${ssh_test_shells[@]}"; do
         printf "components=%s\n" "$PATH"
       '
   )
-  _assert_eq "ssh shim: $test_shell preserves empty PATH components" \
-    $'unset='"${ssh_shim%/ssh}"$'\nempty='"${ssh_shim%/ssh}"$'\ncomponents='"${ssh_shim%/ssh}"$':::/usr/bin:' \
+  _assert_eq "ssh routing: $test_shell preserves unrelated empty PATH components" \
+    $'unset=\nempty=\ncomponents=::/usr/bin:' \
     "$ssh_empty_path_output"
 
   ssh_tty_log="$ssh_probe/$test_shell-tty-command.log"
@@ -552,12 +556,9 @@ for test_shell in "${ssh_test_shells[@]}"; do
   # Termux implements conventional /usr/bin shebang paths through termux-exec;
   # preserve only its LD_PRELOAD hook across env isolation so the fixture has
   # the same executable semantics as a real Termux login shell.
-  # Keep all three fixture descriptors non-terminal. This suite owns only PATH
-  # interposition and argument forwarding, so a fake Termnav records the exact
-  # adapter call without also starting the independently-tested relay
-  # supervisor. Relay-test and relay-terminal-test own enhanced SSH behavior
-  # and the real PTY contract. Separating those layers also keeps Android's adb
-  # transport PTY from coupling shell activation to relay lifecycle behavior.
+  # Keep all three fixture descriptors non-terminal. This suite owns only the
+  # shell boundary and argument forwarding, so fake commands record the exact
+  # calls without also starting the independently-tested relay supervisor.
   # shellcheck disable=SC2016
   ssh_probe_output=$(
     _with_timeout 20s env -i \
@@ -583,8 +584,7 @@ for test_shell in "${ssh_test_shells[@]}"; do
           printf "function=absent\n"
         fi
         TERMNAV_TEST_COMMAND_LOG="$SSH_TTY_LOG" \
-          "$CHILD_BASH" --noprofile --norc -c \
-          '"'"'exec ssh -t child.example printf hello'"'"'
+          ssh -t shell.example printf hello
         TERMNAV_TEST_COMMAND_LOG="$SSH_PLAIN_LOG" \
           "$CHILD_BASH" --noprofile --norc -c \
           '"'"'exec ssh child.example printf hello </dev/null'"'"'
@@ -594,16 +594,16 @@ for test_shell in "${ssh_test_shells[@]}"; do
   ssh_probe_rc=$?
   _assert_eq "ssh shim: $test_shell fixture exits within its bound" \
     "0" "$ssh_probe_rc"
-  _assert_contains "ssh shim: $test_shell resolves the provider-owned shim" \
-    "ssh=$ssh_shim" "$ssh_probe_output"
-  _assert_contains "ssh shim: $test_shell activation is idempotent" \
-    "shim-count=1" "$ssh_probe_output"
-  _assert_contains "ssh shim: $test_shell defines no ssh function" \
-    "function=absent" "$ssh_probe_output"
-  _assert_eq "ssh shim: $test_shell child delegates the exact tty command" \
-    $'<ssh>\n<-t>\n<child.example>\n<printf>\n<hello>' "$(cat "$ssh_tty_log")"
-  _assert_eq "ssh shim: $test_shell child delegates the exact non-tty command" \
-    $'<ssh>\n<child.example>\n<printf>\n<hello>' "$(cat "$ssh_plain_log")"
+  _assert_contains "ssh routing: $test_shell resolves a shell-local function" \
+    "ssh=ssh" "$ssh_probe_output"
+  _assert_contains "ssh routing: $test_shell leaves no inherited shim" \
+    "shim-count=0" "$ssh_probe_output"
+  _assert_contains "ssh routing: $test_shell defines the ssh function" \
+    "function=present" "$ssh_probe_output"
+  _assert_eq "ssh routing: $test_shell function delegates the exact tty command" \
+    $'<ssh>\n<-t>\n<shell.example>\n<printf>\n<hello>' "$(cat "$ssh_tty_log")"
+  _assert_eq "ssh routing: $test_shell child bypasses Termnav" \
+    $'<child.example>\n<printf>\n<hello>' "$(cat "$ssh_plain_log")"
 done
 
 echo
