@@ -283,6 +283,28 @@ ssh_probe=$(_tmpdir)
 ssh_probe_bin="$ssh_probe/bin"
 mkdir -p "$ssh_probe_bin"
 
+if command -v zsh >/dev/null 2>&1; then
+  path_log="$ssh_probe/zsh-chpwd-paths"
+  zsh_path=/usr/bin:/bin
+  # shellcheck disable=SC2016 # The child zsh expands the fixture variables.
+  env -i \
+    HOME="$HOME" \
+    PATH="$zsh_path" \
+    PATH_LOG="$path_log" \
+    SHELL_INTEGRATION="$shell_integration" \
+    zsh -f -c '
+      capture_chpwd_path() {
+        print -r -- "$PATH" >>"$PATH_LOG"
+      }
+      chpwd_functions=(capture_chpwd_path)
+      source "$SHELL_INTEGRATION"
+    '
+  _assert_eq "shell loader: zsh directory hooks retain PATH" \
+    "$zsh_path" "$(<"$path_log")"
+else
+  echo "  - skipping shell loader PATH case in zsh (zsh unavailable)"
+fi
+
 # Repository synchronization can update this shim before Shdeps reaches its
 # later tool-install phase. During that bounded cutover window, SSH must remain
 # usable so the same update can finish installing the new Termnav binary.

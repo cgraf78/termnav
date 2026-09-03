@@ -16,14 +16,16 @@ _termnav_shell_script_parent() {
 }
 
 _termnav_shell_script_dir() {
-  local path="$1" dir target
-  while [[ -L "$path" ]]; do
-    dir=$(cd -P -- "$(_termnav_shell_script_parent "$path")" && pwd) || return 1
-    target=$(readlink "$path") || return 1
+  # In zsh, lowercase `path` is tied to PATH. Localizing that name would hide
+  # every executable while directory changes run any existing chpwd hooks.
+  local script_path="$1" dir target
+  while [[ -L "$script_path" ]]; do
+    dir=$(cd -P -- "$(_termnav_shell_script_parent "$script_path")" && pwd) || return 1
+    target=$(readlink "$script_path") || return 1
     [[ "$target" == /* ]] || target="$dir/$target"
-    path="$target"
+    script_path="$target"
   done
-  cd -P -- "$(_termnav_shell_script_parent "$path")" && pwd
+  cd -P -- "$(_termnav_shell_script_parent "$script_path")" && pwd
 }
 
 _termnav_shell_source_path="$0"
