@@ -75,4 +75,39 @@ _assert_file_missing "process contract: shell activation invokes no Termnav comm
 _assert_eq "process contract: shell activation creates no runtime state" \
   false "$([[ -e "$tmp/runtime" ]] && echo true || echo false)"
 
+# Plain SSH modes must replace Termnav with OpenSSH. Supervisors such as
+# fwdports signal and reap the PID they launched; retaining a waiting Termnav
+# parent would let the real SSH process survive after that PID exits.
+ssh_bin="$tmp/ssh-bin"
+ssh_pid_file="$tmp/ssh.pid"
+mkdir -p "$ssh_bin"
+cat >"$ssh_bin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$TERMNAV_TEST_SSH_PID_FILE"
+trap 'exit 0' HUP INT TERM
+while :; do
+  sleep 1
+done
+SH
+chmod 0700 "$ssh_bin/ssh"
+
+TERMNAV_TEST_SSH_PID_FILE="$ssh_pid_file" \
+  PATH="$ssh_bin:${BASH%/*}:/usr/bin:/bin" \
+  "$TERMNAV_TEST_BINARY" ssh -N pid-contract.example \
+  >/dev/null 2>&1 &
+launcher_pid=$!
+deadline=$((SECONDS + 5))
+while [[ ! -s "$ssh_pid_file" && $SECONDS -lt $deadline ]]; do
+  sleep 0.01
+done
+ssh_pid=$(cat "$ssh_pid_file" 2>/dev/null || true)
+_assert_eq "process contract: plain SSH preserves the launched PID" \
+  "$launcher_pid" "$ssh_pid"
+
+kill -TERM "$launcher_pid" 2>/dev/null || true
+if [[ -n "$ssh_pid" && "$ssh_pid" != "$launcher_pid" ]]; then
+  kill -TERM "$ssh_pid" 2>/dev/null || true
+fi
+wait "$launcher_pid" 2>/dev/null || true
+
 _test_summary

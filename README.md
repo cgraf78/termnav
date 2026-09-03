@@ -30,9 +30,11 @@ installation path to build, publish, update, and diagnose.
   tab selection, and tab movement. `pane-move left|down|up|right` swaps the
   active pane with one directional neighbor through local tmux ancestry only;
   it never crosses SSH, WezTerm, VS Code, or another terminal boundary.
-- `termnav ssh SSH-ARG...`: supervise the user's one requested SSH session and
-  its connection-scoped reverse relay. It never opens a second authenticated
-  transport, including during cleanup or remote editor reuse.
+- `termnav ssh SSH-ARG...`: supervise an enhanced interactive SSH session and
+  its connection-scoped reverse relay. Plain and control-mode invocations
+  replace Termnav with OpenSSH, preserving the launched PID. Termnav never
+  opens a second authenticated transport, including during cleanup or remote
+  editor reuse.
 - `termnav relay send ACTION DIRECTION`: send one navigation request to the
   inherited relay using the same `pane-select`, `tab-select`, or `tab-move`
   action names as `termnav navigate`. The host-local `pane-move` action is
@@ -65,15 +67,15 @@ adapter is available. Passthrough commands otherwise preserve child status.
 Ripgrep's `--hostname-bin` accepts an executable name but cannot pass arguments.
 A consumer can provide a tiny `ripgrep-link-host` wrapper that delegates to the
 explicit `termnav link-host` command; Termnav therefore needs no alternate
-executable name or argv[0] dispatch. The private
-`share/termnav/shims/ssh` adapter is required for PATH interception and contains
-only enough policy to execute `termnav ssh`. It passes its exact runtime
-directory to the native resolver because checkout and installed shim copies can
-coexist during an update; recursive shim entry is rejected before another
-process can be created. During the bounded stage where the shim arrives before
-the binary, it uses a trusted platform OpenSSH path rather than the inherited
-shim-bearing PATH so repository synchronization can finish safely. Historical
-public command names are not installed.
+executable name or argv[0] dispatch. The private `share/termnav/shims/ssh`
+adapter remains available for callers that explicitly opt into scoped PATH
+interception. It contains only enough policy to execute `termnav ssh` and passes
+its exact runtime directory to the native resolver because checkout and
+installed shim copies can coexist during an update. Recursive shim entry is
+rejected before another process can be created. During the bounded stage where
+the shim arrives before the binary, it uses a trusted platform OpenSSH path
+rather than the inherited shim-bearing PATH so repository synchronization can
+finish safely. Historical public command names are not installed.
 
 There is intentionally no source-checkout installer. Shdeps consumers use the
 ordinary `cgraf78/termnav github` dependency form, which prefers a published
@@ -87,7 +89,8 @@ status. Reusable behavior lives behind focused library interfaces:
 - `navigation` owns typed scope traversal and routing decisions;
 - `relay` owns the versioned Unix-socket protocol and transactional directive
   store;
-- `ssh` owns exactly one SSH child and its reverse-forward lifecycle;
+- `ssh` owns one enhanced SSH child and its reverse-forward lifecycle, while
+  plain invocations replace Termnav with OpenSSH;
 - `focus` owns one-hop tmux leases and pane-style restoration;
 - `nvim` owns target parsing, registry selection, RPC, exact-pane transport
   fallback, and mux-only remote reuse;
@@ -146,10 +149,10 @@ constructing protocol objects directly.
   owns and publishes each window's tab-switch socket and capability. New
   integrations use the latest versioned directory declared by their consuming
   configuration.
-- `share/termnav/shell.sh`: sourceable interactive shell loader for inherited
+- `share/termnav/shell.sh`: sourceable interactive shell loader for shell-local
   SSH relay interposition, WezTerm pane context publishing, and file-link mode
-  classification. It prepends a private Termnav shim directory rather than
-  defining an `ssh()` shell function, so child processes use the same route.
+  classification. Its `ssh()` function affects commands entered in that shell;
+  child processes resolve their own SSH executable from PATH.
 
 Discover non-binary assets through the standalone command so consumers do not
 depend on a particular installer or activation root:
@@ -430,9 +433,10 @@ environment channel, including sessions carried by an existing ControlMaster.
 It never changes SSH's destination, remote-command arguments, or login-shell
 selection. Explicit commands are enhanced only when their command line requests
 a TTY, while non-TTY commands and control modes pass through unchanged. The
-sourceable shell integration exposes this behavior to descendants through a
-private `ssh` PATH shim, so scripts and tools need no Termnav-specific
-integration.
+sourceable shell integration exposes this behavior through a shell-local
+`ssh()` function. Scripts and descendant tools continue to resolve their own
+SSH executable; callers that intentionally need inherited interception can add
+the private shim directory to only that launcher's PATH.
 Strict `ExitOnForwardFailure=yes` configurations are delegated unchanged rather
 than making Termnav's optional relay mandatory.
 
