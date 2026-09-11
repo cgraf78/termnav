@@ -451,6 +451,49 @@ PY
   fi
 }
 
+# Run a command with stdout/stderr attached to a pty (so `[ -t 1 ]`
+# succeeds) and print the transcript. Returns 127 without python3, which
+# provides the portable pty allocation; callers skip in that case.
+_with_pty() {
+  command -v python3 &>/dev/null || return 127
+  python3 - "$@" <<'PY'
+import os
+import pty
+import subprocess
+import sys
+
+
+def main(argv):
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=slave,
+            stdout=slave,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    finally:
+        os.close(slave)
+    chunks = []
+    while True:
+        try:
+            data = os.read(master, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        chunks.append(data)
+    proc.wait()
+    os.close(master)
+    sys.stdout.buffer.write(b"".join(chunks))
+    return proc.returncode
+
+
+sys.exit(main(sys.argv[1:]))
+PY
+}
+
 # Run one Lua script through Neovim's command API rather than `nvim -l`, which
 # is unavailable before Neovim 0.9. Recreate standalone Lua's `arg` table so
 # fixtures can share the same entry point under either interpreter.

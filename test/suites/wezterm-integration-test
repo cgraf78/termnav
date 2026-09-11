@@ -389,17 +389,21 @@ for test_shell in bash zsh; do
         SECONDS=100
         source "$SHELL_INTEGRATION" >/dev/null
         printf "loaded=%s\n" "${TERMNAV_SHELL_LOADED:-}"
-        printf "queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+        printf "source-queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+        _termnav_wezterm_precmd >/dev/null
+        printf "precmd-queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
         printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
       '
   )
   _assert_contains "shell integration: $test_shell loads the real provider" \
     "loaded=1" "$startup_publish_output"
-  _assert_contains "shell integration: $test_shell startup shares one tmux context query" \
-    "queries=1" "$startup_publish_output"
-  _assert_contains "shell integration: $test_shell shared startup query publishes global remote host" \
+  _assert_contains "shell integration: $test_shell source performs no tmux query" \
+    "source-queries=0" "$startup_publish_output"
+  _assert_contains "shell integration: $test_shell first prompt shares one tmux context query" \
+    "precmd-queries=1" "$startup_publish_output"
+  _assert_contains "shell integration: $test_shell shared first-prompt query publishes global remote host" \
     "host=remote.example" "$startup_publish_output"
-  _assert_contains "shell integration: $test_shell shared startup query reads global tmux environment" \
+  _assert_contains "shell integration: $test_shell shared first-prompt query reads global tmux environment" \
     "show-environment -g TERMNAV_REMOTE_LINK_HOST" "$(cat "$shell_tmux_log")"
 
   for query_result in failure empty; do
@@ -421,6 +425,9 @@ for test_shell in bash zsh; do
           source "$SHELL_INTEGRATION" >/dev/null
           printf "initial=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
 
+          _termnav_wezterm_precmd >/dev/null
+          printf "first-prompt=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+
           unset TMUX_MOCK_DISPLAY_FAIL TMUX_MOCK_DISPLAY_EMPTY
           export TMUX_MOCK_REMOTE_LINK_HOST=remote.example
           SECONDS=106
@@ -429,10 +436,12 @@ for test_shell in bash zsh; do
           printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
         '
     )
-    _assert_contains "shell integration: $test_shell startup $query_result uses one tmux query" \
-      "initial=1" "$startup_recovery_output"
+    _assert_contains "shell integration: $test_shell startup $query_result uses no tmux query" \
+      "initial=0" "$startup_recovery_output"
+    _assert_contains "shell integration: $test_shell first prompt $query_result attempts discovery" \
+      "first-prompt=7" "$startup_recovery_output"
     _assert_contains "shell integration: $test_shell startup $query_result retries on expiry" \
-      "recovered=2" "$startup_recovery_output"
+      "recovered=8" "$startup_recovery_output"
     _assert_contains "shell integration: $test_shell startup $query_result recovers remote host" \
       "host=remote.example" "$startup_recovery_output"
   done
@@ -447,6 +456,8 @@ for test_shell in bash zsh; do
       "${test_shell_command[@]}" -c '
         SECONDS=100
         source "$SHELL_INTEGRATION" >/dev/null
+        # Prime the caches the source-time publish used to fill.
+        _termnav_wezterm_preexec true >/dev/null
         : >"$TERMNAV_TMUX_QUERY_LOG"
 
         _termnav_wezterm_preexec true >/dev/null
@@ -479,6 +490,7 @@ remote_refresh_output=$(
     bash --noprofile --norc -c '
       SECONDS=100
       source "$SHELL_INTEGRATION" >/dev/null
+      _termnav_wezterm_precmd >/dev/null
       printf "initial=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
 
       export TMUX_MOCK_REMOTE_LINK_HOST=remote-b.example
@@ -497,6 +509,7 @@ remote_refresh_output=$(
 
       export TMUX_MOCK_REMOTE_LINK_HOST=remote-d.example
       source "$SHELL_INTEGRATION" >/dev/null
+      _termnav_wezterm_precmd >/dev/null
       printf "resource=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-}"
     '
 )
@@ -579,6 +592,8 @@ for test_shell in bash zsh; do
       "${test_shell_command[@]}" -c '
         SECONDS=100
         source "$SHELL_INTEGRATION" >/dev/null
+        # Prime the caches the source-time publish used to fill.
+        _termnav_wezterm_preexec true >/dev/null
         : >"$TERMNAV_HOSTNAME_QUERY_LOG"
 
         _termnav_wezterm_preexec true >/dev/null
@@ -2022,6 +2037,110 @@ if [[ "$(uname)" == "Darwin" ]]; then
     "send-keys" "$gui_env_typed"
 else
   echo "  - skipping stripped gui environment smoke test (macOS only)"
+fi
+
+echo
+echo "=== shell integration: deferred first publish ==="
+
+# Sourcing with captured stdout must not capture OSC bytes (WezTerm-active,
+# no tmux involved). Fails before the source-time publish is deferred.
+# shellcheck disable=SC2016 # Variables expand in the child shell.
+_non_tty_source_output=$(
+  env -i \
+    HOME="$HOME" \
+    PATH="/usr/bin:/bin" \
+    TERM_PROGRAM=WezTerm \
+    SHELL_INTEGRATION="$shell_integration" \
+    bash --noprofile --norc -c '
+      source "$SHELL_INTEGRATION"
+      printf "loaded=%s\n" "${TERMNAV_SHELL_LOADED:-}"
+    '
+)
+_assert_not_contains "shell integration: captured stdout stays free of OSC bytes" \
+  "SetUserVar" "$_non_tty_source_output"
+_assert_contains "shell integration: quiet source still loads" \
+  "loaded=1" "$_non_tty_source_output"
+
+# Sourcing performs no tmux query; the first precmd discovers once and
+# exports. Fails before the source-time publish is deferred.
+: >"$shell_tmux_log"
+# shellcheck disable=SC2016 # Variables expand in the child shell.
+_deferred_publish_output=$(
+  TMUX=/tmp/tmux-deferred,1,0 \
+    TMUX_MOCK_REMOTE_LINK_HOST=remote.example \
+    TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+    PATH="$shell_tmux_mock:$PATH" \
+    SHELL_INTEGRATION="$shell_integration" \
+    bash --noprofile --norc -c '
+      SECONDS=100
+      source "$SHELL_INTEGRATION" >/dev/null
+      printf "source-queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+      _termnav_wezterm_precmd >/dev/null
+      printf "precmd-queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+      printf "precmd-host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-empty}"
+      _termnav_wezterm_precmd >/dev/null
+      printf "second-queries=%s\n" "$(wc -l <"$TERMNAV_TMUX_QUERY_LOG" | tr -d " ")"
+    '
+)
+_assert_contains "shell integration: source performs no tmux query" \
+  "source-queries=0" "$_deferred_publish_output"
+_assert_contains "shell integration: first precmd discovers remote host in one query" \
+  "precmd-queries=1" "$_deferred_publish_output"
+_assert_contains "shell integration: first precmd exports discovered host" \
+  "precmd-host=remote.example" "$_deferred_publish_output"
+_assert_contains "shell integration: second precmd performs no new query" \
+  "second-queries=1" "$_deferred_publish_output"
+
+# A precmd without a tty emits no bytes but still exports discovered state.
+# Fails before emission is guarded on a terminal.
+: >"$shell_tmux_log"
+# shellcheck disable=SC2016 # Variables expand in the child shell.
+_non_tty_precmd_output=$(
+  TMUX=/tmp/tmux-nontty,1,0 \
+    TMUX_MOCK_REMOTE_LINK_HOST=remote.example \
+    TERMNAV_TMUX_QUERY_LOG="$shell_tmux_log" \
+    PATH="$shell_tmux_mock:$PATH" \
+    SHELL_INTEGRATION="$shell_integration" \
+    bash --noprofile --norc -c '
+      SECONDS=100
+      source "$SHELL_INTEGRATION" >/dev/null
+      _termnav_wezterm_precmd
+      printf "host=%s\n" "${TERMNAV_REMOTE_LINK_HOST:-empty}"
+    '
+)
+_assert_not_contains "shell integration: precmd without tty emits no OSC bytes" \
+  "SetUserVar" "$_non_tty_precmd_output"
+_assert_contains "shell integration: tty-less precmd still exports host" \
+  "host=remote.example" "$_non_tty_precmd_output"
+
+# On a real terminal the first precmd still emits: source stays quiet, the
+# prompt publishes.
+if _with_pty true >/dev/null 2>&1; then
+  _pty_probe=$(_tmpdir)/pty-probe.sh
+  cat >"$_pty_probe" <<'EOF'
+#!/usr/bin/env bash
+source "$SHELL_INTEGRATION"
+printf 'SOURCE-DONE\n'
+_termnav_wezterm_precmd
+printf 'PRECMD-DONE\n'
+EOF
+  chmod +x "$_pty_probe"
+  _pty_output=$(
+    _with_pty env -i \
+      HOME="$HOME" \
+      PATH="/usr/bin:/bin" \
+      TERM_PROGRAM=WezTerm \
+      SHELL_INTEGRATION="$shell_integration" \
+      "$_pty_probe" 2>/dev/null
+  )
+  _pty_before_source=${_pty_output%%SOURCE-DONE*}
+  _pty_after_source=${_pty_output#*SOURCE-DONE}
+  _assert_not_contains "shell integration: pty source emits no OSC bytes" \
+    "SetUserVar" "$_pty_before_source"
+  _assert_contains "shell integration: pty first precmd emits OSC bytes" \
+    "SetUserVar" "$_pty_after_source"
+else
+  echo "  - skipping pty publish test (python3 unavailable)"
 fi
 
 echo

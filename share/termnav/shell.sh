@@ -85,7 +85,10 @@ ssh() {
 }
 
 # Prompt hooks share this cache in the current shell. Re-sourcing the integration
-# intentionally refreshes it, matching the low-level tmux-client cache.
+# intentionally refreshes it, matching the low-level tmux-client cache. The
+# first-publish flag moves the initial publication from source time to the
+# first prompt; re-sourcing re-arms it like every other cache here.
+_termnav_wezterm_first_publish_done=0
 _termnav_wezterm_remote_link_host_cache_set=0
 _termnav_wezterm_remote_link_host_cache_tmux=""
 _termnav_wezterm_remote_link_host_cache_ssh=""
@@ -141,7 +144,14 @@ _termnav_wezterm_set_user_var() {
   # Classification and OSC generation are one publication transaction. Cache
   # only after the bytes were produced successfully; otherwise a transient
   # attach-time tmux query failure would suppress every retry of the same value.
-  termnav_wezterm_user_var_sequence "$1" "$2" auto || return
+  if [ -t 1 ]; then
+    termnav_wezterm_user_var_sequence "$1" "$2" auto || return
+  else
+    # Prompting or sourcing with captured stdout (e.g. `x=$(zsh -ic …)`)
+    # must not capture OSC bytes. Discovery, classification, and value
+    # caching still run so retries and exports behave identically.
+    termnav_wezterm_user_var_sequence "$1" "$2" auto >/dev/null || return
+  fi
   case "$1" in
     IS_NVIM)
       _termnav_wezterm_sent_IS_NVIM=1
@@ -333,6 +343,14 @@ _termnav_wezterm_preexec() {
 }
 
 _termnav_wezterm_precmd() {
+  if [[ "${_termnav_wezterm_first_publish_done:-0}" != 1 ]]; then
+    # The initial publication moved from source time to first prompt: one
+    # shared observation discovers the host and primes client
+    # classification for the emissions below, so the first prompt costs
+    # the same single query the source-time publish used to cost.
+    _termnav_wezterm_first_publish_done=1
+    _termnav_wezterm_publish_link_context with-tmux-context
+  fi
   _termnav_wezterm_set_user_var IS_NVIM false
   _termnav_wezterm_publish_link_context
   _termnav_wezterm_publish_tmux_context
@@ -358,5 +376,6 @@ _termnav_wezterm_register_hooks() {
 
 if _termnav_wezterm_active; then
   _termnav_wezterm_register_hooks
-  _termnav_wezterm_publish_link_context with-tmux-context
+  # No source-time publish: the first precmd performs the initial
+  # publication (same single query), and non-tty shells stay silent.
 fi
