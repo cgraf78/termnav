@@ -2126,12 +2126,15 @@ printf 'PRECMD-DONE\n'
 EOF
   chmod +x "$_pty_probe"
   _pty_output=$(
+    # Invoke via the current shell binary: the probe's `env bash` shebang
+    # re-resolves in the child's stripped PATH, which has no bash on
+    # systems without /usr/bin/bash (Termux keeps it under $PREFIX/bin).
     _with_pty env -i \
       HOME="$HOME" \
       PATH="/usr/bin:/bin" \
       TERM_PROGRAM=WezTerm \
       SHELL_INTEGRATION="$shell_integration" \
-      "$_pty_probe" 2>/dev/null
+      "${BASH:-bash}" "$_pty_probe" 2>/dev/null
   )
   _pty_before_source=${_pty_output%%SOURCE-DONE*}
   _pty_after_source=${_pty_output#*SOURCE-DONE}
