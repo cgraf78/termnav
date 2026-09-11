@@ -459,11 +459,16 @@ _with_pty() {
   python3 - "$@" <<'PY'
 import os
 import pty
+import select
 import subprocess
 import sys
+import time
 
 
 def main(argv):
+    # Hang guard: a stuck child must fail the test, not the whole suite.
+    # 30s is generous for these trivial scripts; 124 matches timeout(1).
+    deadline = time.monotonic() + 30.0
     master, slave = pty.openpty()
     try:
         proc = subprocess.Popen(
@@ -476,7 +481,16 @@ def main(argv):
     finally:
         os.close(slave)
     chunks = []
+    timed_out = False
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        ready, _, _ = select.select([master], [], [], remaining)
+        if not ready:
+            timed_out = True
+            break
         try:
             data = os.read(master, 65536)
         except OSError:
@@ -484,10 +498,12 @@ def main(argv):
         if not data:
             break
         chunks.append(data)
+    if timed_out:
+        proc.kill()
     proc.wait()
     os.close(master)
     sys.stdout.buffer.write(b"".join(chunks))
-    return proc.returncode
+    return 124 if timed_out else proc.returncode
 
 
 sys.exit(main(sys.argv[1:]))
