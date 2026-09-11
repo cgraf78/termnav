@@ -623,22 +623,52 @@ esac
 SH
 chmod +x "$shell_tmux_bin/tmux"
 
-tmux_publication=$(
-  TERM_PROGRAM=WezTerm \
-    TMUX=/tmp/termnav-tmux,1,0 \
-    PATH="$shell_tmux_bin:$PATH" \
-    bash --noprofile --norc -c 'source "$1"' _ "$shell_integration"
-)
-_assert_contains "tmux context: shell publishes provider-owned true state" \
-  'SetUserVar=TERMNAV_TMUX=dHJ1ZQ==' "$tmux_publication"
+if _with_pty true >/dev/null 2>&1; then
+  # shellcheck disable=SC2016 # Variables expand in the child shell.
+  tmux_publication=$(
+    TERM_PROGRAM=WezTerm \
+      TMUX=/tmp/termnav-tmux,1,0 \
+      PATH="$shell_tmux_bin:$PATH" \
+      SHELL_INTEGRATION="$shell_integration" \
+      _with_pty bash --noprofile --norc -c '
+        source "$SHELL_INTEGRATION"
+        _termnav_wezterm_precmd
+      '
+  )
+  _assert_contains "tmux context: shell publishes provider-owned true state" \
+    'SetUserVar=TERMNAV_TMUX=dHJ1ZQ==' "$tmux_publication"
 
-plain_publication=$(
-  TERM_PROGRAM=WezTerm \
-    TMUX='' \
-    bash --noprofile --norc -c 'source "$1"' _ "$shell_integration"
-)
-_assert_contains "tmux context: shell publishes provider-owned empty state" \
-  'SetUserVar=TERMNAV_TMUX=' "$plain_publication"
+  # shellcheck disable=SC2016 # Variables expand in the child shell.
+  plain_publication=$(
+    TERM_PROGRAM=WezTerm \
+      TMUX='' \
+      SHELL_INTEGRATION="$shell_integration" \
+      _with_pty bash --noprofile --norc -c '
+        source "$SHELL_INTEGRATION"
+        _termnav_wezterm_precmd
+      '
+  )
+  _assert_contains "tmux context: shell publishes provider-owned empty state" \
+    'SetUserVar=TERMNAV_TMUX=' "$plain_publication"
+
+  # shellcheck disable=SC2016 # Variables expand in the child shell.
+  prompt_publication=$(
+    TERM_PROGRAM=WezTerm \
+      TMUX=/tmp/termnav-tmux,1,0 \
+      PATH="$shell_tmux_bin:$PATH" \
+      SHELL_INTEGRATION="$shell_integration" \
+      _with_pty bash --noprofile --norc -c '
+        source "$SHELL_INTEGRATION"
+        _termnav_wezterm_precmd
+        _termnav_wezterm_precmd
+      '
+  )
+  prompt_tmux_count=$(awk 'BEGIN { RS="SetUserVar=TERMNAV_TMUX=" } END { print NR - 1 }' <<<"$prompt_publication")
+  _assert_eq "tmux context: every returned prompt reasserts its shell state" \
+    "3" "$prompt_tmux_count"
+else
+  echo "  - skipping tmux context publication tests (python3 unavailable)"
+fi
 
 nvim_publication=$(
   TERM_PROGRAM=WezTerm \
@@ -647,19 +677,5 @@ nvim_publication=$(
 )
 _assert_not_contains "tmux context: embedded Neovim terminals publish no shell state" \
   'SetUserVar=TERMNAV_TMUX=' "$nvim_publication"
-
-prompt_publication=$(
-  TERM_PROGRAM=WezTerm \
-    TMUX=/tmp/termnav-tmux,1,0 \
-    PATH="$shell_tmux_bin:$PATH" \
-    bash --noprofile --norc -c '
-      source "$1"
-      _termnav_wezterm_precmd
-      _termnav_wezterm_precmd
-    ' _ "$shell_integration"
-)
-prompt_tmux_count=$(awk 'BEGIN { RS="SetUserVar=TERMNAV_TMUX=" } END { print NR - 1 }' <<<"$prompt_publication")
-_assert_eq "tmux context: every returned prompt reasserts its shell state" \
-  "3" "$prompt_tmux_count"
 
 _test_summary
