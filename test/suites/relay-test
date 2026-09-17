@@ -186,10 +186,33 @@ _assert_eq "relay: stalled and concurrent clients cannot block valid fragmented 
   12 "$(wc -l <"$concurrent_log" | tr -d ' ')" # v1 is now rejected (not counted) per v18 #1
 set +e
 TERMNAV_PARENT_RELAY="$concurrent_socket" "$relay" send pane-select left \
-  --client-pid "$$" --client-tty /dev/definitely-not-this-tty >/dev/null 2>&1
+  --client-pid 2147483647 --client-tty /dev/definitely-not-this-tty >/dev/null 2>&1
 tty_mismatch_rc=$?
 set -e
-_assert_exit "relay: a PID with the wrong client TTY fails closed" 1 "$tty_mismatch_rc"
+_assert_exit "relay: a client without its own relay ignores inherited socket" 3 "$tty_mismatch_rc"
+client_marker="$tmp/client.ready"
+TERMNAV_PARENT_RELAY="$concurrent_socket" python3 - "$client_marker" <<'PY' &
+import pathlib
+import sys
+import time
+
+pathlib.Path(sys.argv[1]).touch()
+time.sleep(30)
+PY
+client_pid=$!
+for _ in {1..50}; do
+  [[ -f "$client_marker" ]] && break
+  sleep 0.02
+done
+_assert_file_exists "relay: live client fixture starts" "$client_marker"
+set +e
+"$relay" send pane-select left \
+  --client-pid "$client_pid" --client-tty /dev/definitely-not-this-tty >/dev/null 2>&1
+tty_mismatch_rc=$?
+set -e
+_assert_exit "relay: a live client's wrong TTY fails closed" 1 "$tty_mismatch_rc"
+kill "$client_pid" 2>/dev/null || true
+wait "$client_pid" 2>/dev/null || true
 kill "$concurrent_pid"
 wait "$concurrent_pid" 2>/dev/null || true
 

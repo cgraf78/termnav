@@ -183,6 +183,28 @@ fn relay_send_declines_without_an_advertised_parent() {
 }
 
 #[test]
+fn relay_send_does_not_borrow_a_stale_parent_for_an_exact_client() {
+    let output = termnav()
+        .args([
+            "relay",
+            "send",
+            "pane-select",
+            "left",
+            "--client-pid",
+            "2147483647",
+            "--client-tty",
+            "/dev/null",
+        ])
+        .env("TERMNAV_PARENT_RELAY", "/tmp/termnav-stale-parent.sock")
+        .output()
+        .expect("run termnav");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn malformed_relay_arguments_are_usage_errors() {
     for arguments in [
         &[
