@@ -222,23 +222,21 @@ pub fn send_navigation(
         // accidentally serialize it onto an SSH relay.
         return 3;
     };
-    let mut parent = client_pid
-        .and_then(|pid| process::environment(pid, "TERMNAV_PARENT_RELAY"))
-        .filter(|value| !value.is_empty());
-    if parent.is_none() {
-        parent = parent_override
-            .map(str::to_owned)
-            .or_else(|| std::env::var("TERMNAV_PARENT_RELAY").ok())
-            .filter(|value| !value.is_empty());
-    }
+    let client_relay = client_pid.map(|pid| process::environment(pid, "TERMNAV_PARENT_RELAY"));
+    let inherited_relay = std::env::var("TERMNAV_PARENT_RELAY").ok();
+    let parent = relay_path(
+        client_relay.as_ref().map(Option::as_deref),
+        parent_override,
+        inherited_relay.as_deref(),
+    );
     if let (Some(pid), Some(tty)) = (client_pid, client_tty)
         && !process::tty_matches(pid, tty)
     {
-        return if parent.is_some() { 1 } else { 3 };
+        return if parent.is_empty() { 3 } else { 1 };
     }
-    let Some(parent) = parent else {
+    if parent.is_empty() {
         return 3;
-    };
+    }
     let request = json!({
         "v": super::protocol::VERSION,
         "op": super::protocol::operation::NAVIGATE,
@@ -249,7 +247,7 @@ pub fn send_navigation(
         "direction": direction.as_str(),
         "nonce": super::client::new_nonce(),
     });
-    match send(Path::new(&parent), &request, RELAY_TIMEOUT)
+    match send(Path::new(parent), &request, RELAY_TIMEOUT)
         .ok()
         .and_then(|response| {
             response
@@ -614,9 +612,30 @@ fn has_incomplete_tmux(info: &Option<LocalScope>) -> bool {
 }
 
 fn parent_relay(info: Option<&LocalScope>) -> String {
-    info.and_then(|scope| process::environment(scope.client.pid, "TERMNAV_PARENT_RELAY"))
-        .or_else(|| std::env::var("TERMNAV_PARENT_RELAY").ok())
-        .unwrap_or_default()
+    let client_relay =
+        info.map(|scope| process::environment(scope.client.pid, "TERMNAV_PARENT_RELAY"));
+    let inherited_relay = std::env::var("TERMNAV_PARENT_RELAY").ok();
+    relay_path(
+        client_relay.as_ref().map(Option::as_deref),
+        None,
+        inherited_relay.as_deref(),
+    )
+    .to_owned()
+}
+
+fn relay_path<'a>(
+    client_relay: Option<Option<&'a str>>,
+    parent_override: Option<&'a str>,
+    inherited_relay: Option<&'a str>,
+) -> &'a str {
+    // A persistent tmux server can retain an SSH relay long after its creator
+    // disconnects. Once a client is known, only that client's environment can
+    // describe its parent transport; the server's startup environment cannot.
+    match client_relay {
+        Some(Some(relay)) if !relay.is_empty() => relay,
+        Some(_) => parent_override.unwrap_or_default(),
+        None => parent_override.or(inherited_relay).unwrap_or_default(),
+    }
 }
 
 fn execute_record(info: &LocalScope, nonce: &str, scope: &str, direction: &str) -> Directive {
@@ -1170,7 +1189,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{SocketPathGuard, dispatch, prepare_socket_path, wire_action, wire_scope};
+    use super::{
+        SocketPathGuard, dispatch, prepare_socket_path, relay_path, wire_action, wire_scope,
+    };
     use crate::navigation::Action;
 
     #[test]
@@ -1195,6 +1216,27 @@ mod tests {
         assert!(wire_action("pane", "next").is_none());
         assert!(wire_action("window", "previous").is_some());
         assert!(wire_action("move", "down").is_none());
+    }
+
+    #[test]
+    fn tmux_client_without_relay_does_not_inherit_server_relay() {
+        assert_eq!(relay_path(Some(None), None, Some("/tmp/stale.sock")), "");
+        assert_eq!(
+            relay_path(Some(Some("/tmp/live.sock")), None, Some("/tmp/stale.sock")),
+            "/tmp/live.sock"
+        );
+        assert_eq!(
+            relay_path(None, None, Some("/tmp/direct.sock")),
+            "/tmp/direct.sock"
+        );
+        assert_eq!(
+            relay_path(
+                Some(None),
+                Some("/tmp/explicit.sock"),
+                Some("/tmp/stale.sock")
+            ),
+            "/tmp/explicit.sock"
+        );
     }
 
     #[test]
