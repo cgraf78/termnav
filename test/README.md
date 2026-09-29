@@ -1,8 +1,9 @@
 # Test Harness
 
-`test/termnav-test` is the complete local and CI entrypoint. It loads shared
-helpers from `test/helpers.sh`, uses fixtures under `test/fixtures/`, and runs
-focused suites from `test/suites/`.
+`test/termnav-test` is the shell-suite entrypoint; CI's main test command runs
+it after the Rust tests as `cargo test --locked && test/termnav-test`. It
+loads shared helpers from `test/helpers.sh`, uses fixtures under
+`test/fixtures/`, and runs focused suites from `test/suites/`.
 
 Suite ownership follows the integration boundary:
 

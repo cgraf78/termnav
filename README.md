@@ -19,7 +19,13 @@ curl -fsSL https://raw.githubusercontent.com/cgraf78/termnav/main/install.sh | b
 
 The installer selects the platform archive, verifies its SHA-256 checksum and
 embedded build identity, activates the complete release atomically, and links
-`termnav` into the user command directory. There is one executable and one
+`termnav` into the user command directory. When GitHub CLI 2.49+ is logged in
+to github.com, it also verifies the archive's GitHub artifact attestation
+(signed by `cgraf78/actions`) and refuses an archive without a valid one;
+otherwise it proceeds on the checksum alone and says so. Pass
+`--require-attestation` to make provenance verification mandatory. Local
+`--archive` installs are checksum-only; combining `--archive` with
+`--require-attestation` is an error. There is one executable and one
 installation path to build, publish, update, and diagnose.
 
 ## Command interface
@@ -95,7 +101,12 @@ status. Reusable behavior lives behind focused library interfaces:
 - `nvim` owns target parsing, registry selection, RPC, exact-pane transport
   fallback, and mux-only remote reuse;
 - `click` owns mouse-text recognition and returns typed URL/file targets;
+- `vscode` owns VS Code window focus publication to the companion extension;
 - `assets` owns installed provider-root discovery;
+- `shell` owns POSIX shell quoting and tmux format escaping at explicit
+  subprocess boundaries;
+- `cli` owns top-level command parsing and dispatch;
+- `version` owns the embedded build identity;
 - `terminal`, `process`, `runtime`, and `links` isolate operating-system and
   terminal-protocol boundaries shared by those domains.
 
@@ -383,8 +394,7 @@ route can identify the next scope, navigation is consumed without guessing.
 
 Neovim socket discovery state lives under
 an absolute `$XDG_STATE_HOME/nvim-tmux-open`, falling back to
-`$HOME/.local/state/nvim-tmux-open`. The opener's diagnostic log uses the same
-state root at `wezterm-nvim-open.log`. Discovery records are published
+`$HOME/.local/state/nvim-tmux-open`. Discovery records are published
 atomically with owner-only permissions and are scoped to the tmux server,
 pane, and Neovim process so concurrent editors cannot replace or remove one
 another's registrations. Each scope's atomic `latest` record is a complete
@@ -392,11 +402,15 @@ ordering point, while a final versioned per-process commit record keeps partial
 initial publications undiscoverable. Long encoded pane identities are split
 across bounded path components without losing identity information.
 When Neovim does not already expose a record-safe RPC address,
-Termnav creates its socket below an absolute `$XDG_RUNTIME_DIR/termnav` or a
-private, short `/tmp/termnav-UID` fallback so Unix socket path limits do not
-depend on the state-directory length. As required by the XDG specification,
-empty and relative values are ignored. Runtime paths containing newlines also
-use the short fallback so line-oriented discovery records remain valid.
+Termnav creates its socket in the first candidate whose socket path is at
+most 100 bytes (below every supported platform's Unix socket limit):
+`$XDG_RUNTIME_DIR/termnav` and then `$TMPDIR/termnav-UID` when those base
+directories are absolute and exist, then a short `/tmp/termnav-UID` fallback.
+The chosen directory is secured owner-only, and socket path limits do not
+depend on the state-directory length. Empty and relative values are ignored
+(as XDG requires for `XDG_RUNTIME_DIR`). Runtime and temporary paths
+containing newlines are also skipped so line-oriented discovery records remain
+valid.
 Without either state base directory,
 filesystem discovery and publication are disabled rather than writing below
 `/`. Set `XDG_STATE_HOME` to an absolute
@@ -440,10 +454,10 @@ the private shim directory to only that launcher's PATH.
 Strict `ExitOnForwardFailure=yes` configurations are delegated unchanged rather
 than making Termnav's optional relay mandatory.
 
-Run tests with:
+Run CI's main test command with:
 
 ```bash
-./test/termnav-test
+cargo test --locked && ./test/termnav-test
 ```
 
 CI also runs the WezTerm suite against Arch's current `eza` package so changes
