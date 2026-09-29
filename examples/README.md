@@ -68,8 +68,11 @@ Load the provider-owned shell integration directly; no wrapper file is needed:
 . "$(termnav asset-path share/termnav/shell.sh)"
 ```
 
-Hook that loader into the shell framework you already use. Termnav exposes the
-callbacks, while the consumer owns when prompt hooks run. The same loader also
+Inside tmux, WezTerm, or SSH (and outside Neovim), the loader registers its own
+prompt hooks: `preexec`, `precmd`, and `chpwd` through `add-zsh-hook` in zsh,
+and `preexec` and `precmd` through the `preexec_functions` and
+`precmd_functions` arrays in bash. Bash consumers therefore need bash-preexec
+or an equivalent that runs those arrays. The same loader also
 exposes `termnav_file_links_need_plain_output`; use its return status to choose
 between a tool's plain-path output and its semantic OSC-8 mode without copying
 terminal or tmux-client detection into shell aliases. A consumer that already
