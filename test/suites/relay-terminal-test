@@ -67,5 +67,13 @@ _assert_contains "relay terminal: remote bubbling reaches the VS Code window ada
   "test_one_window_tab_selection_reaches_the_vscode_window_adapter" "$output"
 _assert_contains "relay terminal: post-start focus changes select the live client" \
   "test_relay_started_before_focus_switch_targets_the_live_client" "$output"
+_assert_contains "relay terminal: teardown kills a TERM-blocked tmux server" \
+  "test_teardown_kills_a_server_that_blocks_term" "$output"
+_assert_contains "relay terminal: teardown finds a tmux server recorded before its PID" \
+  "test_teardown_kills_a_server_recorded_before_its_pid" "$output"
+_assert_contains "relay terminal: teardown kills a tmux server that cannot answer" \
+  "test_teardown_kills_a_server_that_cannot_answer" "$output"
+_assert_contains "relay terminal: a killed harness is reaped out of process" \
+  "test_killed_harness_is_reaped_out_of_process" "$output"
 
 _test_summary
