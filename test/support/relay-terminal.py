@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import pathlib
 import pty
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -26,6 +29,11 @@ SENTINEL_KEY = b"\x07"
 # the outer query is observable. Keep their test deadline aligned with the
 # asynchronous sender's ten-second completion bound.
 RELAY_TRANSACTION_TIMEOUT = 10.0
+# Each teardown step (kill-server, TERM, KILL) gets this long to take effect.
+TEARDOWN_GRACE = 1.0
+OWNED_MANIFEST = "owned-processes.jsonl"
+REAPER_FLAG = "--reap-on-eof"
+FIXTURE_FLAG = "--hold-fixture"
 
 
 def wait_for(getter, description: str, timeout: float = 4.0):
@@ -38,6 +46,151 @@ def wait_for(getter, description: str, timeout: float = 4.0):
             return last
         time.sleep(0.02)
     raise AssertionError(f"timed out waiting for {description}; last state: {last!r}")
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnedProcess:
+    """A daemon started by one harness, identified by a path in its argv.
+
+    `marker` lives inside the harness's private root, so it names exactly one
+    invocation's process and doubles as a guard against recycled PIDs. `pid`
+    is None only while a tmux server is being created and its PID is unknown.
+    """
+
+    pid: int | None
+    marker: str
+    tmux_socket: str | None = None
+
+
+def owned_process_running(owned: OwnedProcess) -> bool:
+    """Return whether owned.pid is still the live process whose argv names marker."""
+    if owned.pid is None:
+        return False
+    cmdline = pathlib.Path(f"/proc/{owned.pid}/cmdline")
+    if pathlib.Path("/proc/self/cmdline").exists():
+        try:
+            argv = cmdline.read_bytes()
+        except OSError:
+            return False
+        # Zombies expose an empty cmdline and so count as exited.
+        return owned.marker.encode() in argv
+    listing = subprocess.run(
+        ["ps", "-ww", "-o", "command=", "-p", str(owned.pid)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return listing.returncode == 0 and owned.marker in listing.stdout
+
+
+def wait_exited(owned: list[OwnedProcess], timeout: float) -> list[OwnedProcess]:
+    """Poll until every owned process exits; return those outliving timeout."""
+    deadline = time.monotonic() + timeout
+    while running := [entry for entry in owned if owned_process_running(entry)]:
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    return running
+
+
+def resolve_server(server: OwnedProcess, environment: dict[str, str] | None) -> OwnedProcess:
+    """Look up a server PID the harness did not live long enough to record."""
+    if server.pid is not None:
+        return server
+    try:
+        shown = subprocess.run(
+            ["tmux", "-S", server.tmux_socket, "display-message", "-p", "#{pid}"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=TEARDOWN_GRACE,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return server
+    pid = shown.stdout.strip()
+    if shown.returncode != 0 or not pid.isdigit():
+        return server
+    return dataclasses.replace(server, pid=int(pid))
+
+
+def stop_owned(
+    owned: list[OwnedProcess], environment: dict[str, str] | None = None
+) -> list[OwnedProcess]:
+    """Stop owned processes together, escalating only the survivors.
+
+    tmux servers daemonize into their own session, so neither unittest nor the
+    suite's process-group timeout can reach them. Ask each server to exit over
+    its socket first, but never trust that request: `kill-server` makes the
+    server signal itself with TERM and reports success immediately. A server
+    inherits its launcher's signal mask, so one started with TERM blocked
+    keeps running with TERM pending, and a stopped server cannot answer at
+    all. Escalate through TERM to KILL on exact recorded PIDs, re-checking
+    identity before every signal. Phases span every process so the whole
+    teardown stays bounded.
+    """
+    servers = [
+        resolve_server(entry, environment) for entry in owned if entry.tmux_socket is not None
+    ]
+    for server in servers:
+        if server.pid is not None and not owned_process_running(server):
+            continue
+        try:
+            subprocess.run(
+                ["tmux", "-S", server.tmux_socket, "kill-server"],
+                env=environment,
+                capture_output=True,
+                timeout=TEARDOWN_GRACE,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+    survivors = wait_exited(servers, TEARDOWN_GRACE) + [
+        entry for entry in owned if entry.tmux_socket is None and owned_process_running(entry)
+    ]
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        for entry in survivors:
+            if owned_process_running(entry):
+                try:
+                    os.kill(entry.pid, signum)
+                except ProcessLookupError:
+                    pass
+        survivors = wait_exited(survivors, TEARDOWN_GRACE)
+    return survivors
+
+
+def reap(root: pathlib.Path, environment: dict[str, str] | None = None) -> list[OwnedProcess]:
+    """Stop every process recorded under root, then delete root.
+
+    Sockets live under root, so the directory is removed only after every
+    graceful kill-server attempt. Returns processes that survived KILL.
+    """
+    owned: dict[str, OwnedProcess] = {}
+    try:
+        lines = (root / OWNED_MANIFEST).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        try:
+            entry = OwnedProcess(**json.loads(line))
+        except (TypeError, ValueError):
+            # A harness killed mid-append leaves a truncated final record.
+            continue
+        # A server's PID record supersedes its pre-creation socket record.
+        owned[entry.marker] = entry
+    survivors = stop_owned(list(owned.values()), environment)
+    shutil.rmtree(root, ignore_errors=True)
+    return survivors
+
+
+def reap_on_eof(root: pathlib.Path) -> int:
+    """Wait for the owning harness to exit by any means, then reap its root.
+
+    stdin is a pipe whose only writer is the harness, so EOF arrives on a
+    normal close, an unhandled exception, KeyboardInterrupt, TERM, or KILL.
+    """
+    sys.stdin.buffer.read()
+    return 1 if reap(root) else 0
 
 
 class TerminalClient:
@@ -224,31 +377,85 @@ class RelayHarness:
         # /var/folders TMPDIR plus descriptive mixed-version socket names can
         # exceed that before the test reaches any relay behavior.
         short_root = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else None
-        self.temporary = tempfile.TemporaryDirectory(prefix="tnrt-", dir=short_root)
-        self.root = pathlib.Path(self.temporary.name)
+        # Not TemporaryDirectory: its exit-time finalizer deletes the root, and
+        # with it every tmux socket, even when teardown never ran. That left
+        # servers running with no way to reach them.
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="tnrt-", dir=short_root))
         self.runtime = self.root / "runtime"
         self.runtime.mkdir(mode=0o700)
         self.environment = os.environ.copy()
         self.environment["XDG_RUNTIME_DIR"] = str(self.runtime)
         self.sentinel = self.root / "input-ready"
         self.tmux_sockets: list[str] = []
+        self.owned: dict[str, OwnedProcess] = {}
         self.relays: list[subprocess.Popen] = []
         self.relay_logs: list[pathlib.Path] = []
         self.terminals: list[TerminalClient] = []
+        self.closed = False
+        self.reaper = self._start_reaper()
+
+    def _start_reaper(self) -> subprocess.Popen[bytes]:
+        """Start the out-of-process reaper before any daemon exists.
+
+        tearDown cannot run when this process is interrupted or killed. The
+        reaper sits in its own session, outside the suite timeout's process
+        group, and reaps the root once this process's pipe end closes.
+        """
+        read_end, self.reaper_pipe = os.pipe()
+        try:
+            return subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).resolve()),
+                    REAPER_FLAG,
+                    str(self.root),
+                ],
+                stdin=read_end,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=self.environment,
+                start_new_session=True,
+            )
+        except BaseException:
+            os.close(self.reaper_pipe)
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise
+        finally:
+            os.close(read_end)
+
+    def own(self, owned: OwnedProcess) -> None:
+        """Record a daemon so every exit path, including the reaper, stops it."""
+        self.owned[owned.marker] = owned
+        with (self.root / OWNED_MANIFEST).open("a", encoding="utf-8") as manifest:
+            manifest.write(json.dumps(dataclasses.asdict(owned)) + "\n")
 
     def close(self) -> None:
-        for relay in reversed(self.relays):
-            relay.terminate()
+        """Stop every owned process, then delete the root; safe to call twice."""
+        if self.closed:
+            return
+        self.closed = True
+        survivors: list[OwnedProcess] = []
+        try:
+            for relay in reversed(self.relays):
+                relay.terminate()
+                try:
+                    relay.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    relay.kill()
+                    relay.wait(timeout=2)
+            for terminal in reversed(self.terminals):
+                terminal.close()
+        finally:
             try:
-                relay.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                relay.kill()
-                relay.wait(timeout=2)
-        for terminal in reversed(self.terminals):
-            terminal.close()
-        for tmux_socket in reversed(self.tmux_sockets):
-            self.tmux(tmux_socket, "kill-server", check=False)
-        self.temporary.cleanup()
+                survivors = reap(self.root, self.environment)
+            finally:
+                # Normally the root is gone and the released reaper finds
+                # nothing. If reap() raised, the reaper retries; its steps are
+                # bounded, so wait rather than cut that retry short.
+                os.close(self.reaper_pipe)
+                self.reaper.wait()
+        if survivors:
+            raise AssertionError(f"teardown left owned processes running: {survivors!r}")
 
     def tmux(
         self, tmux_socket: str, *arguments: str, check: bool = True
@@ -264,7 +471,10 @@ class RelayHarness:
     def new_server(self, name: str, session: str, command: str) -> str:
         tmux_socket = str(self.root / f"{name}.sock")
         self.tmux_sockets.append(tmux_socket)
-        self.tmux(
+        # Record the socket before the server exists so an interruption before
+        # its PID is known still leaves the reaper a kill-server target.
+        self.own(OwnedProcess(None, tmux_socket, tmux_socket))
+        pid = self.tmux(
             tmux_socket,
             "-f",
             "/dev/null",
@@ -274,8 +484,12 @@ class RelayHarness:
             session,
             "-n",
             "first",
+            "-P",
+            "-F",
+            "#{pid}",
             command,
-        )
+        ).stdout
+        self.own(OwnedProcess(int(pid), tmux_socket, tmux_socket))
         return tmux_socket
 
     def configure_commits(self, tmux_socket: str, terminal_replies: bool) -> None:
@@ -500,6 +714,7 @@ class RelayHarness:
             text=True,
         )
         self.relays.append(process)
+        self.own(OwnedProcess(process.pid, relay_socket))
 
         def ready() -> bool:
             if not pathlib.Path(relay_socket).exists():
@@ -1359,13 +1574,148 @@ class RelayTerminalTest(unittest.TestCase):
             "three-level nested commit",
         )
 
+    def assert_teardown_kills(self, server: OwnedProcess) -> None:
+        """Close the harness and require server and root to be gone."""
+        try:
+            self.harness.close()
+            self.assertFalse(owned_process_running(server), "tmux server survived teardown")
+            self.assertFalse(self.harness.root.exists(), "teardown kept the private root")
+        finally:
+            if owned_process_running(server):
+                os.kill(server.pid, signal.SIGKILL)
+
+    def test_teardown_kills_a_server_that_blocks_term(self) -> None:
+        # The leaked servers carried exactly this mask, the suite supervisor's
+        # fork-time block set. `kill-server` is then a successful no-op, so
+        # only KILL stops them.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            tmux_socket = self.harness.new_server("term-blocked", "blocked", "cat")
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        self.assert_teardown_kills(self.harness.owned[tmux_socket])
+
+    def test_teardown_kills_a_server_recorded_before_its_pid(self) -> None:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            tmux_socket = self.harness.new_server("unrecorded", "unrecorded", "cat")
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        # Leave only the pre-creation record, as an interruption between
+        # new-session and the PID record would. Teardown must still find the
+        # PID, because this server ignores `kill-server`.
+        pending = OwnedProcess(None, tmux_socket, tmux_socket)
+        (self.harness.root / OWNED_MANIFEST).write_text(
+            json.dumps(dataclasses.asdict(pending)) + "\n", encoding="utf-8"
+        )
+        self.assert_teardown_kills(self.harness.owned[tmux_socket])
+
+    def test_teardown_kills_a_server_that_cannot_answer(self) -> None:
+        tmux_socket = self.harness.new_server("stopped", "stopped", "cat")
+        server = self.harness.owned[tmux_socket]
+        # A stopped server never answers, so `kill-server` must time out.
+        os.kill(server.pid, signal.SIGSTOP)
+        self.assert_teardown_kills(server)
+
+    def test_killed_harness_is_reaped_out_of_process(self) -> None:
+        fixture = subprocess.Popen(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).resolve()),
+                "--relay",
+                self.relay,
+                "--python-relay",
+                self.python_relay,
+                "--termnav",
+                self.termnav,
+                FIXTURE_FLAG,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready, _, _ = select.select([fixture.stdout], [], [], 20)
+            line = fixture.stdout.readline() if ready else ""
+            published = json.loads(line) if line else None
+        finally:
+            # KILL skips every in-process cleanup path, like the suite timeout's
+            # escalation or an outer runner that kills the whole tree.
+            fixture.kill()
+            fixture.wait()
+            fixture.stdin.close()
+            fixture.stdout.close()
+        self.assertIsNotNone(published, "fixture never published its processes")
+        root = pathlib.Path(published["root"])
+        owned = [OwnedProcess(**entry) for entry in published["owned"]]
+        try:
+            wait_for(
+                lambda: not root.exists() and not any(map(owned_process_running, owned)),
+                "out-of-process reaper to stop the killed harness's daemons",
+                timeout=5 * TEARDOWN_GRACE,
+            )
+        finally:
+            for entry in owned:
+                if owned_process_running(entry):
+                    os.kill(entry.pid, signal.SIGKILL)
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def hold_fixture(harness: RelayHarness) -> int:
+    """Build a nested fixture, publish its processes, and wait to be killed.
+
+    Servers start with INT/TERM blocked, as the leaked servers did, so the
+    reaper must escalate. The outer pane hosts a nested attach client, which
+    matches the leaked topology.
+    """
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    try:
+        inner_socket = harness.new_server("orphan-inner", "inner", "cat")
+        outer_socket = harness.new_server("orphan-outer", "outer", "cat")
+        outer_pane = harness.tmux(
+            outer_socket, "display-message", "-p", "-t", "outer", "#{pane_id}"
+        ).stdout.strip()
+        harness.tmux(
+            outer_socket,
+            "respawn-pane",
+            "-k",
+            "-t",
+            outer_pane,
+            f"exec tmux -S {shlex.quote(inner_socket)} attach-session -t inner",
+        )
+        _, client = harness.client_identity(inner_socket)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    owned = [
+        *harness.owned.values(),
+        OwnedProcess(client, inner_socket),
+        OwnedProcess(harness.reaper.pid, str(harness.root)),
+    ]
+    print(
+        json.dumps(
+            {"root": str(harness.root), "owned": [dataclasses.asdict(entry) for entry in owned]}
+        ),
+        flush=True,
+    )
+    sys.stdin.read()
+    return 0
+
 
 def main() -> int:
+    # The reaper takes only its root: it must run without the test arguments
+    # and never runs the suite.
+    if sys.argv[1:2] == [REAPER_FLAG]:
+        return reap_on_eof(pathlib.Path(sys.argv[2]))
     parser = argparse.ArgumentParser()
     parser.add_argument("--relay", required=True)
     parser.add_argument("--python-relay", required=True)
     parser.add_argument("--termnav", required=True)
+    parser.add_argument(FIXTURE_FLAG, action="store_true", help=argparse.SUPPRESS)
     arguments, _ = parser.parse_known_args()
+    if arguments.hold_fixture:
+        return hold_fixture(
+            RelayHarness(arguments.relay, arguments.python_relay, arguments.termnav)
+        )
     RelayTerminalTest.relay = arguments.relay
     RelayTerminalTest.python_relay = arguments.python_relay
     RelayTerminalTest.termnav = arguments.termnav
