@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use super::{Action, Backend, Client, Direction, Outcome, Scope, choose_client};
+use super::{Action, Backend, Client, Direction, Outcome, Scope, choose_client, reselect_client};
 use crate::process;
 use crate::relay::client::{new_nonce, send};
 use crate::terminal::{self, TmuxMode};
@@ -717,7 +717,7 @@ impl Backend for SystemBackend {
                 .iter()
                 .any(|candidate| Self::same_route(candidate, client));
         }
-        choose_client(&current, started_at, 2)
+        reselect_client(&current, started_at, 2)
             .is_some_and(|selected| Self::same_route(&selected, client))
     }
 

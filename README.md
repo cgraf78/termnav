@@ -365,8 +365,12 @@ identity, so one client snapshot resolves both the logical tmux scope and any
 safe physical provenance. Local pane operations need no client, and local tab
 operations need only a session shared by the clients viewing that pane. A sole
 eligible client, unique focused client, or unique fresh client is retained when
-available so a buffered chord sequence keeps its original ancestry. Physical
-ambiguity fails closed only when the action must leave the local tmux scope.
+available so a buffered chord sequence keeps its original ancestry. When
+several clients claim focus, as happens when an idle terminal on another machine
+never reports focus-out from a shared session, the uniquely fresh focused client
+is the one that carried the chord and is retained. Physical ambiguity, including
+stale or tied focus claims, fails closed only when the action must leave the
+local tmux scope.
 Every selected client is revalidated before traversal and again before terminal
 or relay dispatch, so detach, recreation, pane-switch, and session-switch races
 do not redirect a delayed chord. Linked windows use the selected client's
