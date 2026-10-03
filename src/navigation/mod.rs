@@ -260,9 +260,8 @@ pub fn choose_client(
         return None;
     }
 
-    // Focus is stronger than activity. When more than one terminal claims
-    // focus, picking either would turn inconsistent external state into a
-    // potentially destructive navigation action, so ambiguity stops here.
+    // Focus is stronger than activity, so an unfocused client never wins
+    // while any client claims focus.
     let focused = eligible
         .iter()
         .filter(|client| client.focused)
@@ -271,15 +270,59 @@ pub fn choose_client(
     if focused.len() == 1 {
         return Some(focused[0].clone());
     }
-    if !focused.is_empty() {
-        return None;
-    }
 
-    // Some terminals briefly omit focus during handoff. Recency is therefore
-    // allowed only as a bounded compatibility fallback, never as an unbounded
-    // "most recently used" heuristic that could select a stale attachment.
-    let newest_activity = eligible.iter().map(|client| client.activity).max()?;
-    let newest = eligible
+    // Several focus claims are common: each machine attached to one shared
+    // session keeps its claim until its terminal reports focus-out, which an
+    // idle or half-dead connection may never do. The gesture being routed was
+    // just typed into exactly one of them, so only a uniquely fresh claim is
+    // trusted; stale or tied claims still fail closed.
+    //
+    // Some terminals also briefly omit focus during handoff, so with no claim
+    // at all the same bounded recency fallback applies to every client.
+    let contenders = if focused.is_empty() {
+        eligible
+    } else {
+        focused
+    };
+    freshest(&contenders, started_at, freshness_seconds).cloned()
+}
+
+/// Re-run client selection on a later snapshot of the same gesture.
+///
+/// Revalidation exists to catch detach, recreation, and pane or session
+/// switches between selection and dispatch, not to re-judge freshness against
+/// the gesture's start. A held or repeated chord legitimately advances the
+/// source client's activity past `started_at`, which would otherwise read as
+/// "activity from the future" and reject the very client that was selected.
+/// Measuring from the newest observed activity keeps that client while still
+/// failing closed on ties; callers compare the result to the original route,
+/// so a different client becoming freshest is still rejected.
+#[must_use]
+pub fn reselect_client(
+    clients: &[Client],
+    started_at: u64,
+    freshness_seconds: u64,
+) -> Option<Client> {
+    let observed = clients
+        .iter()
+        .map(|client| client.activity)
+        .max()
+        .unwrap_or(started_at)
+        .max(started_at);
+    choose_client(clients, observed, freshness_seconds)
+}
+
+/// Return the single client active within the freshness bound, if exactly one.
+///
+/// Recency is never an unbounded "most recently used" heuristic: a stale
+/// attachment must not be selected merely because nothing newer exists.
+fn freshest<'a>(
+    clients: &[&'a Client],
+    started_at: u64,
+    freshness_seconds: u64,
+) -> Option<&'a Client> {
+    let newest_activity = clients.iter().map(|client| client.activity).max()?;
+    let newest = clients
         .iter()
         .filter(|client| client.activity == newest_activity)
         .copied()
@@ -290,7 +333,7 @@ pub fn choose_client(
     {
         return None;
     }
-    Some(newest[0].clone())
+    Some(newest[0])
 }
 
 /// Walk local scopes, process ancestry, SSH relays, and the terminal once each.

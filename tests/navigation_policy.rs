@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use termnav::navigation::{
-    Action, Backend, Client, Direction, Navigator, Outcome, Scope, choose_client,
+    Action, Backend, Client, Direction, Navigator, Outcome, Scope, choose_client, reselect_client,
 };
 
 #[derive(Default)]
@@ -126,6 +126,120 @@ fn unique_focused_client_beats_newer_activity() {
         choose_client(&[focused.clone(), newer], 100, 2),
         Some(focused)
     );
+}
+
+fn focused_client(pid: u32, activity: u64) -> Client {
+    let mut client = client(pid);
+    client.activity = activity;
+    client.focused = true;
+    client
+}
+
+#[test]
+fn freshest_of_several_focused_clients_wins() {
+    // A terminal on another machine can keep claiming focus long after its
+    // user walked away; the client that just carried the keystroke is fresh.
+    let current = focused_client(10, 99);
+    let abandoned = focused_client(11, 10);
+
+    assert_eq!(
+        choose_client(&[abandoned, current.clone()], 100, 2),
+        Some(current)
+    );
+}
+
+#[test]
+fn several_focused_clients_ignore_fresher_unfocused_client() {
+    let current = focused_client(10, 99);
+    let abandoned = focused_client(11, 10);
+    let mut unfocused = client(12);
+    unfocused.activity = 100;
+
+    assert_eq!(
+        choose_client(&[abandoned, unfocused, current.clone()], 100, 2),
+        Some(current)
+    );
+}
+
+#[test]
+fn several_stale_focused_clients_fail_closed() {
+    let first = focused_client(10, 90);
+    let second = focused_client(11, 10);
+
+    assert_eq!(choose_client(&[first, second], 100, 2), None);
+}
+
+#[test]
+fn several_equally_fresh_focused_clients_fail_closed() {
+    let first = focused_client(10, 99);
+    let second = focused_client(11, 99);
+
+    assert_eq!(choose_client(&[first, second], 100, 2), None);
+}
+
+#[test]
+fn several_focused_clients_with_future_activity_fail_closed() {
+    let first = focused_client(10, 101);
+    let second = focused_client(11, 10);
+
+    assert_eq!(choose_client(&[first, second], 100, 2), None);
+}
+
+#[test]
+fn several_stale_focused_clients_ignore_fresh_unfocused_client() {
+    let first = focused_client(10, 90);
+    let second = focused_client(11, 10);
+    let mut unfocused = client(12);
+    unfocused.activity = 100;
+
+    assert_eq!(choose_client(&[first, second, unfocused], 100, 2), None);
+}
+
+#[test]
+fn focused_client_at_the_freshness_bound_is_fresh() {
+    let current = focused_client(10, 98);
+    let abandoned = focused_client(11, 10);
+    assert_eq!(
+        choose_client(&[abandoned.clone(), current.clone()], 100, 2),
+        Some(current)
+    );
+
+    let expired = focused_client(10, 97);
+    assert_eq!(choose_client(&[abandoned, expired], 100, 2), None);
+}
+
+#[test]
+fn reselection_keeps_client_whose_activity_advanced() {
+    // A held or repeated chord advances the source client's activity past the
+    // gesture's start before dispatch revalidates the selection.
+    let abandoned = focused_client(11, 10);
+    let selected = choose_client(&[abandoned.clone(), focused_client(10, 100)], 100, 2);
+    assert_eq!(selected.map(|client| client.pid), Some(10));
+
+    let advanced = focused_client(10, 102);
+    assert_eq!(
+        reselect_client(&[abandoned, advanced.clone()], 100, 2),
+        Some(advanced)
+    );
+}
+
+#[test]
+fn reselection_rejects_newly_fresher_competitor() {
+    let selected = focused_client(10, 100);
+    let competitor = focused_client(11, 102);
+
+    assert_eq!(
+        reselect_client(&[selected, competitor.clone()], 100, 2).map(|client| client.pid),
+        Some(competitor.pid)
+    );
+}
+
+#[test]
+fn reselection_fails_closed_on_tied_activity() {
+    let first = focused_client(10, 102);
+    let second = focused_client(11, 102);
+
+    assert_eq!(reselect_client(&[first, second], 100, 2), None);
 }
 
 #[test]
