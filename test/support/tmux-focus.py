@@ -20,14 +20,27 @@ import time
 import unittest
 
 
-def wait_until(predicate, description: str, timeout: float = 3.0) -> None:
-    """Poll an observable condition so timing variance cannot make tests flaky."""
+def wait_until(predicate, description: str, timeout: float = 3.0, observed=None) -> None:
+    """Poll an observable condition so timing variance cannot make tests flaky.
+
+    ``observed`` is an optional callable rendering the live state on timeout,
+    so a CI-only failure explains itself instead of naming only the condition.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             return
         time.sleep(0.02)
-    raise AssertionError(f"timed out waiting for {description}")
+    message = f"timed out waiting for {description}"
+    if observed is not None:
+        # The fixture may be what broke (for example, a dead tmux server), so a
+        # failing probe must not replace the timeout with an unrelated error.
+        try:
+            state = observed()
+        except Exception as error:  # noqa: BLE001
+            state = f"unavailable ({error!r})"
+        message += f"; observed: {state}"
+    raise AssertionError(message)
 
 
 def socket_temp_directory(prefix: str):
@@ -938,6 +951,45 @@ class NestedFocusTest(unittest.TestCase):
             rows.append(f"{socket_path.name}: {clients}; {panes}")
         return " | ".join(rows)
 
+    def publisher_state(self, inner: pathlib.Path, outer: pathlib.Path) -> str:
+        """Describe nested focus ownership for a publisher wait that timed out."""
+        watchers = self.helper_process_details("watch", inner)
+        return f"{self.focus_snapshot(inner, outer)} | inner watchers={watchers}"
+
+    def focused_nested_pair(self, name: str) -> tuple[pathlib.Path, pathlib.Path, str]:
+        """Attach a nested client from an outer pane that is already focused.
+
+        Starting the nested client in a clientless outer server races the PTY
+        attachment: when the nested client enables focus reporting, an
+        unfocused outer pane answers with a focus-out. tmux releases without
+        client-focus-in (CentOS Stream 9 ships 3.2a) then never restart the
+        publisher that focus-out stopped. Launching the nested client only after
+        the outer client is focused mirrors normal use and makes the initial
+        focus report deterministic on every tmux version.
+        """
+        inner = self.new_server(f"{name}-inner", "sleep 30")
+        outer = self.new_server(f"{name}-outer", "sleep 30")
+        nested_pane = self.tmux(outer, "display-message", "-p", "#{pane_id}")
+        client = PtyClient(outer, self.environment)
+        self.clients.append(client)
+        client.focus()
+        wait_until(
+            lambda: (
+                "focused" in self.tmux(outer, "list-clients", "-F", "#{client_flags}").split(",")
+            ),
+            "outer client focus before nesting",
+            observed=lambda: self.focus_snapshot(outer),
+        )
+        self.tmux(
+            outer,
+            "respawn-pane",
+            "-k",
+            "-t",
+            nested_pane,
+            f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus",
+        )
+        return inner, outer, nested_pane
+
     def helper_processes(self, command: str, socket_path: pathlib.Path) -> list[int]:
         def is_helper(arguments: list[str]) -> bool:
             """Recognize both the rollout alias and the unified Rust CLI."""
@@ -1400,22 +1452,16 @@ class NestedFocusTest(unittest.TestCase):
         self.assertEqual("bg=#222222", self.pane_active_style(outer, nested_pane))
 
     def test_delayed_focus_out_cannot_stop_a_refocused_client(self) -> None:
-        inner = self.new_server("bounce-inner", "sleep 30")
-        outer = self.new_server(
-            "bounce-outer",
-            f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus",
-        )
-        nested_pane = self.tmux(outer, "display-message", "-p", "#{pane_id}")
-        client = PtyClient(outer, self.environment)
-        self.clients.append(client)
-        client.focus()
+        inner, outer, nested_pane = self.focused_nested_pair("bounce")
         wait_until(
             lambda: bool(self.pane_claim(outer, nested_pane)),
             "claim before stale stop simulation",
+            observed=lambda: self.publisher_state(inner, outer),
         )
         wait_until(
             lambda: len(self.helper_lock_holders("watch", inner)) == 1,
             "publisher before stale stop simulation",
+            observed=lambda: self.publisher_state(inner, outer),
         )
         publisher = self.helper_lock_holders("watch", inner)[0]
         client_pid, client_tty = self.client_identity(inner)
@@ -1450,22 +1496,16 @@ class NestedFocusTest(unittest.TestCase):
                 and bool(self.pane_claim(outer, nested_pane))
             ),
             "renewal after a stale stop signal",
+            observed=lambda: self.publisher_state(inner, outer),
         )
         self.assertEqual([publisher], self.helper_lock_holders("watch", inner))
 
     def test_renewals_keep_one_expirer_and_direct_clients_keep_no_watcher(self) -> None:
-        inner = self.new_server("efficient-inner", "sleep 30")
-        outer = self.new_server(
-            "efficient-outer",
-            f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus",
-        )
-        nested_pane = self.tmux(outer, "display-message", "-p", "#{pane_id}")
-        client = PtyClient(outer, self.environment)
-        self.clients.append(client)
-        client.focus()
+        inner, outer, nested_pane = self.focused_nested_pair("efficient")
         wait_until(
             lambda: bool(self.pane_claim(outer, nested_pane)),
             "claim before process-count check",
+            observed=lambda: self.publisher_state(inner, outer),
         )
         # Allow several 150 ms renewals. They update one lease in place rather
         # than creating a timer process for every heartbeat.
