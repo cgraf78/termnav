@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@dea363fed9e62883887a39790006a111a458af31
     with:
       matrix-set: full
       msrv-toolchain: "1.88"
@@ -49,6 +49,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
@@ -56,7 +61,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@cff4d77cf738c278a8c1279a89b20c9c546d9c5b
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@dea363fed9e62883887a39790006a111a458af31
 
   vscode-adapter:
     name: VS Code adapter / Ubuntu
@@ -64,6 +69,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
@@ -85,6 +95,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -116,6 +131,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -148,9 +168,27 @@ jobs:
         run: |
           pacman-key --init
           pacman-key --populate
-          pacman -Syu --noconfirm bash eza git lua python rust zsh
+          # Name only missing targets: pacman warns "up to date --
+          # reinstalling" for each one already installed, and the image
+          # ships bash. `-T` lists the unsatisfied targets and exits 127;
+          # any other failure falls back to the full list so errors surface.
+          targets="bash eza git lua python rust zsh"
+          status=0
+          # shellcheck disable=SC2086 # Split into one package per word.
+          missing=$(pacman -T $targets) || status=$?
+          if [ "$status" -ne 0 ] && [ "$status" -ne 127 ]; then
+            missing=$targets
+          fi
+          # `-u` still upgrades everything installed, as before.
+          # shellcheck disable=SC2086 # Split into one package per word.
+          pacman -Syu --noconfirm --needed $missing
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Name checkout's throwaway initial branch so Git skips its hint.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: init.defaultBranch
+          GIT_CONFIG_VALUE_0: main
         with:
           persist-credentials: false
 
