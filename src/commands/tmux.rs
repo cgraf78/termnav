@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
-use crate::terminal::{self, TmuxMode};
+use crate::terminal;
 
 const HELP: &str = r#"usage:
   termnav tmux context --tty TTY --client-termname TERM [--control-mode 0|1]
@@ -297,11 +297,7 @@ fn context(
     let Some(termname) = termname.filter(|value| !value.is_empty()) else {
         return usage(stderr, "--client-termname is required");
     };
-    let mode = if termname.starts_with("tmux") || termname.starts_with("screen") {
-        TmuxMode::Passthrough
-    } else {
-        TmuxMode::Raw
-    };
+    let mode = terminal::tmux_mode(&termname);
     let mut file = match OpenOptions::new()
         .append(true)
         .custom_flags(libc::O_NOCTTY)

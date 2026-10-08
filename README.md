@@ -53,6 +53,22 @@ installation path to build, publish, update, and diagnose.
   editor target.
 - `termnav link-host`: print the host represented by the current terminal
   context for hyperlink producers such as ripgrep and eza.
+- `termnav open-url [--tty PATH] URL`: ask the outer terminal to open an
+  `http`, `https`, or `mailto` URL on the machine that runs it, across SSH and
+  tmux, through the `TERMNAV_OPEN_URL` request. Inside tmux it writes to the
+  most recently active client of the caller's session, preferring clients
+  showing the caller's window and skipping control-mode and VS Code (xterm.js)
+  clients; otherwise it writes to `--tty PATH` or the controlling terminal.
+  One passthrough frame is added when that terminal type is `tmux*` or
+  `screen*`; the outer tmux then needs `allow-passthrough`, and GNU screen is
+  unsupported. `--tty` serves callers without a controlling terminal, such as
+  Neovim's TUI server, whose stderr is still the terminal; it is ignored inside
+  tmux. Other schemes and control characters are invalid syntax (`2`). No
+  eligible client or terminal is an operational failure (`1`); stdout is never
+  used. Success means the request was written, not that a terminal acted on
+  it. Editors and scripts should call it rather than constructing the escape.
+  The scheme check binds only this publisher; WezTerm's handler still opens
+  whatever value a program writes to the terminal directly.
 - `termnav nvim open MODE ...`: open a target in the narrowest eligible editor
   scope. `ssh-open` is the fail-closed existing-ControlMaster transport.
 - `termnav vscode focus ...`: publish ordered, authenticated Neovim focus
@@ -101,6 +117,8 @@ status. Reusable behavior lives behind focused library interfaces:
 - `nvim` owns target parsing, registry selection, RPC, exact-pane transport
   fallback, and mux-only remote reuse;
 - `click` owns mouse-text recognition and returns typed URL/file targets;
+- `browser` owns open-URL validation and delivery of `TERMNAV_OPEN_URL` to
+  the outer terminal;
 - `vscode` owns VS Code window focus publication to the companion extension;
 - `assets` owns installed provider-root discovery;
 - `shell` owns POSIX shell quoting and tmux format escaping at explicit
@@ -239,7 +257,8 @@ The WezTerm protocol consists of `IS_NVIM`, `NVIM_OPEN_SOCKET`,
 `NVIM_REMOTE_TMUX`, and `TERMNAV_TMUX` pane metadata plus the
 `TERMNAV_TAB_SELECT`, `TERMNAV_TAB_MOVE`, and `TERMNAV_OPEN_URL` requests.
 `routes.setup()` owns the request handlers; consumers should use route helpers
-instead of interpreting metadata directly. There are no `DOT_*` aliases.
+instead of interpreting metadata directly, and should publish open-URL
+requests through `termnav open-url`. There are no `DOT_*` aliases.
 
 `lib/termnav/nvim/setup.lua` accepts `group_name`, `opener`, `navigation`,
 `wezterm_vars`, `vscode_focus`, `publish_delay_ms`, `publish_events`,

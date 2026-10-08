@@ -16,7 +16,7 @@ if [[ ! -x $termnav ]]; then
 fi
 
 top_help=$($termnav --help)
-for command in navigate relay ssh link-host tmux nvim vscode eza asset-path version; do
+for command in navigate relay ssh link-host tmux nvim open-url vscode eza asset-path version; do
   _assert_contains "CLI contract: top-level help exposes $command" \
     "$command" "$top_help"
 done

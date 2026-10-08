@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import json
 import os
@@ -1270,6 +1271,54 @@ class RelayTerminalTest(unittest.TestCase):
 
         payload = terminal.read_until(b"]1337;SetUserVar=TERMNAV_TAB_SELECT=")
         self.assertIn(b"\x1b]1337;SetUserVar=TERMNAV_TAB_SELECT=", payload)
+
+    def test_open_url_from_a_pane_reaches_the_outer_terminal(self) -> None:
+        tmux_socket, source_pane, _, terminal, _ = self.top_level()
+        terminal.drain()
+        url = "https://example.com/path?a=1&b=two three"
+
+        # The pane process inherits only tmux's own TMUX/TMUX_PANE context, so
+        # this proves real client resolution rather than a faked query reply.
+        self.harness.tmux(
+            tmux_socket,
+            "split-window",
+            "-d",
+            "-t",
+            source_pane,
+            f"{shlex.quote(self.harness.termnav)} open-url {shlex.quote(url)}",
+        )
+
+        # Byte-for-byte the raw request WezTerm parses; the attached client is
+        # xterm-256color, so no passthrough frame may be added.
+        terminal.read_until(
+            b"\x1b]1337;SetUserVar=TERMNAV_OPEN_URL=" + base64.b64encode(url.encode()) + b"\x07"
+        )
+
+    def test_open_url_from_a_detached_session_never_reaches_another_client(self) -> None:
+        tmux_socket, _, _, terminal, _ = self.top_level()
+        self.harness.tmux(tmux_socket, "new-session", "-d", "-s", "detached", "cat")
+        terminal.drain()
+        status = self.harness.root / "detached-open-url.status"
+
+        # tmux's best-client lookup would fall back to the attached `top`
+        # client. That would open the URL on someone else's terminal, so the
+        # request must fail instead.
+        self.harness.tmux(
+            tmux_socket,
+            "split-window",
+            "-d",
+            "-t",
+            "detached",
+            f"{shlex.quote(self.harness.termnav)} open-url https://example.com/; "
+            f"echo $? > {shlex.quote(str(status))}",
+        )
+
+        code = wait_for(
+            lambda: status.read_text().strip() if status.exists() else None,
+            "detached open-url exit status",
+        )
+        self.assertEqual(code, "1")
+        self.assertNotIn(b"TERMNAV_OPEN_URL", terminal.drain())
 
     def test_relay_started_before_focus_switch_targets_the_live_client(self) -> None:
         tmux_socket, _, _, first, relay_socket = self.top_level()

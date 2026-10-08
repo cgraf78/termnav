@@ -30,6 +30,7 @@ fn top_level_help_lists_the_cohesive_surface() {
         "link-host",
         "tmux",
         "nvim",
+        "open-url",
         "vscode",
         "eza",
         "asset-path",
