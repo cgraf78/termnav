@@ -35,6 +35,7 @@ Suite ownership follows the integration boundary:
   ceilings; pull-request CI compares against the explicit PR base revision
   automatically.
 - `relay-terminal-test` covers the terminal barrier, mixed-version relay paths,
+  `open-url` delivery from a real tmux pane to its attached client,
   arbitrary nesting depth, burst preservation, and VS Code terminal handoff. Its
   harness also proves that tmux servers and relays are stopped on every exit
   path, including servers that ignore `kill-server` and a harness killed

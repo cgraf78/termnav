@@ -1,6 +1,7 @@
 //! Native Termnav implementation.
 
 pub mod assets;
+pub mod browser;
 pub mod cli;
 pub mod click;
 pub mod commands;

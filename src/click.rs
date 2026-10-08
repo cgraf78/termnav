@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::browser;
 use crate::terminal::{self, TmuxMode};
 
 /// Raw fields supplied by the tmux mouse binding.
@@ -550,7 +551,7 @@ fn hostname(flag: &str) -> Option<String> {
 }
 
 fn open_url(url: &str, explicit_tty: &str) -> io::Result<()> {
-    let escape = terminal::user_var("TERMNAV_OPEN_URL", url, TmuxMode::Raw);
+    let escape = terminal::user_var(browser::USER_VAR, url, TmuxMode::Raw);
     if write_tty(explicit_tty, &escape).is_ok() {
         return Ok(());
     }

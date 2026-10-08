@@ -27,6 +27,20 @@ pub fn user_var(name: &str, value: &str, mode: TmuxMode) -> Vec<u8> {
     }
 }
 
+/// Choose framing from the terminal type that will interpret an escape.
+///
+/// A `tmux*` or `screen*` terminal type means another tmux layer sits between
+/// the destination and WezTerm; `screen` is tmux's historical default
+/// `default-terminal`. GNU screen's own passthrough syntax is not supported.
+#[must_use]
+pub fn tmux_mode(termname: &str) -> TmuxMode {
+    if termname.starts_with("tmux") || termname.starts_with("screen") {
+        TmuxMode::Passthrough
+    } else {
+        TmuxMode::Raw
+    }
+}
+
 fn base64(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -52,7 +66,7 @@ fn base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TmuxMode, base64, user_var};
+    use super::{TmuxMode, base64, tmux_mode, user_var};
 
     #[test]
     fn base64_matches_terminal_protocol_examples() {
@@ -60,6 +74,15 @@ mod tests {
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn nested_terminal_types_select_passthrough() {
+        assert_eq!(tmux_mode("tmux-256color"), TmuxMode::Passthrough);
+        assert_eq!(tmux_mode("screen-256color"), TmuxMode::Passthrough);
+        assert_eq!(tmux_mode("xterm-256color"), TmuxMode::Raw);
+        assert_eq!(tmux_mode("wezterm"), TmuxMode::Raw);
+        assert_eq!(tmux_mode(""), TmuxMode::Raw);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# relay-terminal-test - real tmux and PTY coverage for the terminal commit barrier.
+# relay-terminal-test - real tmux and PTY coverage for the terminal commit barrier
+# and other requests delivered to the attached client terminal.
 
 set -euo pipefail
 export NO_COLOR=1
@@ -67,6 +68,10 @@ _assert_contains "relay terminal: remote bubbling reaches the VS Code window ada
   "test_one_window_tab_selection_reaches_the_vscode_window_adapter" "$output"
 _assert_contains "relay terminal: post-start focus changes select the live client" \
   "test_relay_started_before_focus_switch_targets_the_live_client" "$output"
+_assert_contains "relay terminal: open-url from a pane reaches the attached client" \
+  "test_open_url_from_a_pane_reaches_the_outer_terminal" "$output"
+_assert_contains "relay terminal: open-url never crosses to another session's client" \
+  "test_open_url_from_a_detached_session_never_reaches_another_client" "$output"
 _assert_contains "relay terminal: teardown kills a TERM-blocked tmux server" \
   "test_teardown_kills_a_server_that_blocks_term" "$output"
 _assert_contains "relay terminal: teardown finds a tmux server recorded before its PID" \

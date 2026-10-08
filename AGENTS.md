@@ -20,6 +20,7 @@ modules:
 - `focus` — one-hop tmux leases and pane-style restoration
 - `nvim` — target parsing, RPC, and mux-only remote reuse
 - `click` — mouse-text recognition
+- `browser` — open-URL validation and terminal delivery
 - `vscode` — VS Code window focus publication
 - `assets` — installed provider-root discovery
 - `shell` — POSIX shell quoting and tmux format escaping at

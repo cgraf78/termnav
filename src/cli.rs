@@ -13,6 +13,7 @@ commands:
   link-host  print the host represented by the current terminal context
   tmux       manage tmux context, focus, and click routing
   nvim       open and route Neovim targets
+  open-url   ask the outer terminal to open a URL locally
   vscode     publish VS Code focus
   eza        render terminal-aware directory links
   asset-path print the absolute path of an installed runtime asset
@@ -73,6 +74,7 @@ where
             Ok(2)
         }
         "nvim" => crate::commands::nvim::run(&arguments[1..], stdout, stderr),
+        "open-url" => crate::commands::open_url::run(&arguments[1..], stdout, stderr),
         "tmux" => crate::commands::tmux::run(&arguments[1..], stdout, stderr),
         "eza" => crate::commands::eza::run(&arguments[1..], stdout, stderr),
         "asset-path"

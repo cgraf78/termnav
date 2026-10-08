@@ -42,6 +42,9 @@ termnav \- route terminal navigation, focus, links, and editor opens
 .B termnav nvim ssh-open
 .I HOST TARGET
 .br
+.B termnav open-url
+.RI [ --tty " PATH" ] " URL"
+.br
 .B termnav vscode focus claim|release
 .I SOURCE CYCLE SEQUENCE OBSERVED
 .br
@@ -124,6 +127,29 @@ X, CWD, TTY, PANE, Y, TOP, LEFT, SOCKET. With
 .BR --stdin ,
 the same fields are newline-delimited; input is limited to eleven lines and 64
 KiB.
+.TP
+.B open-url
+Accepts exactly one
+.BR http ,
+.BR https ,
+or
+.B mailto
+URL and asks the outer terminal to open it on the machine that runs the
+terminal, through the
+.B TERMNAV_OPEN_URL
+request. Other schemes and control characters are invalid syntax. Inside tmux
+the request is written to the most recently active client of the caller's
+session, preferring clients that show the caller's window and skipping
+control-mode and VS Code (xterm.js) clients; otherwise it is written to
+.B --tty PATH
+when given, or to the controlling terminal. The option serves callers without
+a controlling terminal, such as Neovim's TUI server, and is ignored inside tmux.
+Either destination receives one tmux passthrough frame when its terminal type
+starts with tmux or screen, which requires
+.B allow-passthrough
+on that outer tmux; GNU screen itself is unsupported. No eligible client or a
+missing terminal is an operational failure; standard output is never used.
+Success means the request was written, not that the terminal acted on it.
 .SH ENVIRONMENT
 .TP
 .B TERMNAV_ASSET_ROOT
@@ -199,6 +225,9 @@ registers the open-uri router and handlers for
 .BR TERMNAV_TAB_MOVE ,
 and
 .BR TERMNAV_OPEN_URL .
+.B termnav open-url
+is the public publisher for TERMNAV_OPEN_URL; integrations should invoke it
+instead of constructing the escape.
 Pane metadata uses IS_NVIM, NVIM_OPEN_SOCKET, NVIM_LINK_CWD,
 NVIM_REMOTE_LINK_HOST, NVIM_REMOTE_CWD, NVIM_REMOTE_TMUX, and TERMNAV_TMUX.
 There are no DOT_* aliases.
