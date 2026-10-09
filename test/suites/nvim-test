@@ -314,6 +314,7 @@ if command -v python3 >/dev/null 2>&1; then
   # Drive the real TUI on a fresh pty with no tmux and no controlling-terminal
   # shortcut: the user var must arrive on that pty.
   pty_status=$(_tmpdir)/pty-status
+  pty_report=$(_tmpdir)/pty-report
   pty_script=$(_tmpdir)/pty-publish.lua
   cat >"$pty_script" <<EOF
 local ok = dofile('$vars_module').set('TERMNAV_PTY_TEST', 'ok')
@@ -323,14 +324,50 @@ file:close()
 vim.cmd('qa!')
 EOF
   pty_output=$(
-    python3 -I - "$pty_script" <<'PY'
+    python3 -I - "$pty_script" "$pty_report" <<'PY'
 import os
 import pty
+import re
 import select
 import sys
 import time
 
 needle = b"\x1b]1337;SetUserVar=TERMNAV_PTY_TEST=b2s=\x07"
+
+
+def read_line(fd, seconds):
+    data = bytearray()
+    deadline = time.monotonic() + seconds
+    while b"\n" not in data and time.monotonic() < deadline:
+        if select.select([fd], [], [], 0.1)[0]:
+            try:
+                chunk = os.read(fd, 1024)
+            except OSError:
+                break
+            if not chunk:
+                break
+            data.extend(chunk)
+    return data.split(b"\n", 1)[0].strip().decode(errors="replace")
+
+
+# The publisher reopens, by name, a pty that another session controls.
+# Android denies that to unprivileged apps; relay-terminal-test skips its
+# synthetic tmux client for the same rule. Probe exactly that condition.
+probe_pid, probe_master = pty.fork()
+if probe_pid == 0:
+    print(os.ttyname(0), flush=True)
+    time.sleep(5)
+    os._exit(0)
+restricted = False
+try:
+    os.close(os.open(read_line(probe_master, 5), os.O_WRONLY | os.O_NOCTTY))
+except PermissionError:
+    restricted = True
+finally:
+    os.kill(probe_pid, 9)
+    os.waitpid(probe_pid, 0)
+    os.close(probe_master)
+
 pid, master = pty.fork()
 if pid == 0:
     os.environ["TERM"] = "xterm-256color"
@@ -349,12 +386,27 @@ while time.monotonic() < deadline and needle not in seen:
         seen.extend(chunk)
 if needle not in seen:
     os.kill(pid, 9)
+    # Keep the editor's readable output for the report: escape sequences
+    # and padding would otherwise fill it.
+    text = re.sub(rb"\x1b(\[[0-9;?>=]*[ -/]*[@-~]|\][^\x07]*\x07|.)", b"", bytes(seen))
+    text = re.sub(rb"[\x00-\x1f ]+", b" ", text).strip()
+    with open(sys.argv[2], "wb") as report:
+        report.write(text[:1000] + (b" ... " + text[-1000:] if len(text) > 2000 else text[1000:]))
 os.waitpid(pid, 0)
-print("delivered" if needle in seen else "missing")
+print(("delivered" if needle in seen else "missing") + (" restricted" if restricted else ""))
 PY
   )
-  _assert_eq "wezterm-vars: a real TUI outside tmux publishes to its pty" \
-    "delivered true" "$pty_output $(cat "$pty_status" 2>/dev/null)"
+  if [[ $pty_output == "missing restricted" ]]; then
+    # A known platform limitation: the publisher cannot reach the pty there.
+    # Still show what the editor printed so the exact cause stays visible.
+    echo "  SKIP: wezterm-vars real pty publication (platform forbids reopening a pty)"
+  else
+    _assert_eq "wezterm-vars: a real TUI outside tmux publishes to its pty" \
+      "delivered true" "${pty_output% restricted} $(cat "$pty_status" 2>/dev/null)"
+  fi
+  if [[ $pty_output == missing* && -s $pty_report ]]; then
+    printf '    editor output: %s\n' "$(cat "$pty_report")"
+  fi
 else
   echo "  SKIP: wezterm-vars real pty publication (python3 unavailable)"
 fi
