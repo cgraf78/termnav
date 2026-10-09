@@ -221,9 +221,10 @@ fn identify_client(client: &Client) -> Terminal {
 /// session, or one whose tmux reply proves it is tmux although no local pane
 /// owns the client's tty: it receives one passthrough frame and its own outer
 /// terminal is trusted, as before. A layer only guessed from inherited
-/// variables is not trusted that way. A tmux client is identified by its XTVERSION reply
-/// (falling back to its environment without one), a plain terminal by
-/// `TERM_PROGRAM`, `STY`, `WEZTERM_PANE`, or `TERM`; see [`identify`].
+/// variables is not trusted that way. A tmux client is identified by its
+/// XTVERSION reply (falling back to its environment without one), a plain
+/// terminal by `TERM_PROGRAM`, `STY`, `WEZTERM_PANE`, or `TERM`; the private
+/// `identify` helper owns the plain-terminal order.
 ///
 /// `terminal` exists for callers without a controlling terminal of their
 /// own: Neovim's TUI runs the editor in a separate session, so its children
