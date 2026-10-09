@@ -318,22 +318,33 @@ else
   # run-as context), /proc/self/exe and therefore v:progpath name
   # /system/bin/linker64, so the TUI runs `linker64 --embed`, the linker
   # rejects that ("expected absolute path"), and no editor starts. Probe
-  # exactly what the TUI does; the case below may skip only when this fails
-  # and its script never ran, so a started editor always asserts.
+  # whether v:progpath runs when executed directly, as the server spawn
+  # requires (bounded, without stdin). The case below may skip only when
+  # this fails and the editor never started its script, so a started editor
+  # always asserts.
   pty_progpath=$(nvim --headless -u NONE -i NONE \
-    --cmd 'lua io.stdout:write(vim.v.progpath)' --cmd 'qa!' 2>/dev/null)
+    --cmd 'lua io.stdout:write(vim.v.progpath)' --cmd 'qa!' </dev/null 2>/dev/null)
   pty_unstartable=
-  if [[ -n $pty_progpath ]] &&
-    ! "$pty_progpath" --headless -u NONE -i NONE --cmd 'qa!' >/dev/null 2>&1; then
+  if [[ -n $pty_progpath ]] && ! python3 -I -c '
+import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[1:], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=10).returncode)
+except (OSError, subprocess.TimeoutExpired):
+    sys.exit(1)
+' "$pty_progpath" --headless -u NONE -i NONE --cmd 'qa!'; then
     pty_unstartable=1
   fi
   # Drive the real TUI on a fresh pty with no tmux. On Neovim 0.10+ the
   # editor has no controlling terminal, so the user var must reach the pty
   # through the stderr path; older Neovim still uses /dev/tty.
   pty_status=$(_tmpdir)/pty-status
+  pty_started=$(_tmpdir)/pty-started
   pty_report=$(_tmpdir)/pty-report
   pty_script=$(_tmpdir)/pty-publish.lua
   cat >"$pty_script" <<EOF
+assert(io.open('$pty_started', 'w')):close()
 local ok = dofile('$vars_module').set('TERMNAV_PTY_TEST', 'ok')
 local file = assert(io.open('$pty_status', 'w'))
 file:write(tostring(ok))
@@ -378,9 +389,9 @@ os.waitpid(pid, 0)
 print("delivered" if needle in seen else "missing")
 PY
   )
-  if [[ -n $pty_unstartable && $pty_output == missing && ! -e $pty_status ]]; then
+  if [[ -n $pty_unstartable && $pty_output == missing && ! -e $pty_started ]]; then
     echo "  SKIP: wezterm-vars real pty publication (Neovim's v:progpath" \
-      "$pty_progpath cannot be executed, so its TUI starts no editor here)"
+      "$pty_progpath fails when executed directly, so its TUI starts no editor here)"
   else
     _assert_eq "wezterm-vars: a real TUI outside tmux publishes to its pty" \
       "delivered true" "$pty_output $(cat "$pty_status" 2>/dev/null)"
