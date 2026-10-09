@@ -1395,14 +1395,18 @@ class RelayTerminalTest(unittest.TestCase):
         url = "https://example.com/nested"
 
         # The inner client's termtype is tmux; Termnav must follow it to the
-        # outer server and write once, unwrapped, to the WezTerm client.
+        # outer server and write once, unwrapped, to the WezTerm client. The
+        # C locale matches minimal containers such as Alpine, where a tmux
+        # command client without TMUX prints tab separators as "_" unless
+        # told its output is UTF-8.
         self.harness.tmux(
             inner_socket,
             "split-window",
             "-d",
             "-t",
             inner_pane,
-            f"{shlex.quote(self.harness.termnav)} open-url {shlex.quote(url)}",
+            f"env -u LC_CTYPE LANG=C LC_ALL=C {shlex.quote(self.harness.termnav)} "
+            f"open-url {shlex.quote(url)}",
         )
 
         payload = terminal.read_until(

@@ -48,11 +48,11 @@ impl Fixture {
     /// and then the outer client tty.
     fn nested(inner: &str, outer: &str) -> Self {
         Self::with_body(&format!(
-            "if [ \"$1\" = -S ]; then\n\
-             printf '{outer}\\n' \"$TERMNAV_TEST_PANE_TTY\" \"$TERMNAV_TEST_OUTER_TTY\"\n\
-             else\n\
-             printf '{inner}\\n' \"$TERMNAV_TEST_TTY\" \"$TERMNAV_TEST_CLIENT_PID\"\n\
-             fi"
+            "case \" $* \" in *' -S '*)\n\
+             printf '{outer}\\n' \"$TERMNAV_TEST_PANE_TTY\" \"$TERMNAV_TEST_OUTER_TTY\" ;;\n\
+             *)\n\
+             printf '{inner}\\n' \"$TERMNAV_TEST_TTY\" \"$TERMNAV_TEST_CLIENT_PID\" ;;\n\
+             esac"
         ))
     }
 
@@ -66,9 +66,29 @@ impl Fixture {
         std::fs::write(&outer_tty, []).expect("create fake outer client tty");
         let log = root.join("tmux.log");
         let script = bin.join("tmux");
+        // Like tmux, a command client that does not consider its output
+        // UTF-8 (no `-u` among the options before the command, no `TMUX`, no
+        // UTF-8 locale) prints control characters such as tabs as `_`. `run` pins `LC_ALL=C` so the model
+        // behaves the same on every host.
         std::fs::write(
             &script,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$TERMNAV_TEST_LOG\"\n{body}\n"),
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >>\"$TERMNAV_TEST_LOG\"\n\
+                 utf8=\n\
+                 skip=\n\
+                 for arg in \"$@\"; do\n\
+                 if [ -n \"$skip\" ]; then skip=; continue; fi\n\
+                 case $arg in -u) utf8=1 ;; -S | -L | -f) skip=1 ;; -*) ;; *) break ;; esac\n\
+                 done\n\
+                 [ -n \"$TMUX\" ] && utf8=1\n\
+                 case \"${{LC_ALL:-${{LC_CTYPE:-$LANG}}}}\" in *[Uu][Tt][Ff]-8* | *[Uu][Tt][Ff]8*) utf8=1 ;; esac\n\
+                 reply() {{\n{body}\n}}\n\
+                 if [ -n \"$utf8\" ]; then reply \"$@\"; exit $?; fi\n\
+                 out=$(reply \"$@\"); status=$?\n\
+                 printf '%s\\n' \"$out\" | tr '\\t' '_'\n\
+                 exit $status\n"
+            ),
         )
         .expect("write fake tmux");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
@@ -92,6 +112,8 @@ impl Fixture {
             )
             .env("TMUX", "/tmp/termnav-open-url,1,0")
             .env("TMUX_PANE", "%1")
+            // A non-UTF-8 locale, as in Alpine containers; see `with_body`.
+            .env("LC_ALL", "C")
             // Inside tmux the caller's own terminal variables describe where
             // the pane was created, not where it is shown; prove they are
             // ignored by making them claim WezTerm.
@@ -229,6 +251,15 @@ fn local_nested_tmux_requests_go_raw_to_the_outer_wezterm_client() {
         "-S {} display-message -p -t %9 #{{window_id}}\t#{{pane_tty}} ; list-clients -t %9 -F",
         outer.display()
     )));
+    // Both queries must keep their tab separators intact.
+    assert!(
+        fixture
+            .tmux_calls()
+            .lines()
+            .all(|call| call.starts_with("-u ")),
+        "{}",
+        fixture.tmux_calls()
+    );
 }
 
 #[test]

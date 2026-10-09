@@ -396,6 +396,12 @@ struct Client {
 /// user vars and would swallow it.
 fn tmux_client(server: Option<&str>, target: &str) -> io::Result<(Client, String)> {
     let mut command = Command::new("tmux");
+    // A command client that does not believe the terminal is UTF-8 prints
+    // control characters, including the tab separators below, as `_`. tmux
+    // assumes UTF-8 when `TMUX` is set, but the parent query must clear it
+    // and the locale may be `C` (e.g. Alpine containers); `-u` keeps the
+    // output byte-exact everywhere.
+    command.arg("-u");
     if let Some(socket) = server {
         command.args(["-S", socket]);
         // An inherited TMUX value can retarget the command on older tmux
