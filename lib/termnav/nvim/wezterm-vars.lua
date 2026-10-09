@@ -11,6 +11,11 @@ local vim = vim
 local M = {}
 
 local tty_path
+-- hrtime before which publishing is skipped after a write timed out, so a
+-- stuck terminal costs one bounded wait per second rather than one per
+-- user var on every autocmd.
+local stalled_until = 0
+local stall_cooldown_ns = 1000 * 1000000
 local base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 local function base64_encode(value)
@@ -174,6 +179,53 @@ function M.editor_tty_path()
   return M.stderr_tty_path()
 end
 
+-- Open a terminal for one write without ever blocking the editor.
+-- O_NONBLOCK keeps open() from waiting for a carrier that may not return
+-- (BSD and macOS ptys whose terminal has closed) and write() from waiting on
+-- a terminal that stopped reading. A queue that is only momentarily full
+-- (BSD ptys hold about 1 KiB, so a TUI redraw can fill one) gets a short
+-- bounded retry, which also makes leaving half an escape sequence in the
+-- stream unlikely; past that the write reports failure and setup retries
+-- later.
+-- O_NOCTTY keeps the editor, a session leader without a controlling terminal
+-- on Neovim 0.10+, from adopting the pty. Returns a handle with the
+-- write/flush/close subset of an io file, where close() reports whether
+-- everything was written, or nil when the open failed.
+function M.open_tty(path)
+  local uv = vim.uv or vim.loop
+  local flags = uv and uv.constants
+  -- LuaJIT ships `bit`; Neovim bundles it for PUC Lua builds.
+  local has_bit, bit = pcall(require, "bit")
+  if not (flags and flags.O_WRONLY and flags.O_NONBLOCK and flags.O_NOCTTY and has_bit) then
+    return io.open(path, "w")
+  end
+  local fd = uv.fs_open(path, bit.bor(flags.O_WRONLY, flags.O_NONBLOCK, flags.O_NOCTTY), 0)
+  if not fd then
+    return nil
+  end
+  local complete = true
+  return {
+    write = function(_, data)
+      local deadline = uv.hrtime() + 100 * 1000000
+      while complete and #data > 0 do
+        local written, _, code = uv.fs_write(fd, data, -1)
+        if written and written > 0 then
+          data = data:sub(written + 1)
+        elseif (written or code == "EAGAIN") and uv.hrtime() < deadline then
+          uv.sleep(1)
+        else
+          complete = false
+        end
+      end
+    end,
+    flush = function() end,
+    close = function()
+      uv.fs_close(fd)
+      return complete
+    end,
+  }
+end
+
 local function tmux_passthrough(sequence)
   return "\027Ptmux;" .. sequence:gsub("\027", "\027\027") .. "\027\\"
 end
@@ -199,6 +251,10 @@ function M.tty_path()
 end
 
 function M.set(name, value, batch)
+  local uv = vim.uv or vim.loop
+  if uv and uv.hrtime() < stalled_until then
+    return false
+  end
   local path = M.tty_path()
   if not path then
     return false
@@ -219,14 +275,20 @@ function M.set(name, value, batch)
     end
   end
 
-  local tty = io.open(path, "w")
+  local tty = M.open_tty(path)
   if not tty then
     return false
   end
 
   tty:write(osc)
   tty:flush()
-  tty:close()
+  -- io files and test doubles return true or nil; only a short write fails.
+  if tty:close() == false then
+    if uv then
+      stalled_until = uv.hrtime() + stall_cooldown_ns
+    end
+    return false
+  end
   return true
 end
 
