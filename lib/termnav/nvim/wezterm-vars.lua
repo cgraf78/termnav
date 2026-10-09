@@ -2,7 +2,8 @@
 --
 -- nvim's TUI path cannot use plain io.write reliably, so callers write OSC
 -- directly to the pane tty. Inside tmux, that OSC must be wrapped in DCS
--- passthrough so it reaches the outer WezTerm process.
+-- passthrough so it reaches the outer WezTerm process. Outside tmux the
+-- editor names its own terminal; see editor_tty_path().
 
 -- selene: allow(undefined_variable)
 local vim = vim
@@ -10,6 +11,11 @@ local vim = vim
 local M = {}
 
 local tty_path
+-- hrtime before which publishing is skipped after a write timed out, so a
+-- stuck terminal costs one bounded wait per second rather than one per
+-- user var on every autocmd.
+local stalled_until = 0
+local stall_cooldown_ns = 1000 * 1000000
 local base64_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 local function base64_encode(value)
@@ -114,31 +120,141 @@ local function tmux_client_is_nested(batch)
   return nested, true
 end
 
+-- True while a terminal UI attached over the editor's stdio is present: the
+-- TUI that started this editor process and shares its stderr. A UI attached
+-- over a socket (`--remote-ui`, or the one left after `:detach`) can sit in a
+-- different terminal, and the stderr device would then be the wrong pane.
+local function stdio_tui_attached()
+  local ok, uis = pcall(vim.api.nvim_list_uis)
+  if not ok or type(uis) ~= "table" then
+    return false
+  end
+  for _, ui in ipairs(uis) do
+    if ui.stdout_tty and ui.chan then
+      local ok_info, info = pcall(vim.api.nvim_get_chan_info, ui.chan)
+      if ok_info and type(info) == "table" and info.stream == "stdio" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- Neovim 0.10+ runs the editor in its own session, separate from the TUI, so
+-- opening /dev/tty fails with ENXIO even though the editor's stderr is still
+-- the terminal. Name that device directly: procfs on Linux, ttyname(3) through
+-- LuaJIT's FFI elsewhere (macOS has no procfs). Returns nil unless the TUI
+-- that owns stderr is attached, when stderr is not a terminal, or when
+-- neither method applies, e.g. a PUC Lua build off Linux.
+function M.stderr_tty_path()
+  local uv = vim.uv or vim.loop
+  if not uv or uv.guess_handle(2) ~= "tty" or not stdio_tui_attached() then
+    return nil
+  end
+  local path = uv.fs_readlink("/proc/self/fd/2")
+  if type(path) == "string" and path:match("^/dev/") then
+    return path
+  end
+  local ok, name = pcall(function()
+    local ffi = require("ffi")
+    pcall(ffi.cdef, "char *ttyname(int fd);")
+    local pointer = ffi.C.ttyname(2)
+    return pointer ~= nil and ffi.string(pointer) or nil
+  end)
+  return ok and name or nil
+end
+
+-- Terminal for writes from the editor when no tmux pane sits in between.
+-- The controlling terminal keeps priority while the editor has one (Neovim
+-- before 0.10): unlike the device path, /dev/tty also works for a user who
+-- may not reopen that pty by name, e.g. under `su`. Otherwise the TUI's
+-- stderr terminal; nil when neither is available. navigation.lua passes the
+-- same answer to the native requests it starts.
+function M.editor_tty_path()
+  local probe = io.open("/dev/tty", "w")
+  if probe then
+    probe:close()
+    return "/dev/tty"
+  end
+  return M.stderr_tty_path()
+end
+
+-- Open a terminal for one write without ever blocking the editor.
+-- O_NONBLOCK keeps open() from waiting for a carrier that may not return
+-- (BSD and macOS ptys whose terminal has closed) and write() from waiting on
+-- a terminal that stopped reading. A queue that is only momentarily full
+-- (BSD ptys hold about 1 KiB, so a TUI redraw can fill one) gets a short
+-- bounded retry, which also makes leaving half an escape sequence in the
+-- stream unlikely; past that the write reports failure and setup retries
+-- later.
+-- O_NOCTTY keeps the editor, a session leader without a controlling terminal
+-- on Neovim 0.10+, from adopting the pty. Returns a handle with the
+-- write/flush/close subset of an io file, where close() reports whether
+-- everything was written, or nil when the open failed.
+function M.open_tty(path)
+  local uv = vim.uv or vim.loop
+  local flags = uv and uv.constants
+  -- LuaJIT ships `bit`; Neovim bundles it for PUC Lua builds.
+  local has_bit, bit = pcall(require, "bit")
+  if not (flags and flags.O_WRONLY and flags.O_NONBLOCK and flags.O_NOCTTY and has_bit) then
+    return io.open(path, "w")
+  end
+  local fd = uv.fs_open(path, bit.bor(flags.O_WRONLY, flags.O_NONBLOCK, flags.O_NOCTTY), 0)
+  if not fd then
+    return nil
+  end
+  local complete = true
+  return {
+    write = function(_, data)
+      local deadline = uv.hrtime() + 100 * 1000000
+      while complete and #data > 0 do
+        local written, _, code = uv.fs_write(fd, data, -1)
+        if written and written > 0 then
+          data = data:sub(written + 1)
+        elseif (written or code == "EAGAIN") and uv.hrtime() < deadline then
+          uv.sleep(1)
+        else
+          complete = false
+        end
+      end
+    end,
+    flush = function() end,
+    close = function()
+      uv.fs_close(fd)
+      return complete
+    end,
+  }
+end
+
 local function tmux_passthrough(sequence)
   return "\027Ptmux;" .. sequence:gsub("\027", "\027\027") .. "\027\\"
 end
 
 function M.tty_path()
+  if not vim.env.TMUX then
+    -- Not cached: UIs can attach and detach during the editor's lifetime.
+    return M.editor_tty_path()
+  end
+
   if type(tty_path) == "string" and tty_path ~= "" then
     return tty_path
   end
 
-  if vim.env.TMUX then
-    local path = tmux_tty_path()
-    -- Do not cache a failed lookup. Startup timing can briefly make tmux pane
-    -- metadata unavailable, and later focus events should be able to recover.
-    if not path then
-      return nil
-    end
-    tty_path = path
-  else
-    tty_path = "/dev/tty"
+  local path = tmux_tty_path()
+  -- Do not cache a failed lookup. Startup timing can briefly make tmux pane
+  -- metadata unavailable, and later focus events should be able to recover.
+  if not path then
+    return nil
   end
-
+  tty_path = path
   return tty_path
 end
 
 function M.set(name, value, batch)
+  local uv = vim.uv or vim.loop
+  if uv and uv.hrtime() < stalled_until then
+    return false
+  end
   local path = M.tty_path()
   if not path then
     return false
@@ -159,14 +275,20 @@ function M.set(name, value, batch)
     end
   end
 
-  local tty = io.open(path, "w")
+  local tty = M.open_tty(path)
   if not tty then
     return false
   end
 
   tty:write(osc)
   tty:flush()
-  tty:close()
+  -- io files and test doubles return true or nil; only a short write fails.
+  if tty:close() == false then
+    if uv then
+      stalled_until = uv.hrtime() + stall_cooldown_ns
+    end
+    return false
+  end
   return true
 end
 

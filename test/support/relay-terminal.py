@@ -26,6 +26,8 @@ COMMIT_KEY = b"\x1b[777009u"
 COMMIT_QUERY = b"\x1b[?2004$p"
 DECRQM_RESPONSES = tuple(f"\x1b[?2004;{state}$y".encode() for state in range(5))
 SENTINEL_KEY = b"\x07"
+# What WezTerm answers to XTVERSION, recorded by tmux as `client_termtype`.
+WEZTERM_XTVERSION = b"WezTerm 20240203-110809-5046fc22"
 # Multi-hop requests may consume the relay's eight-second RPC allowance before
 # the outer query is observable. Keep their test deadline aligned with the
 # asynchronous sender's ten-second completion bound.
@@ -201,8 +203,12 @@ class TerminalClient:
         self.harness = harness
         self.tmux_socket = tmux_socket
         self.session = session
+        self.xtversion = harness.xtversion
         self.pid, self.master = pty.fork()
         if self.pid == 0:
+            # Replace rather than merge so variables the harness removed do
+            # not survive from the runner's environment.
+            os.environ.clear()
             os.environ.update(harness.environment)
             os.environ["TERM"] = "xterm-256color"
             os.execvp(
@@ -255,6 +261,10 @@ class TerminalClient:
         # before the tests send any user keys.
         if b"\x1b[?996n" in payload:
             os.write(self.master, b"\x1b[?997;1n")
+        # tmux records the XTVERSION reply as `client_termtype`, which is how
+        # Termnav recognizes a WezTerm client.
+        if self.xtversion is not None and (b"\x1b[>q" in payload or b"\x1b[>0q" in payload):
+            os.write(self.master, b"\x1bP>|" + self.xtversion + b"\x1b\\")
 
     def _finish_initialization(self) -> None:
         # New tmux versions probe for terminal capability passthrough with DSR
@@ -386,6 +396,17 @@ class RelayHarness:
         self.runtime.mkdir(mode=0o700)
         self.environment = os.environ.copy()
         self.environment["XDG_RUNTIME_DIR"] = str(self.runtime)
+        # The synthetic terminals are no real terminal program, and nothing
+        # here runs inside the runner's tmux. Inherited identity would change
+        # how Termnav classifies them, and an inherited TMUX would let process
+        # ancestry lead it to the runner's own tmux server; tests opt in to
+        # either explicitly.
+        for name in ("TERM_PROGRAM", "WEZTERM_PANE", "STY", "TMUX", "TMUX_PANE"):
+            self.environment.pop(name, None)
+        # XTVERSION reply for terminals attached from now on, e.g.
+        # b"WezTerm 20240203-110809-5046fc22"; None leaves the query
+        # unanswered like a terminal without XTVERSION support.
+        self.xtversion: bytes | None = None
         self.sentinel = self.root / "input-ready"
         self.tmux_sockets: list[str] = []
         self.owned: dict[str, OwnedProcess] = {}
@@ -1273,7 +1294,18 @@ class RelayTerminalTest(unittest.TestCase):
         self.assertIn(b"\x1b]1337;SetUserVar=TERMNAV_TAB_SELECT=", payload)
 
     def test_open_url_from_a_pane_reaches_the_outer_terminal(self) -> None:
+        self.harness.xtversion = WEZTERM_XTVERSION
         tmux_socket, source_pane, _, terminal, _ = self.top_level()
+        wait_for(
+            lambda: (
+                self.harness.tmux(
+                    tmux_socket, "list-clients", "-F", "#{client_termtype}"
+                ).stdout.strip()
+                == WEZTERM_XTVERSION.decode()
+                or None
+            ),
+            "WezTerm client termtype",
+        )
         terminal.drain()
         url = "https://example.com/path?a=1&b=two three"
 
@@ -1294,7 +1326,96 @@ class RelayTerminalTest(unittest.TestCase):
             b"\x1b]1337;SetUserVar=TERMNAV_OPEN_URL=" + base64.b64encode(url.encode()) + b"\x07"
         )
 
+    def test_open_url_declines_for_a_client_that_is_not_wezterm(self) -> None:
+        # The synthetic terminal ignores XTVERSION and carries no WezTerm
+        # environment, so it is not known to act on the request.
+        tmux_socket, source_pane, _, terminal, _ = self.top_level()
+        terminal.drain()
+        status = self.harness.root / "unknown-open-url.status"
+
+        self.harness.tmux(
+            tmux_socket,
+            "split-window",
+            "-d",
+            "-t",
+            source_pane,
+            f"{shlex.quote(self.harness.termnav)} open-url https://example.com/; "
+            f"echo $? > {shlex.quote(str(status))}",
+        )
+
+        code = wait_for(
+            lambda: status.read_text().strip() if status.exists() else None,
+            "undeliverable open-url exit status",
+        )
+        self.assertEqual(code, "3")
+        self.assertNotIn(b"TERMNAV_OPEN_URL", terminal.drain())
+
+    def test_open_url_from_local_nested_tmux_goes_raw_to_the_outer_terminal(self) -> None:
+        inner_socket = self.harness.new_server("url-inner", "inner", "cat")
+        inner_pane = self.harness.tmux(
+            inner_socket, "display-message", "-p", "-t", "inner", "#{pane_id}"
+        ).stdout.strip()
+        outer_socket = self.harness.new_server("url-outer", "outer", "cat")
+        outer_pane = self.harness.tmux(
+            outer_socket, "display-message", "-p", "-t", "outer", "#{pane_id}"
+        ).stdout.strip()
+        # Provides the input-readiness binding that attach waits for.
+        self.harness.configure_commits(outer_socket, terminal_replies=True)
+        self.harness.xtversion = WEZTERM_XTVERSION
+        terminal = self.harness.attach(outer_socket, "outer")
+        wait_for(
+            lambda: (
+                self.harness.tmux(
+                    outer_socket, "list-clients", "-F", "#{client_termtype}"
+                ).stdout.strip()
+                == WEZTERM_XTVERSION.decode()
+                or None
+            ),
+            "outer WezTerm client termtype",
+        )
+        self.harness.tmux(
+            outer_socket,
+            "respawn-pane",
+            "-k",
+            "-t",
+            outer_pane,
+            f"exec tmux -S {shlex.quote(inner_socket)} attach-session -t inner",
+        )
+        self.harness.wait_for_nested_client(outer_socket, outer_pane, inner_socket, inner_pane)
+        wait_for(
+            lambda: (
+                self.harness.tmux(
+                    inner_socket, "list-clients", "-F", "#{client_termtype}"
+                ).stdout.startswith("tmux")
+                or None
+            ),
+            "inner client termtype from the outer tmux",
+        )
+        terminal.drain()
+        url = "https://example.com/nested"
+
+        # The inner client's termtype is tmux; Termnav must follow it to the
+        # outer server and write once, unwrapped, to the WezTerm client. The
+        # C locale matches minimal containers such as Alpine, where a tmux
+        # command client without TMUX prints tab separators as "_" unless
+        # told its output is UTF-8.
+        self.harness.tmux(
+            inner_socket,
+            "split-window",
+            "-d",
+            "-t",
+            inner_pane,
+            f"env -u LC_CTYPE LANG=C LC_ALL=C {shlex.quote(self.harness.termnav)} "
+            f"open-url {shlex.quote(url)}",
+        )
+
+        payload = terminal.read_until(
+            b"\x1b]1337;SetUserVar=TERMNAV_OPEN_URL=" + base64.b64encode(url.encode()) + b"\x07"
+        )
+        self.assertNotIn(b"\x1bPtmux;", payload)
+
     def test_open_url_from_a_detached_session_never_reaches_another_client(self) -> None:
+        self.harness.xtversion = WEZTERM_XTVERSION
         tmux_socket, _, _, terminal, _ = self.top_level()
         self.harness.tmux(tmux_socket, "new-session", "-d", "-s", "detached", "cat")
         terminal.drain()

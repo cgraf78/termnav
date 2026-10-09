@@ -30,6 +30,7 @@ const TMUX_TIMEOUT: Duration = Duration::from_secs(2);
 /// live client/process state is deliberately re-read at every safety boundary.
 pub struct SystemBackend {
     environment: HashMap<String, String>,
+    terminal: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -87,15 +88,27 @@ impl SystemBackend {
     /// Build a backend from the process environment.
     #[must_use]
     pub fn from_current_environment() -> Self {
-        Self {
-            environment: env::vars().collect(),
-        }
+        Self::new(env::vars().collect())
     }
 
     /// Build a backend around an explicit environment for deterministic tests.
     #[must_use]
     pub fn new(environment: HashMap<String, String>) -> Self {
-        Self { environment }
+        Self {
+            environment,
+            terminal: None,
+        }
+    }
+
+    /// Write terminal requests that have no tmux client to `terminal` instead
+    /// of the controlling terminal.
+    ///
+    /// Neovim's TUI runs the editor in its own session, so a navigation job it
+    /// starts cannot open `/dev/tty`; the editor passes its stderr terminal.
+    #[must_use]
+    pub fn with_terminal(mut self, terminal: Option<String>) -> Self {
+        self.terminal = terminal;
+        self
     }
 
     fn tmux(&self, scope: &Scope, arguments: &[String]) -> Option<Output> {
@@ -781,7 +794,9 @@ impl Backend for SystemBackend {
             || {
                 (
                     std::process::id(),
-                    "/dev/tty".to_owned(),
+                    self.terminal
+                        .clone()
+                        .unwrap_or_else(|| "/dev/tty".to_owned()),
                     self.environment.get("TERM").cloned().unwrap_or_default(),
                 )
             },

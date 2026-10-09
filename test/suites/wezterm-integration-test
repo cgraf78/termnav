@@ -1331,6 +1331,228 @@ fi
 _assert_eq "wezterm route module handles local, remote, and lazygit URIs" "ok" "$route_lua_output"
 
 echo
+echo "=== WezTerm open-url request policy ==="
+
+# Any program whose output reaches the terminal can set TERMNAV_OPEN_URL, so
+# the WezTerm handler, not the `termnav open-url` publisher, is the trust
+# boundary. Both enforce one policy in two languages; these checks pin them
+# to the same allowlist and the same accept/reject decisions.
+open_url_schemes_test=$(_tmpdir)/open-url-schemes-test.lua
+cat >"$open_url_schemes_test" <<'EOF'
+local function read(path)
+  local file = assert(io.open(path, "r"))
+  local text = file:read("*a")
+  file:close()
+  return text
+end
+
+local function words(body)
+  local list = {}
+  for word in body:gmatch('"([^"]*)"') do
+    table.insert(list, word)
+  end
+  return table.concat(list, ",")
+end
+
+local rust = assert(
+  read(arg[1]):match("pub const SCHEMES: &%[&str%] = &%[(.-)%];"),
+  "src/browser.rs: SCHEMES not found"
+)
+local lua = assert(
+  read(arg[2]):match("local open_url_schemes = {(.-)\n}"),
+  "link-routes.lua: open_url_schemes not found"
+)
+print(words(rust) .. "|" .. words(lua))
+EOF
+open_url_schemes_output=$(_run_lua "$open_url_schemes_test" \
+  "$TERMNAV_ROOT/src/browser.rs" "$wezterm_routes")
+_assert_eq "open-url: Rust publisher and WezTerm handler share one scheme allowlist" \
+  "http,https,mailto|http,https,mailto" "$open_url_schemes_output"
+
+open_url_handler_test=$(_tmpdir)/open-url-handler-test.lua
+cat >"$open_url_handler_test" <<'EOF'
+local handlers = {}
+local opened = {}
+local warnings = {}
+local wezterm = {
+  hostname = function()
+    return "macbook"
+  end,
+  on = function(name, cb)
+    handlers[name] = cb
+  end,
+  open_with = function(url)
+    table.insert(opened, url)
+  end,
+  log_warn = function(message)
+    table.insert(warnings, message)
+  end,
+  action = {},
+}
+local routes = dofile(arg[1]).new(wezterm, { remote_open_scope = "/tmp/wezterm.sock" })
+routes.setup()
+
+local function check(name, ok)
+  if not ok then
+    error(name, 0)
+  end
+end
+
+local function request(value)
+  opened = {}
+  warnings = {}
+  handlers["user-var-changed"]({}, {}, "TERMNAV_OPEN_URL", value)
+end
+
+for _, value in ipairs({
+  "https://example.com/path?a=1&b=two three",
+  "http://localhost:3000",
+  "HTTPS://EXAMPLE.COM",
+  "Http://example.com",
+  "mailto:someone@example.com",
+  "MailTo:someone@example.com",
+}) do
+  request(value)
+  check("opens allowed URL: " .. value, #opened == 1 and opened[1] == value)
+  check("logs nothing for allowed URL: " .. value, #warnings == 0)
+end
+
+local esc, bel = string.char(27), string.char(7)
+local rejected = {
+  ["file URL"] = "file:///etc/passwd",
+  ["upper-case file URL"] = "FILE:///Applications/Calculator.app",
+  ["mixed-case file URL"] = "File:///etc/passwd",
+  ["VS Code file URL"] = "vscode://file/etc/passwd",
+  ["SMB share"] = "smb://attacker.example/share",
+  ["AFP share"] = "afp://attacker.example/share",
+  ["javascript URL"] = "javascript:alert(1)",
+  ["data URL"] = "data:text/html,x",
+  ["ms- handler"] = "ms-msdt:/id",
+  ["Windows drive path"] = "C:\\Windows\\System32\\calc.exe",
+  ["termnav nvim route"] = "nvim-open://src/main.rs",
+  ["bare host"] = "example.com",
+  ["absolute path"] = "/Applications/Calculator.app",
+  ["option-like value"] = "-a Calculator",
+  ["empty target"] = "https:",
+  ["empty scheme"] = ":https://example.com",
+  ["percent-encoded scheme letter"] = "%66ile:///etc/passwd",
+  ["percent-encoded allowed scheme"] = "%68ttps://example.com",
+  ["percent-encoded colon"] = "https%3A//example.com",
+  ["leading space"] = " https://example.com",
+  ["leading tab"] = "\thttps://example.com",
+  ["space inside scheme"] = "ht tp://example.com",
+  ["space before colon"] = "https ://example.com",
+  ["fullwidth colon"] = "https\239\188\154//example.com",
+  ["newline"] = "https://example.com/\nfile:///etc/passwd",
+  ["carriage return"] = "https://example.com/\r",
+  ["NUL"] = "https://example.com/\0file:///etc/passwd",
+  ["embedded OSC"] = "https://example.com/" .. esc .. "]0;title" .. bel,
+  ["DEL"] = "https://example.com/\127",
+  ["C1 NEL"] = "https://example.com/\194\133",
+  ["C1 CSI"] = "https://example.com/\194\155",
+}
+for name, value in pairs(rejected) do
+  request(value)
+  check("does not open " .. name, #opened == 0)
+  check("logs one short warning for " .. name, #warnings == 1 and #warnings[1] < 80)
+  check(
+    "warning omits the untrusted value for " .. name,
+    not warnings[1]:find(value, 1, true) and not warnings[1]:find("example", 1, true)
+  )
+end
+
+request("")
+check("empty value is a silent no-op", #opened == 0 and #warnings == 0)
+
+-- A Unicode character just above the C1 range is ordinary URL text.
+request("https://example.com/\194\160")
+check("non-control UTF-8 is not mistaken for C1", #opened == 1)
+
+-- Without a log_warn function a rejection is still never opened.
+wezterm.log_warn = nil
+request("file:///etc/passwd")
+check("rejects without a logger", #opened == 0)
+print("ok")
+EOF
+open_url_handler_output=$(_run_lua "$open_url_handler_test" "$wezterm_routes")
+_assert_eq "open-url: WezTerm handler opens only allowlisted URLs" \
+  "ok" "$open_url_handler_output"
+
+# Feed the same values to both enforcers. NUL cannot travel in argv, so the
+# handler test above covers it on its own.
+open_url_parity_cases=(
+  "https://example.com/path?a=1&b=two three"
+  "http://localhost:3000"
+  "HTTPS://EXAMPLE.COM"
+  "mailto:someone@example.com"
+  "MAILTO:someone@example.com"
+  "https://example.com/trailing "
+  "https://example.com/caf"$'\303\251'
+  "https://example.com/nbsp"$'\302\240'
+  "https://example.com/zwsp"$'\342\200\213'
+  "https://example.com/\"quoted\""
+  "mailto:someone@example.com?subject=hi"
+  "https:file:///etc/passwd"
+  "file:///etc/passwd"
+  "FILE:///etc/passwd"
+  "vscode://file/etc/passwd"
+  "smb://attacker.example/share"
+  "javascript:alert(1)"
+  "C:\\Windows\\System32\\calc.exe"
+  "nvim-open://src/main.rs"
+  "%66ile:///etc/passwd"
+  "%68ttps://example.com"
+  "https%3A//example.com"
+  " https://example.com"
+  $'\thttps://example.com'
+  $'\357\273\277'"https://example.com"
+  "HTTP"$'\305\277'"://example.com"
+  "ht tp://example.com"
+  "https:"
+  ":x"
+  "example.com"
+  "https://example.com/"$'\n'"x"
+  "https://example.com/"$'\r'
+  "https://example.com/"$'\033]0;t\007'
+  "https://example.com/"$'\177'
+  "https://example.com/"$'\302\205'
+)
+open_url_parity_dir=$(_tmpdir)
+open_url_parity_values="$open_url_parity_dir/values"
+: >"$open_url_parity_values"
+open_url_rust_verdicts=""
+for open_url_case in "${open_url_parity_cases[@]}"; do
+  printf '%s\0' "$open_url_case" >>"$open_url_parity_values"
+  : >"$open_url_parity_dir/tty"
+  env -u TMUX -u TMUX_PANE TERM=xterm-256color TERM_PROGRAM=WezTerm \
+    "$termnav" open-url --tty "$open_url_parity_dir/tty" "$open_url_case" \
+    >/dev/null 2>&1
+  case $? in
+    0) open_url_rust_verdicts+="1" ;;
+    2) open_url_rust_verdicts+="0" ;;
+    *) open_url_rust_verdicts+="?" ;;
+  esac
+done
+
+open_url_parity_test=$(_tmpdir)/open-url-parity-test.lua
+cat >"$open_url_parity_test" <<'EOF'
+local routes = dofile(arg[1]).new({ hostname = function() return "macbook" end }, {})
+local file = assert(io.open(arg[2], "rb"))
+local values = file:read("*a")
+file:close()
+local verdicts = {}
+for value in values:gmatch("([^%z]*)%z") do
+  table.insert(verdicts, routes.open_url(value) and "1" or "0")
+end
+print(table.concat(verdicts))
+EOF
+open_url_lua_verdicts=$(_run_lua "$open_url_parity_test" "$wezterm_routes" "$open_url_parity_values")
+_assert_eq "open-url: parity cases cover accepted and rejected values" \
+  "11111111111100000000000000000000000" "$open_url_rust_verdicts"
+_assert_eq "open-url: WezTerm handler matches the Rust publisher case for case" \
+  "$open_url_rust_verdicts" "$open_url_lua_verdicts"
+
+echo
 echo "=== eza semantic links ==="
 
 link_context_tmp=$(_tmpdir)

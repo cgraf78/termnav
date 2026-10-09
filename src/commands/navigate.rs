@@ -26,6 +26,7 @@ options:
   --source-session ID  optional exact source tmux session
   --emit-continuation  print bounded state for one ordered successor
   --continuation JSON  resume from revalidated prior routing state
+  --tty PATH           terminal for requests outside tmux (default /dev/tty)
 "#;
 
 #[derive(Default)]
@@ -40,6 +41,7 @@ struct Options {
     source_session: Option<String>,
     emit_continuation: bool,
     continuation: Option<String>,
+    tty: Option<String>,
     positional: Vec<String>,
 }
 
@@ -114,7 +116,7 @@ pub fn run(
         .map(|state| (state.client, state.scope))
         .unwrap_or_default();
 
-    let mut backend = SystemBackend::from_current_environment();
+    let mut backend = SystemBackend::from_current_environment().with_terminal(options.tty);
     let mut navigator = Navigator::new(&mut backend, now_seconds);
     let result = navigator.route(
         action,
@@ -159,6 +161,13 @@ fn parse(arguments: &[String]) -> Result<Options, String> {
             }
             "--continuation" => {
                 options.continuation = Some(value(arguments, &mut index, argument)?.to_owned());
+            }
+            "--tty" => {
+                let tty = value(arguments, &mut index, argument)?;
+                if tty.is_empty() {
+                    return Err("--tty requires a path".to_owned());
+                }
+                options.tty = Some(tty.to_owned());
             }
             "--client-pid" => {
                 options.client_pid = Some(

@@ -59,16 +59,33 @@ installation path to build, publish, update, and diagnose.
   most recently active client of the caller's session, preferring clients
   showing the caller's window and skipping control-mode and VS Code (xterm.js)
   clients; otherwise it writes to `--tty PATH` or the controlling terminal.
-  One passthrough frame is added when that terminal type is `tmux*` or
-  `screen*`; the outer tmux then needs `allow-passthrough`, and GNU screen is
-  unsupported. `--tty` serves callers without a controlling terminal, such as
-  Neovim's TUI server, whose stderr is still the terminal; it is ignored inside
-  tmux. Other schemes and control characters are invalid syntax (`2`). No
-  eligible client or terminal is an operational failure (`1`); stdout is never
-  used. Success means the request was written, not that a terminal acted on
-  it. Editors and scripts should call it rather than constructing the escape.
-  The scheme check binds only this publisher; WezTerm's handler still opens
-  whatever value a program writes to the terminal directly.
+  `--tty` serves callers without a controlling terminal, such as Neovim's TUI
+  server, whose stderr is still the terminal; it is ignored inside tmux.
+  The request is written only when the destination is known to be WezTerm,
+  the only terminal that acts on it: a tmux client by the XTVERSION reply tmux
+  records as `client_termtype` (or, on tmux without one, its `TERM_PROGRAM`,
+  `WEZTERM_PANE`, or terminal name), and a plain terminal by
+  `TERM_PROGRAM=WezTerm` (which decides whenever set), `WEZTERM_PANE`, or
+  `TERM=wezterm`. A client running inside another local tmux is followed to
+  that tmux's client for the hosting pane and written to directly; ancestry
+  whose pane does not own the client's tty is not followed. A tmux layer that
+  cannot be inspected from this host, such as local tmux behind an SSH
+  session, or one whose tmux reply proves it is tmux but whose pane cannot be
+  found, gets one passthrough frame and is trusted; it then needs
+  `allow-passthrough`. GNU screen (`STY`) cannot forward it and declines, as
+  does everything else, before writing and with status `3`. That includes SSH
+  or WSL sessions from WezTerm that forward none of those variables; set
+  WezTerm's `term = "wezterm"` (with its terminfo installed remotely) to make
+  such sessions identifiable. Other schemes and control characters are invalid
+  syntax (`2`). No eligible client or terminal is an operational failure
+  (`1`); stdout is never used. Success means the
+  request was written, not that a terminal acted on it. Callers should fall
+  back to their own opener on any nonzero status. Editors and scripts should
+  call it rather than constructing the escape.
+  WezTerm's `routes.setup()` handler enforces the same scheme and
+  control-character policy on every `TERMNAV_OPEN_URL` value, because any
+  program whose output reaches the terminal can set it; rejected values are
+  logged as a warning without the value and never opened.
 - `termnav nvim open MODE ...`: open a target in the narrowest eligible editor
   scope. `ssh-open` is the fail-closed existing-ControlMaster transport.
 - `termnav vscode focus ...`: publish ordered, authenticated Neovim focus
@@ -81,7 +98,8 @@ installation path to build, publish, update, and diagnose.
 Complete leaf syntax is available from command-group help and the manpage.
 Exit status `0` means handled/success, `1` means operational failure, and `2`
 means invalid syntax. Navigation and relay-send use `3` for a valid request
-declined at the current boundary. `nvim ssh-open` additionally uses `10` for
+declined at the current boundary, and `open-url` uses it when the destination
+is not known to be WezTerm. `nvim ssh-open` additionally uses `10` for
 unavailable connection configuration, `11` for an invalid host, `12` for SSH
 failure, and `13` for a disallowed host. `vscode focus` uses `10` when no
 adapter is available. Passthrough commands otherwise preserve child status.
@@ -263,7 +281,14 @@ requests through `termnav open-url`. There are no `DOT_*` aliases.
 `lib/termnav/nvim/setup.lua` accepts `group_name`, `opener`, `navigation`,
 `wezterm_vars`, `vscode_focus`, `publish_delay_ms`, `publish_events`,
 `refresh_events`, and `clear_events`. `navigation.lua` accepts `application`,
-`command`, `executable`, `mappings`, `notify`, `schedule`, and `spawn`.
+`command`, `executable`, `mappings`, `notify`, `schedule`, `spawn`, and
+`terminal`. Outside tmux, `terminal()` names the editor's terminal for
+`termnav navigate --tty`, because Neovim 0.10+ runs the editor in a session
+whose children cannot open `/dev/tty`. `wezterm-vars.lua` publishes to the
+same device and owns that lookup as `editor_tty_path()`: the controlling
+terminal when there is one, otherwise the stderr terminal, and that only while
+the TUI attached over the editor's stdio is present, so a UI attached over a
+socket (`--remote-ui`, or what remains after `:detach`) never redirects it.
 `vscode-focus.lua` accepts `command`, `interval_ms`, `observed`, and `source`.
 Defaults are production implementations; collaborator overrides exist for
 embedding and deterministic tests. A partial `application` table is merged

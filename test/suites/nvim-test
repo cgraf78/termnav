@@ -63,7 +63,6 @@ result=$(_nvim_lua "
   vim.env.TMUX_PANE = '%42'
   local vars = dofile('$vars_module')
   local old_system = vim.fn.system
-  local old_open = io.open
   local calls = 0
   local opened = {}
   vim.fn.system = function(cmd)
@@ -77,8 +76,8 @@ result=$(_nvim_lua "
     print(table.concat(cmd, ' '))
     return '/dev/pts/42\n'
   end
-  io.open = function(path, mode)
-    opened[#opened + 1] = path .. ' ' .. mode
+  vars.open_tty = function(path)
+    opened[#opened + 1] = path
     return {
       write = function(_, text)
         local esc = string.char(27)
@@ -100,9 +99,8 @@ result=$(_nvim_lua "
   print(opened[1])
   print(opened[2])
   vim.fn.system = old_system
-  io.open = old_open
 ")
-expected="$(printf 'false\n1\n0\ntmux display-message -t %%42 -p #{pane_tty}\ntrue\n3\n/dev/pts/42 w\nuser-var')"
+expected="$(printf 'false\n1\n0\ntmux display-message -t %%42 -p #{pane_tty}\ntrue\n3\n/dev/pts/42\nuser-var')"
 _assert_eq "wezterm-vars: empty tmux tty is not cached and next publish can recover" \
   "$expected" "$result"
 
@@ -115,9 +113,8 @@ result=$(_nvim_lua "
   vars.tty_path = function()
     return '/dev/pts/42'
   end
-  local old_open = io.open
   local writes = {}
-  io.open = function()
+  vars.open_tty = function()
     return {
       write = function(_, text)
         writes[#writes + 1] = text
@@ -129,7 +126,6 @@ result=$(_nvim_lua "
   print(tostring(vars.set('IS_NVIM', 'true')))
   print(writes[1]:match('SetUserVar=IS_NVIM=dHJ1ZQ==') and 'encoded' or writes[1])
   vim.base64 = old_base64
-  io.open = old_open
 ")
 expected="$(printf 'true\nencoded')"
 _assert_eq "wezterm-vars: base64 fallback supports older nvim" "$expected" "$result"
@@ -142,7 +138,6 @@ result=$(_nvim_lua "
     return '/dev/pts/42'
   end
   local old_system = vim.fn.system
-  local old_open = io.open
   vim.fn.system = function(cmd)
     if cmd[#cmd] == '#{client_termname}' then
       return 'tmux-256color\n'
@@ -150,7 +145,7 @@ result=$(_nvim_lua "
     return ''
   end
   local writes = {}
-  io.open = function()
+  vars.open_tty = function()
     return {
       write = function(_, text)
         writes[#writes + 1] = text
@@ -170,7 +165,6 @@ result=$(_nvim_lua "
   print(tostring(passthrough_count))
   print(writes[1] == expected and 'exact' or writes[1])
   vim.fn.system = old_system
-  io.open = old_open
 ")
 expected="$(printf 'true\n2\nexact')"
 _assert_eq "wezterm-vars: nested tmux clients double-wrap OSC passthrough" \
@@ -184,14 +178,13 @@ result=$(_nvim_lua "
     return '/dev/pts/42'
   end
   local old_system = vim.fn.system
-  local old_open = io.open
   local calls = 0
   local writes = {}
   vim.fn.system = function()
     calls = calls + 1
     return calls == 1 and 'xterm-256color\n' or 'tmux-256color\n'
   end
-  io.open = function()
+  vars.open_tty = function()
     return {
       write = function(_, text)
         local esc = string.char(27)
@@ -206,9 +199,432 @@ result=$(_nvim_lua "
   vars.set('SECOND', 'true', {})
   print(table.concat({ calls, writes[1], writes[2] }, ' '))
   vim.fn.system = old_system
-  io.open = old_open
 ")
 _assert_eq "wezterm-vars: a new publish observes a changed tmux client" "2 1 2" "$result"
+
+# Outside tmux the editor's stderr names the terminal: Neovim 0.10+ runs the
+# editor in its own session, where /dev/tty is ENXIO.
+wezterm_vars_stub='
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local uv = vim.uv or vim.loop
+  local saved = {
+    guess = uv.guess_handle,
+    readlink = uv.fs_readlink,
+    open = io.open,
+    uis = vim.api.nvim_list_uis,
+    chan = vim.api.nvim_get_chan_info,
+    ffi = package.loaded.ffi,
+  }
+  -- opts: ctty (bool), stderr (handle type), link (readlink result),
+  -- uis (list of { stream, stdout_tty }), ttyname (FFI result or nil).
+  local function with(opts, callback)
+    io.open = function(path, mode)
+      if path == "/dev/tty" then
+        return opts.ctty and { close = function() end } or nil
+      end
+      return saved.open(path, mode)
+    end
+    uv.guess_handle = function(fd)
+      return fd == 2 and (opts.stderr or "tty") or saved.guess(fd)
+    end
+    uv.fs_readlink = function(target)
+      if target == "/proc/self/fd/2" then
+        return opts.link
+      end
+      return saved.readlink(target)
+    end
+    local uis = opts.uis or { { stream = "stdio", stdout_tty = true } }
+    vim.api.nvim_list_uis = function()
+      local list = {}
+      for index, ui in ipairs(uis) do
+        list[index] = { chan = index, stdout_tty = ui.stdout_tty }
+      end
+      return list
+    end
+    vim.api.nvim_get_chan_info = function(chan)
+      return { stream = uis[chan] and uis[chan].stream }
+    end
+    package.loaded.ffi = {
+      cdef = function() end,
+      C = { ttyname = function(fd) return fd == 2 and opts.ttyname or nil end },
+      string = function(pointer) return pointer end,
+    }
+    local ok, result = pcall(callback)
+    uv.guess_handle, uv.fs_readlink, io.open = saved.guess, saved.readlink, saved.open
+    vim.api.nvim_list_uis, vim.api.nvim_get_chan_info = saved.uis, saved.chan
+    package.loaded.ffi = saved.ffi
+    assert(ok, result)
+    return result
+  end
+  local vars = dofile("'"$vars_module"'")
+  local function path(opts)
+    return tostring(with(opts, vars.tty_path))
+  end
+'
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  print(path({ link = '/dev/pts/77' }))
+  -- Redirected or piped stderr leaves nothing to name.
+  print(path({ stderr = 'file', link = '/tmp/nvim.log' }))
+  print(path({ stderr = 'pipe' }))
+")
+expected="$(printf '/dev/pts/77\nnil\nnil')"
+_assert_eq "wezterm-vars: outside tmux, publish to the editor's stderr terminal" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  -- Older Neovim keeps its controlling terminal, which also works for users
+  -- who may not reopen the pty by name.
+  print(path({ ctty = true, link = '/dev/pts/77' }))
+")
+_assert_eq "wezterm-vars: a controlling terminal keeps priority" "/dev/tty" "$result"
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  -- After :detach, or with --remote-ui, the remaining UI may be elsewhere.
+  print(path({ link = '/dev/pts/77', uis = { { stream = 'socket', stdout_tty = true } } }))
+  print(path({ link = '/dev/pts/77', uis = {} }))
+  -- An embedding client such as a GUI talks over stdio without a terminal.
+  print(path({ link = '/dev/pts/77', uis = { { stream = 'stdio', stdout_tty = false } } }))
+  -- Not cached: the TUI coming back restores publication.
+  print(path({ link = '/dev/pts/77' }))
+")
+expected="$(printf 'nil\nnil\nnil\n/dev/pts/77')"
+_assert_eq "wezterm-vars: only the TUI that owns stderr makes it the destination" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  -- macOS has no procfs, so readlink fails and ttyname(3) names the device.
+  print(path({ link = nil, ttyname = '/dev/ttys004' }))
+  print(path({ link = nil, ttyname = nil }))
+")
+expected="$(printf '/dev/ttys004\nnil')"
+_assert_eq "wezterm-vars: without procfs, ttyname(2) names the stderr terminal" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local uv = vim.uv or vim.loop
+  local old_hrtime = uv.hrtime
+  local now = 0
+  uv.hrtime = function()
+    return now
+  end
+  local vars = dofile('$vars_module')
+  vars.tty_path = function()
+    return '/dev/pts/42'
+  end
+  local opens = 0
+  vars.open_tty = function()
+    opens = opens + 1
+    return { write = function() end, flush = function() end, close = function() return false end }
+  end
+  local first, second = vars.set('A', '1'), vars.set('B', '2')
+  now = 2 * 1000 * 1000000
+  local third = vars.set('C', '3')
+  uv.hrtime = old_hrtime
+  print(table.concat({ tostring(first), tostring(second), tostring(third), opens }, ' '))
+")
+_assert_eq "wezterm-vars: a timed-out write pauses publishing for a second" \
+  "false false false 2" "$result"
+
+# Publishing must never block the editor on its terminal. Fill a real pty's
+# output queue with nobody reading the master, then hang the terminal up;
+# both writes have to fail promptly instead of waiting.
+if command -v python3 >/dev/null 2>&1; then
+  open_tty_output=$(
+    python3 -I - "$vars_module" <<'PY'
+import os
+import pty
+import subprocess
+import sys
+import time
+
+master, slave = pty.openpty()
+name = os.ttyname(slave)
+os.set_blocking(slave, False)
+
+
+def fill():
+    written = 0
+    try:
+        while True:
+            written += os.write(slave, b"x" * 4096)
+    except BlockingIOError:
+        return written
+
+
+# The kernel keeps moving queued bytes toward the master for a moment after
+# the first EAGAIN, so refill until a pass finds no room (bounded).
+fill()
+for _ in range(50):
+    time.sleep(0.02)
+    if fill() == 0:
+        break
+lua = (
+    "local h = dofile(%r).open_tty(%r) "
+    "if not h then io.stdout:write('nil') "
+    "else h:write(string.rep('y', 64)) io.stdout:write(tostring(h:close())) end"
+) % (sys.argv[1], name)
+
+
+def publish():
+    try:
+        result = subprocess.run(
+            ["nvim", "--headless", "-u", "NONE", "-i", "NONE", "--cmd", "lua " + lua,
+             "--cmd", "qa!"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=10)
+    except subprocess.TimeoutExpired:
+        return "blocked"
+    return result.stdout.decode(errors="replace") or "error"
+
+
+full = publish()
+os.close(master)
+hung_up = publish()
+os.close(slave)
+# A hung-up terminal may refuse the open (nil) or the write (false).
+print(full, "closed" if hung_up in ("nil", "false") else hung_up)
+PY
+  )
+  _assert_eq "wezterm-vars: publishing never blocks on a full or hung-up terminal" \
+    "false closed" "$open_tty_output"
+else
+  echo "  SKIP: wezterm-vars non-blocking publication (python3 unavailable)"
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  SKIP: wezterm-vars real pty publication (python3 unavailable)"
+else
+  # Neovim 0.10+'s TUI starts its editor server by executing v:progpath with
+  # --embed. Where termux-exec uses system-linker exec (as in the Termux CI's
+  # run-as context), /proc/self/exe and therefore v:progpath name
+  # /system/bin/linker64, so the TUI runs `linker64 --embed`, the linker
+  # rejects that ("expected absolute path"), and no editor starts. Probe
+  # whether v:progpath runs when executed directly, as the server spawn
+  # requires. The case below may skip only when this fails and the editor
+  # never started its script, so a started editor always asserts. Every
+  # process here is bounded, gets no stdin, and runs in its own session that
+  # is killed on timeout, so nothing can stall the suite.
+  pty_probe=$(
+    python3 -I - <<'PY'
+import os
+import signal
+import subprocess
+import tempfile
+
+
+def run(argv, capture):
+    # Output goes to a file and only its start is read, so a misbehaving
+    # child can neither hold a pipe open nor fill memory.
+    with tempfile.TemporaryFile() as out:
+        try:
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     stdout=out if capture else subprocess.DEVNULL,
+                                     start_new_session=True)
+        except OSError:
+            return None, b""
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            child.wait()
+            return None, b""
+        out.seek(0)
+        return child.returncode, out.read(4096)
+
+
+_, out = run(["nvim", "--headless", "-u", "NONE", "-i", "NONE",
+              "--cmd", "lua io.stdout:write(vim.v.progpath)", "--cmd", "qa!"], True)
+progpath = out.decode(errors="replace")
+code = run([progpath, "--headless", "-u", "NONE", "-i", "NONE", "--cmd", "qa!"],
+           False)[0] if progpath else 0
+# The flag comes first so the line split never depends on the path.
+print("1" if progpath and code != 0 else "0")
+print(progpath)
+PY
+  )
+  pty_unstartable=${pty_probe%%$'\n'*}
+  pty_progpath=${pty_probe#*$'\n'}
+  # Drive the real TUI on a fresh pty with no tmux. On Neovim 0.10+ the
+  # editor has no controlling terminal, so the user var must reach the pty
+  # through the stderr path; older Neovim still uses /dev/tty.
+  pty_status=$(_tmpdir)/pty-status
+  pty_started=$(_tmpdir)/pty-started
+  pty_report=$(_tmpdir)/pty-report
+  pty_script=$(_tmpdir)/pty-publish.lua
+  cat >"$pty_script" <<EOF
+assert(io.open('$pty_started', 'w')):close()
+local ok = dofile('$vars_module').set('TERMNAV_PTY_TEST', 'ok')
+local file = assert(io.open('$pty_status', 'w'))
+file:write(tostring(ok))
+file:close()
+vim.cmd('qa!')
+EOF
+  pty_output=$(
+    python3 -I - "$pty_script" "$pty_report" <<'PY'
+import os
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+
+needle = b"\x1b]1337;SetUserVar=TERMNAV_PTY_TEST=b2s=\x07"
+# Terminal queries this harness answers, as a real terminal would: primary
+# device attributes (DA1) and device status (DSR). Neovim's startup probes
+# and its exit flush handshake wait on DA1.
+replies = {b"\x1b[c": b"\x1b[?62;22c", b"\x1b[5n": b"\x1b[0n"}
+keep = 64 * 1024
+
+pid, master = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    try:
+        os.execvp("nvim", ["nvim", "-u", "NONE", "-i", "NONE", "-c", "luafile " + sys.argv[1]])
+    finally:
+        os._exit(127)
+# Never block on the master: a reply to an editor that stopped reading its
+# input must not stall the harness past its deadline.
+os.set_blocking(master, False)
+
+head = bytearray()
+tail = bytearray()
+delivered = False
+carry = b""
+
+
+def take(chunk):
+    """Record output (bounded), detect the needle, and answer queries."""
+    global carry, delivered, tail
+    if len(head) < keep:
+        head.extend(chunk[: keep - len(head)])
+    tail = (tail + chunk)[-keep:]
+    scan = carry + chunk
+    delivered = delivered or needle in scan
+    for query, reply in replies.items():
+        for _ in range(scan.count(query) - carry.count(query)):
+            try:
+                os.write(master, reply)
+            except OSError:
+                pass
+    carry = scan[-(len(needle) - 1):]
+
+
+def drain():
+    """Read what is buffered, at most 1 MiB per call so a flooding editor
+    cannot keep the loop from checking its deadline; report whether the pty
+    is still open."""
+    for _ in range(16):
+        try:
+            chunk = os.read(master, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        take(chunk)
+    return True
+
+
+# Act as the terminal until the editor exits, within one deadline. The pty
+# must be drained the whole time: a TUI whose output nobody reads cannot
+# finish exiting (macOS also makes an exiting session leader wait for its
+# terminal's output to drain), so waiting without reading never returns.
+status = None
+deadline = time.monotonic() + 15
+while status is None and time.monotonic() < deadline:
+    if select.select([master], [], [], 0.05)[0] and not drain():
+        time.sleep(0.05)
+    done, code = os.waitpid(pid, os.WNOHANG)
+    if done:
+        status = code
+        drain()
+def children(parent):
+    """Direct children of a live process, from procfs or ps."""
+    try:
+        entries = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        entries = []
+    found, readable = [], False
+    for entry in entries:
+        try:
+            with open("/proc/%s/stat" % entry, "rb") as stat:
+                ppid = int(stat.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        readable = True
+        if ppid == parent:
+            found.append(int(entry))
+    # An empty or foreign /proc (a chroot, BSD procfs) falls through to ps.
+    if readable:
+        return found
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pairs = zip(listing[0::2], listing[1::2])
+    return [int(child) for child, ppid in pairs
+            if child.isdigit() and ppid.isdigit() and int(ppid) == parent]
+
+
+timed_out = status is None
+if timed_out:
+    # pty.fork made the TUI a session and process-group leader. Its editor
+    # server runs in a session of its own but stays the TUI's child until
+    # the TUI exits, so collect and kill the children first, then the TUI.
+    try:
+        targets = children(pid)
+    except Exception:  # cleanup must still reach the TUI
+        targets = []
+    for target in targets + [pid]:
+        try:
+            os.killpg(target, signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(target, signal.SIGKILL)
+            except OSError:
+                pass
+    # Hanging up the terminal wakes an exit that waits for output to drain.
+    os.close(master)
+    reap_deadline = time.monotonic() + 5
+    while time.monotonic() < reap_deadline and not os.waitpid(pid, os.WNOHANG)[0]:
+        time.sleep(0.05)
+if not delivered or timed_out:
+    # Keep the editor's readable output for the report: escape sequences
+    # and padding would otherwise fill it.
+    seen = bytes(head) + (b" ... " + bytes(tail) if len(head) >= keep else b"")
+    text = re.sub(rb"\x1b(\[[0-9;?>=]*[ -/]*[@-~]|\][^\x07\x1b]{0,512}\x07?|.)", b"", seen)
+    text = re.sub(rb"[\x00-\x1f ]+", b" ", text).strip()
+    text = text[:1000] + (b" ... " + text[-1000:] if len(text) > 2000 else text[1000:])
+    if timed_out:
+        text = b"(killed: did not exit within 15s; delivered=%s) " % (
+            b"yes" if delivered else b"no") + text
+    with open(sys.argv[2], "wb") as report:
+        report.write(text)
+print("delivered" if delivered and not timed_out else "timeout" if timed_out else "missing")
+PY
+  )
+  if [[ $pty_unstartable == 1 && $pty_output == missing && ! -e $pty_started ]]; then
+    echo "  SKIP: wezterm-vars real pty publication (Neovim's v:progpath" \
+      "$pty_progpath fails when executed directly, so its TUI starts no editor here)"
+  else
+    _assert_eq "wezterm-vars: a real TUI outside tmux publishes to its pty" \
+      "delivered true" "$pty_output $(cat "$pty_status" 2>/dev/null)"
+  fi
+  if [[ $pty_output != delivered && -s $pty_report ]]; then
+    printf '    editor output: %s\n' "$(cat "$pty_report")"
+  fi
+fi
 
 result=$(_nvim_lua "
   vim.env.TMUX = '/tmp/tmux.sock,1,0'
@@ -217,7 +633,6 @@ result=$(_nvim_lua "
   local vars = dofile('$vars_module')
   local setup = dofile('$setup_module')
   local old_system = vim.fn.system
-  local old_open = io.open
   local tty_calls = 0
   local termname_calls = 0
   local client_ready = false
@@ -233,7 +648,7 @@ result=$(_nvim_lua "
     end
     return ''
   end
-  io.open = function()
+  vars.open_tty = function()
     return {
       write = function()
         writes = writes + 1
@@ -262,7 +677,6 @@ result=$(_nvim_lua "
   ctx.publish()
   print(table.concat({ tty_calls, termname_calls, writes }, ' '))
   vim.fn.system = old_system
-  io.open = old_open
 ")
 _assert_eq "nvim setup: failed client classification retries the same publish values" \
   "$(printf '1 1 0\n1 2 6\n1 3 6\n1 4 12')" "$result"

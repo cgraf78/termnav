@@ -51,6 +51,25 @@ _assert_contains "navigation CLI: missing parent identity is actionable" \
   "--client-pid, --client-tty, --client-created, --client-termtype, --source-socket, and --source-pane are required" \
   "$missing_identity_output"
 
+# Neovim's TUI runs the editor in its own session, so jobs it starts cannot
+# open /dev/tty; the editor passes its stderr terminal instead.
+navigate_tty=$(_tmpdir)/navigate-tty
+: >"$navigate_tty"
+set +e
+env -u TERM_PROGRAM TERM=xterm-256color "$navigate" --tty "$navigate_tty" tab-select next
+navigate_tty_rc=$?
+empty_tty_output=$("$navigate" --tty "" tab-select next 2>&1)
+empty_tty_rc=$?
+set -e
+_assert_exit "navigation CLI: an explicit terminal handles a direct tab request" \
+  0 "$navigate_tty_rc"
+_assert_contains "navigation CLI: an explicit terminal receives the tab request" \
+  $'\e]1337;SetUserVar=TERMNAV_TAB_SELECT=' "$(cat "$navigate_tty")"
+_assert_exit "navigation CLI: an empty terminal path is rejected" 2 "$empty_tty_rc"
+_assert_contains "navigation CLI: an empty terminal path is actionable" \
+  "--tty requires a path" "$empty_tty_output"
+_assert_contains "navigation CLI: names the terminal option" "--tty PATH" "$help_output"
+
 if [[ ! -x "$navigate" ]] || ! command -v tmux >/dev/null 2>&1; then
   _test_summary
 fi
