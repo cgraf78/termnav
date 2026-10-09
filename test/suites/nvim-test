@@ -310,9 +310,26 @@ expected="$(printf '/dev/ttys004\nnil')"
 _assert_eq "wezterm-vars: without procfs, ttyname(2) names the stderr terminal" \
   "$expected" "$result"
 
-if command -v python3 >/dev/null 2>&1; then
-  # Drive the real TUI on a fresh pty with no tmux and no controlling-terminal
-  # shortcut: the user var must arrive on that pty.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  SKIP: wezterm-vars real pty publication (python3 unavailable)"
+else
+  # Neovim 0.10+'s TUI starts its editor server by executing v:progpath with
+  # --embed. Where termux-exec uses system-linker exec (as in the Termux CI's
+  # run-as context), /proc/self/exe and therefore v:progpath name
+  # /system/bin/linker64, so the TUI runs `linker64 --embed`, the linker
+  # rejects that ("expected absolute path"), and no editor starts. Probe
+  # exactly what the TUI does; the case below may skip only when this fails
+  # and its script never ran, so a started editor always asserts.
+  pty_progpath=$(nvim --headless -u NONE -i NONE \
+    --cmd 'lua io.stdout:write(vim.v.progpath)' --cmd 'qa!' 2>/dev/null)
+  pty_unstartable=
+  if [[ -n $pty_progpath ]] &&
+    ! "$pty_progpath" --headless -u NONE -i NONE --cmd 'qa!' >/dev/null 2>&1; then
+    pty_unstartable=1
+  fi
+  # Drive the real TUI on a fresh pty with no tmux. On Neovim 0.10+ the
+  # editor has no controlling terminal, so the user var must reach the pty
+  # through the stderr path; older Neovim still uses /dev/tty.
   pty_status=$(_tmpdir)/pty-status
   pty_report=$(_tmpdir)/pty-report
   pty_script=$(_tmpdir)/pty-publish.lua
@@ -333,41 +350,6 @@ import sys
 import time
 
 needle = b"\x1b]1337;SetUserVar=TERMNAV_PTY_TEST=b2s=\x07"
-
-
-def read_line(fd, seconds):
-    data = bytearray()
-    deadline = time.monotonic() + seconds
-    while b"\n" not in data and time.monotonic() < deadline:
-        if select.select([fd], [], [], 0.1)[0]:
-            try:
-                chunk = os.read(fd, 1024)
-            except OSError:
-                break
-            if not chunk:
-                break
-            data.extend(chunk)
-    return data.split(b"\n", 1)[0].strip().decode(errors="replace")
-
-
-# The publisher reopens, by name, a pty that another session controls.
-# Android denies that to unprivileged apps; relay-terminal-test skips its
-# synthetic tmux client for the same rule. Probe exactly that condition.
-probe_pid, probe_master = pty.fork()
-if probe_pid == 0:
-    print(os.ttyname(0), flush=True)
-    time.sleep(5)
-    os._exit(0)
-restricted = False
-try:
-    os.close(os.open(read_line(probe_master, 5), os.O_WRONLY | os.O_NOCTTY))
-except PermissionError:
-    restricted = True
-finally:
-    os.kill(probe_pid, 9)
-    os.waitpid(probe_pid, 0)
-    os.close(probe_master)
-
 pid, master = pty.fork()
 if pid == 0:
     os.environ["TERM"] = "xterm-256color"
@@ -393,22 +375,19 @@ if needle not in seen:
     with open(sys.argv[2], "wb") as report:
         report.write(text[:1000] + (b" ... " + text[-1000:] if len(text) > 2000 else text[1000:]))
 os.waitpid(pid, 0)
-print(("delivered" if needle in seen else "missing") + (" restricted" if restricted else ""))
+print("delivered" if needle in seen else "missing")
 PY
   )
-  if [[ $pty_output == "missing restricted" ]]; then
-    # A known platform limitation: the publisher cannot reach the pty there.
-    # Still show what the editor printed so the exact cause stays visible.
-    echo "  SKIP: wezterm-vars real pty publication (platform forbids reopening a pty)"
+  if [[ -n $pty_unstartable && $pty_output == missing && ! -e $pty_status ]]; then
+    echo "  SKIP: wezterm-vars real pty publication (Neovim's v:progpath" \
+      "$pty_progpath cannot be executed, so its TUI starts no editor here)"
   else
     _assert_eq "wezterm-vars: a real TUI outside tmux publishes to its pty" \
-      "delivered true" "${pty_output% restricted} $(cat "$pty_status" 2>/dev/null)"
+      "delivered true" "$pty_output $(cat "$pty_status" 2>/dev/null)"
   fi
-  if [[ $pty_output == missing* && -s $pty_report ]]; then
+  if [[ $pty_output == missing && -s $pty_report ]]; then
     printf '    editor output: %s\n' "$(cat "$pty_report")"
   fi
-else
-  echo "  SKIP: wezterm-vars real pty publication (python3 unavailable)"
 fi
 
 result=$(_nvim_lua "
