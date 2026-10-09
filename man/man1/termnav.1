@@ -227,7 +227,10 @@ and
 .BR TERMNAV_OPEN_URL .
 .B termnav open-url
 is the public publisher for TERMNAV_OPEN_URL; integrations should invoke it
-instead of constructing the escape.
+instead of constructing the escape. Because any program whose output reaches
+the terminal can set the variable, the handler applies the same scheme and
+control-character policy itself and ignores, with a warning that omits the
+value, anything the publisher would reject.
 Pane metadata uses IS_NVIM, NVIM_OPEN_SOCKET, NVIM_LINK_CWD,
 NVIM_REMOTE_LINK_HOST, NVIM_REMOTE_CWD, NVIM_REMOTE_TMUX, and TERMNAV_TMUX.
 There are no DOT_* aliases.

@@ -6,8 +6,10 @@
 //! transport. The URL is base64-encoded inside the escape, which means its
 //! content can never terminate the sequence or inject other terminal
 //! controls. [`Url::parse`] additionally limits what Termnav will publish on
-//! behalf of a possibly remote process; it cannot constrain bytes that other
-//! programs write to the terminal themselves.
+//! behalf of a possibly remote process. It cannot constrain bytes that other
+//! programs write to the terminal themselves, so the WezTerm handler in
+//! `lib/termnav/wezterm/link-routes.lua` enforces the same policy again; the
+//! WezTerm integration suite pins the two copies to the same decisions.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -23,6 +25,9 @@ use crate::terminal::{self, TmuxMode};
 pub const USER_VAR: &str = "TERMNAV_OPEN_URL";
 
 /// Schemes Termnav will ask the local desktop to open.
+///
+/// `open_url_schemes` in `lib/termnav/wezterm/link-routes.lua` must list the
+/// same values; the WezTerm integration suite fails when they differ.
 ///
 /// An allowlist rather than a denylist: the request usually originates on a
 /// remote host, and desktop handlers for other schemes reach local files

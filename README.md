@@ -67,8 +67,10 @@ installation path to build, publish, update, and diagnose.
   eligible client or terminal is an operational failure (`1`); stdout is never
   used. Success means the request was written, not that a terminal acted on
   it. Editors and scripts should call it rather than constructing the escape.
-  The scheme check binds only this publisher; WezTerm's handler still opens
-  whatever value a program writes to the terminal directly.
+  WezTerm's `routes.setup()` handler enforces the same scheme and
+  control-character policy on every `TERMNAV_OPEN_URL` value, because any
+  program whose output reaches the terminal can set it; rejected values are
+  logged as a warning without the value and never opened.
 - `termnav nvim open MODE ...`: open a target in the narrowest eligible editor
   scope. `ssh-open` is the fail-closed existing-ControlMaster transport.
 - `termnav vscode focus ...`: publish ordered, authenticated Neovim focus

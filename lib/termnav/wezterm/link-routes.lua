@@ -21,6 +21,19 @@ local shell_user_vars = {
   tmux = "TERMNAV_TMUX",
 }
 
+-- Schemes TERMNAV_OPEN_URL may hand to the desktop opener. This mirrors
+-- `SCHEMES` in src/browser.rs, but it is the enforcing copy: any program whose
+-- output reaches this terminal, including `cat` of a remote file, can set the
+-- user var without going through `termnav open-url`. Desktop handlers for
+-- other schemes reach local files (`file:`, `vscode://file/...`), mount shares
+-- (`smb:`), or launch programs. The two hosts cannot share code, so the
+-- WezTerm integration suite pins this table to the Rust constant.
+local open_url_schemes = {
+  "http",
+  "https",
+  "mailto",
+}
+
 function M.new(wezterm, options)
   options = options or {}
   local routes = {}
@@ -33,6 +46,45 @@ function M.new(wezterm, options)
     or os.getenv("TERMNAV_WEZTERM_SCOPE")
     or os.getenv("WEZTERM_UNIX_SOCKET")
     or ""
+
+  -- Return the URL when TERMNAV_OPEN_URL may open it, or nil and a fixed
+  -- reason. The rules match `Url::parse` in src/browser.rs: a non-empty target
+  -- after the first colon, a case-insensitive scheme from open_url_schemes,
+  -- and no control characters (Rust's `char::is_control`: C0, DEL, and the
+  -- UTF-8 encoded C1 range). Nothing is decoded first, so a percent-encoded or
+  -- padded scheme simply fails the comparison.
+  function routes.open_url(value)
+    if type(value) ~= "string" or value == "" then
+      return nil, "empty"
+    end
+    for index = 1, #value do
+      local byte = value:byte(index)
+      if byte < 0x20 or byte == 0x7f then
+        return nil, "control character"
+      end
+      if byte == 0xc2 then
+        local continuation = value:byte(index + 1)
+        if continuation and continuation >= 0x80 and continuation <= 0x9f then
+          return nil, "control character"
+        end
+      end
+    end
+    local scheme, target = value:match("^([^:]*):(.*)$")
+    if not scheme or target == "" then
+      return nil, "missing scheme or target"
+    end
+    -- ASCII-only lowering, like Rust's `to_ascii_lowercase`: string.lower
+    -- follows the C locale and must not decide a security comparison.
+    scheme = scheme:gsub("[A-Z]", function(letter)
+      return string.char(letter:byte() + 32)
+    end)
+    for _, allowed in ipairs(open_url_schemes) do
+      if scheme == allowed then
+        return value
+      end
+    end
+    return nil, "disallowed scheme"
+  end
 
   function routes.uri_decode(s)
     return (s:gsub("%%(%x%x)", function(hex)
@@ -353,7 +405,13 @@ function M.new(wezterm, options)
         local relative = direction == "left" and -1 or 1
         window:perform_action(wezterm.action.MoveTabRelative(relative), pane)
       elseif name == "TERMNAV_OPEN_URL" then
-        wezterm.open_with(value)
+        local url, reason = routes.open_url(value)
+        if url then
+          wezterm.open_with(url)
+        elseif type(wezterm.log_warn) == "function" then
+          -- The value is untrusted terminal output; never echo it into the log.
+          wezterm.log_warn("termnav: ignored TERMNAV_OPEN_URL request: " .. reason)
+        end
       end
     end)
   end
