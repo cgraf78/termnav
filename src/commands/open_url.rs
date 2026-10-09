@@ -4,9 +4,15 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::browser::{self, Url};
+use crate::browser::{self, Undelivered, Url};
+use crate::navigation::Outcome;
 
 const HELP: &str = "usage: termnav open-url [--tty PATH] URL\n";
+
+/// A valid request the destination terminal cannot act on. Shares the
+/// navigation "declined at this boundary" status so callers fall back to
+/// their own opener instead of treating it as a broken installation.
+const DECLINED: i32 = Outcome::Declined as i32;
 
 /// Validate one URL and ask the outer terminal to open it locally.
 pub fn run(
@@ -51,9 +57,12 @@ pub fn run(
     };
     match browser::request(&url, terminal) {
         Ok(()) => Ok(0),
-        Err(error) => {
-            writeln!(stderr, "termnav open-url: {error}")?;
-            Ok(1)
+        Err(failure) => {
+            writeln!(stderr, "termnav open-url: {failure}")?;
+            Ok(match failure {
+                Undelivered::Declined(_) => DECLINED,
+                Undelivered::Failed(_) => 1,
+            })
         }
     }
 }

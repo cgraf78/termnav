@@ -72,6 +72,10 @@ _assert_contains "relay terminal: open-url from a pane reaches the attached clie
   "test_open_url_from_a_pane_reaches_the_outer_terminal" "$output"
 _assert_contains "relay terminal: open-url never crosses to another session's client" \
   "test_open_url_from_a_detached_session_never_reaches_another_client" "$output"
+_assert_contains "relay terminal: open-url declines for a client that is not WezTerm" \
+  "test_open_url_declines_for_a_client_that_is_not_wezterm" "$output"
+_assert_contains "relay terminal: open-url follows local nested tmux to WezTerm" \
+  "test_open_url_from_local_nested_tmux_goes_raw_to_the_outer_terminal" "$output"
 _assert_contains "relay terminal: teardown kills a TERM-blocked tmux server" \
   "test_teardown_kills_a_server_that_blocks_term" "$output"
 _assert_contains "relay terminal: teardown finds a tmux server recorded before its PID" \

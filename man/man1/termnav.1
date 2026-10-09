@@ -144,12 +144,35 @@ control-mode and VS Code (xterm.js) clients; otherwise it is written to
 .B --tty PATH
 when given, or to the controlling terminal. The option serves callers without
 a controlling terminal, such as Neovim's TUI server, and is ignored inside tmux.
-Either destination receives one tmux passthrough frame when its terminal type
-starts with tmux or screen, which requires
+.IP
+The request is written only when its destination is known to be WezTerm, the
+only terminal that acts on it. A tmux client is identified by the XTVERSION
+reply tmux records as
+.BR client_termtype ,
+or on tmux releases without one by its
+.BR TERM_PROGRAM ,
+.BR WEZTERM_PANE ,
+or terminal name; a plain terminal by
+.B TERM_PROGRAM=WezTerm
+(which decides whenever set),
+.BR WEZTERM_PANE ,
+or
+.BR TERM=wezterm .
+A client running inside another local tmux is followed to that tmux's client
+for the hosting pane, and the request is written there directly; ancestry whose
+pane does not own the client's tty is not followed. A tmux layer that cannot be
+inspected from this host, such as local tmux behind an SSH session, or one whose
+tmux reply proves it is tmux but whose pane cannot be found, receives one
+passthrough frame and is trusted; that requires
 .B allow-passthrough
-on that outer tmux; GNU screen itself is unsupported. No eligible client or a
-missing terminal is an operational failure; standard output is never used.
-Success means the request was written, not that the terminal acted on it.
+on it. GNU screen, recognized by
+.BR STY ,
+cannot forward the frame and declines. Anything else, including an SSH session
+from WezTerm that forwards none of those variables, declines with status 3
+before writing. No eligible client or a missing terminal is an operational
+failure (1); standard output is never used. Success means the request was
+written, not that the terminal acted on it. Callers should fall back to their
+own opener on any nonzero status.
 .SH ENVIRONMENT
 .TP
 .B TERMNAV_ASSET_ROOT
@@ -192,7 +215,9 @@ Operational failure.
 Invalid syntax.
 .TP
 .B 3
-Valid navigation or relay-send request declined at this boundary.
+Valid navigation or relay-send request declined at this boundary, or an
+.B open-url
+request whose destination is not known to be WezTerm.
 .TP
 .B 10, 11, 12, 13
 .B nvim ssh-open

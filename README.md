@@ -59,14 +59,29 @@ installation path to build, publish, update, and diagnose.
   most recently active client of the caller's session, preferring clients
   showing the caller's window and skipping control-mode and VS Code (xterm.js)
   clients; otherwise it writes to `--tty PATH` or the controlling terminal.
-  One passthrough frame is added when that terminal type is `tmux*` or
-  `screen*`; the outer tmux then needs `allow-passthrough`, and GNU screen is
-  unsupported. `--tty` serves callers without a controlling terminal, such as
-  Neovim's TUI server, whose stderr is still the terminal; it is ignored inside
-  tmux. Other schemes and control characters are invalid syntax (`2`). No
-  eligible client or terminal is an operational failure (`1`); stdout is never
-  used. Success means the request was written, not that a terminal acted on
-  it. Editors and scripts should call it rather than constructing the escape.
+  `--tty` serves callers without a controlling terminal, such as Neovim's TUI
+  server, whose stderr is still the terminal; it is ignored inside tmux.
+  The request is written only when the destination is known to be WezTerm,
+  the only terminal that acts on it: a tmux client by the XTVERSION reply tmux
+  records as `client_termtype` (or, on tmux without one, its `TERM_PROGRAM`,
+  `WEZTERM_PANE`, or terminal name), and a plain terminal by
+  `TERM_PROGRAM=WezTerm` (which decides whenever set), `WEZTERM_PANE`, or
+  `TERM=wezterm`. A client running inside another local tmux is followed to
+  that tmux's client for the hosting pane and written to directly; ancestry
+  whose pane does not own the client's tty is not followed. A tmux layer that
+  cannot be inspected from this host, such as local tmux behind an SSH
+  session, or one whose tmux reply proves it is tmux but whose pane cannot be
+  found, gets one passthrough frame and is trusted; it then needs
+  `allow-passthrough`. GNU screen (`STY`) cannot forward it and declines, as
+  does everything else, before writing and with status `3`. That includes SSH
+  or WSL sessions from WezTerm that forward none of those variables; set
+  WezTerm's `term = "wezterm"` (with its terminfo installed remotely) to make
+  such sessions identifiable. Other schemes and control characters are invalid
+  syntax (`2`). No eligible client or terminal is an operational failure
+  (`1`); stdout is never used. Success means the
+  request was written, not that a terminal acted on it. Callers should fall
+  back to their own opener on any nonzero status. Editors and scripts should
+  call it rather than constructing the escape.
   WezTerm's `routes.setup()` handler enforces the same scheme and
   control-character policy on every `TERMNAV_OPEN_URL` value, because any
   program whose output reaches the terminal can set it; rejected values are
@@ -83,7 +98,8 @@ installation path to build, publish, update, and diagnose.
 Complete leaf syntax is available from command-group help and the manpage.
 Exit status `0` means handled/success, `1` means operational failure, and `2`
 means invalid syntax. Navigation and relay-send use `3` for a valid request
-declined at the current boundary. `nvim ssh-open` additionally uses `10` for
+declined at the current boundary, and `open-url` uses it when the destination
+is not known to be WezTerm. `nvim ssh-open` additionally uses `10` for
 unavailable connection configuration, `11` for an invalid host, `12` for SSH
 failure, and `13` for a disallowed host. `vscode focus` uses `10` when no
 adapter is available. Passthrough commands otherwise preserve child status.
