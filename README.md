@@ -281,7 +281,14 @@ requests through `termnav open-url`. There are no `DOT_*` aliases.
 `lib/termnav/nvim/setup.lua` accepts `group_name`, `opener`, `navigation`,
 `wezterm_vars`, `vscode_focus`, `publish_delay_ms`, `publish_events`,
 `refresh_events`, and `clear_events`. `navigation.lua` accepts `application`,
-`command`, `executable`, `mappings`, `notify`, `schedule`, and `spawn`.
+`command`, `executable`, `mappings`, `notify`, `schedule`, `spawn`, and
+`terminal`. Outside tmux, `terminal()` names the editor's terminal for
+`termnav navigate --tty`, because Neovim 0.10+ runs the editor in a session
+whose children cannot open `/dev/tty`. `wezterm-vars.lua` publishes to the
+same device and owns that lookup as `editor_tty_path()`: the controlling
+terminal when there is one, otherwise the stderr terminal, and that only while
+the TUI attached over the editor's stdio is present, so a UI attached over a
+socket (`--remote-ui`, or what remains after `:detach`) never redirects it.
 `vscode-focus.lua` accepts `command`, `interval_ms`, `observed`, and `source`.
 Defaults are production implementations; collaborator overrides exist for
 embedding and deterministic tests. A partial `application` table is merged

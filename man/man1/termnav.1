@@ -79,8 +79,13 @@ Options are
 .BR --source-pane ,
 .BR --source-session ,
 .BR --emit-continuation ,
+.BR --continuation ,
 and
-.BR --continuation .
+.BR "--tty PATH" ,
+which names the terminal for a request that reaches it without a tmux client
+in place of the controlling terminal; the Neovim adapter passes its editor's
+stderr terminal there, because Neovim's TUI runs the editor in a session
+without one.
 .TP
 .B relay send
 Uses pane-select, tab-select, and tab-move with their navigation directions and

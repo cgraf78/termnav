@@ -98,6 +98,40 @@ local function application_with_defaults(overrides)
   return application
 end
 
+-- Absolute directory of this file, fixed at load time: a relative chunk name
+-- resolved later, after `:cd`, could name a file in an untrusted directory.
+-- fs_realpath is safe in libuv callbacks and fails closed on a missing path.
+local module_dir = (function()
+  local uv = type(vim) == "table" and (vim.uv or vim.loop) or nil
+  local info = type(debug) == "table" and debug.getinfo(1, "S") or nil
+  local source = info and info.source or ""
+  local dir = source:sub(1, 1) == "@" and source:sub(2):gsub("\\", "/"):match("^(.*)/[^/]+$")
+  if not uv or not dir then
+    return nil
+  end
+  return uv.fs_realpath(dir == "" and "/" or dir)
+end)()
+
+-- Outside tmux a native request may end at the terminal itself. Under Neovim
+-- 0.10+ the editor runs in its own session, so the job cannot open /dev/tty
+-- and needs the editor's terminal named. wezterm-vars.lua owns that lookup.
+-- Consumers may construct this module without setup.lua, so load the sibling
+-- file here; anything unavailable keeps Termnav's /dev/tty default.
+local editor_tty_path
+
+local function default_terminal()
+  if editor_tty_path == nil then
+    editor_tty_path = false
+    if module_dir then
+      local ok, vars = pcall(dofile, module_dir .. "/wezterm-vars.lua")
+      if ok and type(vars) == "table" and type(vars.editor_tty_path) == "function" then
+        editor_tty_path = vars.editor_tty_path
+      end
+    end
+  end
+  return editor_tty_path and editor_tty_path() or nil
+end
+
 local function tmux_context()
   local value = vim.env.TMUX or ""
   local socket = value:match("^(.*),%d+,%d+$")
@@ -112,8 +146,9 @@ function M.new(options)
   options = options or {}
 
   -- Public embedding options: application, command, executable, mappings,
-  -- notify, schedule, and spawn. The defaults own native Termnav behavior;
-  -- consumers replace a collaborator only when their host API requires it.
+  -- notify, schedule, spawn, and terminal. The defaults own native Termnav
+  -- behavior; consumers replace a collaborator only when their host API
+  -- requires it.
 
   local ctx = {
     application = application_with_defaults(options.application),
@@ -123,6 +158,7 @@ function M.new(options)
     notify = options.notify or vim.notify,
     schedule = options.schedule or vim.schedule,
     spawn = options.spawn or default_spawn,
+    terminal = options.terminal or default_terminal,
   }
   local queue = {}
   local running
@@ -137,6 +173,21 @@ function M.new(options)
     ctx.notify(message, vim.log.levels.WARN, { title = "Termnav" })
   end
 
+  -- The `--tty` argument for a request outside tmux, or nil to keep Termnav's
+  -- /dev/tty default. Resolved per request because UIs can attach and detach;
+  -- the lookup is a few syscalls next to the process it accompanies. A broken
+  -- collaborator must never wedge the queue, so failures degrade to nil.
+  local function terminal_argument()
+    if tmux_context() then
+      return nil
+    end
+    local ok, path = pcall(ctx.terminal)
+    if not ok or type(path) ~= "string" or path == "" or path == "/dev/tty" then
+      return nil
+    end
+    return path
+  end
+
   local drain
   drain = function()
     if running ~= nil or #queue == 0 then
@@ -144,6 +195,7 @@ function M.new(options)
     end
 
     local request = table.remove(queue, 1)
+    local tty = terminal_argument()
     generation = generation + 1
     local token = { generation = generation }
     running = token
@@ -161,6 +213,10 @@ function M.new(options)
     if continuation ~= nil and continuation ~= "" then
       arguments[#arguments + 1] = "--continuation"
       arguments[#arguments + 1] = continuation
+    end
+    if tty then
+      arguments[#arguments + 1] = "--tty"
+      arguments[#arguments + 1] = tty
     end
     local ok, handle = pcall(ctx.spawn, arguments, function(status, output)
       ctx.schedule(function()

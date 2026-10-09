@@ -321,6 +321,115 @@ test("single application tab delegates linked-session policy to the router", fun
   )
 end)
 
+local function single_tab(terminal)
+  return fake_context({
+    application = {
+      tab_count = function()
+        return 1
+      end,
+    },
+    terminal = terminal,
+  })
+end
+
+test("requests outside tmux name the editor terminal per request", function()
+  local lookups = 0
+  local ctx, _, jobs = single_tab(function()
+    lookups = lookups + 1
+    return "/dev/pts/77"
+  end)
+
+  equal(ctx.tab_select("next"), true, "router should own the terminal boundary")
+  jobs[1].finish(0, "")
+  equal(ctx.tab_select("next"), true, "a second gesture should also route")
+
+  local expected =
+    { "termnav", "navigate", "--emit-continuation", "tab-select", "next", "--tty", "/dev/pts/77" }
+  equal(jobs[1].arguments, expected, "the job should receive the editor terminal")
+  equal(jobs[2].arguments, expected, "later jobs should receive it too")
+  -- UIs can attach and detach, so each request asks again.
+  equal(lookups, 2, "the terminal should be resolved per request")
+end)
+
+test("requests outside tmux keep the default without a usable answer", function()
+  local plain = { "termnav", "navigate", "--emit-continuation", "tab-select", "previous" }
+  for _, terminal in ipairs({
+    function()
+      return nil
+    end,
+    function()
+      return ""
+    end,
+    -- A controlling terminal is already Termnav's default.
+    function()
+      return "/dev/tty"
+    end,
+    function()
+      error("broken collaborator")
+    end,
+  }) do
+    local ctx, _, jobs = single_tab(terminal)
+    equal(ctx.tab_select("previous"), true, "router should own the terminal boundary")
+    equal(jobs[1].arguments, plain, "no terminal option should be invented")
+    -- A failing lookup must not wedge the queue.
+    jobs[1].finish(0, "")
+    equal(ctx.tab_select("previous"), true, "the next gesture should still route")
+    equal(#jobs, 2, "the next gesture should start its own request")
+  end
+end)
+
+test("requests inside tmux leave the terminal to the attached client", function()
+  vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
+  vim.env.TMUX_PANE = "%7"
+  local ctx, _, jobs = single_tab(function()
+    error("the editor terminal must not be looked up inside tmux")
+  end)
+
+  equal(ctx.tab_select("next"), true, "router should own the tmux boundary")
+  equal(
+    jobs[1].arguments,
+    { "termnav", "navigate", "--emit-continuation", "tab-select", "next" },
+    "tmux requests should not carry a terminal"
+  )
+end)
+
+test("the default terminal lookup reuses wezterm-vars", function()
+  local uv = vim.uv or vim.loop
+  local saved = {
+    guess = uv.guess_handle,
+    readlink = uv.fs_readlink,
+    open = io.open,
+    uis = vim.api.nvim_list_uis,
+    chan = vim.api.nvim_get_chan_info,
+  }
+  -- rawset: selene rejects direct writes to standard library fields.
+  rawset(io, "open", function(path, mode)
+    if path == "/dev/tty" then
+      return nil
+    end
+    return saved.open(path, mode)
+  end)
+  uv.guess_handle = function()
+    return "tty"
+  end
+  uv.fs_readlink = function()
+    return "/dev/pts/88"
+  end
+  vim.api.nvim_list_uis = function()
+    return { { chan = 1, stdout_tty = true } }
+  end
+  vim.api.nvim_get_chan_info = function()
+    return { stream = "stdio" }
+  end
+  local ok, ctx, _, jobs = pcall(single_tab, nil)
+  local routed = ok and ctx.tab_select("next")
+  uv.guess_handle, uv.fs_readlink = saved.guess, saved.readlink
+  rawset(io, "open", saved.open)
+  vim.api.nvim_list_uis, vim.api.nvim_get_chan_info = saved.uis, saved.chan
+  truthy(ok and routed, "router should own the terminal boundary")
+  equal(jobs[1].arguments[#jobs[1].arguments], "/dev/pts/88", "default lookup should name the tty")
+end)
+
 test("boundary bursts use one bounded FIFO of native requests", function()
   vim.env.TMUX = "/tmp/termnav-test.sock,10,0"
   vim.env.TMUX_PANE = "%7"

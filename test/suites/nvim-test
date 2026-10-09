@@ -210,6 +210,155 @@ result=$(_nvim_lua "
 ")
 _assert_eq "wezterm-vars: a new publish observes a changed tmux client" "2 1 2" "$result"
 
+# Outside tmux the editor's stderr names the terminal: Neovim 0.10+ runs the
+# editor in its own session, where /dev/tty is ENXIO.
+wezterm_vars_stub='
+  vim.env.TMUX = nil
+  vim.env.TMUX_PANE = nil
+  local uv = vim.uv or vim.loop
+  local saved = {
+    guess = uv.guess_handle,
+    readlink = uv.fs_readlink,
+    open = io.open,
+    uis = vim.api.nvim_list_uis,
+    chan = vim.api.nvim_get_chan_info,
+    ffi = package.loaded.ffi,
+  }
+  -- opts: ctty (bool), stderr (handle type), link (readlink result),
+  -- uis (list of { stream, stdout_tty }), ttyname (FFI result or nil).
+  local function with(opts, callback)
+    io.open = function(path, mode)
+      if path == "/dev/tty" then
+        return opts.ctty and { close = function() end } or nil
+      end
+      return saved.open(path, mode)
+    end
+    uv.guess_handle = function(fd)
+      return fd == 2 and (opts.stderr or "tty") or saved.guess(fd)
+    end
+    uv.fs_readlink = function(target)
+      if target == "/proc/self/fd/2" then
+        return opts.link
+      end
+      return saved.readlink(target)
+    end
+    local uis = opts.uis or { { stream = "stdio", stdout_tty = true } }
+    vim.api.nvim_list_uis = function()
+      local list = {}
+      for index, ui in ipairs(uis) do
+        list[index] = { chan = index, stdout_tty = ui.stdout_tty }
+      end
+      return list
+    end
+    vim.api.nvim_get_chan_info = function(chan)
+      return { stream = uis[chan] and uis[chan].stream }
+    end
+    package.loaded.ffi = {
+      cdef = function() end,
+      C = { ttyname = function(fd) return fd == 2 and opts.ttyname or nil end },
+      string = function(pointer) return pointer end,
+    }
+    local ok, result = pcall(callback)
+    uv.guess_handle, uv.fs_readlink, io.open = saved.guess, saved.readlink, saved.open
+    vim.api.nvim_list_uis, vim.api.nvim_get_chan_info = saved.uis, saved.chan
+    package.loaded.ffi = saved.ffi
+    assert(ok, result)
+    return result
+  end
+  local vars = dofile("'"$vars_module"'")
+  local function path(opts)
+    return tostring(with(opts, vars.tty_path))
+  end
+'
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  print(path({ link = '/dev/pts/77' }))
+  -- Redirected or piped stderr leaves nothing to name.
+  print(path({ stderr = 'file', link = '/tmp/nvim.log' }))
+  print(path({ stderr = 'pipe' }))
+")
+expected="$(printf '/dev/pts/77\nnil\nnil')"
+_assert_eq "wezterm-vars: outside tmux, publish to the editor's stderr terminal" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  -- Older Neovim keeps its controlling terminal, which also works for users
+  -- who may not reopen the pty by name.
+  print(path({ ctty = true, link = '/dev/pts/77' }))
+")
+_assert_eq "wezterm-vars: a controlling terminal keeps priority" "/dev/tty" "$result"
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  -- After :detach, or with --remote-ui, the remaining UI may be elsewhere.
+  print(path({ link = '/dev/pts/77', uis = { { stream = 'socket', stdout_tty = true } } }))
+  print(path({ link = '/dev/pts/77', uis = {} }))
+  -- An embedding client such as a GUI talks over stdio without a terminal.
+  print(path({ link = '/dev/pts/77', uis = { { stream = 'stdio', stdout_tty = false } } }))
+  -- Not cached: the TUI coming back restores publication.
+  print(path({ link = '/dev/pts/77' }))
+")
+expected="$(printf 'nil\nnil\nnil\n/dev/pts/77')"
+_assert_eq "wezterm-vars: only the TUI that owns stderr makes it the destination" \
+  "$expected" "$result"
+
+result=$(_nvim_lua "$wezterm_vars_stub
+  -- macOS has no procfs, so readlink fails and ttyname(3) names the device.
+  print(path({ link = nil, ttyname = '/dev/ttys004' }))
+  print(path({ link = nil, ttyname = nil }))
+")
+expected="$(printf '/dev/ttys004\nnil')"
+_assert_eq "wezterm-vars: without procfs, ttyname(2) names the stderr terminal" \
+  "$expected" "$result"
+
+if command -v python3 >/dev/null 2>&1; then
+  # Drive the real TUI on a fresh pty with no tmux and no controlling-terminal
+  # shortcut: the user var must arrive on that pty.
+  pty_status=$(_tmpdir)/pty-status
+  pty_script=$(_tmpdir)/pty-publish.lua
+  cat >"$pty_script" <<EOF
+local ok = dofile('$vars_module').set('TERMNAV_PTY_TEST', 'ok')
+local file = assert(io.open('$pty_status', 'w'))
+file:write(tostring(ok))
+file:close()
+vim.cmd('qa!')
+EOF
+  pty_output=$(
+    python3 -I - "$pty_script" <<'PY'
+import os
+import pty
+import select
+import sys
+import time
+
+needle = b"\x1b]1337;SetUserVar=TERMNAV_PTY_TEST=b2s=\x07"
+pid, master = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp("nvim", ["nvim", "-u", "NONE", "-i", "NONE", "-c", "luafile " + sys.argv[1]])
+seen = bytearray()
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline and needle not in seen:
+    ready, _, _ = select.select([master], [], [], 0.1)
+    if ready:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        seen.extend(chunk)
+if needle not in seen:
+    os.kill(pid, 9)
+os.waitpid(pid, 0)
+print("delivered" if needle in seen else "missing")
+PY
+  )
+  _assert_eq "wezterm-vars: a real TUI outside tmux publishes to its pty" \
+    "delivered true" "$pty_output $(cat "$pty_status" 2>/dev/null)"
+else
+  echo "  SKIP: wezterm-vars real pty publication (python3 unavailable)"
+fi
+
 result=$(_nvim_lua "
   vim.env.TMUX = '/tmp/tmux.sock,1,0'
   vim.env.TMUX_PANE = '%42'

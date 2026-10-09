@@ -2,7 +2,8 @@
 --
 -- nvim's TUI path cannot use plain io.write reliably, so callers write OSC
 -- directly to the pane tty. Inside tmux, that OSC must be wrapped in DCS
--- passthrough so it reaches the outer WezTerm process.
+-- passthrough so it reaches the outer WezTerm process. Outside tmux the
+-- editor names its own terminal; see editor_tty_path().
 
 -- selene: allow(undefined_variable)
 local vim = vim
@@ -114,27 +115,86 @@ local function tmux_client_is_nested(batch)
   return nested, true
 end
 
+-- True while a terminal UI attached over the editor's stdio is present: the
+-- TUI that started this editor process and shares its stderr. A UI attached
+-- over a socket (`--remote-ui`, or the one left after `:detach`) can sit in a
+-- different terminal, and the stderr device would then be the wrong pane.
+local function stdio_tui_attached()
+  local ok, uis = pcall(vim.api.nvim_list_uis)
+  if not ok or type(uis) ~= "table" then
+    return false
+  end
+  for _, ui in ipairs(uis) do
+    if ui.stdout_tty and ui.chan then
+      local ok_info, info = pcall(vim.api.nvim_get_chan_info, ui.chan)
+      if ok_info and type(info) == "table" and info.stream == "stdio" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- Neovim 0.10+ runs the editor in its own session, separate from the TUI, so
+-- opening /dev/tty fails with ENXIO even though the editor's stderr is still
+-- the terminal. Name that device directly: procfs on Linux, ttyname(3) through
+-- LuaJIT's FFI elsewhere (macOS has no procfs). Returns nil unless the TUI
+-- that owns stderr is attached, when stderr is not a terminal, or when
+-- neither method applies, e.g. a PUC Lua build off Linux.
+function M.stderr_tty_path()
+  local uv = vim.uv or vim.loop
+  if not uv or uv.guess_handle(2) ~= "tty" or not stdio_tui_attached() then
+    return nil
+  end
+  local path = uv.fs_readlink("/proc/self/fd/2")
+  if type(path) == "string" and path:match("^/dev/") then
+    return path
+  end
+  local ok, name = pcall(function()
+    local ffi = require("ffi")
+    pcall(ffi.cdef, "char *ttyname(int fd);")
+    local pointer = ffi.C.ttyname(2)
+    return pointer ~= nil and ffi.string(pointer) or nil
+  end)
+  return ok and name or nil
+end
+
+-- Terminal for writes from the editor when no tmux pane sits in between.
+-- The controlling terminal keeps priority while the editor has one (Neovim
+-- before 0.10): unlike the device path, /dev/tty also works for a user who
+-- may not reopen that pty by name, e.g. under `su`. Otherwise the TUI's
+-- stderr terminal; nil when neither is available. navigation.lua passes the
+-- same answer to the native requests it starts.
+function M.editor_tty_path()
+  local probe = io.open("/dev/tty", "w")
+  if probe then
+    probe:close()
+    return "/dev/tty"
+  end
+  return M.stderr_tty_path()
+end
+
 local function tmux_passthrough(sequence)
   return "\027Ptmux;" .. sequence:gsub("\027", "\027\027") .. "\027\\"
 end
 
 function M.tty_path()
+  if not vim.env.TMUX then
+    -- Not cached: UIs can attach and detach during the editor's lifetime.
+    return M.editor_tty_path()
+  end
+
   if type(tty_path) == "string" and tty_path ~= "" then
     return tty_path
   end
 
-  if vim.env.TMUX then
-    local path = tmux_tty_path()
-    -- Do not cache a failed lookup. Startup timing can briefly make tmux pane
-    -- metadata unavailable, and later focus events should be able to recover.
-    if not path then
-      return nil
-    end
-    tty_path = path
-  else
-    tty_path = "/dev/tty"
+  local path = tmux_tty_path()
+  -- Do not cache a failed lookup. Startup timing can briefly make tmux pane
+  -- metadata unavailable, and later focus events should be able to recover.
+  if not path then
+    return nil
   end
-
+  tty_path = path
   return tty_path
 end
 
