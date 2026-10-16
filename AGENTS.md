@@ -5,62 +5,90 @@
 `termnav` is the single compiled executable for terminal navigation:
 pane and tab routing, WezTerm link routing, tmux ctrl-click
 follow-through, OSC-8-aware `eza` links, SSH reverse relay, and
-existing-session Neovim opens. There is one installation path and no
-source-checkout installer.
+existing-session Neovim opens. It installs only from release archives;
+there is no source-checkout installer. User-facing contracts live in
+`docs/reference.md` and `man/man1/termnav.1`.
 
-## Architecture
+## Layout
 
-`src/main.rs` is a thin exit-code adapter. `src/commands/` validates
-syntax and translates status. Reusable behavior lives in library
-modules:
-
-- `navigation` — typed scope traversal and routing
-- `relay` — versioned Unix-socket protocol and transactional store
-- `ssh` — one enhanced SSH child and its reverse-forward lifecycle
-- `focus` — one-hop tmux leases and pane-style restoration
-- `nvim` — target parsing, RPC, and mux-only remote reuse
-- `click` — mouse-text recognition
-- `browser` — open-URL validation and terminal delivery
-- `vscode` — VS Code window focus publication
-- `assets` — installed provider-root discovery
-- `shell` — POSIX shell quoting and tmux format escaping at
-  subprocess boundaries
-- `cli` — top-level command parsing and dispatch
-- `version` — embedded build identity
-- `terminal`, `process`, `runtime`, `links` — OS and terminal-protocol
-  boundaries
-
-`lib/termnav/` holds shell and Lua integrations. Shared route
-vocabulary stays centralized so tmux, Neovim, and WezTerm agree.
-
-Relay protocol vocabulary lives in `src/relay/protocol.rs`. The frozen
-Python peer in tests is the cross-version oracle. Consumers should
-invoke `termnav relay` rather than constructing protocol objects.
+- `src/main.rs` is a thin exit-code adapter; `src/commands/` validates
+  syntax and translates status; library modules (`navigation`, `relay`,
+  `ssh`, `focus`, `nvim`, ...) own behavior. `src/lib.rs` lists them.
+- `lib/termnav/` holds the shell and Lua integrations; `share/termnav/`
+  holds the shell loader, the opt-in `ssh` shim, and the VS Code adapter.
+- `examples/` is tested by `test/suites/examples-test`. The release
+  archive ships `README.md`, `LICENSE`, the man page, `examples/`,
+  `lib/`, and `share/` (`scripts/release.conf`), but not `docs/`.
 
 ## Invariants
 
 - `pane-move` stays inside local tmux ancestry. It never crosses SSH,
   WezTerm, VS Code, or another terminal boundary.
 - Termnav never opens a second authenticated transport, including
-  during cleanup or remote editor reuse.
-- An indeterminate timed-out SSH request is never retried through a
-  second transport.
+  during cleanup or remote editor reuse. An indeterminate timed-out SSH
+  request is never retried through a second transport.
 - The private `share/termnav/shims/ssh` adapter is opt-in PATH
   interception only; recursive shim entry is rejected.
+- Relay protocol vocabulary lives in `src/relay/protocol.rs`; the frozen
+  Python peer in tests is the cross-version oracle.
+- A VS Code adapter change bumps `package.json` `version`, the
+  `share/termnav/vscode/termnav-X.Y.Z` directory name, and its consumers
+  together. No test enforces this.
 - MSRV is 1.88 (`Cargo.toml` `rust-version`).
 
 ## Testing
 
-CI rust-ci `test-command`:
+- Quality job: `cargo fmt --check`;
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`;
+  `RUSTDOCFLAGS='-D missing-docs' cargo doc --locked --no-deps`;
+  `cargo audit --file Cargo.lock`; MSRV
+  `cargo +1.88 check --locked --all-targets --all-features`.
+- `cargo test --locked && test/termnav-test` is CI's `test-command`. It
+  builds the release binary unless `TERMNAV_TEST_BINARY` is set and runs
+  ShellCheck unless `TERMNAV_SKIP_SHELLCHECK=1`.
+- Required extra jobs: `test/suites/vscode-adapter-test` (needs `node`;
+  skips locally without it) and, against current `eza` on
+  `archlinux:latest`, `test/suites/wezterm-integration-test` after
+  `cargo build --release --locked`. PR-only on Ubuntu and macOS:
+  `TERMNAV_PERFORMANCE_BASELINE=<base-sha> test/suites/relay-performance-test`.
+- Termux: `TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test`.
 
-```sh
-cargo test --locked && test/termnav-test
-```
+## Test isolation
 
-`test/termnav-test` builds the release binary unless
-`TERMNAV_TEST_BINARY` is set. Prefer fake terminal commands and
-fixtures over a live tmux, Neovim, SSH, or WezTerm session.
+- `test/helpers.sh` relocates `HOME`, `XDG_*`, `TMPDIR`, and
+  `XDG_RUNTIME_DIR`, and unsets `TMUX`, `NVIM`, `SSH_*`, and WezTerm
+  variables. `test/suites/test-isolation-test` seeds live-looking
+  sentinels and must keep passing.
+- Real tmux runs only on private servers: the Python harnesses use
+  `-S <tmp>`, and `test/relay-performance.py` uses a unique `-L` name
+  with `-f /dev/null`. Never touch the default server.
 
-PR-only: `test/suites/relay-performance-test` against the PR base.
-Required extra jobs: `test/suites/vscode-adapter-test` and Arch
-`test/suites/wezterm-integration-test`.
+## CI and generated files
+
+- There is no ShellCheck inventory job: `.github/shellcheck-files.txt` is
+  read by nothing. The lint list is in `test/termnav-test`; a new shell
+  file under `bin`, `lib`, or `share` must be added to
+  `runtime_shell_files`, which is drift-checked even with
+  `TERMNAV_SKIP_SHELLCHECK=1`. The matrix lints through its `shellcheck`
+  profile.
+- `install.sh` is generated by cgraf78/actions release-installer and
+  byte-checked by `actions-sync`. Edit `scripts/release.conf`, then run
+  `consumer-ci/sync.sh <this checkout>` from cgraf78/actions at the locked
+  SHA.
+- `.github/cgraf78-actions.lock` and every `uses: cgraf78/actions/...@sha`
+  move together, only via `consumer-ci/sync.sh`, which also refreshes the
+  vendored release scripts (`scripts/.release-scripts.manifest`):
+  `release`, `release-lib`, `release-tag`, `release-version`,
+  `package-release`, `smoke-release`. Repo-owned: `scripts/release.conf`,
+  `scripts/release-smoke-hook.sh`.
+- `test/suites/ci-contract-test` pins `test.yml` and `release.yml` text,
+  the `_with_timeout` values in four suites, and the thresholds in
+  `test/relay-performance.py`; edit them together.
+- `retry-infrastructure.yml` keys on the workflow name `Tests`; don't
+  rename it.
+
+## Release
+
+`scripts/release.sh --dry-run`, then `scripts/release.sh --push` from a
+clean `main` matching `origin/main`. It tags `YYYYMMDD-HHMMSS-<8hex>`,
+and the tag runs shared `rust-release` (including `android-aarch64`).
