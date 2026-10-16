@@ -11,15 +11,18 @@ the tabs of the terminal that hosts it all.
 
 - **Panes:** from Neovim, `Ctrl-h/j/k/l` moves between splits and, at the edge
   of the editor, on into the neighboring tmux pane. That includes tmux nested
-  inside tmux, on the same host or over SSH through the `termnav ssh` relay.
+  inside tmux, on the same host or over SSH through the `termnav ssh` relay
+  (see [over SSH](#over-ssh) for what the remote host needs).
   `Alt-H/J/K/L` swaps the current pane with its neighbor; it stays inside the
   local Neovim and tmux layers and never crosses SSH, WezTerm, or VS Code.
   The shipped examples bind these keys in Neovim only; see
   [what the examples bind](#what-the-examples-bind-and-what-they-dont).
-- **Tabs:** `Ctrl-Tab` moves to the next window of a tmux layer that has
-  several. In a one-window layer it continues outward to a parent tmux, a
-  WezTerm tab, or (with the [VS Code adapter](#vs-code-advanced)) a VS Code
-  terminal tab.
+- **Tabs:** once `Ctrl-Tab` reaches tmux, it moves to the next window of a
+  tmux layer that has several. In a one-window layer it continues outward to
+  a parent tmux, a WezTerm tab, or (with the [VS Code adapter](#vs-code-advanced))
+  a VS Code terminal tab. Getting the key to tmux takes terminal and tmux
+  settings the examples don't ship; see
+  [what the examples bind](#what-the-examples-bind-and-what-they-dont).
 - **Links:** in tmux, Ctrl-click a file path to open it in a Neovim you
   already have running, or a URL to have WezTerm open it on your local
   machine, even from inside SSH. Remote file opens reuse an existing SSH
@@ -53,7 +56,10 @@ installation path to build, publish, update, and diagnose.
 The [`examples/`](examples/) directory holds tested configuration snippets,
 and the release installs them too. Copy them into your own configs:
 
-1. **tmux.** Copy the example and source it from your `tmux.conf`:
+1. **tmux.** Copy the example and source it from your `tmux.conf`. Besides
+   its bindings and focus hooks, it turns on `mouse`, `focus-events`,
+   `allow-passthrough`, and hyperlinks, and sets `window-style`,
+   `window-active-style`, and `@termnav_inactive_style`; edit those to taste:
 
    ```bash
    mkdir -p ~/.config/tmux
@@ -90,31 +96,61 @@ and the release installs them too. Copy them into your own configs:
    return config
    ```
 
-For navigation through nested tmux over SSH, also load the shell integration
-in your interactive shell. Its `ssh()` function runs `termnav ssh` for you:
+### Over SSH
+
+For navigation through nested tmux over SSH, load the shell integration in
+your interactive shell. Its `ssh()` function runs `termnav ssh` for you:
 
 ```sh
 . "$(termnav asset-path share/termnav/shell.sh)"
 ```
 
+`termnav ssh` forwards a Unix socket with `RemoteForward` and names it to the
+remote side with `SendEnv=TERMNAV_PARENT_RELAY`. Each remote host therefore
+needs:
+
+- termnav installed, plus the tmux and Neovim setup above;
+- `AcceptEnv TERMNAV_PARENT_RELAY` in its sshd configuration. termnav ships
+  that line as a fragment (`termnav asset-path share/termnav/sshd_config`
+  prints its path); install it as, for example,
+  `/etc/ssh/sshd_config.d/termnav.conf` and reload sshd;
+- Unix-socket forwarding allowed (`AllowStreamLocalForwarding`, which is on
+  by default).
+
 ### What the examples bind, and what they don't
 
-- **Neovim** (`examples/nvim.lua`): `Ctrl-h/j/k/l` selects panes,
-  `Alt-H/J/K/L` moves them, `Ctrl-\` returns to the previous pane, and
-  `Ctrl-Tab`/`Ctrl-Shift-Tab` and `Alt-{`/`Alt-}` select and move tabs, in
-  normal and terminal modes.
+- **Neovim** (`examples/nvim.lua`): `Ctrl-h/j/k/l` selects panes and
+  `Alt-H/J/K/L` moves them, in normal and terminal modes; `Ctrl-\` returns
+  to the previous pane in normal mode; `Ctrl-Tab`/`Ctrl-Shift-Tab` and
+  `Alt-{`/`Alt-}` select and move tabs in normal, insert, and terminal modes.
 - **tmux** (`examples/tmux.conf`): `Ctrl-Tab`/`Ctrl-Shift-Tab` tab routing,
   Ctrl-click link following, and the focus hooks that tell nested tmux layers
   which pane really has focus.
 - **WezTerm** (`examples/wezterm.lua`): termnav's link rules and the handler
-  that acts on tab and URL requests. Key assignments stay yours.
+  that acts on tab and URL requests. It assigns no keys.
+
+`Ctrl-Tab` needs your own configuration in three places before the routing
+above works:
+
+- **Terminal:** WezTerm's default key assignments use `Ctrl-Tab` and
+  `Ctrl-Shift-Tab` to switch its own tabs, so the keys never reach tmux or
+  Neovim. Your WezTerm config has to pass them to the pane instead, at least
+  when the pane runs tmux or Neovim.
+- **tmux:** tmux generally needs extended keys to tell `C-Tab` from `Tab`:
+  `extended-keys on` plus the `extkeys` terminal feature for your terminal
+  (and for `tmux*` when tmux is nested).
+- **Neovim inside tmux:** the example's `C-Tab` binding takes the key in
+  every pane, so Neovim's own `Ctrl-Tab` mapping only fires outside tmux
+  unless your tmux binding forwards the key to Neovim panes.
 
 The tmux example does **not** bind `Ctrl-h/j/k/l` or `Alt-H/J/K/L`. In a tmux
 shell pane those keys do whatever your own tmux config says. For
 vim-tmux-navigator-style movement from shell panes, bind them in your own
 tmux config to `termnav navigate pane-select DIRECTION` and
-`termnav navigate pane-move DIRECTION`. Like vim-tmux-navigator's bindings,
-yours must pass the keys through to panes running Neovim. See
+`termnav navigate pane-move DIRECTION`. No tested recipe ships. Like
+vim-tmux-navigator's bindings, yours must pass the keys through to panes
+running Neovim. The command exits with status `3` when it declines a request
+at the current boundary. See
 [`examples/README.md`](examples/README.md) and the
 [reference](docs/reference.md#command-interface).
 

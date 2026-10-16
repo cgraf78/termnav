@@ -473,3 +473,12 @@ SSH executable; callers that intentionally need inherited interception can add
 the private shim directory to only that launcher's PATH.
 Strict `ExitOnForwardFailure=yes` configurations are delegated unchanged rather
 than making Termnav's optional relay mandatory.
+
+The relay path travels as `TERMNAV_PARENT_RELAY` over `SendEnv`, next to a
+`RemoteForward` of the local relay socket, so the remote sshd must accept that
+variable. Install the shipped `share/termnav/sshd_config` fragment (`AcceptEnv
+TERMNAV_PARENT_RELAY`; `termnav asset-path share/termnav/sshd_config` prints
+its path) on each participating host, for example as
+`/etc/ssh/sshd_config.d/termnav.conf`, then reload sshd. Keep
+Unix-socket forwarding (`AllowStreamLocalForwarding`) enabled. The remote host
+also needs termnav and its tmux and Neovim integration.
