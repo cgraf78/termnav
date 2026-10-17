@@ -90,3 +90,9 @@ only from release archives. User-facing contracts live in
 `scripts/release.sh --dry-run`, then `scripts/release.sh --push` from a
 clean `main` matching `origin/main`. It tags `YYYYMMDD-HHMMSS-<8hex>`,
 and the tag runs shared `rust-release` (including `android-aarch64`).
+
+Verify published artifacts using the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+Constrain the source to `cgraf78/termnav` and the signer to
+`cgraf78/actions/.github/workflows/rust-release.yml` at the revision pinned
+by the release commit.

@@ -51,6 +51,11 @@ otherwise it proceeds on the checksum alone and says so. Pass
 `--require-attestation` is an error. There is one executable and one
 installation path to build, publish, update, and diagnose.
 
+For manual archive verification, follow the shared
+[attestation verification guide](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#verifying-published-attestations).
+The release source is `cgraf78/termnav`; its signer is the reusable release
+workflow in `cgraf78/actions`.
+
 ## Quickstart
 
 The [`examples/`](examples/) directory holds tested configuration snippets,
@@ -218,7 +223,8 @@ cargo test --locked && ./test/termnav-test
 ```
 
 Contributor and agent notes, including the other required CI jobs, are in
-[`AGENTS.md`](AGENTS.md).
+[`AGENTS.md`](AGENTS.md). Its [release section](AGENTS.md#release) also covers
+publication and artifact verification.
 
 ## License
 
