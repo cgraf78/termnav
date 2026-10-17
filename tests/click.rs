@@ -1,6 +1,6 @@
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use termnav::click::{Input, Target, resolve};
 
@@ -54,21 +54,17 @@ fn browser_targets_are_returned_to_the_exact_click_client() {
     std::fs::write(&other, []).expect("create fake other client tty");
     // Two WezTerm clients; the other one is listed first. The fake tmux is
     // the only server this test can reach.
-    let tmux = bin.join("tmux");
-    std::fs::write(
-        &tmux,
-        format!(
-            "#!/bin/sh\ncase \" $* \" in *\" list-clients \"*)\n\
+    script(
+        &bin.join("tmux"),
+        &format!(
+            "case \" $* \" in *\" list-clients \"*)\n\
              printf '0\\tWezTerm 1\\t%s\\txterm-256color\\t0\\n' '{}'\n\
              printf '0\\tWezTerm 1\\t%s\\txterm-256color\\t0\\n' '{}'\n\
              exit 0;;\nesac\nexit 1\n",
             other.display(),
             tty.display()
         ),
-    )
-    .expect("write fake tmux");
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake tmux executable");
+    );
 
     let status = Command::new(env!("CARGO_BIN_EXE_termnav"))
         .args([
@@ -94,10 +90,32 @@ fn browser_targets_are_returned_to_the_exact_click_client() {
 }
 
 /// Write an executable `#!/bin/sh` script.
+///
+/// Tests run on parallel threads. A thread that spawns a process while this
+/// one holds a script open for writing hands that descriptor to its child
+/// until the child execs, and running the script meanwhile fails with
+/// ETXTBSY ("Text file busy"). A short-lived `sh` writes the file instead,
+/// so no test thread ever holds it open. Concurrent spawns can inherit the
+/// pipe to it, which only delays its end of input until they exec.
 fn script(path: &std::path::Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}")).expect("write script");
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .expect("make script executable");
+    let mut writer = Command::new("/bin/sh")
+        .args(["-c", "cat >\"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("start script writer");
+    writer
+        .stdin
+        .take()
+        .expect("script writer stdin")
+        .write_all(format!("#!/bin/sh\n{body}").as_bytes())
+        .expect("write script");
+    let status = writer.wait().expect("wait for script writer");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
 }
 
 /// Run one URL click through a fake tmux. A plain `list-clients` prints
@@ -510,14 +528,10 @@ fn file_targets_reuse_nvim_in_the_current_tmux_window() {
     std::fs::create_dir_all(&bin).expect("create fake bin");
     let _cleanup = Cleanup(root.clone());
     let log = root.join("tmux.log");
-    let tmux = bin.join("tmux");
-    std::fs::write(
-        &tmux,
-        "#!/bin/sh\nif [ \"$1\" = list-panes ]; then printf '%s\\t%s\\n' '%2' nvim; exit 0; fi\nprintf '%s\\n' \"$*\" >>\"$TERMNAV_CLICK_LOG\"\n",
-    )
-    .expect("write fake tmux");
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake tmux executable");
+    script(
+        &bin.join("tmux"),
+        "if [ \"$1\" = list-panes ]; then printf '%s\\t%s\\n' '%2' nvim; exit 0; fi\nprintf '%s\\n' \"$*\" >>\"$TERMNAV_CLICK_LOG\"\n",
+    );
     let status = Command::new(env!("CARGO_BIN_EXE_termnav"))
         .args([
             "tmux",
