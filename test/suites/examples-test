@@ -394,8 +394,13 @@ SH
       _wait_for_format keys '#{pane_id}' "$1"
     }
 
+    # tmux reports a failed binding command either in a view over the pane or,
+    # on some platforms, back to the `send-keys -K` client that injected the
+    # key. Capture that client's result instead of letting it end the suite.
     _press() {
-      tmux -L "$_socket" send-keys -K -c "$_key_client" "$@"
+      _press_status=0
+      _press_output=$(tmux -L "$_socket" send-keys -K -c "$_key_client" "$@" 2>&1) ||
+        _press_status=$?
     }
 
     _routes_logged() {
@@ -427,6 +432,7 @@ SH
 
     tmux -L "$_socket" select-pane -t "$_left_pane"
     _press C-h
+    _edge_press="$_press_status:$_press_output"
     # Boundary routing runs in the foreground, so the next key waits for
     # Termnav to finish. Once Ctrl-l has moved selection, the declined route
     # has completed and any tmux error for its status would be visible.
@@ -440,29 +446,39 @@ SH
       "--source-socket $_keys_socket_path" "$_edge_route"
     _assert_contains "examples: the edge route names the source pane" \
       "--source-pane $_left_pane " "$_edge_route"
+    _assert_eq "examples: a declined edge route reports nothing to the key's client" \
+      "0:" "$_edge_press"
     _assert_eq "examples: a declined edge route shows no tmux error" \
       0 "$(tmux -L "$_socket" display-message -p -t "$_left_pane" '#{pane_in_mode}')"
 
     : >"$_stub_log"
     tmux -L "$_socket" select-pane -t "$_left_pane"
     _press C-Tab
+    _tab_press="$_press_status:$_press_output"
     _press C-l
     _assert_eq "examples: the key after a tab route runs" \
       "$_right_pane" "$(_wait_for_active "$_right_pane")"
     _assert_contains "examples: Ctrl-Tab in a one-window layer asks the parent layer" \
       "navigate tab-select next --parent" "$(_routes_logged)"
+    _assert_eq "examples: a declined tab route reports nothing to the key's client" \
+      "0:" "$_tab_press"
     _assert_eq "examples: a declined tab route shows no tmux error" \
       0 "$(tmux -L "$_socket" display-message -p -t "$_left_pane" '#{pane_in_mode}')"
 
     # Only the decline status is silenced; a real failure must still surface.
+    # No follow-up key here: the error view would take it in emacs mode-keys.
     echo 5 >"$_stub_status"
     tmux -L "$_socket" select-pane -t "$_left_pane"
     _press C-h
-    _press C-l
-    _assert_eq "examples: the key after a failed route runs" \
-      "$_right_pane" "$(_wait_for_active "$_right_pane")"
-    _assert_eq "examples: a failed edge route still shows the tmux error" \
-      1 "$(tmux -L "$_socket" display-message -p -t "$_left_pane" '#{pane_in_mode}')"
+    if [[ $_press_output == *"returned 5"* ]]; then
+      _failed_route="reported to the key's client"
+    elif [[ $(_wait_for_format "$_left_pane" '#{pane_in_mode}' 1) == 1 ]]; then
+      _failed_route="shown over the pane"
+    else
+      _failed_route="hidden (status $_press_status, output '$_press_output')"
+    fi
+    _assert_not_contains "examples: a failed edge route still reports its status" \
+      "hidden" "$_failed_route"
   fi
   _stop_examples_tmux
   trap _cleanup EXIT

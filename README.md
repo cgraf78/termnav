@@ -151,11 +151,11 @@ above works:
 
 The tmux example binds `Ctrl-h/j/k/l` but not `Alt-H/J/K/L`. A
 `Ctrl-h/j/k/l` key goes to the pane when its foreground program owns it: Vim,
-Neovim, and fzf always, and SSH (including `termnav ssh`), mosh, ET, or a
-nested tmux or screen while it has mouse reporting on. Otherwise tmux selects
-its neighboring pane, and at its edge
-`termnav navigate pane-select DIRECTION --parent` continues outward. The
-example publishes that ownership test as `@termnav_pane_owns_chord`. It sees
+Neovim, and fzf always, and SSH (including `termnav ssh`, which Termnav's
+shell integration runs for plain `ssh`), mosh, ET, or a nested tmux or screen
+while it has mouse reporting on. Otherwise tmux selects its neighboring pane,
+and at its edge `termnav navigate pane-select DIRECTION --parent` continues
+outward. The example publishes that ownership test as `@termnav_pane_owns_chord`. It sees
 only the pane's foreground process, so extend it if you want the keys to reach
 an editor started by a parent that doesn't `exec` it, such as `git commit`
 opening Vim, or fzf run by a shell key binding.
