@@ -403,6 +403,11 @@ class RelayHarness:
         # either explicitly.
         for name in ("TERM_PROGRAM", "WEZTERM_PANE", "STY", "TMUX", "TMUX_PANE"):
             self.environment.pop(name, None)
+        # A click the terminal cannot take falls back to $BROWSER. Tests that
+        # exercise the fallback install a stub; nothing may open a browser.
+        self.environment["BROWSER"] = "false"
+        for name in ("DISPLAY", "WAYLAND_DISPLAY"):
+            self.environment.pop(name, None)
         # XTVERSION reply for terminals attached from now on, e.g.
         # b"WezTerm 20240203-110809-5046fc22"; None leaves the query
         # unanswered like a terminal without XTVERSION support.
@@ -1440,6 +1445,138 @@ class RelayTerminalTest(unittest.TestCase):
         )
         self.assertEqual(code, "1")
         self.assertNotIn(b"TERMNAV_OPEN_URL", terminal.drain())
+
+    def click(
+        self, tmux_socket: str, pane: str, client_tty: str, url: str, *, background: bool = True
+    ) -> str:
+        """Run follow-click the way the tmux binding does: from run-shell, with
+        all eleven fields on stdin including the server socket. The job drops
+        TMUX so the explicit socket is what routes the click. Returns the
+        job's output, which tmux would show in the pane."""
+
+        fields = (url, "", "", "0", "/tmp", client_tty, pane, "0", "0", "0", tmux_socket)
+        command = (
+            "printf '%s\\n' "
+            + " ".join(shlex.quote(field) for field in fields)
+            + " | env -u TMUX "
+            + shlex.quote(self.harness.termnav)
+            + " tmux follow-click --stdin"
+        )
+        # run-shell expands tmux formats in its command.
+        command = command.replace("#", "##")
+        arguments = ["run-shell", *(["-b"] if background else []), command]
+        return self.harness.tmux(tmux_socket, *arguments).stdout
+
+    def wait_for_termtype(self, tmux_socket: str, prefix: str) -> None:
+        """Wait until every attached client reports a termtype with prefix."""
+
+        def ready() -> bool:
+            termtypes = self.harness.tmux(
+                tmux_socket, "list-clients", "-F", "#{client_termtype}"
+            ).stdout.splitlines()
+            return bool(termtypes) and all(line.startswith(prefix) for line in termtypes)
+
+        wait_for(lambda: ready() or None, f"client termtype {prefix}")
+
+    def test_follow_click_from_local_nested_tmux_reaches_the_outer_terminal(self) -> None:
+        # A raw write to the inner client's tty, as follow-click used to do,
+        # is a pane write to the outer tmux, which drops it.
+        inner_socket = self.harness.new_server("click-inner", "inner", "cat")
+        inner_pane = self.harness.tmux(
+            inner_socket, "display-message", "-p", "-t", "inner", "#{pane_id}"
+        ).stdout.strip()
+        outer_socket = self.harness.new_server("click-outer", "outer", "cat")
+        outer_pane = self.harness.tmux(
+            outer_socket, "display-message", "-p", "-t", "outer", "#{pane_id}"
+        ).stdout.strip()
+        self.harness.configure_commits(outer_socket, terminal_replies=True)
+        self.harness.xtversion = WEZTERM_XTVERSION
+        terminal = self.harness.attach(outer_socket, "outer")
+        self.wait_for_termtype(outer_socket, WEZTERM_XTVERSION.decode())
+        self.harness.tmux(
+            outer_socket,
+            "respawn-pane",
+            "-k",
+            "-t",
+            outer_pane,
+            f"exec tmux -S {shlex.quote(inner_socket)} attach-session -t inner",
+        )
+        inner_tty, _ = self.harness.wait_for_nested_client(
+            outer_socket, outer_pane, inner_socket, inner_pane
+        )
+        self.wait_for_termtype(inner_socket, "tmux")
+        terminal.drain()
+        url = "https://example.com/clicked/nested"
+
+        self.click(inner_socket, inner_pane, inner_tty, url)
+
+        payload = terminal.read_until(
+            b"\x1b]1337;SetUserVar=TERMNAV_OPEN_URL=" + base64.b64encode(url.encode()) + b"\x07"
+        )
+        self.assertNotIn(b"\x1bPtmux;", payload)
+
+    def test_follow_click_reaches_the_clicking_client_not_the_latest(self) -> None:
+        self.harness.xtversion = WEZTERM_XTVERSION
+        tmux_socket, source_pane, _, latest, _ = self.top_level()
+        clicked = self.harness.attach(tmux_socket, "top")
+        self.wait_for_termtype(tmux_socket, WEZTERM_XTVERSION.decode())
+        # tmux lists the first client first, which also wins activity ties
+        # (activity counts whole seconds), and input makes it the most recent:
+        # it is the client `open-url` would choose either way.
+        latest.synchronize_input()
+        clicked.drain()
+        latest.drain()
+        url = "https://example.com/clicked/exact"
+
+        self.click(tmux_socket, source_pane, clicked.tty, url)
+
+        clicked.read_until(
+            b"\x1b]1337;SetUserVar=TERMNAV_OPEN_URL=" + base64.b64encode(url.encode()) + b"\x07"
+        )
+        self.assertNotIn(b"TERMNAV_OPEN_URL", latest.drain())
+
+    def test_follow_click_falls_back_to_browser_when_the_client_cannot_open(self) -> None:
+        # The synthetic terminal ignores XTVERSION and carries no WezTerm
+        # environment, so the request is declined and the host opener runs.
+        tmux_socket, source_pane, _, terminal, _ = self.top_level()
+        log = self.harness.root / "browser.log"
+        opener = self.harness.root / "browser-stub"
+        opener.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {shlex.quote(str(log))}\n')
+        opener.chmod(0o755)
+        self.harness.tmux(tmux_socket, "set-environment", "-g", "BROWSER", str(opener))
+        terminal.drain()
+        url = "https://example.com/clicked/fallback"
+
+        self.click(tmux_socket, source_pane, terminal.tty, url)
+
+        self.assertEqual(
+            wait_for(
+                lambda: log.read_text().strip() if log.exists() else None,
+                "fallback opener call",
+            ),
+            url,
+        )
+        self.assertNotIn(b"TERMNAV_OPEN_URL", terminal.drain())
+
+    def test_follow_click_tells_the_clicking_client_when_nothing_opens(self) -> None:
+        tmux_socket, source_pane, _, terminal, _ = self.top_level()
+        self.harness.tmux(tmux_socket, "set-environment", "-gu", "BROWSER")
+        terminal.drain()
+        # %Y is a strftime conversion and #{pane_id} a tmux format; the
+        # message must show both as written.
+        url = "https://example.com/%Y#{pane_id}"
+
+        output = self.click(tmux_socket, source_pane, terminal.tty, url, background=False)
+
+        self.assertEqual(output, "")
+        payload = terminal.read_until(b"termnav: could not open " + url.encode())
+        self.assertNotIn(b"TERMNAV_OPEN_URL", payload)
+        self.assertEqual(
+            self.harness.tmux(
+                tmux_socket, "display-message", "-p", "-t", source_pane, "#{pane_in_mode}"
+            ).stdout.strip(),
+            "0",
+        )
 
     def test_relay_started_before_focus_switch_targets_the_live_client(self) -> None:
         tmux_socket, _, _, first, relay_socket = self.top_level()
