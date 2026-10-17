@@ -66,6 +66,10 @@ _assert_contains "tmux focus: arbitrary depth retains one highlighted leaf" \
   "test_three_levels_keep_exactly_one_highlighted_leaf" "$output"
 _assert_contains "tmux focus: shared inner sessions keep attachments independent" \
   "test_shared_inner_session_keeps_outer_attachments_independent" "$output"
+_assert_contains "tmux focus: hooks target their own client, not the most active" \
+  "test_focus_hook_targets_its_own_client_not_the_most_active" "$output"
+_assert_contains "tmux focus: named control-mode clients never claim a parent" \
+  "test_a_named_control_mode_client_never_claims_its_parent" "$output"
 _assert_contains "tmux focus: killed publishers expire and recover" \
   "test_publisher_crash_expires_then_next_focus_recovers" "$output"
 _assert_contains "tmux focus: delayed focus-out cannot kill a refocused publisher" \

@@ -383,3 +383,118 @@ fn link_host_is_not_part_of_the_neovim_namespace() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("termnav nvim"));
 }
+
+#[test]
+fn focus_client_name_excludes_the_exact_identity_form() {
+    for extra in [
+        &["--client-pid", "123"][..],
+        &["--client-tty", "/dev/pts/1"][..],
+    ] {
+        let mut arguments = vec![
+            "tmux",
+            "focus",
+            "watch",
+            "--tmux-socket",
+            "/tmp/termnav-no-such-server.sock",
+            "--client-name",
+            "/dev/pts/1",
+        ];
+        arguments.extend_from_slice(extra);
+        let output = termnav().args(&arguments).output().expect("run termnav");
+
+        assert_eq!(output.status.code(), Some(2), "arguments: {arguments:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("cannot be combined"),
+            "arguments: {arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn focus_client_name_must_not_be_empty() {
+    let output = termnav()
+        .args([
+            "tmux",
+            "focus",
+            "stop",
+            "--tmux-socket",
+            "/tmp/termnav-no-such-server.sock",
+            "--client-name",
+            "",
+        ])
+        .output()
+        .expect("run termnav");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("client name must not be empty"));
+}
+
+#[test]
+fn focus_watch_rejects_bad_timing_before_resolving_the_client() {
+    let output = termnav()
+        .args([
+            "tmux",
+            "focus",
+            "watch",
+            "--tmux-socket",
+            "/tmp/termnav-no-such-server.sock",
+            "--client-name",
+            "/dev/pts/1",
+            "--lease-ms",
+            "100",
+            "--interval-ms",
+            "100",
+        ])
+        .env_remove("TMUX")
+        .output()
+        .expect("run termnav");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lease must cover two intervals"));
+}
+
+#[test]
+fn focus_for_an_unresolvable_named_client_is_a_quiet_no_op() {
+    // No server answers here, so the name cannot resolve, as when a detach
+    // hook runs after tmux has dropped its client. That is not an error; a
+    // departed client's watcher exits on its own next heartbeat. The live
+    // missing-name case is covered by the `parse_named_client` unit tests.
+    let socket = std::env::temp_dir().join(format!("termnav-absent-{}.sock", std::process::id()));
+    let socket = socket.to_str().expect("UTF-8 temp path");
+    for command in ["watch", "stop", "sync"] {
+        let output = termnav()
+            .args([
+                "tmux",
+                "focus",
+                command,
+                "--tmux-socket",
+                socket,
+                "--client-name",
+                "/dev/pts/1",
+            ])
+            .env_remove("TMUX")
+            .output()
+            .expect("run termnav");
+
+        assert_eq!(output.status.code(), Some(0), "command: {command}");
+        assert!(output.stdout.is_empty(), "command: {command}");
+        assert!(output.stderr.is_empty(), "command: {command}");
+    }
+}
+
+#[test]
+fn focus_watch_requires_a_client() {
+    let output = termnav()
+        .args([
+            "tmux",
+            "focus",
+            "watch",
+            "--tmux-socket",
+            "/tmp/termnav-no-such-server.sock",
+        ])
+        .output()
+        .expect("run termnav");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires exact client options"));
+}
