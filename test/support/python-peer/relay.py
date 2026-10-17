@@ -36,7 +36,11 @@ PROTOCOL_TIMEOUT = 8.0
 REQUEST_TIMEOUT = 2.0
 VALID_NONCE = re.compile(r"[0-9a-f]{12}")
 CLIENT_FORMAT = "#{client_tty}|#{client_pid}|#{client_created}"
-STOP = threading.Event()
+# Signal handlers only assign this flag. `threading.Event.set()` takes a lock,
+# and a second signal handled while the first handler holds it deadlocks the
+# peer forever. A terminal interrupt delivers two when `python3` is a launcher
+# that forwards signals to the interpreter it forked.
+STOPPING = False
 SERVER_SOCKET = ""
 
 
@@ -352,12 +356,13 @@ def serve(path: str) -> int:
     listener.settimeout(0.2)
 
     def stop(_signal: int, _frame: object) -> None:
-        STOP.set()
+        global STOPPING
+        STOPPING = True
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        while not STOP.is_set():
+        while not STOPPING:
             try:
                 connection, _ = listener.accept()
             # Python 3.9 does not reliably alias this to builtin TimeoutError.
