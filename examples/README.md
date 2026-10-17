@@ -44,8 +44,11 @@ source-file ~/.config/tmux/termnav.conf
 ```
 
 It provides a deliberately small starting point: Ctrl-Tab ownership across
-tmux layers and safe Ctrl-click forwarding. More elaborate foreground-process
-policy still belongs in the consuming tmux config. Once that policy assigns a
+tmux layers, Ctrl-h/j/k/l pane selection that leaves those keys to Vim,
+Neovim, fzf, and mouse-reporting remote or nested terminals, and safe
+Ctrl-click forwarding. The ownership test is a pure format published as
+`@termnav_pane_owns_chord`. More elaborate foreground-process policy still
+belongs in the consuming tmux config. Once that policy assigns a
 Meta-direction chord to tmux, invoke `termnav navigate pane-move DIRECTION` in
 the foreground without `--parent`; Termnav owns current-scope probing and
 same-host parent traversal.

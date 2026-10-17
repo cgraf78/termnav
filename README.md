@@ -15,7 +15,8 @@ the tabs of the terminal that hosts it all.
   (see [over SSH](#over-ssh) for what the remote host needs).
   `Alt-H/J/K/L` swaps the current pane with its neighbor; it stays inside the
   local Neovim and tmux layers and never crosses SSH, WezTerm, or VS Code.
-  The shipped examples bind these keys in Neovim only; see
+  The shipped examples bind `Ctrl-h/j/k/l` in Neovim and tmux, and
+  `Alt-H/J/K/L` in Neovim only; see
   [what the examples bind](#what-the-examples-bind-and-what-they-dont).
 - **Tabs:** once `Ctrl-Tab` reaches tmux, it moves to the next window of a
   tmux layer that has several. In a one-window layer it continues outward to
@@ -128,9 +129,9 @@ needs:
   `Alt-H/J/K/L` moves them, in normal and terminal modes; `Ctrl-\` returns
   to the previous pane in normal mode; `Ctrl-Tab`/`Ctrl-Shift-Tab` and
   `Alt-{`/`Alt-}` select and move tabs in normal, insert, and terminal modes.
-- **tmux** (`examples/tmux.conf`): `Ctrl-Tab`/`Ctrl-Shift-Tab` tab routing,
-  Ctrl-click link following, and the focus hooks that tell nested tmux layers
-  which pane really has focus.
+- **tmux** (`examples/tmux.conf`): `Ctrl-h/j/k/l` pane selection,
+  `Ctrl-Tab`/`Ctrl-Shift-Tab` tab routing, Ctrl-click link following, and the
+  focus hooks that tell nested tmux layers which pane really has focus.
 - **WezTerm** (`examples/wezterm.lua`): termnav's link rules and the handler
   that acts on tab and URL requests. It assigns no keys.
 
@@ -148,14 +149,31 @@ above works:
   every pane, so Neovim's own `Ctrl-Tab` mapping only fires outside tmux
   unless your tmux binding forwards the key to Neovim panes.
 
-The tmux example does **not** bind `Ctrl-h/j/k/l` or `Alt-H/J/K/L`. In a tmux
-shell pane those keys do whatever your own tmux config says. For
-vim-tmux-navigator-style movement from shell panes, bind them in your own
-tmux config to `termnav navigate pane-select DIRECTION` and
-`termnav navigate pane-move DIRECTION`. No tested recipe ships. Like
-vim-tmux-navigator's bindings, yours must pass the keys through to panes
-running Neovim. The command exits with status `3` when it declines a request
-at the current boundary. See
+The tmux example binds `Ctrl-h/j/k/l` but not `Alt-H/J/K/L`. A
+`Ctrl-h/j/k/l` key goes to the pane when its foreground program owns it: Vim,
+Neovim, and fzf always, and SSH (including `termnav ssh`, which Termnav's
+shell integration runs for plain `ssh`), mosh, ET, or a nested tmux or screen
+while it has mouse reporting on. Otherwise tmux selects its neighboring pane,
+and at its edge `termnav navigate pane-select DIRECTION --parent` continues
+outward. The example publishes that ownership test as
+`@termnav_pane_owns_chord`. It sees only the pane's foreground process, so
+extend it if you want the keys to reach an editor started by a parent that
+doesn't `exec` it, such as `git commit` opening Vim, or fzf run by a shell key
+binding.
+
+Like vim-tmux-navigator's bindings, these take the keys from shell panes and
+any other program the test doesn't recognize, so readline's `Ctrl-l` (clear
+screen), `Ctrl-k` (kill line), and `Ctrl-j` (accept line) no longer reach the
+shell. `Ctrl-h` is also backward-delete, and on terminals whose Backspace key
+sends `^H` it collides with Backspace: tmux reads the byte as Backspace when
+the terminal's erase character is `^H`, so left selection never fires, and as
+`Ctrl-h` otherwise, so Backspace selects the left pane.
+
+For `Alt-H/J/K/L` from shell panes, bind them in your own tmux config to
+`termnav navigate pane-move DIRECTION`, passing the keys through to Neovim
+panes the same way. The command exits with status `3` when it declines a
+request at the current boundary; append the example's
+`$navigate_declined_ok` to treat that as a no-op. See
 [`examples/README.md`](examples/README.md) and the
 [reference](docs/reference.md#command-interface).
 
