@@ -406,7 +406,7 @@ fn the_browser_never_inherits_a_stale_pane() {
 /// `display-message -c` as tmux 3.2 does. The clicking client
 /// (`/dev/pts/clicked`, or none when `tty` is empty) is in session `$1`, and
 /// another client is in `$2`; the clicked pane's session check answers
-/// `check` (`ID COUNT`, or `fail`), and only when it names pane `%3`.
+/// `check` (`ID COUNT`, empty, or `fail`), and only when it names pane `%3`.
 /// Returns the tmux calls with their `TMUX_PANE`, and termnav's stderr.
 fn tell_without_client_flag(tty: &str, check: &str) -> (String, String) {
     let root = temporary_root();
@@ -491,8 +491,9 @@ fn a_message_tmux_will_not_target_goes_to_the_clicked_pane_session() {
 #[test]
 fn a_message_never_reaches_another_session() {
     // The pane's session is detached; the pane resolves to another session,
-    // as a linked window or grouped session can make it; the pane is gone.
-    for check in ["$1 0", "$2 1", "fail"] {
+    // as a linked window or grouped session can make it; the check fails; the
+    // pane is gone, which real tmux reports with no output and status 0.
+    for check in ["$1 0", "$2 1", "fail", ""] {
         let (calls, stderr) = tell_without_client_flag("/dev/pts/clicked", check);
         assert!(retries(&calls).is_empty(), "{check}: {calls}");
         assert!(

@@ -572,7 +572,8 @@ const OPENER_GRACE: Duration = Duration::from_secs(3);
 /// that would drop a raw write to the clicking client's tty. When the
 /// terminal cannot take it, `$BROWSER` runs, as it does for `open-url`
 /// callers. When neither opens it, the clicking client is told so with the
-/// URL, so a click is never silently lost. Nothing reaches stdout, which tmux
+/// URL where tmux can still show it (see [`tell`]); a client that has
+/// detached sees nothing. Nothing reaches stdout, which tmux
 /// would show in the pane.
 fn open_url(url: &str, input: &Input) {
     let reason = match browser::Url::parse(url) {
