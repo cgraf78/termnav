@@ -272,15 +272,138 @@ pub fn request(url: &Url, terminal: Option<&Path>) -> Result<(), Undelivered> {
     }
 }
 
+/// Where a click happened: the tmux server, the clicked pane, and the exact
+/// client whose terminal received it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Click<'a> {
+    /// Socket of the server holding the pane; empty means the caller's own
+    /// server, which `$TMUX` selects.
+    pub socket: &'a str,
+    /// Clicked pane; it chooses the session when the client is gone.
+    pub pane: &'a str,
+    /// tty of the client that received the click.
+    pub client_tty: &'a str,
+}
+
+/// Deliver one request to the WezTerm behind the tmux client that received a
+/// click.
+///
+/// This is [`request`]'s tmux path, started from the clicking client instead
+/// of the session's most recently active one, so the URL opens where the user
+/// clicked even while another terminal is attached. Through a local or remote
+/// outer tmux it follows the same hops as `request`. A clicking client that
+/// cannot act on the request (a control-mode client, or VS Code's xterm.js
+/// terminal) declines rather than handing the URL to another attachment,
+/// which may be another machine's terminal. A client that detached since the
+/// click is replaced by the clicked pane's choice, as `request` makes it.
+///
+/// # Errors
+///
+/// Returns [`Undelivered::Declined`] when the clicking client or a terminal
+/// behind it is not known to act on the request, and [`Undelivered::Failed`]
+/// when no tmux server, client, or terminal device can be found, or writing
+/// fails.
+pub fn request_click(url: &Url, click: &Click<'_>) -> Result<(), Undelivered> {
+    let server = (!click.socket.is_empty()).then_some(click.socket);
+    let socket = match server {
+        Some(socket) => socket.to_owned(),
+        None => match std::env::var("TMUX") {
+            Ok(tmux) if !tmux.is_empty() => socket_of(&tmux).to_owned(),
+            _ => return Err(io::Error::other("the clicked tmux server is unknown").into()),
+        },
+    };
+    let client = match clicking_client(server, click.client_tty)? {
+        Clicked::Client(client) => client,
+        Clicked::Ineligible(reason) => return Err(Undelivered::Declined(reason)),
+        // Without the pane there is nothing to choose from that is known to
+        // be the user's.
+        Clicked::Gone if valid_pane(click.pane) => tmux_client(server, click.pane)?.0,
+        Clicked::Gone => {
+            return Err(io::Error::other("the clicking tmux client is not attached").into());
+        }
+    };
+    deliver(url, client, vec![canonical_socket(&socket)])
+}
+
+/// What the server knows about the client that received a click.
+#[derive(Debug, Eq, PartialEq)]
+enum Clicked {
+    /// Attached and able to receive terminal requests.
+    Client(Client),
+    /// Attached, but its tty cannot carry a request; the text says why.
+    Ineligible(String),
+    /// No longer attached, or never named.
+    Gone,
+}
+
+fn clicking_client(server: Option<&str>, tty: &str) -> io::Result<Clicked> {
+    if tty.is_empty() {
+        return Ok(Clicked::Gone);
+    }
+    let mut command = tmux_command(server);
+    command.args([
+        "list-clients",
+        "-F",
+        "#{client_control_mode}\t#{client_termtype}\t#{client_tty}\t#{client_termname}\t\
+         #{client_pid}",
+    ]);
+    let output = process::output_timeout(&mut command, TMUX_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(io::Error::other("tmux client query failed"));
+    }
+    Ok(find_client(&String::from_utf8_lossy(&output.stdout), tty))
+}
+
+/// Pick the row for `tty` from `list-clients` output.
+fn find_client(listing: &str, tty: &str) -> Clicked {
+    for line in listing.lines() {
+        let mut fields = line.splitn(5, '\t');
+        let (Some(control), Some(termtype), Some(client_tty)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if client_tty != tty {
+            continue;
+        }
+        if control == "1" {
+            return Clicked::Ineligible("the clicking tmux client is a control client".to_owned());
+        }
+        if termtype.starts_with("xterm.js") {
+            return Clicked::Ineligible(
+                "the clicking tmux client is a VS Code terminal, which ignores the request"
+                    .to_owned(),
+            );
+        }
+        let termname = fields.next().unwrap_or("");
+        let pid = fields.next().and_then(|pid| pid.parse().ok()).unwrap_or(0);
+        return Clicked::Client(Client {
+            pid,
+            termtype: termtype.to_owned(),
+            tty: client_tty.to_owned(),
+            termname: termname.to_owned(),
+        });
+    }
+    Clicked::Gone
+}
+
 /// Bound on local tmux nesting followed from one request. Real setups nest
 /// two or three deep; the limit only stops a pathological process tree.
 const MAX_TMUX_DEPTH: usize = 8;
 
+/// The socket path in a `$TMUX` value (`socket,server-pid,session-id`).
+fn socket_of(tmux: &str) -> &str {
+    tmux.rsplitn(3, ',').last().unwrap_or(tmux)
+}
+
 fn request_tmux(url: &Url, tmux: &str) -> Result<(), Undelivered> {
-    let mut seen = vec![canonical_socket(
-        tmux.rsplitn(3, ',').last().unwrap_or(tmux),
-    )];
-    let (mut client, _) = tmux_client(None, &own_target(tmux)?)?;
+    let (client, _) = tmux_client(None, &own_target(tmux)?)?;
+    deliver(url, client, vec![canonical_socket(socket_of(tmux))])
+}
+
+/// Write the request for `client`, following tmux layers outward from it.
+/// `seen` holds the servers already visited.
+fn deliver(url: &Url, mut client: Client, mut seen: Vec<PathBuf>) -> Result<(), Undelivered> {
     for _ in 0..MAX_TMUX_DEPTH {
         let mode = match identify_client(&client) {
             Terminal::WezTerm => terminal::tmux_mode(&client.termname),
@@ -395,19 +518,7 @@ struct Client {
 /// control protocol, and VS Code's xterm.js terminals, which ignore WezTerm
 /// user vars and would swallow it.
 fn tmux_client(server: Option<&str>, target: &str) -> io::Result<(Client, String)> {
-    let mut command = Command::new("tmux");
-    // A command client that does not believe the terminal is UTF-8 prints
-    // control characters, including the tab separators below, as `_`. tmux
-    // assumes UTF-8 when `TMUX` is set, but the parent query must clear it
-    // and the locale may be `C` (e.g. Alpine containers); `-u` keeps the
-    // output byte-exact everywhere.
-    command.arg("-u");
-    if let Some(socket) = server {
-        command.args(["-S", socket]);
-        // An inherited TMUX value can retarget the command on older tmux
-        // releases despite the explicit socket.
-        command.env_remove("TMUX");
-    }
+    let mut command = tmux_command(server);
     // One tmux invocation answers both questions so the window and client
     // views come from the same server state.
     command.args([
@@ -436,6 +547,25 @@ fn tmux_client(server: Option<&str>, target: &str) -> io::Result<(Client, String
         io::Error::new(io::ErrorKind::NotFound, "no attached tmux client")
     })?;
     Ok((client, pane_tty.to_owned()))
+}
+
+/// A tmux command for `server`, or for the caller's own server (`$TMUX`) when
+/// it is `None`.
+fn tmux_command(server: Option<&str>) -> Command {
+    let mut command = Command::new("tmux");
+    // A command client that does not believe the terminal is UTF-8 prints
+    // control characters, including the tab separators queried here, as `_`.
+    // tmux assumes UTF-8 when `TMUX` is set, but the parent query must clear
+    // it and the locale may be `C` (e.g. Alpine containers); `-u` keeps the
+    // output byte-exact everywhere.
+    command.arg("-u");
+    if let Some(socket) = server {
+        command.args(["-S", socket]);
+        // An inherited TMUX value can retarget the command on older tmux
+        // releases despite the explicit socket.
+        command.env_remove("TMUX");
+    }
+    command
 }
 
 fn valid_pane(value: &str) -> bool {
@@ -499,8 +629,8 @@ fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, Environment, Terminal, TmuxMode, Url, escape, identify, identify_client,
-        select_client, valid_pane,
+        Clicked, Client, Environment, Terminal, TmuxMode, Url, escape, find_client, identify,
+        identify_client, select_client, socket_of, valid_pane,
     };
 
     fn plain(term_program: Option<&str>, wezterm_pane: Option<&str>, term: &str) -> Terminal {
@@ -756,6 +886,66 @@ mod tests {
             identify_client(&client("", "xterm-256color")),
             Terminal::Other
         );
+    }
+
+    #[test]
+    fn the_clicking_client_is_found_by_its_tty() {
+        let listing = "0\tWezTerm 20240203\t/dev/pts/1\txterm-256color\t11\n\
+                       0\ttmux 3.6b\t/dev/pts/2\ttmux-256color\t12\n";
+        assert_eq!(
+            find_client(listing, "/dev/pts/2"),
+            Clicked::Client(Client {
+                pid: 12,
+                termtype: "tmux 3.6b".to_owned(),
+                tty: "/dev/pts/2".to_owned(),
+                termname: "tmux-256color".to_owned(),
+            })
+        );
+        // Recency does not matter: the click names its client.
+        assert_eq!(
+            find_client(listing, "/dev/pts/1"),
+            Clicked::Client(Client {
+                pid: 11,
+                termtype: "WezTerm 20240203".to_owned(),
+                tty: "/dev/pts/1".to_owned(),
+                termname: "xterm-256color".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_clicking_client_that_cannot_act_declines_instead_of_moving() {
+        let listing = "0\txterm.js(6.1.0)\t/dev/pts/3\txterm-256color\t13\n\
+                       1\t\t/dev/pts/4\t\t14\n\
+                       0\tWezTerm 20240203\t/dev/pts/5\txterm-256color\t15\n";
+        for tty in ["/dev/pts/3", "/dev/pts/4"] {
+            assert!(
+                matches!(find_client(listing, tty), Clicked::Ineligible(_)),
+                "{tty}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_detached_or_unnamed_client_is_gone() {
+        let listing = "0\tWezTerm 20240203\t/dev/pts/1\txterm-256color\t11\nmalformed\n";
+        assert_eq!(find_client(listing, "/dev/pts/9"), Clicked::Gone);
+        assert_eq!(find_client("", "/dev/pts/1"), Clicked::Gone);
+        // Rows without a pid still select; pid 0 reads no process.
+        assert!(matches!(
+            find_client("0\t\t/dev/pts/7\n", "/dev/pts/7"),
+            Clicked::Client(Client { pid: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn tmux_values_name_their_socket() {
+        assert_eq!(
+            socket_of("/tmp/tmux-1/default,123,4"),
+            "/tmp/tmux-1/default"
+        );
+        assert_eq!(socket_of("/tmp/a,b/sock,123,4"), "/tmp/a,b/sock");
+        assert_eq!(socket_of("/tmp/sock"), "/tmp/sock");
     }
 
     #[test]

@@ -27,7 +27,20 @@ configuration, and `man termnav` has the complete command syntax.
 - `termnav tmux context ...`: publish tmux ownership to one exact terminal
   client; `termnav tmux focus ...` maintains hierarchical focus leases; and
   `termnav tmux follow-click ...` resolves mouse metadata to a browser or
-  editor target.
+  editor target. A URL target is delivered the way `open-url` delivers, but
+  starting from the exact client that received the click instead of the most
+  recent one, so it crosses a local or SSH-separated outer tmux; like
+  `open-url`, it identifies WezTerm across SSH by tmux 3.2's XTVERSION record.
+  A clicking control-mode or VS Code (xterm.js) client declines rather than
+  receiving the request. When the request is declined or fails, `$BROWSER`
+  runs with the URL (the shared convention: `:`-separated entries, each a
+  program with optional arguments, `%s` for the URL), as if from the clicked
+  pane. An entry that is still running after three seconds counts as
+  launched and is left running; one that fails sooner passes the URL to the
+  next. When none opens it, the clicking client shows a message with the URL. A
+  clicked line that is not on the live screen, such as a scrolled copy-mode
+  line, resolves from tmux's copy of that line. A well-formed click exits `0`
+  and writes nothing to stdout, which tmux would show in the pane.
 - `termnav link-host`: print the host represented by the current terminal
   context for hyperlink producers such as ripgrep and eza.
 - `termnav open-url [--tty PATH] URL`: ask the outer terminal to open an
