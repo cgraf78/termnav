@@ -14,6 +14,9 @@ export TMUX=/tmp/termnav-live-tmux-sentinel,1,0
 export TMUX_PANE=%999
 export NVIM=/tmp/termnav-live-nvim-sentinel
 export SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22'
+export BROWSER=/termnav-live-browser-sentinel
+export DISPLAY=:99
+export WAYLAND_DISPLAY=wayland-99
 
 # shellcheck source=../helpers.sh
 . "$TERMNAV_TEST_DIR/helpers.sh"
@@ -53,13 +56,16 @@ case "$XDG_STATE_HOME" in
   *) _fail "test isolation: XDG state escaped the invocation root ($XDG_STATE_HOME)" ;;
 esac
 
-for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION; do
+for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION DISPLAY WAYLAND_DISPLAY; do
   if [[ -v $variable ]]; then
     _fail "test isolation: $variable leaked into a suite"
   else
     _pass "test isolation: $variable is cleared"
   fi
 done
+
+_assert_eq "test isolation: URL fallbacks reach a failing opener, not a browser" \
+  false "${BROWSER-unset}"
 
 if command -v nvim >/dev/null 2>&1 && nvim --version >/dev/null 2>&1; then
   nvim_fixture_dir=$(_tmpdir)

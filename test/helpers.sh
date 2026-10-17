@@ -244,7 +244,12 @@ unset \
   NVIM NVIM_LISTEN_ADDRESS \
   SSH_CLIENT SSH_CONNECTION SSH_TTY \
   WEZTERM_PANE TERM_PROGRAM \
+  DISPLAY WAYLAND_DISPLAY \
   TERMNAV_REMOTE_CWD TERMNAV_REMOTE_LINK_HOST TERMNAV_REMOTE_TMUX
+# A click whose terminal cannot open a URL falls back to $BROWSER. A test must
+# never open the developer's browser, so the default opener fails; tests that
+# exercise the fallback install their own stub.
+export BROWSER=false
 
 # Git and subprocesses launched by a test share the same isolation boundary.
 # An ordinary file is intentional: tests may safely exercise global writes,

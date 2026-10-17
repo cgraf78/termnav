@@ -491,10 +491,12 @@ _mock_bin="$_td/mock-bin"
 _browser_tty="$_td/browser-tty"
 mkdir -p "$_mock_bin"
 : >"$_browser_tty"
+# The clicking client is a WezTerm attachment whose tty is a plain file.
 cat >"$_mock_bin/tmux" <<'SH'
 #!/usr/bin/env bash
-if [[ "$1 $2 $3" == "display-message -p #{client_tty}" ]]; then
-  printf '%s\n' "$TERMNAV_EXAMPLE_BROWSER_TTY"
+if [[ " $* " == *" list-clients "* ]]; then
+  printf '0\tWezTerm 20240203-110809-5046fc22\t%s\txterm-256color\t0\n' \
+    "$TERMNAV_EXAMPLE_BROWSER_TTY"
   exit 0
 fi
 exit 1
