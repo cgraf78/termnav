@@ -619,7 +619,7 @@ fn open_with_browser(url: &browser::Url, pane: &str) -> Result<(), String> {
             .process_group(0);
         // A server started inside another tmux pane holds that outer pane's
         // id in its environment; never pass it on as this click's pane.
-        if pane.starts_with('%') && std::env::var_os("TMUX").is_some() {
+        if browser::valid_pane(pane) && std::env::var_os("TMUX").is_some() {
             command.env("TMUX_PANE", pane);
         } else {
             command.env_remove("TMUX_PANE");
@@ -676,42 +676,105 @@ fn browser_commands(value: &str, url: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Show `message` on the clicking client's status line, or on stderr when the
-/// click names no tmux server.
+/// Show `message` on the clicking client's status line, or on stderr when it
+/// cannot be shown there.
 ///
 /// tmux expands both `#{...}` formats and strftime `%` sequences in
 /// display-message, so both are doubled; a URL's `%2F` would otherwise print
-/// as a date. `-d` needs tmux 3.2, and tmux 3.2 rejects `-c` with a usage
-/// error, so refusals retry with less: without `-d`, then on whichever client
-/// tmux picks for the session.
+/// as a date. `-d` needs tmux 3.2, so a refusal retries without it.
+///
+/// `-c` names the clicking client. tmux 3.2 rejects it with a usage error
+/// (later releases accept it, and show nothing for a client that has gone).
+/// Without `-c`, tmux shows the message on the client it considers current:
+/// one of the session the pane in `TMUX_PANE` resolves to, or, when that
+/// session has no client, the most recently active client of any session. A
+/// linked window or a grouped session can make the pane resolve to another
+/// session. A click's URL must not reach another session's screen, so the
+/// retry names the clicked pane and runs only while that pane resolves to an
+/// attached session that is the clicking client's own (any attached session
+/// when the click names no client). The check and the display are separate
+/// tmux calls, so a client that detaches between them is a residual race.
 fn tell(input: &Input, message: &str) {
     if input.tmux_socket.is_empty() && std::env::var_os("TMUX").is_none() {
         eprintln!("{message}");
         return;
     }
     let escaped = message.replace('#', "##").replace('%', "%%");
-    let display = |client: bool, delay: bool| {
+    let tmux = || {
         let mut command = Command::new("tmux");
         if !input.tmux_socket.is_empty() {
             command.args(["-S", &input.tmux_socket]).env_remove("TMUX");
         }
+        command
+    };
+    let succeeds = |mut command: Command| {
+        crate::process::output_timeout(&mut command, Duration::from_secs(2))
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let display = |client: Option<&str>, pane: Option<&str>, delay: bool| {
+        let mut command = tmux();
+        match pane {
+            Some(pane) => command.env("TMUX_PANE", pane),
+            None => command.env_remove("TMUX_PANE"),
+        };
         command.arg("display-message");
-        if client && !input.client_tty.is_empty() {
-            command.args(["-c", &input.client_tty]);
+        if let Some(client) = client {
+            command.args(["-c", client]);
         }
         if delay {
             command.args(["-d", "10000"]);
         }
         command.arg(&escaped);
-        crate::process::output_timeout(&mut command, Duration::from_secs(2))
-            .is_ok_and(|output| output.status.success())
+        succeeds(command).is_some()
     };
-    let shown = [(true, true), (true, false), (false, true), (false, false)]
-        .into_iter()
-        .any(|(client, delay)| display(client, delay));
-    if !shown {
-        eprintln!("{message}");
+    let client = (!input.client_tty.is_empty()).then_some(input.client_tty.as_str());
+    if client.is_some()
+        && [true, false]
+            .into_iter()
+            .any(|delay| display(client, None, delay))
+    {
+        return;
     }
+    let pane = browser::valid_pane(&input.pane).then_some(input.pane.as_str());
+    let attached = pane.is_some_and(|pane| {
+        let mut command = tmux();
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{session_id} #{session_attached}",
+        ]);
+        let Some(state) = succeeds(command) else {
+            return false;
+        };
+        let Some((session, count)) = state.split_once(' ') else {
+            return false;
+        };
+        if !count.parse::<u32>().is_ok_and(|count| count > 0) {
+            return false;
+        }
+        let Some(client) = client else {
+            return true;
+        };
+        let mut command = tmux();
+        command.args(["list-clients", "-F", "#{client_tty} #{session_id}"]);
+        succeeds(command).is_some_and(|listing| {
+            listing
+                .lines()
+                .any(|line| line.split_once(' ') == Some((client, session)))
+        })
+    });
+    if attached
+        && [true, false]
+            .into_iter()
+            .any(|delay| display(None, pane, delay))
+    {
+        return;
+    }
+    eprintln!("{message}");
 }
 
 fn extension_target(token: &str, original: &str) -> Option<Target> {

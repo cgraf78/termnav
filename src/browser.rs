@@ -568,7 +568,8 @@ fn tmux_command(server: Option<&str>) -> Command {
     command
 }
 
-fn valid_pane(value: &str) -> bool {
+/// Whether `value` is a tmux pane id (`%N`).
+pub(crate) fn valid_pane(value: &str) -> bool {
     value.strip_prefix('%').is_some_and(|digits| {
         !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
     })
