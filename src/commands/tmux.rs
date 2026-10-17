@@ -12,9 +12,10 @@ const HELP: &str = r#"usage:
   termnav tmux focus claim --parent-tmux PATH --parent-pane ID --token TOKEN --lease-ms N
   termnav tmux focus release --parent-tmux PATH --parent-pane ID --token TOKEN
   termnav tmux focus expire --parent-tmux PATH --parent-pane ID
-  termnav tmux focus watch --tmux-socket PATH --client-pid PID --client-tty TTY
-       [--lease-ms N] [--interval-ms N]
-  termnav tmux focus stop|sync --tmux-socket PATH --client-pid PID --client-tty TTY
+  termnav tmux focus watch --tmux-socket PATH CLIENT [--lease-ms N] [--interval-ms N]
+  termnav tmux focus stop|sync --tmux-socket PATH CLIENT
+       CLIENT is --client-name NAME (a hook's #{hook_client}) or
+       --client-pid PID --client-tty TTY
   termnav tmux follow-click [--stdin | [HYPERLINK WORD LINE X CWD TTY PANE Y TOP LEFT SOCKET]]
 "#;
 const FOLLOW_CLICK_STDIN_LIMIT: u64 = 64 * 1024;
@@ -148,41 +149,84 @@ fn focus(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -
             };
             Ok(crate::focus::expire(&socket, &pane))
         }
-        "watch" => {
-            let (Some(socket), Some(pid), Some(tty)) =
-                (options.tmux_socket, options.client_pid, options.client_tty)
-            else {
-                return usage(stderr, "focus watch requires exact client options");
+        "watch" | "stop" | "sync" => {
+            let lease_ms = options.lease_ms.unwrap_or(3500);
+            let interval_ms = options.interval_ms.unwrap_or(1000);
+            // Reject invalid timing before asking tmux about the client, so the
+            // result does not depend on whether that client still exists.
+            if command == "watch" && !crate::focus::valid_watch_timing(lease_ms, interval_ms) {
+                return usage(stderr, "focus watch lease must cover two intervals");
+            }
+            let (socket, pid, tty, name) = match focus_client(options, command) {
+                FocusClient::Exact {
+                    socket,
+                    pid,
+                    tty,
+                    name,
+                } => (socket, pid, tty, name),
+                FocusClient::Absent => return Ok(0),
+                FocusClient::Invalid(message) => return usage(stderr, &message),
             };
-            Ok(crate::focus::watch(
-                &socket,
-                pid,
-                &tty,
-                options.lease_ms.unwrap_or(3500),
-                options.interval_ms.unwrap_or(1000),
-            ))
-        }
-        "stop" => {
-            let (Some(socket), Some(pid), Some(tty)) =
-                (options.tmux_socket, options.client_pid, options.client_tty)
-            else {
-                return usage(stderr, "focus stop requires exact client options");
-            };
-            Ok(crate::focus::stop_watch(&socket, pid, &tty))
-        }
-        "sync" => {
-            let (Some(socket), Some(pid), Some(tty)) =
-                (options.tmux_socket, options.client_pid, options.client_tty)
-            else {
-                return usage(stderr, "focus sync requires exact client options");
-            };
-            Ok(if crate::focus::sync_client_style(&socket, pid, &tty) {
-                0
-            } else {
-                1
+            Ok(match command {
+                "watch" => crate::focus::watch(&socket, pid, &tty, lease_ms, interval_ms),
+                "stop" => crate::focus::stop_watch(&socket, pid, &tty, name.as_deref()),
+                _ if crate::focus::sync_client_style(&socket, pid, &tty) => 0,
+                _ => 1,
             })
         }
         _ => usage(stderr, &format!("unknown focus command: {command}")),
+    }
+}
+
+/// The client a watch, stop, or sync request targets.
+enum FocusClient {
+    /// One live interactive client.
+    Exact {
+        socket: String,
+        pid: u32,
+        tty: String,
+        name: Option<String>,
+    },
+    /// The named client has gone or is a control-mode transport, so there is
+    /// no terminal focus to publish. A watcher left by a departed client exits
+    /// on its next heartbeat.
+    Absent,
+    /// The options do not name exactly one client.
+    Invalid(String),
+}
+
+/// Resolve the client from either its tmux name or its exact PID and tty.
+///
+/// Notification hooks must pass `#{hook_client}`: their `#{client_pid}` and
+/// `#{client_tty}` describe the session's most recently active client, which
+/// in a shared session can be a different client from the one that triggered
+/// the hook. Command hooks such as `after-select-pane` run with the invoking
+/// client and keep the PID and tty form, which older configurations also use.
+fn focus_client(options: FocusOptions, command: &str) -> FocusClient {
+    let missing = || FocusClient::Invalid(format!("focus {command} requires exact client options"));
+    let Some(socket) = options.tmux_socket else {
+        return missing();
+    };
+    match (options.client_name, options.client_pid, options.client_tty) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => FocusClient::Invalid(
+            "--client-name cannot be combined with --client-pid or --client-tty".to_owned(),
+        ),
+        (Some(name), None, None) => match crate::focus::named_client(&socket, &name) {
+            Some(client) if !client.control_mode => FocusClient::Exact {
+                socket,
+                pid: client.pid,
+                tty: client.tty,
+                name: Some(name),
+            },
+            _ => FocusClient::Absent,
+        },
+        (None, Some(pid), Some(tty)) => FocusClient::Exact {
+            socket,
+            pid,
+            tty,
+            name: None,
+        },
+        _ => missing(),
     }
 }
 
@@ -196,6 +240,7 @@ struct FocusOptions {
     tmux_socket: Option<String>,
     client_pid: Option<u32>,
     client_tty: Option<String>,
+    client_name: Option<String>,
 }
 
 impl FocusOptions {
@@ -232,6 +277,10 @@ impl FocusOptions {
                         Some(value.parse().map_err(|_| "invalid client PID".to_owned())?);
                 }
                 "--client-tty" => parsed.client_tty = Some(value.clone()),
+                "--client-name" if value.is_empty() => {
+                    return Err("client name must not be empty".to_owned());
+                }
+                "--client-name" => parsed.client_name = Some(value.clone()),
                 _ => return Err(format!("unknown focus option: {name}")),
             }
             index += 2;

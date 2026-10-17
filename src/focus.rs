@@ -57,6 +57,14 @@ struct StyleRestore {
     value: String,
 }
 
+/// Return whether a watcher's lease outlives at least two heartbeats.
+#[must_use]
+pub fn valid_watch_timing(lease_ms: u64, interval_ms: u64) -> bool {
+    valid_lease(lease_ms)
+        && valid_interval(interval_ms)
+        && lease_ms >= interval_ms.saturating_mul(2)
+}
+
 /// Return whether a focus token is safe inside a tmux format guard.
 #[must_use]
 pub fn valid_token(token: &str) -> bool {
@@ -202,10 +210,7 @@ pub fn watch(
     lease_ms: u64,
     interval_ms: u64,
 ) -> i32 {
-    if !valid_lease(lease_ms)
-        || !valid_interval(interval_ms)
-        || lease_ms < interval_ms.saturating_mul(2)
-    {
+    if !valid_watch_timing(lease_ms, interval_ms) {
         return 2;
     }
     if client_focused(socket, client_pid, client_tty) != Some(true) {
@@ -256,7 +261,16 @@ pub fn watch(
 }
 
 /// Stop a stale focus watcher without racing a newer focus-in event.
-pub fn stop_watch(socket: &str, client_pid: u32, client_tty: &str) -> i32 {
+///
+/// `client_name` is the tmux client name the caller resolved this client from,
+/// if any; a watcher started with that name is recognized as well as one
+/// started with the exact PID and tty.
+pub fn stop_watch(
+    socket: &str,
+    client_pid: u32,
+    client_tty: &str,
+    client_name: Option<&str>,
+) -> i32 {
     if client_focused(socket, client_pid, client_tty) == Some(true) {
         return 0;
     }
@@ -276,7 +290,7 @@ pub fn stop_watch(socket: &str, client_pid: u32, client_tty: &str) -> i32 {
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok());
     if let Some(watcher) = watcher
-        && process_is_watcher(watcher, socket, client_pid, client_tty)
+        && process_is_watcher(watcher, socket, client_pid, client_tty, client_name)
     {
         let _ = unsafe { libc::kill(watcher as i32, libc::SIGTERM) };
     }
@@ -751,6 +765,82 @@ fn client_focused(socket: &str, client_pid: u32, client_tty: &str) -> Option<boo
         })
 }
 
+/// A tmux client resolved from the name tmux assigned it.
+pub struct NamedClient {
+    /// Client process ID.
+    pub pid: u32,
+    /// Client terminal path.
+    pub tty: String,
+    /// True for a control-mode automation transport.
+    pub control_mode: bool,
+}
+
+/// Resolve the client a notification hook reports as `#{hook_client}`.
+///
+/// tmux expands `#{client_pid}` and `#{client_tty}` in notification hooks
+/// (attach, detach, focus, session change) against the session's most recently
+/// active client, not the client that raised the event, so a second client of
+/// a shared session can inherit another client's identity. Only `hook_client`
+/// names the triggering client. Returns `None` once the client is gone, as
+/// when a detach hook runs.
+#[must_use]
+pub fn named_client(socket: &str, name: &str) -> Option<NamedClient> {
+    let output = run_tmux(
+        socket,
+        &[
+            "list-clients".to_owned(),
+            "-F".to_owned(),
+            NAMED_CLIENT_FORMAT.to_owned(),
+        ],
+    )?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_named_client(&String::from_utf8_lossy(&output.stdout), name)
+}
+
+// Fields are space-separated with the name last, so a name containing spaces
+// cannot shift the other columns and an empty control-client tty stays an
+// empty field. Tabs would be unsafe: a tmux client without a UTF-8 locale, as
+// a hook's `run-shell` may be, prints control characters as `_`.
+const NAMED_CLIENT_FORMAT: &str = "#{client_pid} #{client_control_mode} \
+     #{m:*suspended*,#{client_flags}} #{client_tty} #{client_name}";
+
+fn parse_named_client(listing: &str, name: &str) -> Option<NamedClient> {
+    let mut suspended = None;
+    for line in listing.lines() {
+        let mut fields = line.splitn(5, ' ');
+        let (Some(pid), Some(control_mode), Some(is_suspended), Some(tty), Some(candidate)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse() else {
+            continue;
+        };
+        if candidate != name {
+            continue;
+        }
+        let client = NamedClient {
+            pid,
+            tty: tty.to_owned(),
+            control_mode: control_mode == "1",
+        };
+        // Resuming a shell after suspending its tmux client and attaching
+        // again leaves two clients with the same tty name. The live one is
+        // the client that can raise focus events.
+        if is_suspended != "1" {
+            return Some(client);
+        }
+        suspended.get_or_insert(client);
+    }
+    suspended
+}
+
 fn client_pane(socket: &str, client_pid: u32, client_tty: &str) -> Option<String> {
     let output = run_tmux(
         socket,
@@ -792,16 +882,27 @@ fn pane_has_focused_client(socket: &str, pane: &str) -> bool {
     })
 }
 
-fn process_is_watcher(pid: u32, socket: &str, client_pid: u32, client_tty: &str) -> bool {
+fn process_is_watcher(
+    pid: u32,
+    socket: &str,
+    client_pid: u32,
+    client_tty: &str,
+    client_name: Option<&str>,
+) -> bool {
     let client_pid = client_pid.to_string();
-    let expected = watcher_identity(socket, &client_pid, client_tty);
+    let exact = watcher_identity(socket, &client_pid, client_tty);
+    let named = client_name.map(|name| named_watcher_identity(socket, name));
+    let expected = std::iter::once(&exact[..]).chain(named.as_ref().map(|named| &named[..]));
+    let expected = expected.collect::<Vec<_>>();
     if let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) {
         let arguments = bytes
             .split(|byte| *byte == 0)
             .filter(|value| !value.is_empty())
             .map(|value| String::from_utf8_lossy(value))
             .collect::<Vec<_>>();
-        return watcher_arguments_match(&arguments, &expected);
+        return expected
+            .iter()
+            .any(|expected| watcher_arguments_match(&arguments, expected));
     }
 
     // macOS has no procfs. This is a cold focus-out path, so one bounded `ps`
@@ -814,7 +915,10 @@ fn process_is_watcher(pid: u32, socket: &str, client_pid: u32, client_tty: &str)
         .ok()
         .filter(|output| output.status.success())
         .is_some_and(|output| {
-            watcher_command_matches(&String::from_utf8_lossy(&output.stdout), &expected)
+            let command = String::from_utf8_lossy(&output.stdout);
+            expected
+                .iter()
+                .any(|expected| watcher_command_matches(&command, expected))
         })
 }
 
@@ -832,6 +936,18 @@ fn watcher_identity<'a>(socket: &'a str, client_pid: &'a str, client_tty: &'a st
     ]
 }
 
+fn named_watcher_identity<'a>(socket: &'a str, client_name: &'a str) -> [&'a str; 7] {
+    [
+        "tmux",
+        "focus",
+        "watch",
+        "--tmux-socket",
+        socket,
+        "--client-name",
+        client_name,
+    ]
+}
+
 fn watcher_arguments_match(arguments: &[std::borrow::Cow<'_, str>], expected: &[&str]) -> bool {
     arguments.windows(expected.len()).any(|window| {
         window
@@ -842,7 +958,15 @@ fn watcher_arguments_match(arguments: &[std::borrow::Cow<'_, str>], expected: &[
 }
 
 fn watcher_command_matches(command: &str, expected: &[&str]) -> bool {
-    command.contains(&expected.join(" "))
+    // The identity ends with a tty or client name, so `/dev/pts/4` must not
+    // match the start of `/dev/pts/40`.
+    let expected = expected.join(" ");
+    command.match_indices(&expected).any(|(start, _)| {
+        command[start + expected.len()..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+    })
 }
 
 fn mutation_lock(socket: &str, pane: &str) -> io::Result<File> {
@@ -936,8 +1060,9 @@ mod tests {
     use std::borrow::Cow;
 
     use super::{
-        parse_claim, valid_interval, valid_lease, valid_token, watcher_arguments_match,
-        watcher_command_matches, watcher_identity,
+        named_watcher_identity, parse_claim, parse_named_client, process_is_watcher,
+        valid_interval, valid_lease, valid_token, watcher_arguments_match, watcher_command_matches,
+        watcher_identity,
     };
 
     #[test]
@@ -986,5 +1111,126 @@ mod tests {
             "/bin/termnav tmux focus watch --tmux-socket /tmp/other.sock --client-pid 123 --client-tty /dev/pts/4",
             &expected,
         ));
+    }
+
+    #[test]
+    fn named_client_resolves_only_the_exact_hook_client() {
+        let listing = "101 0 0 /dev/pts/1 /dev/pts/1\n\
+                       202 0 0 /dev/pts/2 /dev/pts/2\n\
+                       303 1 0  client-303\n\
+                       404 0 0 /dev/pts/4 name with spaces\n";
+        let second = parse_named_client(listing, "/dev/pts/2").expect("second client");
+        assert_eq!(
+            (second.pid, second.tty.as_str(), second.control_mode),
+            (202, "/dev/pts/2", false)
+        );
+        let control = parse_named_client(listing, "client-303").expect("control client");
+        assert!(control.control_mode);
+        assert_eq!(control.tty, "");
+        assert_eq!(
+            parse_named_client(listing, "name with spaces").map(|client| client.pid),
+            Some(404)
+        );
+        // A prefix or a departed client must never borrow another identity.
+        assert!(parse_named_client(listing, "/dev/pts").is_none());
+        assert!(parse_named_client(listing, "/dev/pts/9").is_none());
+        assert!(parse_named_client("nope 0 0 /dev/pts/5 /dev/pts/5\n", "/dev/pts/5").is_none());
+        // A non-UTF-8 tmux client prints tabs as `_`; the format must not
+        // depend on them.
+        assert!(parse_named_client("505_0_0_/dev/pts/5_/dev/pts/5\n", "/dev/pts/5").is_none());
+    }
+
+    #[test]
+    fn named_client_prefers_the_live_client_over_a_suspended_namesake() {
+        let listing = "101 0 1 /dev/pts/1 /dev/pts/1\n202 0 0 /dev/pts/1 /dev/pts/1\n";
+        assert_eq!(
+            parse_named_client(listing, "/dev/pts/1").map(|client| client.pid),
+            Some(202)
+        );
+        let only_suspended = "101 0 1 /dev/pts/1 /dev/pts/1\n";
+        assert_eq!(
+            parse_named_client(only_suspended, "/dev/pts/1").map(|client| client.pid),
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn named_watcher_identity_matches_only_its_socket_and_name() {
+        let expected = named_watcher_identity("/tmp/tmux.sock", "/dev/pts/4");
+        let arguments = [
+            "/bin/termnav",
+            "tmux",
+            "focus",
+            "watch",
+            "--tmux-socket",
+            "/tmp/tmux.sock",
+            "--client-name",
+            "/dev/pts/4",
+            "--lease-ms",
+            "600",
+        ]
+        .map(Cow::Borrowed);
+        assert!(watcher_arguments_match(&arguments, &expected));
+        assert!(!watcher_arguments_match(
+            &arguments,
+            &named_watcher_identity("/tmp/tmux.sock", "/dev/pts/40")
+        ));
+        assert!(watcher_command_matches(
+            "/bin/termnav tmux focus watch --tmux-socket /tmp/tmux.sock --client-name /dev/pts/4",
+            &expected,
+        ));
+        assert!(!watcher_command_matches(
+            "/bin/termnav tmux focus watch --tmux-socket /tmp/other.sock --client-name /dev/pts/4",
+            &expected,
+        ));
+        assert!(!watcher_command_matches(
+            "/bin/termnav tmux focus watch --tmux-socket /tmp/tmux.sock --client-name /dev/pts/40",
+            &expected,
+        ));
+        assert!(watcher_command_matches(
+            "/bin/termnav tmux focus watch --tmux-socket /tmp/tmux.sock --client-name /dev/pts/4 --lease-ms 600\n",
+            &expected,
+        ));
+    }
+
+    #[test]
+    fn stop_recognizes_a_watcher_started_by_client_name() {
+        // A stand-in process whose argv carries the name-form watcher
+        // identity. The old exact-form identity alone must not match it.
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "sleep 30; :",
+                "tmux",
+                "focus",
+                "watch",
+                "--tmux-socket",
+                "/tmp/termnav-test.sock",
+                "--client-name",
+                "/dev/pts/4",
+            ])
+            .spawn()
+            .expect("spawn stand-in watcher");
+        let pid = child.id();
+        let named = process_is_watcher(
+            pid,
+            "/tmp/termnav-test.sock",
+            123,
+            "/dev/pts/4",
+            Some("/dev/pts/4"),
+        );
+        let exact_only = process_is_watcher(pid, "/tmp/termnav-test.sock", 123, "/dev/pts/4", None);
+        let other_name = process_is_watcher(
+            pid,
+            "/tmp/termnav-test.sock",
+            123,
+            "/dev/pts/4",
+            Some("/dev/pts/40"),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(named);
+        assert!(!exact_only);
+        assert!(!other_name);
     }
 }
