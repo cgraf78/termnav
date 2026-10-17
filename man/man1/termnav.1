@@ -145,7 +145,12 @@ Accepts at most eleven positional fields in this order: HYPERLINK, WORD, LINE,
 X, CWD, TTY, PANE, Y, TOP, LEFT, SOCKET. With
 .BR --stdin ,
 the same fields are newline-delimited; input is limited to eleven lines and 64
-KiB.
+KiB. A URL target is delivered as by
+.BR open-url ,
+starting from the client named by TTY; a control-mode or VS Code (xterm.js)
+client declines. A declined or failed request runs
+.B $BROWSER
+with the URL; when nothing opens it, the clicking client shows a message.
 .TP
 .B open-url
 Accepts exactly one

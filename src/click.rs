@@ -6,17 +6,16 @@
 //! output is typed as a browser URL or Neovim file request so transport policy
 //! stays out of the parser.
 
-use std::fs::OpenOptions;
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use regex::Regex;
 
 use crate::browser;
-use crate::terminal::{self, TmuxMode};
 
 /// Raw fields supplied by the tmux mouse binding.
 #[derive(Clone, Debug, Default)]
@@ -67,7 +66,10 @@ pub fn follow(input: &Input) -> io::Result<()> {
         return Ok(());
     };
     match target {
-        Target::Url(url) => open_url(&url, &input.client_tty),
+        Target::Url(url) => {
+            open_url(&url, input);
+            Ok(())
+        }
         Target::File {
             target,
             source,
@@ -335,15 +337,23 @@ fn click_row(
     }) {
         return Some(candidate);
     }
-    let matches = physical
+    if mouse_line.is_empty() {
+        return None;
+    }
+    // The clicked line is elsewhere on the live screen, or not on it at all:
+    // copy mode shows history, and streaming output can move the screen
+    // between the click and the capture. Only a unique match is the clicked
+    // row; otherwise the caller resolves from tmux's copy of the line instead
+    // of guessing a row that holds different text.
+    let mut matches = physical
         .iter()
         .enumerate()
-        .filter(|(_, line)| !mouse_line.is_empty() && line.as_str() == mouse_line)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    (matches.len() == 1)
-        .then_some(matches[0])
-        .or_else(|| candidates.into_iter().find(|index| *index < physical.len()))
+        .filter(|(_, line)| line.as_str() == mouse_line)
+        .map(|(index, _)| index);
+    match (matches.next(), matches.next()) {
+        (Some(index), None) => Some(index),
+        _ => None,
+    }
 }
 
 fn from_joined_capture(
@@ -550,32 +560,222 @@ fn hostname(flag: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-fn open_url(url: &str, explicit_tty: &str) -> io::Result<()> {
-    let escape = terminal::user_var(browser::USER_VAR, url, TmuxMode::Raw);
-    if write_tty(explicit_tty, &escape).is_ok() {
-        return Ok(());
-    }
-    if std::env::var_os("TMUX").is_some()
-        && let Ok(output) = Command::new("tmux")
-            .args(["display-message", "-p", "#{client_tty}"])
-            .output()
-        && output.status.success()
-        && write_tty(String::from_utf8_lossy(&output.stdout).trim(), &escape).is_ok()
-    {
-        return Ok(());
-    }
-    io::stdout().write_all(&escape)
+/// How long a fallback opener may take to fail before it counts as launched.
+/// Some openers, such as a browser started in the foreground, run for the
+/// browser's lifetime; they are left running, never killed.
+const OPENER_GRACE: Duration = Duration::from_secs(3);
+
+/// Open a clicked URL on the desktop behind the clicking client.
+///
+/// Delivery is [`browser::request_click`]: the same hops as `termnav
+/// open-url`, so the request crosses an outer tmux, local or across SSH,
+/// that would drop a raw write to the clicking client's tty. When the
+/// terminal cannot take it, `$BROWSER` runs, as it does for `open-url`
+/// callers. When neither opens it, the clicking client is told so with the
+/// URL where tmux can still show it (see [`tell`]); a client that has
+/// detached sees nothing. Nothing reaches stdout, which tmux
+/// would show in the pane.
+fn open_url(url: &str, input: &Input) {
+    let reason = match browser::Url::parse(url) {
+        Err(reason) => reason,
+        Ok(parsed) => {
+            let click = browser::Click {
+                socket: &input.tmux_socket,
+                pane: &input.pane,
+                client_tty: &input.client_tty,
+            };
+            match browser::request_click(&parsed, &click) {
+                Ok(()) => return,
+                Err(failure) => match open_with_browser(&parsed, &input.pane) {
+                    Ok(()) => return,
+                    Err(opener) => format!("{failure}; {opener}"),
+                },
+            }
+        }
+    };
+    tell(input, &format!("termnav: could not open {url} ({reason})"));
 }
 
-fn write_tty(path: &str, bytes: &[u8]) -> io::Result<()> {
-    if path.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "no tty"));
+/// Run `$BROWSER` with the URL, detached from the click.
+///
+/// Inside tmux the opener runs as if from the clicked pane (`TMUX_PANE`), so
+/// an opener that delivers through `termnav open-url` chooses among that
+/// pane's clients. An entry counts as launched when it exits successfully or
+/// is still running after [`OPENER_GRACE`]; one that cannot start or exits
+/// with a failure within it passes the URL to the next entry, as other
+/// `$BROWSER` callers do.
+fn open_with_browser(url: &browser::Url, pane: &str) -> Result<(), String> {
+    let commands = browser_commands(&std::env::var("BROWSER").unwrap_or_default(), url.as_str());
+    if commands.is_empty() {
+        return Err("BROWSER is not set".to_owned());
     }
-    OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(path)?
-        .write_all(bytes)
+    let mut failures = Vec::new();
+    for (program, arguments) in commands {
+        let mut command = Command::new(&program);
+        command
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        // A server started inside another tmux pane holds that outer pane's
+        // id in its environment; never pass it on as this click's pane.
+        if browser::valid_pane(pane) && std::env::var_os("TMUX").is_some() {
+            command.env("TMUX_PANE", pane);
+        } else {
+            command.env_remove("TMUX_PANE");
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                failures.push(format!("{program}: {error}"));
+                continue;
+            }
+        };
+        let deadline = std::time::Instant::now() + OPENER_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => {
+                    failures.push(format!("{program} failed ({status})"));
+                    break;
+                }
+                Err(error) => {
+                    failures.push(format!("{program}: {error}"));
+                    break;
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => return Ok(()),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+    Err(failures.join("; "))
+}
+
+/// The commands a `$BROWSER` value names, in order.
+///
+/// This is the convention Python's `webbrowser` and xdg-utils share: entries
+/// separated by `:`, each a program with optional fixed arguments separated
+/// by whitespace, where `%s` stands for the URL and the URL is appended when
+/// no argument holds it.
+fn browser_commands(value: &str, url: &str) -> Vec<(String, Vec<String>)> {
+    value
+        .split(':')
+        .filter_map(|entry| {
+            let mut words = entry.split_whitespace();
+            let program = words.next()?.to_owned();
+            let mut arguments = words.map(str::to_owned).collect::<Vec<_>>();
+            if arguments.iter().any(|argument| argument.contains("%s")) {
+                for argument in &mut arguments {
+                    *argument = argument.replace("%s", url);
+                }
+            } else {
+                arguments.push(url.to_owned());
+            }
+            Some((program, arguments))
+        })
+        .collect()
+}
+
+/// Show `message` on the clicking client's status line, or on stderr when it
+/// cannot be shown there.
+///
+/// tmux expands both `#{...}` formats and strftime `%` sequences in
+/// display-message, so both are doubled; a URL's `%2F` would otherwise print
+/// as a date. `-d` needs tmux 3.2, so a refusal retries without it.
+///
+/// `-c` names the clicking client. tmux 3.2 rejects it with a usage error
+/// (later releases accept it, and show nothing for a client that has gone).
+/// Without `-c`, tmux shows the message on the client it considers current:
+/// one of the session the pane in `TMUX_PANE` resolves to, or, when that
+/// session has no client, the most recently active client of any session. A
+/// linked window or a grouped session can make the pane resolve to another
+/// session. A click's URL must not reach another session's screen, so the
+/// retry names the clicked pane and runs only while that pane resolves to an
+/// attached session that is the clicking client's own (any attached session
+/// when the click names no client). The check and the display are separate
+/// tmux calls, so a client that detaches between them is a residual race.
+fn tell(input: &Input, message: &str) {
+    if input.tmux_socket.is_empty() && std::env::var_os("TMUX").is_none() {
+        eprintln!("{message}");
+        return;
+    }
+    let escaped = message.replace('#', "##").replace('%', "%%");
+    let tmux = || {
+        let mut command = Command::new("tmux");
+        if !input.tmux_socket.is_empty() {
+            command.args(["-S", &input.tmux_socket]).env_remove("TMUX");
+        }
+        command
+    };
+    let succeeds = |mut command: Command| {
+        crate::process::output_timeout(&mut command, Duration::from_secs(2))
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let display = |client: Option<&str>, pane: Option<&str>, delay: bool| {
+        let mut command = tmux();
+        match pane {
+            Some(pane) => command.env("TMUX_PANE", pane),
+            None => command.env_remove("TMUX_PANE"),
+        };
+        command.arg("display-message");
+        if let Some(client) = client {
+            command.args(["-c", client]);
+        }
+        if delay {
+            command.args(["-d", "10000"]);
+        }
+        command.arg(&escaped);
+        succeeds(command).is_some()
+    };
+    let client = (!input.client_tty.is_empty()).then_some(input.client_tty.as_str());
+    if client.is_some()
+        && [true, false]
+            .into_iter()
+            .any(|delay| display(client, None, delay))
+    {
+        return;
+    }
+    let pane = browser::valid_pane(&input.pane).then_some(input.pane.as_str());
+    let attached = pane.is_some_and(|pane| {
+        let mut command = tmux();
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{session_id} #{session_attached}",
+        ]);
+        let Some(state) = succeeds(command) else {
+            return false;
+        };
+        let Some((session, count)) = state.split_once(' ') else {
+            return false;
+        };
+        if !count.parse::<u32>().is_ok_and(|count| count > 0) {
+            return false;
+        }
+        let Some(client) = client else {
+            return true;
+        };
+        let mut command = tmux();
+        command.args(["list-clients", "-F", "#{client_tty} #{session_id}"]);
+        succeeds(command).is_some_and(|listing| {
+            listing
+                .lines()
+                .any(|line| line.split_once(' ') == Some((client, session)))
+        })
+    });
+    if attached
+        && [true, false]
+            .into_iter()
+            .any(|delay| display(None, pane, delay))
+    {
+        return;
+    }
+    eprintln!("{message}");
 }
 
 fn extension_target(token: &str, original: &str) -> Option<Target> {
@@ -671,7 +871,7 @@ regex!(
 
 #[cfg(test)]
 mod tests {
-    use super::{Input, Target, from_joined_capture, resolve};
+    use super::{Input, Target, browser_commands, click_row, from_joined_capture, resolve};
 
     fn input(hyperlink: &str, word: &str, line: &str, x: usize) -> Input {
         Input {
@@ -787,6 +987,86 @@ mod tests {
                 source: "terminal".to_owned(),
                 context: String::new(),
             })
+        );
+    }
+
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_clicked_row_matches_tmux_line() {
+        let physical = screen(&["one", "two https://a.example/", "three"]);
+        assert_eq!(
+            click_row(&physical, Some(1), "two https://a.example/", None),
+            Some(1)
+        );
+        // A pane below the window top: y counts from the window.
+        assert_eq!(click_row(&physical, Some(6), "three", Some(4)), Some(2));
+        // Without tmux's copy of the line the coordinate decides.
+        assert_eq!(click_row(&physical, Some(0), "", None), Some(0));
+        assert_eq!(click_row(&physical, Some(9), "", None), None);
+    }
+
+    #[test]
+    fn a_line_off_the_live_screen_is_not_guessed() {
+        // Scrolled copy mode: tmux reports a history line the live screen
+        // does not show. This used to panic indexing an empty match list.
+        let physical = screen(&["live one", "live two"]);
+        assert_eq!(
+            click_row(&physical, Some(1), "history https://old.example/", None),
+            None
+        );
+        // Streaming output moved the clicked line to another unique row.
+        let moved = screen(&["new", "clicked https://a.example/", "newer"]);
+        assert_eq!(
+            click_row(&moved, Some(0), "clicked https://a.example/", None),
+            Some(1)
+        );
+        // A line that repeats elsewhere is ambiguous.
+        let repeated = screen(&["x", "same", "y", "same"]);
+        assert_eq!(click_row(&repeated, Some(0), "same", None), None);
+    }
+
+    #[test]
+    fn browser_values_follow_the_shared_convention() {
+        let url = "https://example.com/a";
+        let command = |program: &str, arguments: &[&str]| {
+            (
+                program.to_owned(),
+                arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            browser_commands("/home/u/.local/bin/browser-open", url),
+            vec![command("/home/u/.local/bin/browser-open", &[url])]
+        );
+        assert_eq!(
+            browser_commands("firefox --new-tab", url),
+            vec![command("firefox", &["--new-tab", url])]
+        );
+        assert_eq!(
+            browser_commands("chrome --app=%s:w3m", url),
+            vec![
+                command("chrome", &["--app=https://example.com/a"]),
+                command("w3m", &[url]),
+            ]
+        );
+        assert!(browser_commands("", url).is_empty());
+        assert!(browser_commands(" : ", url).is_empty());
+    }
+
+    #[test]
+    fn a_click_without_a_capture_resolves_from_tmux_line() {
+        // Without a capture, as when the clicked line is not on the live
+        // screen, the URL comes from tmux's copy of the line.
+        let line = "see https://old.example/path for details";
+        assert_eq!(
+            resolve(&input("", "https", line, 8)),
+            Some(Target::Url("https://old.example/path".to_owned()))
         );
     }
 
