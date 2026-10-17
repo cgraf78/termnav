@@ -87,7 +87,8 @@ check_runtime_shell_inventory() {
 }
 
 check_runtime_shell_inventory
-# Shared CI lints once in its dedicated job; local runs still lint by default.
+# CI's matrix legs lint here. Only the Termux leg sets TERMNAV_SKIP_SHELLCHECK=1,
+# because its dependency profile has no ShellCheck.
 if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
     "${runtime_shell_files[@]}" \
