@@ -216,13 +216,24 @@ SH
     awk '$1 ~ /^client-attached(\[[^]]+\])?$/')
   _tmux_focus_sync_hook=$(printf '%s\n' "$_tmux_hooks" |
     awk '$1 ~ /^after-select-pane(\[[^]]+\])?$/')
+  # Notification hooks can expand #{client_*} for another client; only
+  # #{hook_client} names the client that raised them. tmux 3.2 lacks it, so the
+  # exact identity remains as a fallback there, behind the control-mode guard.
+  _tmux_focus_client='#{?hook_client,--client-name #{q:hook_client},--client-pid #{client_pid} --client-tty #{q:client_tty}}'
+  _tmux_focus_guard='#{||:#{hook_client},#{==:#{client_control_mode},0}}'
   if [[ -n $_tmux_focus_hooks ]]; then
     _assert_contains "examples: tmux config registers client focus" \
       "client-focus-in" "$_tmux_focus_hooks"
     _assert_contains "examples: tmux config publishes nested focus" \
       "termnav tmux focus watch" "$_tmux_focus_hooks"
-    _assert_contains "examples: tmux focus excludes control clients" \
-      '#{==:#{client_control_mode},0}' "$_tmux_focus_hooks"
+    for _hook in client-attached client-focus-in client-focus-out client-detached client-session-changed; do
+      _tmux_hook=$(printf '%s\n' "$_tmux_hooks" |
+        awk -v hook="$_hook" 'index($1, hook "[110]") == 1')
+      _assert_contains "examples: $_hook names its triggering client" \
+        "--tmux-socket #{q:socket_path} $_tmux_focus_client" "$_tmux_hook"
+      _assert_contains "examples: $_hook guards only the exact-identity fallback" \
+        "$_tmux_focus_guard" "$_tmux_hook"
+    done
   else
     # tmux 3.2 accepts the newer hook in a config but does not expose it in the
     # supported hook table. Preserve coverage through the attach hook instead
@@ -231,8 +242,10 @@ SH
       "client-attached" "$_tmux_attach_hooks"
     _assert_contains "examples: old tmux publishes initial nested focus" \
       "termnav tmux focus watch" "$_tmux_attach_hooks"
+    _assert_contains "examples: old tmux attachment falls back to its exact client" \
+      "$_tmux_focus_client" "$_tmux_attach_hooks"
     _assert_contains "examples: old tmux attachment excludes control clients" \
-      '#{==:#{client_control_mode},0}' "$_tmux_attach_hooks"
+      "$_tmux_focus_guard" "$_tmux_attach_hooks"
   fi
   _assert_contains "examples: tmux config registers pane focus repair" \
     "after-select-pane" "$_tmux_focus_sync_hook"
@@ -240,6 +253,10 @@ SH
     'termnav tmux focus sync' "$_tmux_focus_sync_hook"
   _assert_contains "examples: ordinary pane selection remains process-free" \
     '#{!=:#{@termnav_client_unfocused},}' "$_tmux_focus_sync_hook"
+  # after-select-pane runs with the invoking client, so the exact identity
+  # is correct there and matches what older configurations pass.
+  _assert_contains "examples: pane selection repair keeps the invoking client" \
+    '--client-pid #{client_pid}' "$_tmux_focus_sync_hook"
   _assert_eq "examples: tmux focus publishes its inactive pane style" \
     'bg=default' \
     "$(tmux -L "$_socket" show-options -gqv @termnav_inactive_style)"

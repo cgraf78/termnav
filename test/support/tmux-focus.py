@@ -748,34 +748,47 @@ class NestedFocusTest(unittest.TestCase):
         self.environment.pop("TERMNAV_TMUX_SESSION", None)
         self.environment["XDG_RUNTIME_DIR"] = str(self.runtime)
         self.environment["PATH"] = f"{self.focus.parent}:{self.environment['PATH']}"
+        # Mirror examples/tmux.conf. Notification hooks can expand #{client_*}
+        # for another client, so they name the client that raised them, with
+        # tmux 3.2's exact-identity fallback; command hooks run with the
+        # invoking client.
+        client = (
+            "#{?hook_client,--client-name #{q:hook_client},"
+            "--client-pid #{client_pid} --client-tty #{q:client_tty}}"
+        )
+        guard = "#{||:#{hook_client},#{==:#{client_control_mode},0}}"
         command = (
             f"{shlex.quote(str(self.focus))} watch "
-            "--tmux-socket #{q:socket_path} --client-pid #{client_pid} "
-            "--client-tty #{q:client_tty} --lease-ms 600 --interval-ms 150"
+            f"--tmux-socket #{{q:socket_path}} {client} --lease-ms 600 --interval-ms 150"
         )
         stop_command = (
-            f"{shlex.quote(str(self.focus))} stop "
-            "--tmux-socket #{q:socket_path} --client-pid #{client_pid} "
-            "--client-tty #{q:client_tty}"
+            f"{shlex.quote(str(self.focus))} stop --tmux-socket #{{q:socket_path}} {client}"
+        )
+        client_sync_command = (
+            f"{shlex.quote(str(self.focus))} sync --tmux-socket #{{q:socket_path}} {client}"
         )
         sync_command = (
             f"{shlex.quote(str(self.focus))} sync "
             "--tmux-socket #{q:socket_path} --client-pid #{client_pid} "
             "--client-tty #{q:client_tty}"
         )
+
+        def notification(hook: str, run: str) -> str:
+            return f"set-hook -g {hook}[110] {{ if-shell -F '{guard}' \"run-shell -b '{run}'\" }}\n"
+
         self.config = self.root / "tmux.conf"
         self.config.write_text(
             "set -g focus-events on\n"
             "set -g status off\n"
             "set -g window-active-style 'bg=#111111'\n"
             "set -g @termnav_inactive_style 'bg=#222222'\n"
-            f"set-hook -g client-attached[110] {{ run-shell -b '{command}' }}\n"
-            f"set-hook -g client-focus-in[110] {{ run-shell -b '{command}' }}\n"
-            f"set-hook -g client-focus-out[110] {{ run-shell -b '{stop_command}' }}\n"
-            f"set-hook -g client-detached[110] {{ run-shell -b '{stop_command}' }}\n"
-            f"set-hook -g after-select-pane[110] {{ run-shell -b '{sync_command}' }}\n"
-            f"set-hook -g after-select-window[110] {{ run-shell -b '{sync_command}' }}\n"
-            f"set-hook -g client-session-changed[110] {{ run-shell -b '{sync_command}' }}\n",
+            + notification("client-attached", command)
+            + notification("client-focus-in", command)
+            + notification("client-focus-out", stop_command)
+            + notification("client-detached", stop_command)
+            + f"set-hook -g after-select-pane[110] {{ run-shell -b '{sync_command}' }}\n"
+            + f"set-hook -g after-select-window[110] {{ run-shell -b '{sync_command}' }}\n"
+            + notification("client-session-changed", client_sync_command),
             encoding="utf-8",
         )
         self.sockets: list[pathlib.Path] = []
@@ -1411,6 +1424,178 @@ class NestedFocusTest(unittest.TestCase):
 
         client_one.focus()
         wait_until(both_claimed, "released attachment reclaiming independently")
+
+    def test_focus_hook_targets_its_own_client_not_the_most_active(self) -> None:
+        # Regression: tmux expands #{client_pid} and #{client_tty} in
+        # notification hooks for the session's most recently active client.
+        # tmux queues a focus-in hook before it refreshes that client's own
+        # activity time, so if another client of the shared session was used
+        # more recently, a hook passing #{client_*} starts that other client's
+        # watcher and this client's outer pane is never claimed.
+        # Hooks run termnav with the server's environment. Without a UTF-8
+        # locale, tmux prints control characters in -F output as `_`, so this
+        # also guards the client lookup against a tab-delimited format.
+        for variable in ("LANG", "LC_ALL", "LC_CTYPE"):
+            self.environment.pop(variable, None)
+        inner = self.new_server("recent-inner", "cat")
+        self.require_client_focus_hooks(inner)
+        inner_pane = self.tmux(inner, "display-message", "-p", "#{pane_id}")
+        attach = f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus"
+        outer_one = self.new_server("recent-outer-one", attach)
+        pane_one = self.tmux(outer_one, "display-message", "-p", "#{pane_id}")
+        outer_two = self.new_server("recent-outer-two", attach)
+        pane_two = self.tmux(outer_two, "display-message", "-p", "#{pane_id}")
+        client_one = PtyClient(outer_one, self.environment)
+        client_two = PtyClient(outer_two, self.environment)
+        self.clients.extend((client_one, client_two))
+        wait_until(
+            lambda: len(self.tmux(inner, "list-clients", "-F", "#{client_pid}").splitlines()) == 2,
+            "two clients attached to the shared inner session",
+        )
+
+        def pump() -> None:
+            client_one.pump(0.02)
+            client_two.pump(0.02)
+
+        client_one.focus()
+        client_two.focus()
+        wait_until(
+            lambda: (
+                pump()
+                or (
+                    bool(self.pane_claim(outer_one, pane_one))
+                    and bool(self.pane_claim(outer_two, pane_two))
+                )
+            ),
+            "both clients' initial claims",
+        )
+        # A blur is client two's last input, so its activity time stops here.
+        client_two.blur()
+        wait_until(
+            lambda: (
+                pump()
+                or (
+                    self.pane_claim(outer_two, pane_two) == ""
+                    and len(self.helper_lock_holders("watch", inner)) == 1
+                )
+            ),
+            "the second client releasing its parent pane and stopping its watcher",
+            observed=lambda: f"watchers: {self.helper_process_details('watch', inner)}",
+        )
+
+        # Client one types afterwards, making it the session's most recently
+        # active client. The echo in the inner pane proves the keystroke was
+        # processed before client two's focus event arrives.
+        os.write(client_one.master, b"z")
+        wait_until(
+            lambda: pump() or "z" in self.tmux(inner, "capture-pane", "-p", "-t", inner_pane),
+            "the first client's keystroke reaching the shared session",
+        )
+
+        self.assertEqual(1, len(self.helper_lock_holders("watch", inner)))
+        client_two.focus()
+        wait_until(
+            lambda: pump() or bool(self.pane_claim(outer_two, pane_two)),
+            "the refocused client's own claim while another client was more active",
+            observed=lambda: (
+                self.tmux(inner, "list-clients", "-F", "#{client_name} #{client_flags}")
+                + f"; watchers: {self.helper_process_details('watch', inner)}"
+            ),
+        )
+        self.assertTrue(self.pane_claim(outer_one, pane_one))
+
+    def test_a_named_control_mode_client_never_claims_its_parent(self) -> None:
+        # Control-mode clients are automation transports. The hooks no longer
+        # guard on #{client_control_mode}, which described another client, so
+        # termnav must skip them by name itself.
+        inner = self.new_server("control-inner", "sleep 30")
+        self.require_client_focus_hooks(inner)
+        outer = self.new_server(
+            "control-outer",
+            f"tmux -S {shlex.quote(str(inner))} -C attach-session -t focus",
+        )
+        outer_pane = self.tmux(outer, "display-message", "-p", "#{pane_id}")
+        client = PtyClient(outer, self.environment)
+        self.clients.append(client)
+        client.focus()
+
+        def control_client() -> str:
+            listing = self.tmux(
+                inner, "list-clients", "-F", "#{client_control_mode} #{client_name}"
+            )
+            return next(
+                (line.split(" ", 1)[1] for line in listing.splitlines() if line.startswith("1 ")),
+                "",
+            )
+
+        wait_until(lambda: client.pump(0.02) or bool(control_client()), "control client attachment")
+        # The attach hook already ran `watch --client-name` for this client;
+        # without the control-mode check, that watcher would claim the outer
+        # pane. A direct named watch must also return at once.
+        result = subprocess.run(
+            [
+                str(self.focus),
+                "watch",
+                "--tmux-socket",
+                str(inner),
+                "--client-name",
+                control_client(),
+                "--lease-ms",
+                "600",
+                "--interval-ms",
+                "150",
+            ],
+            env=self.environment,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("", self.pane_claim(outer, outer_pane))
+        self.assertEqual([], self.helper_lock_holders("watch", inner))
+
+        # Prove the premise: this control client is live, focused, and has a
+        # parent route, so only the control-mode check kept it from claiming.
+        # The exact-identity form has no such check; its configs guard in tmux.
+        identity = self.tmux(
+            inner,
+            "list-clients",
+            "-F",
+            "#{client_control_mode} #{client_pid} #{client_tty}",
+        )
+        _, pid, tty = next(line for line in identity.splitlines() if line.startswith("1 ")).split(
+            " ", 2
+        )
+        exact = subprocess.Popen(
+            [
+                str(self.focus),
+                "watch",
+                "--tmux-socket",
+                str(inner),
+                "--client-pid",
+                pid,
+                "--client-tty",
+                tty,
+                "--lease-ms",
+                "600",
+                "--interval-ms",
+                "150",
+            ],
+            env=self.environment,
+        )
+        try:
+            wait_until(
+                lambda: client.pump(0.02) or bool(self.pane_claim(outer, outer_pane)),
+                "an exact-identity watcher claiming for the same control client",
+            )
+        finally:
+            # A watcher deliberately ignores SIGTERM while its client stays
+            # focused, so end it as a crash would; its lease then expires.
+            exact.kill()
+            exact.wait(timeout=5)
+        wait_until(
+            lambda: client.pump(0.02) or self.pane_claim(outer, outer_pane) == "",
+            "the killed exact-identity watcher's lease expiring",
+        )
 
     def test_publisher_crash_expires_then_next_focus_recovers(self) -> None:
         inner = self.new_server("crash-inner", "sleep 30")
