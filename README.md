@@ -155,10 +155,11 @@ Neovim, and fzf always, and SSH (including `termnav ssh`, which Termnav's
 shell integration runs for plain `ssh`), mosh, ET, or a nested tmux or screen
 while it has mouse reporting on. Otherwise tmux selects its neighboring pane,
 and at its edge `termnav navigate pane-select DIRECTION --parent` continues
-outward. The example publishes that ownership test as `@termnav_pane_owns_chord`. It sees
-only the pane's foreground process, so extend it if you want the keys to reach
-an editor started by a parent that doesn't `exec` it, such as `git commit`
-opening Vim, or fzf run by a shell key binding.
+outward. The example publishes that ownership test as
+`@termnav_pane_owns_chord`. It sees only the pane's foreground process, so
+extend it if you want the keys to reach an editor started by a parent that
+doesn't `exec` it, such as `git commit` opening Vim, or fzf run by a shell key
+binding.
 
 Like vim-tmux-navigator's bindings, these take the keys from shell panes and
 any other program the test doesn't recognize, so readline's `Ctrl-l` (clear

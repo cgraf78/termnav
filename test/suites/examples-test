@@ -394,9 +394,10 @@ SH
       _wait_for_format keys '#{pane_id}' "$1"
     }
 
-    # tmux reports a failed binding command either in a view over the pane or,
-    # on some platforms, back to the `send-keys -K` client that injected the
-    # key. Capture that client's result instead of letting it end the suite.
+    # tmux 3.8 makes `send-keys -K` wait for the binding and returns a failed
+    # command's status to that client; older releases show the error in a view
+    # over the pane. Capture the client's result instead of letting it end the
+    # suite.
     _press() {
       _press_status=0
       _press_output=$(tmux -L "$_socket" send-keys -K -c "$_key_client" "$@" 2>&1) ||
@@ -470,15 +471,12 @@ SH
     echo 5 >"$_stub_status"
     tmux -L "$_socket" select-pane -t "$_left_pane"
     _press C-h
-    if [[ $_press_output == *"returned 5"* ]]; then
-      _failed_route="reported to the key's client"
-    elif [[ $(_wait_for_format "$_left_pane" '#{pane_in_mode}' 1) == 1 ]]; then
-      _failed_route="shown over the pane"
+    if [[ $_press_status -eq 5 ]] ||
+      [[ $(_wait_for_format "$_left_pane" '#{pane_in_mode}' 1) == 1 ]]; then
+      _pass "examples: a failed edge route still reports its status"
     else
-      _failed_route="hidden (status $_press_status, output '$_press_output')"
+      _fail "examples: a failed edge route still reports its status (client status $_press_status, output '$_press_output', no error view)"
     fi
-    _assert_not_contains "examples: a failed edge route still reports its status" \
-      "hidden" "$_failed_route"
   fi
   _stop_examples_tmux
   trap _cleanup EXIT
