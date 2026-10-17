@@ -1,9 +1,10 @@
 # termnav
 
-![Tests](https://github.com/cgraf78/termnav/actions/workflows/test.yml/badge.svg?branch=main)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Android-lightgrey.svg)](#dependencies)
+[![Tests](https://github.com/cgraf78/termnav/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/cgraf78/termnav/actions/workflows/test.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/release-date/cgraf78/termnav?display_date=published_at&label=latest%20release)](https://github.com/cgraf78/termnav/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-67ac09)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-%3E%3D1.88-blue)](#dependencies)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL%20%7C%20Termux-lightgrey)](#dependencies)
 
 **One set of keys for moving around a layered terminal.** `termnav` takes the
 vim-tmux-navigator idea further out: past nested tmux, across SSH, and into
