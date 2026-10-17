@@ -1212,13 +1212,25 @@ mod tests {
             .spawn()
             .expect("spawn stand-in watcher");
         let pid = child.id();
-        let named = process_is_watcher(
-            pid,
-            "/tmp/termnav-test.sock",
-            123,
-            "/dev/pts/4",
-            Some("/dev/pts/4"),
-        );
+        // spawn can return before the child's argv is visible in procfs or
+        // ps, so poll the observable identity with a deadline. The negative
+        // checks below run only after the stand-in is known to be visible.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let named = loop {
+            if process_is_watcher(
+                pid,
+                "/tmp/termnav-test.sock",
+                123,
+                "/dev/pts/4",
+                Some("/dev/pts/4"),
+            ) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let exact_only = process_is_watcher(pid, "/tmp/termnav-test.sock", 123, "/dev/pts/4", None);
         let other_name = process_is_watcher(
             pid,
@@ -1227,9 +1239,12 @@ mod tests {
             "/dev/pts/4",
             Some("/dev/pts/40"),
         );
+        let visible = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+            .unwrap_or_default();
         let _ = child.kill();
         let _ = child.wait();
-        assert!(named);
+        assert!(named, "stand-in watcher argv: {visible:?}");
         assert!(!exact_only);
         assert!(!other_name);
     }
