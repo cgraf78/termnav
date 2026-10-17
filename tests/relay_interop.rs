@@ -48,17 +48,71 @@ impl Server {
             self.socket.display()
         );
     }
+
+    /// Stop the server through its graceful path and reap it.
+    ///
+    /// Some hosts install `python3` as a launcher that forks the real
+    /// interpreter and forwards catchable signals to it. `SIGKILL` cannot be
+    /// forwarded, so killing such a launcher orphans the peer, still bound to
+    /// its socket. Both servers stop on `SIGTERM`; escalate to `SIGKILL` only
+    /// after a deadline.
+    fn stop(&mut self) {
+        // `try_wait` returns the cached status once the child is reaped, so
+        // this never signals a PID that the kernel may already have reused.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && matches!(self.child.try_wait(), Ok(None)) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
+        // A second panic while unwinding a failed test would abort the whole
+        // binary and hide the original failure, so only clean teardowns check
+        // for a leak. That still covers every passing server test.
+        let survived = !thread::panicking() && listener_survives(&self.socket);
         let _ = fs::remove_file(&self.socket);
         if let Some(parent) = self.socket.parent() {
             let _ = fs::remove_dir(parent);
         }
+        if survived {
+            panic!("{}", leak_message(&self.socket));
+        }
     }
+}
+
+/// Report whether anything still accepts connections on a stopped server's socket.
+///
+/// The child is already reaped, so a successful connection can only come from
+/// a descendant that outlived it. Poll briefly in case that descendant is
+/// still exiting asynchronously. Linux blocks `connect` once a listener that
+/// stopped accepting has a full backlog, so keep the attempts (about 50 in
+/// 5 s) well below Python's default backlog of 128 rather than hang the test
+/// binary.
+fn listener_survives(socket: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while UnixStream::connect(socket).is_ok() {
+        if Instant::now() >= deadline {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn leak_message(socket: &Path) -> String {
+    format!(
+        "relay server teardown left a listener on {}: a descendant outlived the \
+         reaped server, such as the interpreter behind a forwarding python3 launcher",
+        socket.display()
+    )
 }
 
 fn root() -> PathBuf {
@@ -209,4 +263,28 @@ fn frozen_python_peer_accepts_a_scheduled_client_after_connect() {
     let _server = Server::start(command, socket.clone());
 
     assert_delayed_request_survives(&socket);
+}
+
+#[test]
+fn teardown_stops_a_python_peer_behind_an_interpreter_launcher() {
+    // Reproduce a forwarding `python3` launcher portably, so runners whose
+    // `python3` is the real interpreter also prove that teardown reaches the
+    // peer and not just the process it spawned.
+    const LAUNCHER: &str = "import signal, subprocess, sys\n\
+        child = subprocess.Popen(sys.argv[1:])\n\
+        signal.signal(signal.SIGTERM, lambda *_: child.terminate())\n\
+        sys.exit(child.wait())\n";
+    let socket = temp_socket("python-launcher");
+    let mut command = Command::new("python3");
+    command
+        .args(["-c", LAUNCHER, "python3"])
+        .arg(root().join("test/support/python-peer/relay.py"))
+        .args(["serve", "--socket"])
+        .arg(&socket)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE");
+    let mut server = Server::start(command, socket.clone());
+
+    server.stop();
+    assert!(!listener_survives(&socket), "{}", leak_message(&socket));
 }
