@@ -1589,13 +1589,10 @@ class NestedFocusTest(unittest.TestCase):
             )
         finally:
             # A watcher deliberately ignores SIGTERM while its client stays
-            # focused, so end it as a crash would; its lease then expires.
+            # focused, so end it as a crash would. Lease expiry after a crash
+            # has its own test; tearDown stops the expirer with the servers.
             exact.kill()
             exact.wait(timeout=5)
-        wait_until(
-            lambda: client.pump(0.02) or self.pane_claim(outer, outer_pane) == "",
-            "the killed exact-identity watcher's lease expiring",
-        )
 
     def test_publisher_crash_expires_then_next_focus_recovers(self) -> None:
         inner = self.new_server("crash-inner", "sleep 30")
