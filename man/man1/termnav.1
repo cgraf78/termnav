@@ -123,8 +123,22 @@ requires parent;
 .B stop,
 and
 .B sync
-require tmux socket, client PID, and client tty. Watch also accepts lease and
-interval options. Command-group help prints the exact option names.
+require the tmux socket and either the client name or the client PID and tty.
+Notification hooks such as
+.B client-focus-in
+pass the name from
+.BR #{hook_client} ,
+because their
+.B #{client_pid}
+and
+.B #{client_tty}
+describe the session's most recently active client rather than the client that
+raised the event; a named client that is gone or in control mode is ignored.
+tmux 3.2 has no
+.BR #{hook_client} ,
+so the example falls back to the exact identity there.
+Watch also accepts lease and interval options. Command-group help prints the
+exact option names.
 .TP
 .B tmux follow-click
 Accepts at most eleven positional fields in this order: HYPERLINK, WORD, LINE,

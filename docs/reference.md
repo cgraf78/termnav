@@ -361,6 +361,20 @@ own active background. Separate clients attached to the same inner session
 publish to their own parent panes independently. A killed publisher, broken
 SSH session, or missed detach event fails closed when its lease expires.
 
+`watch`, `stop`, and `sync` identify their client either by name
+(`--client-name`) or by exact PID and tty (`--client-pid` with
+`--client-tty`). In notification hooks (`client-attached`, `client-detached`,
+`client-focus-in`, `client-focus-out`, `client-session-changed`), tmux expands
+`#{client_pid}` and `#{client_tty}` for the session's most recently active
+client rather than the client that raised the event, so a second client of a
+shared session could start the busier client's publisher and never claim its
+own parent pane. Those hooks pass `#{hook_client}` instead. Termnav ignores a
+named client that has gone, as in a detach hook, and a control-mode client.
+tmux 3.2 has no `#{hook_client}`; there the example falls back to the exact
+identity, which the attach hook resolves to the attaching client. Command hooks
+such as `after-select-pane` run with the invoking client and keep the exact
+form, which older configurations use for every hook.
+
 The rendering path remains entirely inside tmux. Border and label formats can
 combine `pane_active`, the current client's `focused` flag, and the absence of
 the pane-local `@termnav_child_focus` option. Pane content styles are different:
