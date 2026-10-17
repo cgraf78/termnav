@@ -151,19 +151,28 @@ above works:
 
 The tmux example binds `Ctrl-h/j/k/l` but not `Alt-H/J/K/L`. A
 `Ctrl-h/j/k/l` key goes to the pane when its foreground program owns it: Vim,
-Neovim, and fzf always, and SSH, mosh, ET, or a nested tmux or screen while it
-has mouse reporting on. Otherwise tmux selects its neighboring pane, and at
-its edge `termnav navigate pane-select DIRECTION --parent` continues outward.
-The example publishes that ownership test as `@termnav_pane_owns_chord`;
-extend it if you start an editor through a wrapper that doesn't `exec` it.
-Like vim-tmux-navigator's bindings, these take the keys from shell panes too,
-so readline's `Ctrl-l` (clear screen), `Ctrl-k` (kill line), and `Ctrl-h`
-(backspace, on terminals that send `^H`) no longer reach the shell.
+Neovim, and fzf always, and SSH (including `termnav ssh`), mosh, ET, or a
+nested tmux or screen while it has mouse reporting on. Otherwise tmux selects
+its neighboring pane, and at its edge
+`termnav navigate pane-select DIRECTION --parent` continues outward. The
+example publishes that ownership test as `@termnav_pane_owns_chord`. It sees
+only the pane's foreground process, so extend it if you want the keys to reach
+an editor started by a parent that doesn't `exec` it, such as `git commit`
+opening Vim, or fzf run by a shell key binding.
+
+Like vim-tmux-navigator's bindings, these take the keys from shell panes and
+any other program the test doesn't recognize, so readline's `Ctrl-l` (clear
+screen), `Ctrl-k` (kill line), and `Ctrl-j` (accept line) no longer reach the
+shell. `Ctrl-h` is also backward-delete, and on terminals whose Backspace key
+sends `^H` it collides with Backspace: tmux reads the byte as Backspace when
+the terminal's erase character is `^H`, so left selection never fires, and as
+`Ctrl-h` otherwise, so Backspace selects the left pane.
 
 For `Alt-H/J/K/L` from shell panes, bind them in your own tmux config to
 `termnav navigate pane-move DIRECTION`, passing the keys through to Neovim
 panes the same way. The command exits with status `3` when it declines a
-request at the current boundary; the example treats that as a no-op. See
+request at the current boundary; append the example's
+`$navigate_declined_ok` to treat that as a no-op. See
 [`examples/README.md`](examples/README.md) and the
 [reference](docs/reference.md#command-interface).
 
