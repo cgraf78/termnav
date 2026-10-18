@@ -11,9 +11,7 @@
 //! `lib/termnav/wezterm/link-routes.lua` enforces the same policy again; the
 //! WezTerm integration suite pins the two copies to the same decisions.
 
-use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -620,11 +618,7 @@ fn select_client(window: &str, listing: &str) -> Option<Client> {
 }
 
 fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    OpenOptions::new()
-        .append(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(path)?
-        .write_all(bytes)
+    terminal::open_writer(path)?.write_all(bytes)
 }
 
 #[cfg(test)]

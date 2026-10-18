@@ -1,9 +1,8 @@
 //! `termnav tmux` command adapter.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use crate::terminal;
 
@@ -347,11 +346,7 @@ fn context(
         return usage(stderr, "--client-termname is required");
     };
     let mode = terminal::tmux_mode(&termname);
-    let mut file = match OpenOptions::new()
-        .append(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(tty)
-    {
+    let mut file = match terminal::open_writer(Path::new(&tty)) {
         Ok(file) => file,
         Err(error) => {
             writeln!(stderr, "termnav tmux context: {error}")?;

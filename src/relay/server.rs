@@ -6,10 +6,10 @@
 //! query at the outer edge, and commits inward only when the reply traverses
 //! the exact clients that were validated during preparation.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +26,7 @@ use super::protocol;
 use super::store::{Directive, DirectiveAction, Store};
 use crate::navigation::{Action, Backend, Client, Direction, Outcome, Scope, SystemBackend};
 use crate::process;
+use crate::terminal;
 
 const MAX_MESSAGE_BYTES: u64 = 513;
 // A client can be descheduled after connect(2) but before its first write,
@@ -774,11 +775,7 @@ fn emit_commit(tty: &str) -> bool {
     if tty.is_empty() {
         return false;
     }
-    let Ok(mut descriptor) = OpenOptions::new()
-        .append(true)
-        .custom_flags(libc::O_NOCTTY)
-        .open(tty)
-    else {
+    let Ok(mut descriptor) = terminal::open_writer(Path::new(tty)) else {
         return false;
     };
     descriptor.write_all(COMMIT_QUERY).is_ok()

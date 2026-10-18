@@ -2,10 +2,9 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -490,11 +489,7 @@ impl SystemBackend {
             .as_nanos();
         let value = format!("{}:{nanos}.{}", direction.as_str(), std::process::id());
         let sequence = terminal::user_var(name, &value, TmuxMode::Raw);
-        let Ok(mut descriptor) = OpenOptions::new()
-            .append(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open(tty)
-        else {
+        let Ok(mut descriptor) = terminal::open_writer(Path::new(tty)) else {
             return false;
         };
         descriptor.write_all(&sequence).is_ok()
