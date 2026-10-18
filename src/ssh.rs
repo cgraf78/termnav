@@ -33,6 +33,7 @@ const SSH_SHIM_DIR_ENV: &str = "TERMNAV_SSH_SHIM_DIR";
 const SSH_SHIM_MARKER: &[u8] = b"# termnav-ssh-shim-v1";
 const LEGACY_SSH_SHIM_MARKER: &[u8] = b"# Keep SSH interposition inherited by child processes";
 const SSH_SHIM_ORIGINAL_PATH_ENV: &str = "TERMNAV_SSH_ORIGINAL_PATH";
+const REMOTE_SOCKET_DIR_ENV: &str = "TERMNAV_REMOTE_SOCKET_DIR";
 
 /// Run SSH, enriching only an interactive session Termnav can safely own.
 pub fn run(arguments: &[OsString]) -> io::Result<i32> {
@@ -63,17 +64,19 @@ pub fn run(arguments: &[OsString]) -> io::Result<i32> {
         return run_plain(&binary, arguments);
     }
 
+    let token = format!("{}{}", new_nonce(), new_nonce());
+    let Some(remote_socket) = remote_socket(&settings, &token) else {
+        return run_plain(&binary, arguments);
+    };
     if server::sweep().is_err() {
         return run_plain(&binary, arguments);
     }
-    let token = format!("{}{}", new_nonce(), new_nonce());
     let socket_name = OsString::from(format!("relay-{token}.sock"));
     let runtime = match crate::runtime::private_socket_directory(&socket_name) {
         Ok(runtime) => runtime,
         Err(_) => return run_plain(&binary, arguments),
     };
     let local_socket = runtime.join(socket_name);
-    let remote_socket = format!("/tmp/termnav-relay-{token}.sock");
     let (owner_read, owner_write) = match process::pipe(false) {
         Ok(pipe) => pipe,
         Err(_) => return run_plain(&binary, arguments),
@@ -250,12 +253,55 @@ pub(crate) fn effective_config(
         return Err(io::Error::other("ssh -G failed"));
     }
     let mut settings = HashMap::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in String::from_utf8_lossy(&output.stdout).split('\n') {
         if let Some((key, value)) = line.split_once(' ') {
+            // OpenSSH emits each SetEnv assignment on its own line, with
+            // configuration quotes already removed. Do not shell-split its
+            // value: unrelated variables can contain spaces or hint-like text.
+            if key.eq_ignore_ascii_case("setenv")
+                && let Some(directory) = value.strip_prefix(REMOTE_SOCKET_DIR_ENV)
+                && let Some(directory) = directory.strip_prefix('=')
+            {
+                if settings
+                    .get(REMOTE_SOCKET_DIR_ENV)
+                    .is_some_and(|previous| previous != directory)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "conflicting remote relay socket directories",
+                    ));
+                }
+                settings.insert(REMOTE_SOCKET_DIR_ENV.to_owned(), directory.to_owned());
+            }
             settings.insert(key.to_ascii_lowercase(), value.trim().to_owned());
         }
     }
     Ok(settings)
+}
+
+/// Build a remote Unix socket without probing the remote filesystem.
+fn remote_socket(settings: &HashMap<String, String>, token: &str) -> Option<String> {
+    let directory = settings
+        .get(REMOTE_SOCKET_DIR_ENV)
+        .map_or("/tmp", String::as_str);
+    // RemoteForward uses colons and OpenSSH configuration token expansion.
+    // A deliberately narrow literal-path grammar avoids both, along with
+    // quoting ambiguities and control characters. Resolve neither ~ nor $ on
+    // this host: the directory belongs to the remote machine.
+    if !directory.starts_with('/')
+        || !directory
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+        || directory.split('/').any(|part| matches!(part, "." | ".."))
+    {
+        return None;
+    }
+    let socket = format!(
+        "{}/termnav-relay-{token}.sock",
+        directory.trim_end_matches('/')
+    );
+    // 103 non-NUL bytes also fit macOS's smaller sockaddr_un.sun_path.
+    (socket.len() <= crate::runtime::MAX_SOCKET_PATH_BYTES).then_some(socket)
 }
 
 fn interactive(arguments: &[OsString], destination: usize, stdin_tty: bool) -> bool {

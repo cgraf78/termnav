@@ -509,3 +509,27 @@ its path) on each participating host, for example as
 `/etc/ssh/sshd_config.d/termnav.conf`, then reload sshd. Keep
 Unix-socket forwarding (`AllowStreamLocalForwarding`) enabled. The remote host
 also needs termnav and its tmux and Neovim integration.
+
+The remote relay socket defaults to `/tmp`. For a host where that directory
+is unavailable, configure an existing, writable remote directory through a
+host-scoped OpenSSH setting, for example in `~/.ssh/config`:
+
+```sshconfig
+Host phone
+    SetEnv TERMNAV_REMOTE_SOCKET_DIR=/data/data/com.termux/files/usr/tmp
+```
+
+Termnav reads this hint from the existing `ssh -G` configuration query; it
+does not probe the remote host or expand its environment. The hint itself
+does not need `AcceptEnv`, but the generated `TERMNAV_PARENT_RELAY` still does.
+OpenSSH removes configuration quotes before Termnav reads each assignment.
+Use a literal absolute directory containing only ASCII letters, digits,
+`/`, `.`, `_`, and `-`, with no `.` or `..` path components. Spaces, colons,
+shell expressions, and token expansion such as `%h` are unsupported. The
+complete generated socket path must fit 103 bytes; with the current filename,
+the directory excluding trailing slashes can use at most 59 bytes. Repeated
+hints must agree exactly. An invalid or conflicting hint leaves the original
+SSH invocation unchanged, without a Termnav relay. A valid hint does not
+create or check the remote directory; OpenSSH reports a forwarding failure if
+it cannot bind there. The same selected socket is used for the reverse
+forward, per-session environment, and existing-master cleanup.
