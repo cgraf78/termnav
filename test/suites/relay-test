@@ -319,6 +319,8 @@ for destination in arbitrary.example alice@host-with-alias '[2001:db8::7]'; do
   _assert_contains "ssh relay: uses the original SSH process for forwarding" "<RemoteForward=" "$ssh_args"
   forward=${ssh_args#*<RemoteForward=}
   forward=${forward%%>*}
+  _assert_eq "ssh relay: default remote socket stays below /tmp" \
+    true "$([[ $forward == /tmp/termnav-relay-*.sock:* ]] && echo true || echo false)"
   local_socket=${forward#*:}
   _assert_eq "ssh relay: short fixture root exercises the primary runtime path" \
     true "$([[ $local_socket == "$ssh_runtime"/termnav-*/* ]] && echo true || echo false)"
@@ -472,6 +474,91 @@ _assert_eq "ssh relay: each session pairs its current SendEnv value with its for
   "$(cat "$expected_relays")" "$(cat "$actual_relays")"
 _assert_eq "ssh relay: session environment regression exercises distinct relay paths" \
   "$(wc -l <"$actual_relays" | tr -d ' ')" "$(sort -u "$actual_relays" | wc -l | tr -d ' ')"
+
+# A host-specific directory changes only the remote Unix socket. Capture the
+# config query, actual session, and local mux cancellation independently so a
+# second authenticated probe or a mismatched SendEnv value cannot pass.
+directory_ssh="$fake_bin/ssh-directory"
+cat >"$directory_ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == -G ]]; then
+  printf '%s\n' CONFIG >>"$TERMNAV_TEST_SSH_LOG"
+  printf '%s\n' "$TERMNAV_TEST_EFFECTIVE_CONFIG"
+  exit 0
+fi
+printf '%s\n' CALL >>"$TERMNAV_TEST_SSH_LOG"
+printf '<%s>\n' "$@" >>"$TERMNAV_TEST_SSH_LOG"
+printf 'ENV=<%s>\n' "${TERMNAV_PARENT_RELAY:-}" >>"$TERMNAV_TEST_SSH_LOG"
+EOF
+chmod +x "$directory_ssh"
+ln -sfn ssh-directory "$fake_bin/ssh"
+remote_directory=/data/data/com.termux/files/usr/tmp
+ssh_log="$tmp/remote-directory.log"
+# Shell syntax is deliberately literal argv data, never a local command.
+# shellcheck disable=SC2016
+TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\nsetenv TERMNAV_REMOTE_SOCKET_DIR='"$remote_directory"$'\nsetenv OTHER=value with spaces\ncontrolpath /tmp/TermNav-Control-Test' \
+  TERMNAV_TEST_SSH_LOG="$ssh_log" \
+  "$relay_ssh" -t -p 8022 -- '[2001:db8::7]' printf '%s' 'two words' '$(untouched)'
+directory_args=$(cat "$ssh_log")
+forward=$(sed -n 's/^<RemoteForward=\(.*\)>$/\1/p' "$ssh_log")
+remote_socket=${forward%%:*}
+_assert_contains "ssh relay: host hint selects the Termux remote directory" \
+  "<RemoteForward=$remote_directory/termnav-relay-" "$directory_args"
+_assert_eq "ssh relay: configured remote socket is portable" \
+  true "$([[ ${#remote_socket} -le 103 ]] && echo true || echo false)"
+_assert_contains "ssh relay: SendEnv matches the configured remote forward" \
+  "ENV=<$remote_socket>" "$directory_args"
+_assert_contains "ssh relay: cancellation reuses the exact configured forward" \
+  $'<cancel>\n<-R>\n<'"$forward"'>' "$directory_args"
+_assert_eq "ssh relay: host hint needs only one configuration query" \
+  1 "$(grep -c '^CONFIG$' "$ssh_log")"
+_assert_eq "ssh relay: host hint makes one session and one local cancellation" \
+  2 "$(grep -c '^CALL$' "$ssh_log")"
+_assert_contains "ssh relay: host hint preserves IPv6 and literal command arguments" \
+  $'<-->\n<[2001:db8::7]>\n<printf>\n<%s>\n<two words>\n<$(untouched)>' "$directory_args"
+
+# shellcheck disable=SC2016
+for directory_config in \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=' \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=relative/tmp' \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp:bad' \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp with space' \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR="/tmp"' \
+  "setenv TERMNAV_REMOTE_SOCKET_DIR='/tmp'" \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp/$(bad)' \
+  $'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp/\tbad' \
+  $'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp/\rbad' \
+  $'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp\r' \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp/../other' \
+  'setenv TERMNAV_REMOTE_SOCKET_DIR=/tmp/%h' \
+  $'setenv TERMNAV_REMOTE_SOCKET_DIR=/one\nsetenv TERMNAV_REMOTE_SOCKET_DIR=/two' \
+  "setenv TERMNAV_REMOTE_SOCKET_DIR=/$(printf '%059d' 0)" \
+  "setenv TERMNAV_REMOTE_SOCKET_DIR=/$(printf '%080d' 0)"; do
+  ssh_log="$tmp/invalid-directory-${RANDOM}.log"
+  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\n'"$directory_config" \
+    TERMNAV_TEST_SSH_LOG="$ssh_log" \
+    "$relay_ssh" -t phone.example printf '%s' 'two words'
+  directory_args=$(cat "$ssh_log")
+  _assert_not_contains "ssh relay: invalid directory bypasses optional forwarding" \
+    'RemoteForward=' "$directory_args"
+  _assert_contains "ssh relay: invalid directory preserves original arguments" \
+    $'<-t>\n<phone.example>\n<printf>\n<%s>\n<two words>' "$directory_args"
+done
+
+for remote_directory in / /tmp/ "/$(printf '%058d' 0)"; do
+  ssh_log="$tmp/directory-boundary-${RANDOM}.log"
+  TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\nsetenv TERMNAV_REMOTE_SOCKET_DIR='"$remote_directory"$'\nsetenv TERMNAV_REMOTE_SOCKET_DIR='"$remote_directory" \
+    TERMNAV_TEST_SSH_LOG="$ssh_log" "$relay_ssh" -t phone.example
+  _assert_contains "ssh relay: root, trailing slash and 103-byte paths are supported" \
+    "<RemoteForward=${remote_directory%/}/termnav-relay-" "$(cat "$ssh_log")"
+done
+
+ssh_log="$tmp/unrelated-setenv.log"
+TERMNAV_TEST_EFFECTIVE_CONFIG=$'requesttty auto\nsessiontype default\nsetenv OTHER=TERMNAV_REMOTE_SOCKET_DIR=/wrong' \
+  TERMNAV_TEST_SSH_LOG="$ssh_log" "$relay_ssh" -t phone.example
+_assert_contains "ssh relay: unrelated environment values cannot supply the directory" \
+  '<RemoteForward=/tmp/termnav-relay-' "$(cat "$ssh_log")"
 
 for effective_config in 'sessiontype none' 'sessiontype subsystem' $'sessiontype default\nrequesttty no'; do
   ln -sfn ssh-real "$fake_bin/ssh"

@@ -12,6 +12,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// Maximum non-NUL socket path length shared by supported Unix platforms.
+pub(crate) const MAX_SOCKET_PATH_BYTES: usize = 103;
+
 /// Return an owner-only directory below Termnav's per-user runtime root.
 pub fn private_subdirectory(parts: &[&OsStr]) -> io::Result<PathBuf> {
     let base = runtime_base();
@@ -55,7 +58,7 @@ pub fn private_socket_directory(leaf: &OsStr) -> io::Result<PathBuf> {
         let root = base.join(format!("termnav-{uid}"));
         // 103 non-NUL bytes fit both Linux and the more restrictive macOS
         // sockaddr_un layout. Count encoded path bytes, not Unicode scalars.
-        if root.join(leaf).as_os_str().as_bytes().len() > 103 {
+        if root.join(leaf).as_os_str().as_bytes().len() > MAX_SOCKET_PATH_BYTES {
             continue;
         }
         return private_root(&base, uid);

@@ -197,6 +197,36 @@ before writing. No eligible client or a missing terminal is an operational
 failure (1); standard output is never used. Success means the request was
 written, not that the terminal acted on it. Callers should fall back to their
 own opener on any nonzero status.
+.SH SSH RELAY
+Interactive SSH sessions use a remote Unix socket below
+.B /tmp
+by default. A host-specific OpenSSH configuration can select an existing,
+writable directory instead:
+.PP
+.nf
+Host phone
+    SetEnv TERMNAV_REMOTE_SOCKET_DIR=/data/data/com.termux/files/usr/tmp
+.fi
+.PP
+Termnav reads this hint from its existing
+.B ssh -G
+query, without another connection, remote command, or environment expansion.
+The directory must be absolute and contain only ASCII letters, digits,
+slashes, dots, underscores, and hyphens; dot and dot-dot path components are
+invalid. Quotes used by OpenSSH configuration are removed by OpenSSH; literal
+quotes, spaces, colons, shell expressions, and percent-token expansion in the
+resulting directory are unsupported. The complete generated socket path must
+fit 103 bytes (currently at most 59 directory bytes excluding trailing
+slashes). Repeated hints must agree exactly. Invalid or conflicting hints
+delegate the original SSH invocation unchanged, without a Termnav relay.
+The directory is not created or remotely probed; OpenSSH reports bind failures.
+.PP
+The hint does not require remote
+.BR AcceptEnv .
+The generated
+.B TERMNAV_PARENT_RELAY
+still requires it, alongside enabled Unix-socket forwarding. The forward,
+per-session environment, and local existing-master cleanup use the same path.
 .SH ENVIRONMENT
 .TP
 .B TERMNAV_ASSET_ROOT
