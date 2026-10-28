@@ -149,6 +149,9 @@ fn focus(arguments: &[String], stdout: &mut dyn Write, stderr: &mut dyn Write) -
             Ok(crate::focus::expire(&socket, &pane))
         }
         "watch" | "stop" | "sync" => {
+            // Leave room for scheduling and relay delays between renewals.
+            // Normal SSH shutdown releases its claim without waiting for this
+            // crash fallback, so it need not trade resilience for a fast exit.
             let lease_ms = options.lease_ms.unwrap_or(3500);
             let interval_ms = options.interval_ms.unwrap_or(1000);
             // Reject invalid timing before asking tmux about the client, so the

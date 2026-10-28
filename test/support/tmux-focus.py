@@ -10,6 +10,7 @@ import pathlib
 import pty
 import select
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -497,7 +498,8 @@ class RelayFocusTest(unittest.TestCase):
         owns_tmux: bool = False,
         extra_environment: dict[str, str] | None = None,
         navigation_log: pathlib.Path | None = None,
-    ) -> None:
+        owner_fd: int | None = None,
+    ) -> subprocess.Popen[bytes]:
         environment = os.environ.copy()
         environment.pop("TMUX", None)
         environment.pop("TMUX_PANE", None)
@@ -510,6 +512,8 @@ class RelayFocusTest(unittest.TestCase):
         if extra_environment is not None:
             environment.update(extra_environment)
         command = [str(self.relay), "serve", "--socket", str(path)]
+        if owner_fd is not None:
+            command.extend(("--owner-fd", str(owner_fd)))
         if navigation_log is not None:
             command = [
                 sys.executable,
@@ -521,6 +525,7 @@ class RelayFocusTest(unittest.TestCase):
             ]
         process = subprocess.Popen(
             command,
+            pass_fds=() if owner_fd is None else (owner_fd,),
             env=environment,
             stdout=subprocess.DEVNULL,
             # Preserve server tracebacks in the test log. A closed socket is
@@ -531,6 +536,159 @@ class RelayFocusTest(unittest.TestCase):
         )
         self.processes.append(process)
         wait_until(path.is_socket, f"relay listener {path}")
+        return process
+
+    def test_relay_owner_exit_restores_parent_style_before_returning(self) -> None:
+        self.tmux("set-option", "-g", "@termnav_inactive_style", "bg=#010d17")
+        owner_read, owner_write = os.pipe()
+        try:
+            relay_socket = self.root / "owned-relay.sock"
+            relay = self.start_relay(relay_socket, owns_tmux=True, owner_fd=owner_read)
+            token = "111111111111111111111111"
+            reply = send_message(
+                relay_socket,
+                {"v": 2, "op": "focus", "state": "claim", "token": token, "lease_ms": 3500},
+            )
+            self.assertEqual("claimed", reply["result"])
+            self.assertEqual(token, self.pane_claim_owner())
+            self.assertEqual(
+                "bg=#010d17",
+                self.tmux("show-options", "-pqv", "-t", self.pane, "window-active-style"),
+            )
+        finally:
+            os.close(owner_read)
+            os.close(owner_write)
+        # The SSH supervisor closes this pipe and joins the relay before
+        # returning to the shell. It must not leave styling to lease expiry.
+        self.assertEqual(0, relay.wait(timeout=2))
+        self.assertFalse(relay_socket.exists())
+        self.assertEqual("", self.pane_claim_owner())
+        self.assertEqual(
+            "", self.tmux("show-options", "-pqv", "-t", self.pane, "window-active-style")
+        )
+
+    def test_tmuxless_relay_shutdown_releases_its_forwarded_claim(self) -> None:
+        outer_socket = self.root / "outer-relay.sock"
+        inner_socket = self.root / "inner-relay.sock"
+        self.start_relay(outer_socket, owns_tmux=True)
+        inner = self.start_relay(inner_socket, parent=outer_socket)
+        reply = send_message(
+            inner_socket,
+            {
+                "v": 2,
+                "op": "focus",
+                "state": "claim",
+                "token": "222222222222222222222222",
+                "lease_ms": 3500,
+            },
+        )
+        self.assertEqual("claimed", reply["result"])
+        inner.terminate()
+        inner.wait(timeout=2)
+        self.assertEqual("", self.pane_claim_owner())
+
+    def test_relay_shutdown_preserves_a_newer_connections_claim(self) -> None:
+        old_socket = self.root / "old-relay.sock"
+        new_socket = self.root / "new-relay.sock"
+        old = self.start_relay(old_socket, owns_tmux=True)
+        self.start_relay(new_socket, owns_tmux=True)
+        for path, token in (
+            (old_socket, "333333333333333333333333"),
+            (new_socket, "444444444444444444444444"),
+        ):
+            self.assertEqual(
+                "claimed",
+                send_message(
+                    path,
+                    {"v": 2, "op": "focus", "state": "claim", "token": token, "lease_ms": 3500},
+                )["result"],
+            )
+        old.terminate()
+        old.wait(timeout=2)
+        self.assertEqual("444444444444444444444444", self.pane_claim_owner())
+
+    def test_stale_release_preserves_the_same_relays_new_generation_for_cleanup(self) -> None:
+        relay_socket = self.root / "replaced-relay.sock"
+        relay = self.start_relay(relay_socket, owns_tmux=True)
+        old_token = "555555555555555555555555"
+        new_token = "666666666666666666666666"
+        for token in (old_token, new_token):
+            self.assertEqual(
+                "claimed",
+                send_message(
+                    relay_socket,
+                    {"v": 2, "op": "focus", "state": "claim", "token": token, "lease_ms": 3500},
+                )["result"],
+            )
+        self.assertEqual(
+            "released",
+            send_message(
+                relay_socket, {"v": 2, "op": "focus", "state": "release", "token": old_token}
+            )["result"],
+        )
+        self.assertEqual(new_token, self.pane_claim_owner())
+        relay.terminate()
+        relay.wait(timeout=2)
+        self.assertEqual("", self.pane_claim_owner())
+
+    def test_owner_exit_drains_an_inflight_claim_before_cleanup(self) -> None:
+        mock_bin = self.root / "gated-bin"
+        mock_bin.mkdir()
+        claimed = self.root / "claimed"
+        resume = self.root / "resume"
+        # Keep the real tmux mutation, but hold its completion until owner EOF.
+        # Cleanup before joining the handler would miss the in-flight token.
+        wrapper = mock_bin / "tmux"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, subprocess, sys, time\n"
+            f"result = subprocess.run([{shutil.which('tmux')!r}, *sys.argv[1:]])\n"
+            "if any(arg.startswith('777777777777777777777777:') for arg in sys.argv):\n"
+            f"    pathlib.Path({str(claimed)!r}).touch()\n"
+            "    deadline = time.monotonic() + 1.5\n"
+            f"    while not pathlib.Path({str(resume)!r}).exists():\n"
+            "        if time.monotonic() > deadline: sys.exit(1)\n"
+            "        time.sleep(0.01)\n"
+            "sys.exit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        owner_read, owner_write = os.pipe()
+        thread = None
+        replies = []
+        try:
+            relay_socket = self.root / "inflight-relay.sock"
+            relay = self.start_relay(
+                relay_socket,
+                owns_tmux=True,
+                owner_fd=owner_read,
+                extra_environment={"PATH": f"{mock_bin}:{os.environ['PATH']}"},
+            )
+            thread = threading.Thread(
+                target=lambda: replies.append(
+                    send_message(
+                        relay_socket,
+                        {
+                            "v": 2,
+                            "op": "focus",
+                            "state": "claim",
+                            "token": "777777777777777777777777",
+                            "lease_ms": 3500,
+                        },
+                    )
+                )
+            )
+            thread.start()
+            wait_until(claimed.exists, "in-flight real tmux focus mutation")
+        finally:
+            os.close(owner_read)
+            os.close(owner_write)
+            resume.touch()
+            if thread is not None:
+                thread.join(timeout=3)
+        self.assertEqual([{"v": 2, "result": "claimed"}], replies)
+        self.assertEqual(0, relay.wait(timeout=2))
+        self.assertEqual("", self.pane_claim_owner())
 
     def test_relay_claim_is_scoped_to_its_immediate_parent_pane(self) -> None:
         relay_socket = self.root / "relay.sock"
