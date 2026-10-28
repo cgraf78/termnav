@@ -51,6 +51,49 @@ enum Parent {
     Relay(String),
 }
 
+/// The latest focus generation accepted by one connection-owned relay.
+#[derive(Default)]
+pub(crate) struct RelayFocus {
+    token: Option<String>,
+}
+
+impl RelayFocus {
+    /// Dispatch and remember ownership while the caller serializes focus updates.
+    pub(crate) fn handle(&mut self, request: &Value) -> Value {
+        let response = handle_relay(request);
+        match response.get("result").and_then(Value::as_str) {
+            Some(protocol::result::CLAIMED) => {
+                self.token = request
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some(protocol::result::RELEASED)
+                if request.get("token").and_then(Value::as_str) == self.token.as_deref() =>
+            {
+                self.token = None;
+            }
+            _ => {}
+        }
+        response
+    }
+
+    /// Release only this relay's generation after its admitted handlers finish.
+    pub(crate) fn release(&mut self) {
+        if let Some(token) = self.token.take() {
+            // The connection is gone, so no remote detach can use its relay.
+            // Reuse the one-hop route and generation guard: an older SSH exit
+            // must never undim a pane claimed by a newer connection.
+            let _ = handle_relay(&json!({
+                "v": protocol::VERSION,
+                "op": protocol::operation::FOCUS,
+                "state": "release",
+                "token": token,
+            }));
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct StyleRestore {
     had_override: bool,

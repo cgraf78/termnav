@@ -190,10 +190,14 @@ pub fn shutdown_signal() -> Option<i32> {
 /// Handle one validated protocol object without socket framing.
 #[must_use]
 pub fn dispatch(request: &Value) -> Value {
-    dispatch_with_terminal(request, None)
+    dispatch_with_terminal(request, None, None)
 }
 
-fn dispatch_with_terminal(request: &Value, direct_terminal: Option<&DirectTerminal>) -> Value {
+fn dispatch_with_terminal(
+    request: &Value,
+    direct_terminal: Option<&DirectTerminal>,
+    focus: Option<&mut crate::focus::RelayFocus>,
+) -> Value {
     use super::protocol::{VERSION, operation, result};
     if request.get("v").and_then(Value::as_u64) != Some(u64::from(VERSION)) {
         return reply(result::ERROR);
@@ -203,7 +207,10 @@ fn dispatch_with_terminal(request: &Value, direct_terminal: Option<&DirectTermin
         Some(operation::PREPARE_PATH) => handle_prepare(request),
         Some(operation::ABORT_PATH) => handle_abort(request),
         Some(operation::COMMIT_PATH) => handle_commit(request, direct_terminal),
-        Some(operation::FOCUS) => crate::focus::handle_relay(request),
+        Some(operation::FOCUS) => match focus {
+            Some(focus) => focus.handle(request),
+            None => crate::focus::handle_relay(request),
+        },
         _ => reply(result::ERROR),
     }
 }
@@ -892,7 +899,11 @@ fn poll_loop(
     direct_terminal: Option<DirectTerminal>,
 ) -> io::Result<()> {
     let mut handlers = Vec::new();
-    while !STOPPING.load(Ordering::SeqCst) {
+    let focus = Arc::new(Mutex::new(crate::focus::RelayFocus::default()));
+    let result = loop {
+        if STOPPING.load(Ordering::SeqCst) {
+            break Ok(());
+        }
         let mut descriptors = vec![libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -918,7 +929,7 @@ fn poll_loop(
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(error);
+            break Err(error);
         }
         if descriptors[wake_index].revents & libc::POLLIN != 0 {
             let mut byte = [0_u8; 64];
@@ -926,14 +937,14 @@ fn poll_loop(
                 unsafe { libc::read(wake_read.as_raw_fd(), byte.as_mut_ptr().cast(), byte.len()) };
         }
         if STOPPING.load(Ordering::SeqCst) {
-            break;
+            break Ok(());
         }
         if owner_index.is_some_and(|index| descriptors[index].revents != 0) {
             let mut byte = [0_u8; 1];
             let read =
                 unsafe { libc::read(owner_fd.expect("index exists"), byte.as_mut_ptr().cast(), 1) };
             if read <= 0 {
-                break;
+                break Ok(());
             }
         }
         if descriptors[0].revents & libc::POLLIN == 0 {
@@ -952,14 +963,15 @@ fn poll_loop(
                 }
                 let ordering = Arc::clone(&ordering);
                 let direct_terminal = direct_terminal.clone();
+                let focus = Arc::clone(&focus);
                 handlers.push(thread::spawn(move || {
-                    handle_connection(stream, owner_fd, ordering, direct_terminal.as_ref())
+                    handle_connection(stream, owner_fd, ordering, direct_terminal.as_ref(), focus)
                 }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
+            Err(error) => break Err(error),
         }
-    }
+    };
     ordering.stop();
     // No new requests are accepted after owner death, but an admitted request
     // owns transactional state that must reach its bounded success/abort path.
@@ -968,7 +980,13 @@ fn poll_loop(
     for handler in handlers {
         let _ = handler.join();
     }
-    Ok(())
+    // Focus updates have their own lock so heartbeats never queue navigation.
+    // Drain first: an in-flight claim must be recorded before its final release.
+    focus
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .release();
+    result
 }
 
 fn reap_finished(handlers: &mut Vec<thread::JoinHandle<()>>) {
@@ -988,6 +1006,7 @@ fn handle_connection(
     owner_fd: Option<RawFd>,
     ordering: Arc<OrderGate>,
     direct_terminal: Option<&DirectTerminal>,
+    focus: Arc<Mutex<crate::focus::RelayFocus>>,
 ) {
     // BSD-derived kernels may propagate O_NONBLOCK from the listener to an
     // accepted socket. Linux does not, which hid this portability bug until a
@@ -1012,11 +1031,13 @@ fn handle_connection(
         return;
     }
 
-    let response = if request.get("op").and_then(Value::as_str) == Some("focus") {
-        if ordering.stopped() {
+    let response = if request.get("op").and_then(Value::as_str) == Some(protocol::operation::FOCUS)
+    {
+        let mut focus = focus.lock().unwrap_or_else(|error| error.into_inner());
+        if ordering.stopped() || owner_fd.is_some_and(owner_closed) {
             return;
         }
-        dispatch_with_terminal(&request, direct_terminal)
+        dispatch_with_terminal(&request, direct_terminal, Some(&mut focus))
     } else {
         let Some(ticket) = ordering.enter() else {
             return;
@@ -1030,7 +1051,7 @@ fn handle_connection(
             ordering.leave(ticket);
             return;
         }
-        let response = dispatch_with_terminal(&request, direct_terminal);
+        let response = dispatch_with_terminal(&request, direct_terminal, None);
         ordering.leave(ticket);
         response
     };

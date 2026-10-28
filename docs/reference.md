@@ -358,8 +358,15 @@ so a chain of any depth converges without a root coordinator or topology
 configuration. The hooks also reconcile the active pane when a client gains or
 loses terminal focus, preventing an unfocused nested tmux from retaining its
 own active background. Separate clients attached to the same inner session
-publish to their own parent panes independently. A killed publisher, broken
-SSH session, or missed detach event fails closed when its lease expires.
+publish to their own parent panes independently. Each SSH relay remembers its
+latest accepted focus generation and releases it before returning control to
+the shell, including when a remote detach message cannot arrive before the
+transport closes. Cleanup cannot clear a newer connection's generation.
+
+The default publisher interval is one second, with a 3.5-second lease to allow
+for scheduling and relay delays between renewals. The lease is a crash fallback:
+a killed publisher or relay, unreachable parent, or missed detach event still
+fails closed when the last renewal expires.
 
 `watch`, `stop`, and `sync` identify their client either by name
 (`--client-name`) or by exact PID and tty (`--client-pid` with
