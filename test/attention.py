@@ -13,7 +13,77 @@ import time
 
 def run(*args: str, **kwargs) -> subprocess.CompletedProcess[str]:
     """Keep every diagnostic command bounded, including failed setup."""
-    return subprocess.run(args, capture_output=True, text=True, timeout=8, **kwargs)
+    return subprocess.run(args, capture_output=True, text=True, timeout=8, check=False, **kwargs)
+
+
+def diagnose_client(pid: str, inner: str, outer: str, env: dict[str, str]) -> None:
+    """Report only fixture identity fields when Linux and macOS admission differ."""
+    diagnostic: dict[str, object] = {"platform": sys.platform, "client_pid": pid}
+    probes = {
+        "clients": [
+            "tmux",
+            "-S",
+            inner,
+            "list-clients",
+            "-F",
+            "#{client_pid}|#{client_created}|#{client_control_mode}|#{client_tty}|#{client_name}",
+        ],
+        "process": ["ps", "-p", pid, "-o", "pid=", "-o", "pgid=", "-o", "tpgid=", "-o", "tty="],
+        "parent": [
+            "tmux",
+            "-S",
+            outer,
+            "display-message",
+            "-p",
+            "-t",
+            "%0",
+            "#{pane_id}|#{pane_tty}|#{pane_pid}",
+        ],
+    }
+    for name, arguments in probes.items():
+        try:
+            result = subprocess.run(
+                arguments, env=env, capture_output=True, text=True, timeout=2, check=False
+            )
+            diagnostic[name] = {
+                "status": result.returncode,
+                "out": result.stdout[:4096],
+                "err": result.stderr[:4096],
+            }
+        except (OSError, subprocess.TimeoutExpired) as error:
+            diagnostic[name] = {"error": type(error).__name__}
+    proc = pathlib.Path("/proc") / pid
+    try:
+        diagnostic["fd0"] = os.readlink(proc / "fd/0")
+    except OSError as error:
+        diagnostic["fd0"] = {"error": type(error).__name__}
+    try:
+        fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+        diagnostic["proc"] = {
+            "state": fields[0],
+            "pgrp": fields[2],
+            "tty_nr": fields[4],
+            "tpgid": fields[5],
+        }
+    except (OSError, IndexError, ValueError) as error:
+        diagnostic["proc"] = {"error": type(error).__name__}
+    try:
+        # Only the two routing fields leave this helper. Never print an entire
+        # environment: a hosted runner can inherit unrelated credentials.
+        with (proc / "environ").open("rb") as stream:
+            entries = stream.read(1024 * 1024).split(b"\0")
+        diagnostic["inherited"] = {
+            key.decode(): value.decode(errors="replace")
+            for entry in entries
+            if b"=" in entry
+            for key, value in [entry.split(b"=", 1)]
+            if key in (b"TMUX", b"TMUX_PANE")
+        }
+    except OSError as error:
+        diagnostic["inherited"] = {"error": type(error).__name__}
+    print(
+        "attention admission diagnostic: " + json.dumps(diagnostic, sort_keys=True), file=sys.stderr
+    )
 
 
 def main() -> None:
@@ -79,6 +149,8 @@ def main() -> None:
                 "1",
             ]
             sent = run(*args, env=env)
+            if sent.returncode != 0:
+                diagnose_client(pid, inner, outer, env)
             assert sent.returncode == 0, (sent.returncode, sent.stderr)
             state = tmux(
                 outer, "show-option", "-pqv", "-t", "%0", "@termnav_child_attention"
