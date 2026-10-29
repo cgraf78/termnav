@@ -61,6 +61,56 @@ pub(crate) fn owner(pid: u32, tty: &str) -> bool {
     if !process::tty_matches(pid, tty) {
         return false;
     }
+    foreground_owner(pid, tty)
+}
+
+/// Read the controlling device only when the kernel reports foreground ownership.
+///
+/// Linux permits spaces and parentheses inside comm; only the last closing
+/// parenthesis separates it from the fixed-position numeric fields.
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+fn foreground_device(stat: &str, pid: u32) -> Option<u32> {
+    let (identity, fields) = stat.rsplit_once(')')?;
+    let (actual, _) = identity.split_once(" (")?;
+    if actual.parse::<u32>().ok()? != pid {
+        return None;
+    }
+    let fields = fields.split_whitespace().take(6).collect::<Vec<_>>();
+    if fields.len() != 6 {
+        return None;
+    }
+    let group = fields[2].parse::<i32>().ok()?;
+    let foreground = fields[5].parse::<i32>().ok()?;
+    let device = fields[4].parse::<i32>().ok()?;
+    (group > 0 && group == foreground && device != 0)
+        .then_some(u32::from_ne_bytes(device.to_ne_bytes()))
+}
+
+/// Use procfs on minimal Linux installations without requiring procps or GNU ps.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn foreground_owner(pid: u32, tty: &str) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let Some(device) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| foreground_device(&stat, pid))
+    else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(tty) else {
+        return false;
+    };
+    // tty_nr uses Linux's encoded 32-bit dev_t layout, while stat.rdev uses
+    // libc's dev_t. Compare the decoded device pair rather than raw integers.
+    metadata.file_type().is_char_device()
+        && i64::from((device >> 8) & 0xfff) == i64::from(libc::major(metadata.rdev()))
+        && i64::from((device & 0xff) | ((device >> 12) & 0xfff00))
+            == i64::from(libc::minor(metadata.rdev()))
+}
+
+/// macOS exposes controlling foreground ownership through the system ps.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn foreground_owner(pid: u32, _tty: &str) -> bool {
     let mut command = Command::new("ps");
     command.args(["-p", &pid.to_string(), "-o", "pgid=", "-o", "tpgid="]);
     let Some(output) = process::output_timeout(&mut command, Duration::from_secs(2))
@@ -237,7 +287,7 @@ pub fn command(args: &[String], stderr: &mut dyn Write) -> std::io::Result<i32> 
 
 #[cfg(test)]
 mod tests {
-    use super::State;
+    use super::{State, foreground_device};
     use serde_json::json;
 
     #[test]
@@ -261,6 +311,36 @@ mod tests {
             json!({"working":0,"pending":"1","failed":0}),
         ] {
             assert!(State::parse(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn proc_foreground_proof_handles_parentheses_in_process_names() {
+        assert_eq!(
+            foreground_device("42 (name ) (with spaces)) S 1 42 42 34816 42 0", 42),
+            Some(34816)
+        );
+        assert_eq!(
+            foreground_device("42 (name) S 1 42 42 -2147483648 42", 42),
+            Some(2147483648)
+        );
+    }
+
+    #[test]
+    fn proc_foreground_proof_rejects_missing_or_unowned_terminals() {
+        for stat in [
+            "43 (name) S 1 42 42 34816 42",
+            "42 (name) S 1 42 42 34816 43",
+            "42 (name) S 1 42 42 0 42",
+            "42 (name) S 1 0 42 34816 0",
+            "42 (name) S 1 -1 42 34816 -1",
+            "42 (name) S 1 42 42 34816 -1",
+            "42 (name) S 1 42 42 4294967296 42",
+            "42 (name) S 1 42 42 34816",
+            "42 name S 1 42 42 34816 42",
+            "42 (name) S 1 nope 42 34816 nope",
+        ] {
+            assert_eq!(foreground_device(stat, 42), None, "{stat}");
         }
     }
 }
