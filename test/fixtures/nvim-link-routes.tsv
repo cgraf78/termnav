@@ -9,3 +9,7 @@ local-raw-percent	nvim-open-raw://src/file%20name.lua:9	src/file%20name.lua:9	/r
 lazygit-space	lazygit-edit://src/file%20with%20space.lua:7	src/file with space.lua:7	/repo	terminal	-
 localhost-file	file://localhost/tmp/local.lua:4	/tmp/local.lua:4	/repo	terminal	-
 remote-file	file://remote.example/home/alex/.bashrc:1	/home/alex/.bashrc:1	/repo	remote	remote.example
+local-literal-colon	file://localhost/tmp/report:2026	/tmp/report:2026	/repo	terminal	-
+local-encoded-colon	file://localhost/tmp/report%3A2026	/tmp/report:2026	/repo	terminal	-
+local-diagnostic-colon	nvim-remote://localhost/tmp/report:2026:12:3	/tmp/report:2026:12:3	/repo	terminal	-
+remote-diagnostic-colon	nvim-remote://remote.example/tmp/report:2026:12:3	/tmp/report:2026:12:3	/repo	remote	remote.example

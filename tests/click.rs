@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use termnav::click::{Input, Target, resolve};
+use termnav::nvim::open::LinkKind;
 
 mod common;
 
@@ -32,6 +33,11 @@ fn shared_link_route_fixture_matches_the_native_resolver() {
                 ..Input::default()
             }),
             Some(Target::File {
+                kind: if fields[1].starts_with("file://") {
+                    LinkKind::File
+                } else {
+                    LinkKind::Location
+                },
                 target: fields[2].to_owned(),
                 source: fields[4].to_owned(),
                 context: context.to_owned(),

@@ -7,6 +7,7 @@ const HELP: &str = r#"usage:
   termnav nvim open cli FILE [CWD]
   termnav nvim open link [TARGET [CWD [SOURCE [CONTEXT [ROUTE-KIND [ROUTE-SCOPE [PANE]]]]]]]
   termnav nvim open tmux-link [TARGET [CWD [SOURCE [CONTEXT [ROUTE-KIND [ROUTE-SCOPE [PANE]]]]]]]
+  termnav nvim open file|tmux-file [FILE [CWD [SOURCE [CONTEXT [ROUTE-KIND [ROUTE-SCOPE [PANE]]]]]]]
   termnav nvim ssh-open HOST TARGET
 "#;
 
@@ -38,12 +39,17 @@ pub fn run(
         "ssh-open" => usage(stderr, "ssh-open requires HOST and TARGET"),
         "open" => {
             let Some(mode) = arguments.get(1).map(String::as_str) else {
-                return usage(stderr, "open requires cli, link, or tmux-link mode");
+                return usage(
+                    stderr,
+                    "open requires cli, link, tmux-link, file, or tmux-file mode",
+                );
             };
             let mode = match mode {
                 "cli" => crate::nvim::open::Mode::Cli,
                 "link" => crate::nvim::open::Mode::Link,
                 "tmux-link" => crate::nvim::open::Mode::TmuxLink,
+                "file" => crate::nvim::open::Mode::File,
+                "tmux-file" => crate::nvim::open::Mode::TmuxFile,
                 _ => return usage(stderr, &format!("unknown open mode: {mode}")),
             };
             if mode == crate::nvim::open::Mode::Cli && arguments.len() - 2 > 2 {

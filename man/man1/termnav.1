@@ -39,7 +39,7 @@ termnav \- route terminal navigation, focus, links, and editor opens
 .I FILE
 .RI [ CWD ]
 .br
-.B termnav nvim open link|tmux-link
+.B termnav nvim open link|tmux-link|file|tmux-file
 .RI [ TARGET " [" CWD " [" SOURCE " [" CONTEXT " [" ROUTE-KIND " [" ROUTE-SCOPE " [" PANE "]]]]]]]" ]
 .br
 .B termnav nvim ssh-open
@@ -180,7 +180,18 @@ with the URL; when nothing opens it, the clicking client shows a message.
 X and Y are zero-based window cell coordinates. TOP and LEFT identify the
 clicked pane's offsets; SOCKET identifies its exact tmux server. File parsing
 uses Unicode grapheme cell widths, preserves genuine a/ and b/ directories,
-and retains colons before a numeric line/column suffix.
+and retains colons before a numeric line/column suffix. File URIs carry literal
+filenames: file:///tmp/report:2026 opens the filename report:2026. Diagnostic
+producers must use nvim-open:// or nvim-remote://HOST/PATH:LINE:COLUMN instead
+of appending coordinates to file:// targets. Localhost diagnostic links route
+locally; remote hosts reuse only approved existing transports.
+.TP
+.B nvim open
+The cli mode preserves command-line filenames. The link and tmux-link modes
+parse trailing :LINE[:COLUMN] coordinates; file and tmux-file preserve literal
+filenames from file URIs. The tmux variants display routing failure in tmux.
+Literal remote filenames use explicit :1:0 coordinates over the existing
+location API, so older remote helpers preserve numeric filename suffixes.
 .TP
 .B open-url
 Accepts exactly one
