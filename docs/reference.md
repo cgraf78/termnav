@@ -382,10 +382,11 @@ must be a subset of pending attention. Work and attention remain independent,
 so an unfinished activity does not hide a failure elsewhere in the session.
 
 The client identity and foreground terminal ownership must still match when
-publishing. Exit status 0 means the parent accepted the snapshot; 3 means no
-parent route exists and the caller may publish to its independently validated
-client tty. Status 1 is a routing or identity error and must not trigger a
-fallback to another terminal. Invalid arguments return 2. No new SSH connection
+publishing. Exit status 0 means the parent accepted the snapshot or Termnav
+published it to the exact direct terminal. Status 1 is a routing, terminal, or
+identity error; invalid arguments return 2. Legacy versions return 3 for a
+direct terminal; callers must treat it as unsupported and require an updated
+Termnav, never implement their own tty-write fallback. No new SSH connection
 is opened. The accompanying tmux-tools `term-pane-state` publisher supplies
 these identities and aggregates each layer's local and child counts.
 
@@ -396,6 +397,17 @@ arrive out of order, the next publication reconciles them, and disconnected
 publishers expire. Consumers must expire terminal state by local receipt time
 rather than comparing clocks across machines. The protocol does not acknowledge
 user attention or alter the underlying activity lifecycle.
+
+Direct attention writes, including the SSH relay's terminal edge, use a fresh
+nonblocking descriptor with matching character-device, inode, and device
+identity. Client and foreground ownership are checked again after opening.
+Backpressure is limited to 100 milliseconds; a partial frame fails without
+replay. Inherited descriptors and navigation commit writes are unchanged.
+Attention frames begin with CAN at each immediate parser boundary (outside
+and inside a tmux passthrough frame) so a later snapshot cancels an earlier
+incomplete escape. This is terminal output parsing recovery, not terminal
+input or user acknowledgment. Platforms that deny reopening the captured
+terminal decline attention publication rather than use an unbounded write.
 
 ## Nested tmux leaf focus
 
