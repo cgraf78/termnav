@@ -68,6 +68,21 @@ mod attention_foreground_tests {
 
     struct OwnedChild(Child);
 
+    struct ResumeOutput(File);
+
+    impl ResumeOutput {
+        fn resume(&self) {
+            // The owned file pins this private tty across cleanup and panic.
+            let _ = unsafe { libc::tcflow(self.0.as_raw_fd(), libc::TCOON) };
+        }
+    }
+
+    impl Drop for ResumeOutput {
+        fn drop(&mut self) {
+            self.resume();
+        }
+    }
+
     impl Drop for OwnedChild {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -109,6 +124,14 @@ mod attention_foreground_tests {
             assert!(!name.is_null());
             (master, CStr::from_ptr(name).to_str().unwrap().to_owned())
         };
+        use std::os::unix::fs::OpenOptionsExt;
+        let resume = ResumeOutput(
+            File::options()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+                .open(&tty)
+                .unwrap(),
+        );
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -152,6 +175,9 @@ mod attention_foreground_tests {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 outcome => {
+                    // Also resume if the blocked probe is killed before its
+                    // own RAII guard can run, so the owned reader can drain.
+                    resume.resume();
                     // Darwin can keep a killed tty writer exiting until its
                     // queued output is drained. Never wait for that writer
                     // while also withholding the only reader of this PTY.
@@ -212,9 +238,19 @@ mod attention_foreground_tests {
                 .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
                 .open(&tty)
                 .unwrap();
+            let resume = ResumeOutput(fill.try_clone().unwrap());
+            assert_eq!(unsafe { libc::tcflow(fill.as_raw_fd(), libc::TCOOFF) }, 0);
+            // Linux can reject a 4096-byte write while a small frame still
+            // fits, and its downstream queue can transfer without a reader.
+            // Suspend transmission and fill down to a one-byte EAGAIN proof.
             let deadline = Instant::now() + Duration::from_secs(1);
+            let mut size = 4096;
             loop {
-                match fill.write(&[b'x'; 4096]) {
+                assert!(Instant::now() < deadline, "private PTY did not fill");
+                match fill.write(&[b'x'; 4096][..size]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && size > 1 => {
+                        size = 1;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                     Ok(count) if count > 0 && Instant::now() < deadline => {}
                     outcome => panic!("private PTY did not reach backpressure: {outcome:?}"),
@@ -228,6 +264,7 @@ mod attention_foreground_tests {
             );
             assert!(crate::attention::owner(std::process::id(), &tty));
             assert!(!terminal.emit_attention("{}"), "full terminal must decline");
+            drop(resume);
             fs::write(std::path::Path::new(&root).join("complete"), b"returned").unwrap();
             return;
         }

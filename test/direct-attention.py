@@ -120,7 +120,11 @@ def scenario(term: str, malformed_parent: bool = False) -> None:
                 assert sent.returncode == 1, (
                     "malformed inherited parent must not become a direct tty route"
                 )
-                assert not drain(), "malformed parent emitted terminal output"
+                # The tmux client may still deliver its initial screen redraw.
+                # Only the native attention frame is forbidden by admission.
+                assert b"1337;SetUserVar=TERM_PANE_STATE=" not in drain(), (
+                    "malformed parent emitted an attention frame"
+                )
                 print("PASS malformed inherited parent fails closed")
                 return
             assert sent.returncode == 0, (term, sent.returncode, sent.stderr)
@@ -150,23 +154,36 @@ def scenario(term: str, malformed_parent: bool = False) -> None:
             args[args.index("--client-created") + 1] = str(int(created) + 1)
             stale = subprocess.run(args, env=env, capture_output=True, timeout=3, check=False)
             assert stale.returncode == 1
-            assert not drain(), "stale client emitted terminal output"
+            assert b"1337;SetUserVar=TERM_PANE_STATE=" not in drain(), (
+                "stale client emitted an attention frame"
+            )
             args[args.index("--client-created") + 1] = created
             writer = os.open(tty, os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY)
             try:
+                termios.tcflow(slave, termios.TCOOFF)
+                # Linux may reject a large write while still accepting a
+                # frame-sized write, or transfer queued output asynchronously.
+                # Stop transmission and prove even one byte cannot be queued.
                 deadline = time.monotonic() + 2
+                size = 4096
                 while True:
-                    try:
-                        os.write(writer, b"x" * 4096)
-                    except BlockingIOError:
-                        break
                     assert time.monotonic() < deadline, "private terminal did not fill"
+                    try:
+                        os.write(writer, b"x" * size)
+                    except BlockingIOError:
+                        if size > 1:
+                            size = 1
+                            continue
+                        break
                 before = fcntl.fcntl(slave, fcntl.F_GETFL)
                 blocked = subprocess.run(args, env=env, capture_output=True, timeout=3, check=False)
                 assert blocked.returncode == 1, (term, blocked.returncode, blocked.stderr)
                 assert fcntl.fcntl(slave, fcntl.F_GETFL) == before, "shared tty flags changed"
             finally:
-                os.close(writer)
+                try:
+                    termios.tcflow(slave, termios.TCOON)
+                finally:
+                    os.close(writer)
             print(
                 "PASS native direct framing, stale identity, and bounded PTY backpressure: " + term
             )
