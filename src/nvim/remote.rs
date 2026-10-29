@@ -158,6 +158,7 @@ fn mux_only_options(control_path: &str) -> Vec<OsString> {
 
 fn valid_host(host: &str) -> bool {
     !host.is_empty()
+        && !host.starts_with('-')
         && !host.starts_with('.')
         && !host.contains("..")
         && host
@@ -193,6 +194,7 @@ mod tests {
     fn host_validation_rejects_option_and_path_injection() {
         assert!(valid_host("dev1.example"));
         assert!(!valid_host("-oProxyCommand=bad"));
+        assert!(!valid_host("-V"));
         assert!(!valid_host("../host"));
     }
 }

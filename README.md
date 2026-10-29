@@ -190,7 +190,7 @@ request at the current boundary; append the example's
 | `termnav open-url URL` | Ask WezTerm to open an `http`, `https`, or `mailto` URL on the machine it runs on |
 | `termnav nvim open MODE ...` | Open a target in the narrowest eligible existing Neovim |
 | `termnav vscode focus ...` | Publish Neovim focus to the VS Code adapter |
-| `termnav eza ...` | Run eza with remote-aware OSC-8 file links |
+| `termnav eza ...` | Run eza with remote-aware OSC-8 file links compatible with stable WezTerm |
 | `termnav asset-path RELATIVE_PATH` | Print the installed path of a Lua, shell, or example asset |
 | `termnav version` | Print the timestamp/commit build identity |
 
@@ -199,6 +199,19 @@ and `3` a request declined at the current boundary. Command-specific codes,
 protocols, environment variables, and integration contracts are in
 [`docs/reference.md`](docs/reference.md); complete syntax is in
 `man termnav`.
+
+File-link routing preserves genuine `a/` and `b/` directories and colons in
+filenames. WezTerm regex rules should build replacements with
+`routes.raw_link_uri("$1")` so literal percent escapes are not decoded as URI
+syntax. Encoded `nvim-open://`, `file://`, and `lazygit-edit://` links retain
+their existing contract. Eza links encode literal semicolons for stable
+WezTerm, without changing the displayed filename.
+
+The WezTerm adapter acknowledges file-open failures asynchronously and shows a
+concise notification. Remote opens reuse only allowlisted existing SSH masters
+(`TERMNAV_SSH_CONTROL_HOSTS`) or an explicitly configured
+`TERMNAV_REMOTE_OPEN_HELPER` with exact client scope and pane identity. It never
+starts another authenticated connection or guesses among same-host panes.
 
 ## Dependencies
 

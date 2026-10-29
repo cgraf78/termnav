@@ -29,6 +29,9 @@ termnav \- route terminal navigation, focus, links, and editor opens
 .B termnav tmux focus
 .I claim|release|expire|watch|stop|sync options
 .br
+.B termnav tmux attention
+.I options
+.br
 .B termnav tmux follow-click
 .RI [ --stdin | " FIELD ..." ]
 .br
@@ -140,6 +143,22 @@ so the example falls back to the exact identity there.
 Watch also accepts lease and interval options. Command-group help prints the
 exact option names.
 .TP
+.B tmux attention
+Requires
+.B --tmux-socket SOCKET --client-name NAME --client-pid PID --client-created EPOCH
+and
+.BR "--working N --pending N --failed N" .
+Counts are nonnegative and bounded at 100000; failed cannot exceed pending.
+The exact client identity and foreground tty ownership are verified. Status 0
+means the parent accepted the snapshot; status 3 means no parent exists, so a
+caller may publish directly to its independently validated client tty. Status 1
+is an error and must not fall back to another terminal; invalid arguments
+return 2. Existing local tmux ancestry and SSH relays are reused.
+Child contributions expire after 15 seconds on the receiving host. Direct
+terminals receive the TERM_PANE_STATE OSC user variable. Snapshots are advisory:
+overlapping deliveries may briefly arrive out of order before reconciliation.
+Terminal consumers must expire them using local receipt time.
+.TP
 .B tmux follow-click
 Accepts at most eleven positional fields in this order: HYPERLINK, WORD, LINE,
 X, CWD, TTY, PANE, Y, TOP, LEFT, SOCKET. With
@@ -151,6 +170,10 @@ starting from the client named by TTY; a control-mode or VS Code (xterm.js)
 client declines. A declined or failed request runs
 .B $BROWSER
 with the URL; when nothing opens it, the clicking client shows a message.
+X and Y are zero-based window cell coordinates. TOP and LEFT identify the
+clicked pane's offsets; SOCKET identifies its exact tmux server. File parsing
+uses Unicode grapheme cell widths, preserves genuine a/ and b/ directories,
+and retains colons before a numeric line/column suffix.
 .TP
 .B open-url
 Accepts exactly one

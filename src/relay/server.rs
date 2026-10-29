@@ -57,6 +57,158 @@ pub struct DirectTerminal {
     output: Arc<File>,
 }
 
+#[cfg(test)]
+mod attention_foreground_tests {
+    use std::ffi::CStr;
+    use std::fs::{self, File};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    struct OwnedChild(Child);
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn rejects_a_background_process_that_retains_the_terminal() {
+        // A child test process owns a private controlling tty. Its background
+        // child keeps the same tty but a different foreground group, precisely
+        // the condition created by suspending an SSH supervisor with Ctrl-Z.
+        let root = std::env::temp_dir().join(format!(
+            "termnav-attention-{}-{}",
+            std::process::id(),
+            crate::relay::client::new_nonce()
+        ));
+        fs::create_dir(&root).expect("private fixture directory");
+        // SAFETY: plain libc pty allocation, with every result checked and its
+        // descriptor immediately transferred to an owned handle.
+        let (master, tty) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(fd >= 0);
+            let master = OwnedFd::from_raw_fd(fd);
+            assert_eq!(libc::grantpt(master.as_raw_fd()), 0);
+            assert_eq!(libc::unlockpt(master.as_raw_fd()), 0);
+            let name = libc::ptsname(master.as_raw_fd());
+            assert!(!name.is_null());
+            (master, CStr::from_ptr(name).to_str().unwrap().to_owned())
+        };
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "relay::server::attention_foreground_tests::probe",
+                "--nocapture",
+            ])
+            .env("TERMNAV_ATTENTION_TEST_ROOT", &root)
+            .env("TERMNAV_ATTENTION_TEST_TTY", &tty)
+            .stdin(File::open(&tty).unwrap());
+        // SAFETY: only async-signal-safe libc calls run between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1
+                    || libc::tcsetpgrp(0, libc::getpgrp()) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // output_timeout sets a process group before exec, which would make
+        // setsid fail here. Own this session-leader fixture directly instead.
+        let mut probe = command.spawn().expect("run private tty probe");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let status = loop {
+            match probe.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                outcome => {
+                    let _ = probe.kill();
+                    let _ = probe.wait();
+                    panic!("private tty probe did not finish: {outcome:?}");
+                }
+            }
+        };
+        drop(master);
+        fs::remove_dir_all(&root).expect("remove private fixture");
+        assert!(status.success(), "{status:?}");
+    }
+
+    #[test]
+    #[ignore = "owned background process for the foreground admission test"]
+    fn background_probe() {
+        use std::io::Read;
+
+        // The parent-held pipe bounds this child's life even if the supervisor
+        // is killed at its deadline, rather than leaving a detached sleep.
+        let fd = std::env::var("TERMNAV_ATTENTION_LIFETIME_FD")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        // SAFETY: this fixture's parent passes one dedicated pipe descriptor
+        // across exec. It has no other owner in this child process.
+        let mut lifetime = unsafe { File::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        lifetime.read_to_end(&mut bytes).unwrap();
+    }
+
+    #[test]
+    fn probe() {
+        let Ok(root) = std::env::var("TERMNAV_ATTENTION_TEST_ROOT") else {
+            return;
+        };
+        let tty = std::env::var("TERMNAV_ATTENTION_TEST_TTY").unwrap();
+        let (reader, _writer) = crate::process::pipe(false).unwrap();
+        let lifetime_fd = reader.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "relay::server::attention_foreground_tests::background_probe",
+            ])
+            .env("TERMNAV_ATTENTION_LIFETIME_FD", lifetime_fd.to_string())
+            .process_group(0);
+        // Keep stdin on the actual tty: Linux ownership checks inspect fd 0.
+        // A separate lifetime pipe prevents an orphan if the supervisor dies.
+        // SAFETY: fcntl is async-signal-safe and touches only this owned pipe.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(lifetime_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(reader);
+        let child = OwnedChild(child);
+        assert!(crate::process::tty_matches(child.0.id(), &tty));
+        let record = std::path::Path::new(&root).join("record");
+        let terminal = super::DirectTerminal::captured(
+            child.0.id(),
+            tty,
+            "xterm-256color".to_owned(),
+            File::create(&record).unwrap(),
+        );
+        let emitted = terminal.emit_attention("{}");
+        drop(child);
+        assert!(
+            !emitted,
+            "background owner must not publish into a reused terminal"
+        );
+        assert_eq!(fs::metadata(record).unwrap().len(), 0);
+    }
+}
+
 impl DirectTerminal {
     /// Build an identity captured before the SSH supervisor starts threads.
     #[must_use]
@@ -76,6 +228,21 @@ impl DirectTerminal {
         // terminal identity capture and the commit barrier.
         let mut output = self.output.as_ref();
         output.write_all(COMMIT_QUERY).is_ok()
+    }
+
+    /// Emit only while this SSH supervisor still owns the foreground terminal.
+    pub(crate) fn emit_attention(&self, payload: &str) -> bool {
+        if !crate::attention::owner(self.pid, &self.tty) {
+            return false;
+        }
+        let mut output = self.output.as_ref();
+        output
+            .write_all(&terminal::user_var(
+                crate::attention::USER_VAR,
+                payload,
+                terminal::tmux_mode(&self.termtype),
+            ))
+            .is_ok()
     }
 }
 
@@ -211,6 +378,7 @@ fn dispatch_with_terminal(
             Some(focus) => focus.handle(request),
             None => crate::focus::handle_relay(request),
         },
+        Some(operation::ATTENTION) => crate::attention::relay(request, direct_terminal),
         _ => reply(result::ERROR),
     }
 }

@@ -43,6 +43,118 @@ fn shared_link_route_fixture_matches_the_native_resolver() {
 }
 
 #[test]
+fn moving_output_between_captures_never_falls_back_to_another_file() {
+    let root = temporary_root();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create capture test tools");
+    let _cleanup = Cleanup(root.clone());
+    let log = root.join("opened");
+    script(
+        &bin.join("tmux"),
+        r#"
+case "$1" in
+  capture-pane)
+    case " $* " in
+      *" -J "*) printf '/tmp/clicked.rs\n';;
+      *)
+        if test -e "$CAPTURE_COUNT"; then printf '/tmp/changed.rs\n'
+        else touch "$CAPTURE_COUNT"; printf '/tmp/clicked.rs\n'; fi;;
+    esac;;
+  list-panes) printf '%%99\tnvim\n';;
+  send-keys) printf '%s\n' "$*" >>"$OPEN_LOG";;
+  *) exit 1;;
+esac
+"#,
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_termnav"))
+        .args([
+            "tmux",
+            "follow-click",
+            "",
+            "/tmp/fallback.rs",
+            "/tmp/clicked.rs",
+            "5",
+            "/repo",
+            "",
+            "%1",
+            "0",
+            "0",
+            "0",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("TMUX", "/tmp/termnav-capture-fixture.sock,1,0")
+        .env("CAPTURE_COUNT", root.join("reads"))
+        .env("OPEN_LOG", &log)
+        .output()
+        .expect("run changing capture");
+    assert!(result.status.success(), "{:?}", result.stderr);
+    assert!(!log.exists(), "a changed snapshot opened a file");
+}
+
+fn hung_editor_tmux(phase: &str) {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    let root = temporary_root();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let _cleanup = Cleanup(root.clone());
+    script(
+        &bin.join("tmux"),
+        r#"
+case "$1" in
+ list-panes)
+  if test "$HANG_PHASE" = output; then exec sleep 30; fi
+  printf '%%99\tnvim\n';;
+ send-keys) exec sleep 30;;
+ *) exit 1;;
+esac
+"#,
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_termnav"))
+        .args(["nvim", "open", "link", "/tmp/test.rs", "/repo", "terminal"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("TMUX", "/tmp/termnav-editor-fixture.sock,1,0")
+        .env("TMUX_PANE", "%1")
+        .env("HANG_PHASE", phase)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(status) => {
+                assert_eq!(status.code(), Some(1));
+                break;
+            }
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                // Only this invocation created the group, and try_wait proved
+                // its leader still alive; kill descendants before reaping it.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("native opener did not bound its tmux {phase} request");
+            }
+        }
+    }
+}
+
+#[test]
+fn hung_tmux_query_does_not_leave_the_editor_opener_running() {
+    hung_editor_tmux("output");
+}
+
+#[test]
+fn hung_tmux_status_does_not_leave_the_editor_opener_running() {
+    hung_editor_tmux("status");
+}
+
+#[test]
 fn browser_targets_are_returned_to_the_exact_click_client() {
     let root = temporary_root();
     let bin = root.join("bin");

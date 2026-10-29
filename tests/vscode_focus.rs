@@ -50,7 +50,9 @@ fn direct_focus_update_posts_authenticated_ancestry_to_the_window_socket() {
         }
     }
     let _cleanup = Cleanup(root.clone());
-    let socket = root.join("window.sock");
+    let socket_root = common::socket_root();
+    let _socket_cleanup = Cleanup(socket_root.clone());
+    let socket = socket_root.join("window.sock");
     let listener = UnixListener::bind(&socket).expect("bind window socket");
     let server = thread::spawn(move || receive(listener));
 
@@ -103,8 +105,10 @@ fn tmux_claim_targets_only_the_focused_client_showing_the_editor_pane() {
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755))
         .expect("make fake tmux executable");
 
-    let socket_a = root.join("a.sock");
-    let socket_b = root.join("b.sock");
+    let socket_root = common::socket_root();
+    let _socket_cleanup = Cleanup(socket_root.clone());
+    let socket_a = socket_root.join("a.sock");
+    let socket_b = socket_root.join("b.sock");
     let listener_a = UnixListener::bind(&socket_a).expect("bind first window");
     let listener_b = UnixListener::bind(&socket_b).expect("bind second window");
     listener_b
@@ -112,14 +116,12 @@ fn tmux_claim_targets_only_the_focused_client_showing_the_editor_pane() {
         .expect("make second listener nonblocking");
     let token_a = "a".repeat(64);
     let token_b = "b".repeat(64);
-    let child_a = Command::new("sleep")
-        .arg("30")
+    let child_a = common::environment_fixture()
         .env("TERMNAV_VSCODE_SOCKET", &socket_a)
         .env("TERMNAV_VSCODE_TOKEN", &token_a)
         .spawn()
         .expect("start first client");
-    let child_b = Command::new("sleep")
-        .arg("30")
+    let child_b = common::environment_fixture()
         .env("TERMNAV_VSCODE_SOCKET", &socket_b)
         .env("TERMNAV_VSCODE_TOKEN", &token_b)
         .spawn()

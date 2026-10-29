@@ -46,7 +46,7 @@ pub struct Claim {
     pub start_expirer: bool,
 }
 
-enum Parent {
+pub(crate) enum Parent {
     Tmux { socket: String, pane: String },
     Relay(String),
 }
@@ -722,7 +722,7 @@ fn clear_exact_locked(socket: &str, pane: &str, value: &str) -> bool {
     succeeded
 }
 
-fn parent_for_client(client_pid: u32, own_socket: &str) -> Option<Parent> {
+pub(crate) fn parent_for_client(client_pid: u32, own_socket: &str) -> Option<Parent> {
     let tmux = process::environment(client_pid, "TMUX").unwrap_or_default();
     let pane = process::environment(client_pid, "TMUX_PANE").unwrap_or_default();
     if valid_pane(&pane) {

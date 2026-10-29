@@ -8,6 +8,7 @@ pub(crate) mod operation {
     pub(crate) const ABORT_PATH: &str = "abort-path";
     pub(crate) const COMMIT_PATH: &str = "commit-path";
     pub(crate) const FOCUS: &str = "focus";
+    pub(crate) const ATTENTION: &str = "attention";
 }
 
 pub(crate) mod result {
