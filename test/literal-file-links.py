@@ -8,11 +8,15 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from socket import gethostname
 
 
 def main() -> None:
     """Keep every editor, socket and persistence channel invocation-owned."""
     binary = str(Path(sys.argv[1]).resolve())
+    # Minimal Linux images need not ship the hostname command. The native
+    # router uses the system hostname too; keep this fixture dependency-free.
+    hostname = gethostname().split(".", 1)[0]
     repo = Path(__file__).resolve().parent.parent
     nvim = os.environ.get("TERMNAV_TEST_NVIM_BINARY") or str(
         Path.home() / ".local/share/neovim/neovim/bin/nvim"
@@ -134,7 +138,7 @@ assert(routes.open_uri(nil, pane, request.uri) == false, 'URI was not handled')
                             socket=socket,
                             cwd=str(root),
                             uri=uri,
-                            hostname=run(["hostname", "-s"]),
+                            hostname=hostname,
                         )
                     )
                     env["LINK_DRIVER"] = str(driver)
@@ -193,7 +197,6 @@ assert(routes.open_uri(nil, pane, request.uri) == false, 'URI was not handled')
                 opened(literal.as_uri(), router, literal)
                 opened(f"nvim-open://{literal}:12:3", router, literal, 12, 3)
                 opened(f"nvim-remote://localhost{literal}:12:3", router, literal, 12, 3)
-                hostname = run(["hostname", "-s"])
                 opened(f"nvim-remote://{hostname}{literal}:12:3", router, literal, 12, 3)
                 # The file URI keeps its literal suffix even after disappearance.
                 opened((root / "missing:2026").as_uri(), router, root / "missing:2026")
