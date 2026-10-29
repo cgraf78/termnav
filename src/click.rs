@@ -19,6 +19,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::browser;
 use crate::links::percent_decode;
+use crate::nvim::open::LinkKind;
 
 /// Raw fields supplied by the tmux mouse binding.
 #[derive(Clone, Debug, Default)]
@@ -63,6 +64,8 @@ pub enum Target {
     File {
         /// Path with optional line and column suffix.
         target: String,
+        /// Literal filename or diagnostic location semantics.
+        kind: LinkKind,
         /// `terminal` or `remote`.
         source: String,
         /// Remote host when `source` is `remote`.
@@ -82,6 +85,7 @@ pub fn follow(input: &Input) -> io::Result<()> {
         }
         Target::File {
             target,
+            kind,
             source,
             context,
         } => {
@@ -101,7 +105,7 @@ pub fn follow(input: &Input) -> io::Result<()> {
             // tmux run-shell prints a failed command verbatim. TmuxLink owns
             // user-visible failure translation, so the mouse hook itself must
             // always complete successfully after dispatch.
-            let _ = crate::nvim::open::open(crate::nvim::open::Mode::TmuxLink, &arguments);
+            let _ = crate::nvim::open::open(kind.tmux_mode(), &arguments);
             Ok(())
         }
     }
@@ -167,30 +171,38 @@ fn from_hyperlink(uri: &str) -> Option<Target> {
     }
     if let Some(value) = uri.strip_prefix("nvim-remote://") {
         let (host, path) = value.split_once('/')?;
-        return Some(remote_or_local_file(
+        return Some(file_target(
             host,
             percent_decode(&format!("/{path}")),
+            LinkKind::Location,
         ));
     }
     if let Some(value) = uri.strip_prefix("file://") {
         if value.starts_with('/') {
-            return Some(local_file(percent_decode(value)));
+            return Some(file_target("", percent_decode(value), LinkKind::File));
         }
         let (host, path) = value.split_once('/')?;
-        return Some(remote_or_local_file(
+        return Some(file_target(
             host,
             percent_decode(&format!("/{path}")),
+            LinkKind::File,
         ));
     }
     None
 }
 
-fn remote_or_local_file(host: &str, target: String) -> Target {
+fn file_target(host: &str, target: String, kind: LinkKind) -> Target {
     if local_file_host(host) {
-        local_file(target)
+        Target::File {
+            target,
+            kind,
+            source: "terminal".to_owned(),
+            context: String::new(),
+        }
     } else {
         Target::File {
             target,
+            kind,
             source: "remote".to_owned(),
             context: host.to_owned(),
         }
@@ -200,6 +212,7 @@ fn remote_or_local_file(host: &str, target: String) -> Target {
 fn local_file(target: String) -> Target {
     Target::File {
         target,
+        kind: LinkKind::Location,
         source: "terminal".to_owned(),
         context: String::new(),
     }
@@ -543,6 +556,19 @@ fn local_file_host(host: &str) -> bool {
     if matches!(host.as_str(), "" | "localhost" | "127.0.0.1" | "::1") {
         return true;
     }
+    // Minimal distributions may omit hostname(1). The kernel name is enough
+    // to recognize this machine, including its short spelling, without turning
+    // a local diagnostic into an unavailable remote-editor request.
+    if let Some(name) = system_hostname()
+        && (name.eq_ignore_ascii_case(&host)
+            || name
+                .split_once('.')
+                .is_some_and(|(short, _)| short.eq_ignore_ascii_case(&host)))
+    {
+        return true;
+    }
+    // Keep administrator/DNS-resolved aliases and published SSH identities:
+    // these can differ from the kernel's name and remain compatibility routes.
     let names = [hostname("-s"), hostname("-f")];
     if names
         .iter()
@@ -567,6 +593,20 @@ fn local_file_host(host: &str) -> bool {
         })
     });
     published.is_some_and(|value| value.eq_ignore_ascii_case(&host))
+}
+
+/// Read the OS name without depending on an optional userland executable.
+fn system_hostname() -> Option<String> {
+    // Linux, macOS, and Android bound the hostname below 256 bytes. Reject a
+    // truncated or unterminated result rather than guessing another machine's
+    // identity; the established command/published-name fallbacks remain below.
+    let mut bytes = [0_u8; 256];
+    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return None;
+    }
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    let name = std::str::from_utf8(&bytes[..end]).ok()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn hostname(flag: &str) -> Option<String> {
@@ -889,6 +929,7 @@ regex!(
 #[cfg(test)]
 mod tests {
     use super::{Input, Target, browser_commands, click_row, from_joined_capture, resolve};
+    use crate::nvim::open::LinkKind;
 
     fn input(hyperlink: &str, word: &str, line: &str, x: usize) -> Input {
         Input {
@@ -906,6 +947,7 @@ mod tests {
         assert_eq!(
             resolve(&input("file://remote.example/tmp/a%20b:4", "", "", 0)),
             Some(Target::File {
+                kind: LinkKind::File,
                 target: "/tmp/a b:4".to_owned(),
                 source: "remote".to_owned(),
                 context: "remote.example".to_owned()
@@ -914,6 +956,7 @@ mod tests {
         assert_eq!(
             resolve(&input("nvim-open://src/main.rs:4", "", "", 0)),
             Some(Target::File {
+                kind: LinkKind::Location,
                 target: "src/main.rs:4".to_owned(),
                 source: "terminal".to_owned(),
                 context: String::new()
@@ -964,6 +1007,7 @@ mod tests {
                 20
             )),
             Some(Target::File {
+                kind: LinkKind::Location,
                 target: "./project dir/file.rs:12".to_owned(),
                 source: "terminal".to_owned(),
                 context: String::new()
@@ -972,6 +1016,7 @@ mod tests {
         assert_eq!(
             resolve(&input("", "sley", "\tmodified:   src/tool/README.md", 20)),
             Some(Target::File {
+                kind: LinkKind::Location,
                 target: "src/tool/README.md".to_owned(),
                 source: "terminal".to_owned(),
                 context: String::new()
@@ -1000,6 +1045,7 @@ mod tests {
                 22
             )),
             Some(Target::File {
+                kind: LinkKind::Location,
                 target: "src/main.rs:17".to_owned(),
                 source: "terminal".to_owned(),
                 context: String::new(),
@@ -1103,6 +1149,7 @@ mod tests {
         assert_eq!(
             from_joined_capture(&physical, &joined, 1, 4),
             Some(Target::File {
+                kind: LinkKind::Location,
                 target: "/very/long/path/file.cpp:123:45".to_owned(),
                 source: "terminal".to_owned(),
                 context: String::new(),

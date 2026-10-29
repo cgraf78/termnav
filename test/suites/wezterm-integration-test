@@ -60,6 +60,13 @@ _nvim_test_pane_key() {
   printf '\n'
 }
 
+echo "=== literal file URI routing ==="
+if python3 "$TERMNAV_TEST_DIR/literal-file-links.py" "$termnav"; then
+  _pass "file URIs preserve filenames through WezTerm and tmux"
+else
+  _fail "literal file URI routing"
+fi
+
 echo "=== unified executable entry points ==="
 
 mock_bin=$(_tmpdir)/mock-bin
@@ -1104,7 +1111,7 @@ for _, row in ipairs(fixture_rows(fixture_path)) do
   end
   local handled = routes.open_uri(nil, pane(vars, pane_cwd), uri)
   check("shared route handled: " .. name, handled == false)
-  check("shared route mode: " .. name, last_mode() == "link")
+  check("shared route mode: " .. name, last_mode() == (uri:match("^file://") and "file" or "link"))
   check("shared route target: " .. name, last_target() == target)
   check("shared route cwd: " .. name, last_cwd() == expected_cwd)
   check("shared route source: " .. name, last_source() == source)
@@ -1270,7 +1277,7 @@ handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }, {
 }), "file://remote.example/home/alex/.bashrc:1")
 check("local pane remote file URI handled", handled == false)
 check("local pane remote file URI does not send raw prefix", #sent_text == 0)
-check("local pane remote file URI uses helper", last_mode() == "link" and last_source() == "remote" and last_context() == "remote.example")
+check("local pane remote file URI uses helper", last_mode() == "file" and last_source() == "remote" and last_context() == "remote.example")
 
 calls = {}
 sent_text = {}
@@ -1342,7 +1349,7 @@ check("lazygit link is decoded before helper call", last_target() == "src/file w
 calls = {}
 handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }), "file://localhost/tmp/local.lua:4")
 check("localhost file link handled locally", handled == false)
-check("localhost file link uses link mode", last_mode() == "link")
+check("localhost file link preserves literal filename mode", last_mode() == "file")
 check("localhost file link opens decoded path", last_target() == "/tmp/local.lua:4")
 
 calls = {}
@@ -1353,7 +1360,7 @@ check("hostless remote-pane file link does not call helper", #calls == 0)
 calls = {}
 handled = routes.open_uri(nil, pane({}, { host = "", file_path = "/local" }), "file://remote.example/home/alex/.bashrc:1")
 check("remote file URI handled", handled == false)
-check("remote file URI uses link mode", last_mode() == "link")
+check("remote file URI preserves literal filename mode", last_mode() == "file")
 check("remote file URI keeps absolute path", last_target() == "/home/alex/.bashrc:1")
 check("remote file URI passes host", last_context() == "remote.example")
 

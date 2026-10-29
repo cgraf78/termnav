@@ -24,6 +24,36 @@ pub enum Mode {
     Link,
     /// Translate routing failure into a concise tmux-visible message.
     TmuxLink,
+    /// Open a literal filename supplied by a file URI, without location syntax.
+    File,
+    /// Open a literal file URI target and report routing failure through tmux.
+    TmuxFile,
+}
+
+/// Whether a hyperlink carries a literal filename or diagnostic coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkKind {
+    /// Parse the conventional trailing `:line[:column]` diagnostic syntax.
+    Location,
+    /// Preserve every filename byte, including numeric colon suffixes.
+    File,
+}
+
+impl LinkKind {
+    /// Select the corresponding opener mode for a tmux-originated click.
+    #[must_use]
+    pub fn tmux_mode(self) -> Mode {
+        match self {
+            Self::Location => Mode::TmuxLink,
+            Self::File => Mode::TmuxFile,
+        }
+    }
+}
+
+/// Keep the producer's filename semantics attached until the routing boundary.
+struct Link<'a> {
+    text: &'a str,
+    kind: LinkKind,
 }
 
 /// Parsed editor target and cursor coordinates.
@@ -51,7 +81,7 @@ pub fn open(mode: Mode, arguments: &[String]) -> io::Result<i32> {
                 1
             })
         }
-        Mode::Link | Mode::TmuxLink => {
+        Mode::Link | Mode::TmuxLink | Mode::File | Mode::TmuxFile => {
             let input = arguments.first().map(String::as_str).unwrap_or_default();
             let cwd = arguments.get(1).map(String::as_str).unwrap_or_default();
             let source = arguments.get(2).map(String::as_str).unwrap_or("terminal");
@@ -59,8 +89,21 @@ pub fn open(mode: Mode, arguments: &[String]) -> io::Result<i32> {
             let route_kind = arguments.get(4).map(String::as_str).unwrap_or_default();
             let route_scope = arguments.get(5).map(String::as_str).unwrap_or_default();
             let pane = arguments.get(6).map(String::as_str).unwrap_or_default();
-            let result = open_link(input, cwd, source, context, route_kind, route_scope, pane);
-            if mode == Mode::Link || result == 0 {
+            let kind = if matches!(mode, Mode::File | Mode::TmuxFile) {
+                LinkKind::File
+            } else {
+                LinkKind::Location
+            };
+            let result = open_link(
+                Link { text: input, kind },
+                cwd,
+                source,
+                context,
+                route_kind,
+                route_scope,
+                pane,
+            );
+            if matches!(mode, Mode::Link | Mode::File) || result == 0 {
                 return Ok(result);
             }
             let message = if input.is_empty() {
@@ -238,7 +281,7 @@ fn expand_home(file: &str, home: Option<&OsStr>) -> String {
 }
 
 fn open_link(
-    input: &str,
+    link: Link<'_>,
     cwd: &str,
     source: &str,
     context: &str,
@@ -246,10 +289,14 @@ fn open_link(
     route_scope: &str,
     pane: &str,
 ) -> i32 {
+    let Link { text: input, kind } = link;
     if input.is_empty() {
         return 0;
     }
-    let target = Target::link(input);
+    let target = match kind {
+        LinkKind::Location => Target::link(input),
+        LinkKind::File => Target::cli(input),
+    };
     if source != "remote" {
         if source == "nvim" && open_socket(Path::new(context), &target, cwd, source) {
             return 0;
@@ -267,15 +314,30 @@ fn open_link(
         return 1;
     }
 
+    // Remote hosts and configured transport helpers may still run an older
+    // Termnav. Their existing location API can carry a literal filename safely
+    // when both coordinates are supplied explicitly; parsing those two fields
+    // cannot consume a colon belonging to the filename. Expand home aliases
+    // only on the destination, as the legacy remote path already does.
+    let remote_target = match kind {
+        LinkKind::File => format!("{input}:1:0"),
+        LinkKind::Location => input.to_owned(),
+    };
     if !context.is_empty() {
-        match crate::nvim::remote::ssh_open(context, input) {
+        match crate::nvim::remote::ssh_open(context, &remote_target) {
             Ok(0) => return 0,
             Ok(10 | 12 | 13) => {}
             Ok(code) => return code,
             Err(_) => return 1,
         }
     }
-    match crate::nvim::remote::configured_open(route_kind, route_scope, pane, context, input) {
+    match crate::nvim::remote::configured_open(
+        route_kind,
+        route_scope,
+        pane,
+        context,
+        &remote_target,
+    ) {
         Ok(0) => 0,
         Ok(_) | Err(_) => 1,
     }

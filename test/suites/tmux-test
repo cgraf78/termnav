@@ -141,8 +141,10 @@ file://remote.example/home/alex/.zshrc
 /tmp/termnav-test.sock
 EOF
 _assert_exit "native opener: configured remote route succeeds" 0 "$?"
+# File URIs keep filename provenance; old transport helpers receive explicit
+# coordinates so numeric colon suffixes cannot become location syntax.
 _assert_eq "native opener: configured route receives host target and exact clicked pane" \
-  $'<tmux>\n</tmp/termnav-test.sock>\n<%9>\n<remote.example>\n</home/alex/.zshrc>' \
+  $'<tmux>\n</tmp/termnav-test.sock>\n<%9>\n<remote.example>\n</home/alex/.zshrc:1:0>' \
   "$(cat "$remote_helper_log")"
 _assert_not_contains "native opener: configured route never scans or types into another pane" \
   'list-panes' "$(cat "$log")"

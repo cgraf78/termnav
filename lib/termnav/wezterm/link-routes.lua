@@ -358,12 +358,12 @@ function M.new(wezterm, options)
     return remote_open_scope
   end
 
-  function routes.open_in_nvim(window, pane, path_info)
+  function routes.open_in_nvim(window, pane, path_info, mode)
     routes.run_nvim_helper(window, {
       routes.helper_command("termnav"),
       "nvim",
       "open",
-      "link",
+      mode or "link",
       path_info,
       routes.pane_link_cwd(pane),
       routes.is_nvim(pane) and "nvim" or "terminal",
@@ -371,7 +371,7 @@ function M.new(wezterm, options)
     }, "local_unavailable", pane)
   end
 
-  function routes.open_remote_in_nvim(window, pane, remote_host, path_info)
+  function routes.open_remote_in_nvim(window, pane, remote_host, path_info, mode)
     -- The native opener first reuses an authenticated ControlMaster and then,
     -- if configured, asks one explicit transport helper to act on this exact
     -- pane. A raw terminal byte stream cannot acknowledge tmux command mode, so
@@ -380,7 +380,7 @@ function M.new(wezterm, options)
       routes.helper_command("termnav"),
       "nvim",
       "open",
-      "link",
+      mode or "link",
       path_info,
       "",
       "remote",
@@ -420,20 +420,29 @@ function M.new(wezterm, options)
     local remote_host
     remote_host, path_info = routes.remote_uri(uri)
     if path_info then
-      routes.open_remote_in_nvim(window, pane, remote_host, path_info)
+      -- Ripgrep diagnostic links carry the same host vocabulary locally and
+      -- over SSH. A localhost diagnostic must not enter the remote opener.
+      if routes.local_file_host(remote_host) then
+        routes.open_in_nvim(window, pane, path_info)
+      else
+        routes.open_remote_in_nvim(window, pane, remote_host, path_info)
+      end
       return false
     end
 
     remote_host, path_info = routes.remote_file_uri(uri)
     if path_info then
-      routes.open_remote_in_nvim(window, pane, remote_host, path_info)
+      routes.open_remote_in_nvim(window, pane, remote_host, path_info, "file")
       return false
     end
 
     path_info = routes.file_uri_path(uri)
     if path_info then
       if routes.pane_cwd_is_local(pane) then
-        routes.open_in_nvim(window, pane, path_info)
+        -- file: identifies a filename, never diagnostic :line:column syntax.
+        -- Keep that provenance after decoding so a literal report:2026 cannot
+        -- silently open its neighbor report, even when both files exist.
+        routes.open_in_nvim(window, pane, path_info, "file")
         return false
       end
       return true

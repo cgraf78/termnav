@@ -253,8 +253,31 @@ Termnav translates to pane cells once and resolves Unicode grapheme widths.
 
 For WezTerm regex captures, build the replacement with
 `routes.raw_link_uri("$1")`. These are raw filenames, so a literal `%20` is
-preserved. Existing `nvim-open://`, `lazygit-edit://`, and `file://` callers
-continue to supply percent-encoded URI targets. Generic links preserve genuine
+preserved. `nvim-open://`, `nvim-remote://HOST/PATH`, `lazygit-edit://`, and
+`file://` callers supply percent-encoded URI targets. `file://` denotes a
+literal filename: `file:///tmp/report:2026` opens `/tmp/report:2026`, never
+`/tmp/report` at line 2026. Both raw and encoded colon bytes are filename data.
+Diagnostic links retain `:LINE[:COLUMN]` syntax through the other schemes;
+`nvim-remote://localhost/tmp/report:2026:12:3` opens the local filename
+`/tmp/report:2026` at line 12, column 3. Localhost and this machine's hostname
+route locally in both WezTerm and tmux.
+
+**Producer migration:** diagnostic producers previously emitting
+`file://HOST/PATH:LINE:COLUMN` must switch to
+`nvim-remote://HOST/PATH:LINE:COLUMN`, including ripgrep's
+`--hyperlink-format=nvim-remote://{host}{path}:{line}:{column}`. This corrects
+an ambiguous historical contract; suffix-bearing file URIs are now literal.
+Deploy the matching native binary and WezTerm Lua module before switching
+diagnostic producers. `nvim open file` and `nvim open tmux-file` expose the
+literal-filename routing mode; `link` and `tmux-link` retain location parsing.
+The tmux variants display routing failures instead of returning them to the
+mouse binding. A new Lua module paired with an older local native binary fails
+visibly rather than guessing the filename. Remote SSH and configured helpers
+keep the existing `link` API: literal targets append explicit `:1:0`
+coordinates before transport, preserving the full filename on older peers.
+No additional authenticated transport is opened for compatibility.
+
+Generic links preserve genuine
 `a/` and `b/` directories; Git diff prefix interpretation belongs to the producer
 that knows it is emitting a diff, not to the generic editor opener.
 

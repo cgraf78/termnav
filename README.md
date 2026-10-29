@@ -203,8 +203,9 @@ protocols, environment variables, and integration contracts are in
 File-link routing preserves genuine `a/` and `b/` directories and colons in
 filenames. WezTerm regex rules should build replacements with
 `routes.raw_link_uri("$1")` so literal percent escapes are not decoded as URI
-syntax. Encoded `nvim-open://`, `file://`, and `lazygit-edit://` links retain
-their existing contract. Eza links encode literal semicolons for stable
+syntax. `file://` links denote literal filenames, including trailing `:2026`;
+diagnostic links use `nvim-open://`, `nvim-remote://HOST/PATH:LINE:COLUMN`, or
+`lazygit-edit://`. Eza links encode literal semicolons for stable
 WezTerm, without changing the displayed filename.
 
 The WezTerm adapter acknowledges file-open failures asynchronously and shows a
