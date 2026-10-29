@@ -556,6 +556,19 @@ fn local_file_host(host: &str) -> bool {
     if matches!(host.as_str(), "" | "localhost" | "127.0.0.1" | "::1") {
         return true;
     }
+    // Minimal distributions may omit hostname(1). The kernel name is enough
+    // to recognize this machine, including its short spelling, without turning
+    // a local diagnostic into an unavailable remote-editor request.
+    if let Some(name) = system_hostname()
+        && (name.eq_ignore_ascii_case(&host)
+            || name
+                .split_once('.')
+                .is_some_and(|(short, _)| short.eq_ignore_ascii_case(&host)))
+    {
+        return true;
+    }
+    // Keep administrator/DNS-resolved aliases and published SSH identities:
+    // these can differ from the kernel's name and remain compatibility routes.
     let names = [hostname("-s"), hostname("-f")];
     if names
         .iter()
@@ -580,6 +593,20 @@ fn local_file_host(host: &str) -> bool {
         })
     });
     published.is_some_and(|value| value.eq_ignore_ascii_case(&host))
+}
+
+/// Read the OS name without depending on an optional userland executable.
+fn system_hostname() -> Option<String> {
+    // Linux, macOS, and Android bound the hostname below 256 bytes. Reject a
+    // truncated or unterminated result rather than guessing another machine's
+    // identity; the established command/published-name fallbacks remain below.
+    let mut bytes = [0_u8; 256];
+    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return None;
+    }
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    let name = std::str::from_utf8(&bytes[..end]).ok()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 fn hostname(flag: &str) -> Option<String> {

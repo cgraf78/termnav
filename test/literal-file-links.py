@@ -201,6 +201,42 @@ assert(routes.open_uri(nil, pane, request.uri) == false, 'URI was not handled')
                 # The file URI keeps its literal suffix even after disappearance.
                 opened((root / "missing:2026").as_uri(), router, root / "missing:2026")
 
+            # Minimal distributions need not install hostname(1). Keep only the
+            # actual opener/editor in PATH so system-name routing cannot pass
+            # accidentally through a command supplied by the developer's host.
+            (bin_dir / "nvim").symlink_to(nvim)
+            original_path = env["PATH"]
+            env["PATH"] = str(bin_dir)
+            assert shutil.which("hostname", path=env["PATH"]) is None
+            for name in dict.fromkeys((gethostname(), hostname)):
+                for router in ("wezterm", "tmux"):
+                    opened(f"nvim-remote://{name}{literal}:12:3", router, literal, 12, 3)
+            env["PATH"] = original_path
+
+            # The OS fast path must retain administrator-resolved and explicitly
+            # published host aliases, which need not match the kernel's name.
+            hostname_command = bin_dir / "hostname"
+            hostname_command.write_text("""#!/bin/sh
+test "$1" = -f || exit 1
+printf '%s\\n' termnav-resolved-name.invalid
+""")
+            hostname_command.chmod(0o700)
+            env["PATH"] = str(bin_dir) + os.pathsep + original_path
+            opened(
+                f"nvim-remote://termnav-resolved-name.invalid{literal}:12:3", "tmux", literal, 12, 3
+            )
+            hostname_command.unlink()
+            env["TERMNAV_REMOTE_LINK_HOST"] = "termnav-published-name.invalid"
+            opened(
+                f"nvim-remote://termnav-published-name.invalid{literal}:12:3",
+                "tmux",
+                literal,
+                12,
+                3,
+            )
+            env.pop("TERMNAV_REMOTE_LINK_HOST")
+            env["PATH"] = original_path
+
             # An approved-master fixture executes the actual remote shell
             # request locally. This exercises the older location-only remote API
             # without opening a network connection or requiring a second editor.
