@@ -14,8 +14,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use regex::Regex;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::browser;
+use crate::links::percent_decode;
 
 /// Raw fields supplied by the tmux mouse binding.
 #[derive(Clone, Debug, Default)]
@@ -42,6 +45,13 @@ pub struct Input {
     pub pane_top: Option<usize>,
     /// Pane left offset within the window.
     pub pane_left: Option<usize>,
+}
+
+impl Input {
+    /// Translate tmux's window cell coordinate to the clicked pane once.
+    fn pane_x(&self) -> Option<usize> {
+        self.x?.checked_sub(self.pane_left.unwrap_or(0))
+    }
 }
 
 /// Destination selected from click metadata.
@@ -105,17 +115,21 @@ pub fn resolve(input: &Input) -> Option<Target> {
     {
         return Some(target);
     }
-    if !input.pane.is_empty()
-        && let Some(target) = from_capture(input)
-    {
-        return Some(target);
+    if !input.pane.is_empty() {
+        match from_capture(input) {
+            Capture::Target(target) => return Some(target),
+            // Once snapshots disagree, text/word fallbacks can refer to a
+            // different file or a wrapped suffix. Decline the entire gesture.
+            Capture::Changed => return None,
+            Capture::Missing => {}
+        }
     }
     let quoted_line = input
         .line
         .bytes()
         .any(|byte| matches!(byte, b'\'' | b'"' | b'`'));
     if quoted_line
-        && let Some(x) = input.x
+        && let Some(x) = input.pane_x()
         && let Some(target) = from_line(&input.line, x)
     {
         return Some(target);
@@ -125,13 +139,18 @@ pub fn resolve(input: &Input) -> Option<Target> {
     {
         return Some(target);
     }
-    if !quoted_line && let Some(x) = input.x {
+    if !quoted_line && let Some(x) = input.pane_x() {
         return from_line(&input.line, x);
     }
     None
 }
 
 fn from_hyperlink(uri: &str) -> Option<Target> {
+    // Regex captures are raw filenames, unlike percent-encoded OSC-8 targets.
+    // Keep their provenance explicit so a literal "%20" remains a filename.
+    if let Some(value) = uri.strip_prefix("nvim-open-raw://") {
+        return Some(local_file(value.to_owned()));
+    }
     if url_like(uri) {
         return Some(Target::Url(uri.to_owned()));
     }
@@ -201,6 +220,7 @@ fn from_token(original: &str) -> Option<Target> {
 }
 
 fn from_line(line: &str, x: usize) -> Option<Target> {
+    let x = cell_index(line, x)?;
     if let Some(target) = spaced_rfc(line, x) {
         return Some(Target::Url(target));
     }
@@ -213,6 +233,24 @@ fn from_line(line: &str, x: usize) -> Option<Target> {
             return Some(target);
         }
         return from_embedded_token(token, x - start);
+    }
+    None
+}
+
+/// Map a terminal cell to a Unicode scalar index used by token ranges.
+///
+/// Grapheme widths keep emoji/combining sequences together. Counting bytes or
+/// Unicode scalars here moves the click onto a neighboring filename.
+fn cell_index(line: &str, x: usize) -> Option<usize> {
+    let mut cells = 0;
+    let mut characters = 0;
+    for grapheme in line.graphemes(true) {
+        let width = grapheme.width();
+        if x < cells + width {
+            return Some(characters);
+        }
+        cells += width;
+        characters += grapheme.chars().count();
     }
     None
 }
@@ -274,23 +312,37 @@ fn slice_chars(value: &str, start: usize, end: usize) -> &str {
     &value[byte_start..byte_end]
 }
 
-fn from_capture(input: &Input) -> Option<Target> {
-    let x = input.x?;
-    let physical = capture(&input.pane, false)?;
-    let joined = capture(&input.pane, true)?;
-    let row = click_row(&physical, input.y, &input.line, input.pane_top)?;
-    let mut candidates = vec![x];
-    if let Some(left) = input.pane_left
-        && x >= left
-    {
-        candidates.push(x - left);
-        if x > left {
-            candidates.push(x - left - 1);
-        }
+/// Capture availability and instability are distinct fallback decisions.
+enum Capture {
+    Missing,
+    Changed,
+    Target(Target),
+}
+
+/// Reconstruct wrapping only while the physical snapshot remains unchanged.
+fn from_capture(input: &Input) -> Capture {
+    let Some(x) = input.pane_x() else {
+        return Capture::Missing;
+    };
+    let Some(physical) = capture(&input.pane, false) else {
+        return Capture::Missing;
+    };
+    let Some(joined) = capture(&input.pane, true) else {
+        return Capture::Missing;
+    };
+    // tmux does not expose both representations atomically. A second physical
+    // capture detects streaming/scrolling between them; opening the wrong file
+    // is worse than asking the user to click again after output settles.
+    let Some(after) = capture(&input.pane, false) else {
+        return Capture::Changed;
+    };
+    if physical != after {
+        return Capture::Changed;
     }
-    candidates
-        .into_iter()
-        .find_map(|candidate| from_joined_capture(&physical, &joined, row, candidate))
+    let Some(row) = click_row(&physical, input.y, &input.line, input.pane_top) else {
+        return Capture::Missing;
+    };
+    from_joined_capture(&physical, &joined, row, x).map_or(Capture::Missing, Capture::Target)
 }
 
 fn capture(pane: &str, joined: bool) -> Option<Vec<String>> {
@@ -299,10 +351,13 @@ fn capture(pane: &str, joined: bool) -> Option<Vec<String>> {
     if joined {
         command.arg("-J");
     }
-    let output = command
-        .args(["-S", "0", "-E", "-", "-t", pane])
-        .output()
-        .ok()?;
+    command.args(["-S", "0", "-E", "-", "-t", pane]);
+    let output = crate::process::output_timeout_limited(
+        &mut command,
+        Duration::from_millis(500),
+        1024 * 1024,
+    )
+    .ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -317,24 +372,12 @@ fn click_row(
     mouse_line: &str,
     pane_top: Option<usize>,
 ) -> Option<usize> {
-    let mut candidates = Vec::new();
-    if let Some(y) = y {
-        candidates.push(y);
-        if y > 0 {
-            candidates.push(y - 1);
-        }
-        if let Some(top) = pane_top
-            && y >= top
-        {
-            candidates.push(y - top);
-            if y > top {
-                candidates.push(y - top - 1);
-            }
-        }
-    }
-    if let Some(candidate) = candidates.iter().copied().find(|index| {
-        *index < physical.len() && (mouse_line.is_empty() || physical[*index] == mouse_line)
-    }) {
+    // tmux supplies zero-based window cells. Trying several offsets can choose
+    // a different occurrence of an identical line in a lower split.
+    if let Some(candidate) = y.and_then(|y| y.checked_sub(pane_top.unwrap_or(0)))
+        && candidate < physical.len()
+        && (mouse_line.is_empty() || physical[candidate] == mouse_line)
+    {
         return Some(candidate);
     }
     if mouse_line.is_empty() {
@@ -365,6 +408,7 @@ fn from_joined_capture(
     let mut physical_index = 0;
     for logical in joined {
         let mut offset = 0;
+        let mut cells = 0;
         let mut matched = false;
         while physical_index < physical.len() {
             let part = &physical[physical_index];
@@ -381,12 +425,13 @@ fn from_joined_capture(
                 break;
             }
             if physical_index == clicked_row {
-                return from_line(logical, click_x + offset).or_else(|| from_line(part, click_x));
+                return from_line(logical, click_x + cells).or_else(|| from_line(part, click_x));
             }
-            offset += part.chars().count();
+            offset += part.len();
+            cells += part.width();
             matched = true;
             physical_index += 1;
-            if offset >= logical.chars().count() {
+            if offset >= logical.len() {
                 break;
             }
         }
@@ -491,34 +536,6 @@ fn trim_token(mut token: &str) -> &str {
     token = token.trim_end_matches('\r');
     token = token.trim_start_matches(['"', '\'', '`', '(', '[', '{', '<']);
     token.trim_end_matches(['"', '\'', '`', ')', ']', '}', '>', '.', ',', ';'])
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
-        {
-            output.push((high << 4) | low);
-            index += 3;
-        } else {
-            output.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-fn hex(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn local_file_host(host: &str) -> bool {
@@ -1009,6 +1026,12 @@ mod tests {
     }
 
     #[test]
+    fn bottom_split_does_not_choose_a_repeated_line_at_window_y() {
+        let physical = screen(&["a", "b", "same", "d", "e", "f", "same"]);
+        assert_eq!(click_row(&physical, Some(6), "same", Some(4)), Some(2));
+    }
+
+    #[test]
     fn a_line_off_the_live_screen_is_not_guessed() {
         // Scrolled copy mode: tmux reports a history line the live screen
         // does not show. This used to panic indexing an empty match list.
@@ -1084,6 +1107,56 @@ mod tests {
                 source: "terminal".to_owned(),
                 context: String::new(),
             })
+        );
+    }
+
+    #[test]
+    fn joined_capture_keeps_utf8_byte_boundaries() {
+        let physical = screen(&["é /very/", "long/file.rs:3"]);
+        let joined = screen(&["é /very/long/file.rs:3"]);
+        assert_eq!(
+            from_joined_capture(&physical, &joined, 1, 2),
+            Some(super::local_file("/very/long/file.rs:3".to_owned()))
+        );
+    }
+
+    #[test]
+    fn line_click_coordinates_are_terminal_cells() {
+        let line = "界界 /tmp/one.rs /tmp/two.rs";
+        assert_eq!(
+            super::from_line(line, 15),
+            Some(super::local_file("/tmp/one.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn line_click_coordinates_preserve_combining_sequences() {
+        let line = "e\u{301}e\u{301} /tmp/one.rs /tmp/two.rs";
+        assert_eq!(
+            super::from_line(line, 15),
+            Some(super::local_file("/tmp/two.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn raw_regex_links_do_not_percent_decode_filenames() {
+        assert_eq!(
+            resolve(&input("nvim-open-raw:///tmp/file%20name.rs", "", "", 0)),
+            Some(super::local_file("/tmp/file%20name.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn right_split_click_uses_only_pane_relative_coordinates() {
+        let input = Input {
+            line: "/tmp/one.rs /tmp/two.rs".to_owned(),
+            x: Some(17),
+            pane_left: Some(12),
+            ..Input::default()
+        };
+        assert_eq!(
+            resolve(&input),
+            Some(super::local_file("/tmp/one.rs".to_owned()))
         );
     }
 }

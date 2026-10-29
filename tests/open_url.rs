@@ -166,8 +166,7 @@ impl ClientProcess {
     fn start(tmux: &str, pane: &str) -> Self {
         // Its identity variables stand for the client's terminal; never let
         // the test runner's own terminal leak in.
-        let child = Command::new("sleep")
-            .arg("30")
+        let child = common::environment_fixture()
             .env_remove("TERM_PROGRAM")
             .env_remove("WEZTERM_PANE")
             .env_remove("STY")

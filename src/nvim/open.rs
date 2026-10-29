@@ -196,10 +196,6 @@ impl Target {
 
     fn link_with_home(input: &str, home: Option<&OsStr>) -> Self {
         let (file, line, column) = split_location(input);
-        let file = file
-            .strip_prefix("a/")
-            .or_else(|| file.strip_prefix("b/"))
-            .unwrap_or(file);
         Self {
             file: expand_home(file, home),
             line,
@@ -209,19 +205,20 @@ impl Target {
 }
 
 fn split_location(input: &str) -> (&str, u64, u64) {
-    let mut parts = input.rsplitn(3, ':');
-    let last = parts.next().unwrap_or_default();
-    let second = parts.next();
-    let third = parts.next();
-    if let (Some(line_text), Some(file)) = (second, third)
-        && let (Ok(line), Ok(column)) = (line_text.parse::<u64>(), last.parse::<u64>())
+    let Some((prefix, last)) = input.rsplit_once(':') else {
+        return (input, 1, 0);
+    };
+    let Ok(number) = last.parse::<u64>() else {
+        return (input, 1, 0);
+    };
+    // Only the suffix is syntax. Colons earlier in a Unix filename or a
+    // Windows drive prefix must survive a one-coordinate location intact.
+    if let Some((file, line)) = prefix.rsplit_once(':')
+        && let Ok(line) = line.parse::<u64>()
     {
-        return (file, line, column);
+        return (file, line, number);
     }
-    if let (Some(file), Ok(line)) = (second, last.parse::<u64>()) {
-        return (file, line, 0);
-    }
-    (input, 1, 0)
+    (prefix, number, 0)
 }
 
 fn expand_home(file: &str, home: Option<&OsStr>) -> String {
@@ -613,7 +610,18 @@ fn tmux_edit_command(target: &Target, cwd: &str) -> String {
     } else {
         format!("{}/{file}", cwd.trim_end_matches('/'), file = target.file)
     };
-    let escaped = file.replace('\\', "\\\\").replace('"', "\\\"");
+    // This compatibility path types into an editor rather than sending RPC.
+    // Encode control bytes as Vim string escapes so a filename cannot submit
+    // an extra command or change modes while the edit expression is typed.
+    let escaped = file
+        .chars()
+        .map(|character| match character {
+            '\\' => "\\\\".to_owned(),
+            '"' => "\\\"".to_owned(),
+            character if character.is_control() => format!("\\u{:04x}", u32::from(character)),
+            character => character.to_string(),
+        })
+        .collect::<String>();
     format!(
         ":exe 'e '.fnameescape(\"{escaped}\")|call cursor({},{})",
         target.line.max(1),
@@ -648,14 +656,20 @@ fn show_message(message: &str) {
 }
 
 fn tmux_output(arguments: &[&str]) -> Option<Output> {
-    let output = tool_command("tmux").args(arguments).output().ok()?;
+    let mut command = tool_command("tmux");
+    command.args(arguments);
+    // A stalled server must release the asynchronous GUI request's per-pane
+    // latch. Bound both time and bytes, and reap the exact helper on failure.
+    let output =
+        crate::process::output_timeout_limited(&mut command, Duration::from_secs(2), 128 * 1024)
+            .ok()?;
     output.status.success().then_some(output)
 }
 
 fn tmux_status(arguments: &[&str]) -> bool {
-    tool_command("tmux")
-        .args(arguments)
-        .status()
+    let mut command = tool_command("tmux");
+    command.args(arguments);
+    crate::process::status_timeout(&mut command, Duration::from_secs(2))
         .is_ok_and(|status| status.success())
 }
 
@@ -791,7 +805,7 @@ mod tests {
     fn link_locations_and_home_references_are_structured() {
         assert_eq!(
             Target::link_with_home(
-                "a/~/src/main.rs:12:4",
+                "~/src/main.rs:12:4",
                 Some(std::ffi::OsStr::new("/home/test")),
             ),
             Target {
@@ -801,6 +815,22 @@ mod tests {
             }
         );
         assert_eq!(Target::link("name:words").line, 1);
+    }
+
+    #[test]
+    fn link_suffix_retains_colons_in_the_filename() {
+        assert_eq!(Target::link("/tmp/foo:bar:12").file, "/tmp/foo:bar");
+    }
+
+    #[test]
+    fn link_suffix_retains_a_windows_drive() {
+        assert_eq!(Target::link("C:/repo/main.rs:12").file, "C:/repo/main.rs");
+    }
+
+    #[test]
+    fn generic_links_preserve_real_a_and_b_directories() {
+        assert_eq!(Target::link("a/real.rs:2").file, "a/real.rs");
+        assert_eq!(Target::link("b/real.rs:2").file, "b/real.rs");
     }
 
     #[test]
@@ -830,5 +860,18 @@ mod tests {
             command,
             r#":exe 'e '.fnameescape("/tmp/project/weird [name]*.md")|call cursor(12,34)"#
         );
+    }
+
+    #[test]
+    fn socketless_tmux_fallback_never_types_control_bytes() {
+        let command = tmux_edit_command(
+            &Target {
+                file: "a\n|quit\r\u{1b}file".to_owned(),
+                line: 1,
+                column: 0,
+            },
+            "/tmp",
+        );
+        assert!(!command.chars().any(char::is_control));
     }
 }

@@ -237,6 +237,33 @@ transport already knows the remote host identity that file links should carry.
 test harnesses that need to exercise TTY-restoration behavior while stdout is
 piped.
 
+The eza adapter percent-encodes literal semicolons only in OSC 8 URI fields,
+locally and remotely. This preserves file links with stable WezTerm's parser;
+Display labels, OSC parameters, and ordinary output are unchanged; encoded
+targets retain their file semantics when their path interpretation is unique.
+Eza's partially encoded percent signs are resolved against existing paths on
+the producing host. The adapter checks every interpretation of at most eight
+percent-encoded characters (256 metadata probes maximum per complete URI).
+Multiple existing interpretations, metadata errors, larger expansions, or a
+URI above 64 KiB disable that explicit link while preserving its displayed
+label. UTF-8 characters are interpreted as whole scalars, never partial bytes.
+Mouse coordinates supplied to `follow-click` are zero-based window cells.
+Supply `TOP` and `LEFT` from the clicked pane and `SOCKET` from `#{socket_path}`;
+Termnav translates to pane cells once and resolves Unicode grapheme widths.
+
+For WezTerm regex captures, build the replacement with
+`routes.raw_link_uri("$1")`. These are raw filenames, so a literal `%20` is
+preserved. Existing `nvim-open://`, `lazygit-edit://`, and `file://` callers
+continue to supply percent-encoded URI targets. Generic links preserve genuine
+`a/` and `b/` directories; Git diff prefix interpretation belongs to the producer
+that knows it is emitting a diff, not to the generic editor opener.
+
+On supported stable WezTerm, file clicks schedule an asynchronous acknowledged
+opener. The GUI stays responsive while the native helper applies its RPC/SSH
+deadlines. A failed request displays an actionable notification without echoing
+untrusted terminal paths or child stderr. Closed panes are not acted on, and
+only one request per pane is in flight at once.
+
 ## WezTerm protocol
 
 The WezTerm protocol consists of `IS_NVIM`, `NVIM_OPEN_SOCKET`,
@@ -344,6 +371,31 @@ writes `TERMNAV_TMUX=true` synchronously to the exact client tty. Direct
 terminal clients receive raw OSC; an immediate tmux parent receives one
 passthrough wrapper, including when it advertises legacy `screen-*` terminfo.
 Control-mode clients are skipped without requiring terminal metadata.
+
+## Attention across terminal layers
+
+`termnav tmux attention` forwards a snapshot from one exact attached client to
+its containing tmux pane or existing SSH relay. It requires `--tmux-socket`,
+`--client-name`, `--client-pid`, `--client-created`, `--working`, `--pending`,
+and `--failed`. Counts are nonnegative integers capped at 100,000; failures
+must be a subset of pending attention. Work and attention remain independent,
+so an unfinished activity does not hide a failure elsewhere in the session.
+
+The client identity and foreground terminal ownership must still match when
+publishing. Exit status 0 means the parent accepted the snapshot; 3 means no
+parent route exists and the caller may publish to its independently validated
+client tty. Status 1 is a routing or identity error and must not trigger a
+fallback to another terminal. Invalid arguments return 2. No new SSH connection
+is opened. The accompanying tmux-tools `term-pane-state` publisher supplies
+these identities and aggregates each layer's local and child counts.
+
+Parent panes receive a 15-second lease in `@termnav_child_attention`, measured
+on the receiving host. A direct terminal receives the `TERM_PANE_STATE` OSC
+user variable. These are advisory snapshots: overlapping deliveries can briefly
+arrive out of order, the next publication reconciles them, and disconnected
+publishers expire. Consumers must expire terminal state by local receipt time
+rather than comparing clocks across machines. The protocol does not acknowledge
+user attention or alter the underlying activity lifecycle.
 
 ## Nested tmux leaf focus
 

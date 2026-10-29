@@ -531,12 +531,41 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "owned child fixture for ps environment tests"]
+    fn ps_environment_fixture() {
+        use std::io::Read;
+
+        // macOS 27 hides environments of protected platform executables such
+        // as /bin/sleep. Use this unsigned same-user executable instead.
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .expect("read fixture lifetime pipe");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ps_fixture() -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("find test executable"));
+        command.args([
+            "--ignored",
+            "--exact",
+            "process::tests::ps_environment_fixture",
+        ]);
+        command.stdin(std::process::Stdio::piped());
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn ps_fallback_reads_a_value_after_a_pipe_sized_environment() {
         // GitHub's macOS workers have a large inherited environment. Exercise
         // the actual fallback command with enough unrelated data to fill a pipe
         // so exact-client relay discovery cannot regress to a timeout there.
-        let mut command = Command::new("sleep");
-        command.arg("5").env("A_TERMNAV_PS_VALUE", "expected");
+        let mut command = ps_fixture();
+        command.env("A_TERMNAV_PS_VALUE", "expected");
         // Linux limits each individual environment string before the aggregate
         // ARG_MAX limit, so use several realistic entries to exceed pipe size.
         for index in 0..12 {
@@ -561,21 +590,14 @@ mod tests {
         // Use `env -i` so the target is provably the final environment field
         // printed by macOS ps. Nested relays commonly add this variable last,
         // and a newline in the parsed value makes the Unix socket unreachable.
-        let mut child = Command::new("/usr/bin/env")
-            .args([
-                "-i",
-                "TERM=xterm-256color",
-                "TERMNAV_PARENT_RELAY=/tmp/termnav-parent.sock",
-                "/bin/sleep",
-                "5",
-            ])
+        let mut child = ps_fixture()
+            .env_clear()
+            .env("TERM", "xterm-256color")
+            .env("TERMNAV_PARENT_RELAY", "/tmp/termnav-parent.sock")
             .spawn()
             .expect("start process with a final relay environment value");
-        // `Command::spawn` returns after fork but does not guarantee that the
-        // child has completed env's exec into sleep. Querying during that
-        // window finds the assignment in env's argv and legitimately includes
-        // `/bin/sleep 5` in the apparent value. Wait for the observable value
-        // produced by the final process instead of guessing at exec timing.
+        // Query the actual observable environment instead of guessing at the
+        // spawn/exec timing of the owned fixture process.
         let deadline = Instant::now() + Duration::from_secs(2);
         let value = loop {
             let value = environment_from_ps(child.id(), "TERMNAV_PARENT_RELAY");

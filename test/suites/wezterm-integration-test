@@ -896,6 +896,12 @@ local function pane(vars, cwd_uri, opts)
     pane_id = function()
       return opts.pane_id or 17
     end,
+    get_dimensions = function()
+      if opts.closed then
+        error("pane closed")
+      end
+      return {}
+    end,
   }
   if opts.foreground then
     p.get_foreground_process_name = function()
@@ -912,6 +918,9 @@ end
 
 local function window()
   return {
+    get_dimensions = function()
+      return {}
+    end,
     toast_notification = function(_, title, message)
       table.insert(toasts, { title = title, message = message })
     end,
@@ -1287,11 +1296,39 @@ calls = {}
 child_calls = {}
 toasts = {}
 errors = {}
+timers = {}
 child_success = false
 handled = routes.open_uri(window(), pane({}, { host = "", file_path = "/local" }), "file://localhost/tmp/missing.lua:4")
 check("local file link failure is handled by custom route", handled == false)
-check("local file link callback stays asynchronous", #child_calls == 0 and calls[1][4] == "link")
+check("local file link callback stays asynchronous", #child_calls == 0 and #calls == 0 and #timers == 1)
 check("local file link callback does not wait to synthesize an error", #toasts == 0 and #errors == 0)
+flush_timers()
+check("failed opener result becomes visible", #toasts == 1 and #child_calls == 1)
+check("failed opener does not expose child stderr", not toasts[1].message:match("mock opener failure"))
+
+child_calls = {}
+toasts = {}
+timers = {}
+handled = routes.open_uri(window(), pane({}, nil, { closed = true }), "file://localhost/tmp/gone.lua")
+flush_timers()
+check("a closed pane is not used by deferred opener", #child_calls == 0 and #toasts == 0)
+
+local open_errors = {}
+local custom_routes = route_module.new(wezterm, {
+  on_open_error = function(error_window, error_pane, reason)
+    table.insert(open_errors, { window = error_window, pane = error_pane, reason = reason })
+  end,
+})
+timers = {}
+child_calls = {}
+toasts = {}
+local error_window = window()
+local error_pane = pane({}, nil)
+custom_routes.open_uri(error_window, error_pane, "file://localhost/tmp/missing.lua")
+flush_timers()
+check("consumer receives structured opener failure", #open_errors == 1 and open_errors[1].reason == "local_unavailable")
+check("consumer failure callback retains exact originating handles", open_errors[1].window == error_window and open_errors[1].pane == error_pane)
+check("consumer failure callback replaces default notification", #toasts == 0)
 
 calls = {}
 child_calls = {}
@@ -1325,7 +1362,7 @@ EOF
 if ! route_lua_output=$(_run_lua "$route_lua_test" \
   "$TERMNAV_ROOT/lib/termnav/wezterm/link-routes.lua" \
   "$TERMNAV_TEST_DIR/fixtures/nvim-link-routes.tsv"); then
-  _fail "wezterm route behavior test requires lua or nvim"
+  _fail "wezterm route behavior failed: $route_lua_output"
   route_lua_output=""
 fi
 _assert_eq "wezterm route module handles local, remote, and lazygit URIs" "ok" "$route_lua_output"

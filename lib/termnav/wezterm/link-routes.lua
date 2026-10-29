@@ -34,6 +34,12 @@ local open_url_schemes = {
   "mailto",
 }
 
+local open_errors = {
+  local_unavailable = "Could not open this file. Start a Neovim session in this context and try again.",
+  remote_unavailable = "Could not open this remote file. Keep an approved SSH master and Neovim session running, or configure an exact-pane remote opener.",
+  request_busy = "A file-open request is already in progress in this pane. Please try again when it finishes.",
+}
+
 function M.new(wezterm, options)
   options = options or {}
   local routes = {}
@@ -46,6 +52,19 @@ function M.new(wezterm, options)
     or os.getenv("TERMNAV_WEZTERM_SCOPE")
     or os.getenv("WEZTERM_UNIX_SOCKET")
     or ""
+  local opening = {}
+
+  function routes.open_error_message(reason)
+    return open_errors[reason] or "Could not open this file."
+  end
+
+  local function report_open_error(window, pane, reason)
+    if type(options.on_open_error) == "function" then
+      options.on_open_error(window, pane, reason)
+    else
+      window:toast_notification("Open file", routes.open_error_message(reason), nil, 6000)
+    end
+  end
 
   -- Return the URL when TERMNAV_OPEN_URL may open it, or nil and a fixed
   -- reason. The rules match `Url::parse` in src/browser.rs: a non-empty target
@@ -90,6 +109,12 @@ function M.new(wezterm, options)
     return (s:gsub("%%(%x%x)", function(hex)
       return string.char(tonumber(hex, 16))
     end))
+  end
+
+  -- Regex replacement captures are filenames, not serialized URIs. A separate
+  -- scheme preserves literal percent escapes without breaking encoded callers.
+  function routes.raw_link_uri(capture)
+    return "nvim-open-raw://" .. capture
   end
 
   function routes.local_file_host(host)
@@ -282,12 +307,43 @@ function M.new(wezterm, options)
     return name
   end
 
-  function routes.run_nvim_helper(_, argv)
-    -- WezTerm invokes open-uri on its GUI event loop. Never wait there for SSH,
-    -- Neovim RPC, or a consumer transport: the native helper owns their hard
-    -- deadlines and cleanup, while this callback only acknowledges successful
-    -- process creation.
-    wezterm.background_child_process(argv)
+  function routes.run_nvim_helper(window, argv, reason, pane)
+    if not window or not wezterm.time or not wezterm.time.call_after then
+      -- Older consumers without an event scheduler retain the nonblocking
+      -- launcher. Supported stable WezTerm always uses the acknowledged path.
+      wezterm.background_child_process(argv)
+      return true
+    end
+
+    local key = routes.pane_id(pane)
+    if opening[key] then
+      report_open_error(window, pane, "request_busy")
+      return false
+    end
+    opening[key] = true
+    local function alive()
+      -- Deferred callbacks outlive panes/windows. Validate both before the
+      -- request and again after awaiting a child, never a cached focus guess.
+      return pcall(function()
+        window:get_dimensions()
+        pane:get_dimensions()
+      end)
+    end
+    wezterm.time.call_after(0, function()
+      if not alive() then
+        opening[key] = nil
+        return
+      end
+      -- In the exact 20240203 stable source this API is create_async_function
+      -- backed by smol::process::Command.output().await. Running it in the
+      -- scheduled event coroutine yields the GUI while native RPC/SSH applies
+      -- its deadlines; background_child_process cannot report failure.
+      local ok, succeeded = pcall(wezterm.run_child_process, argv)
+      opening[key] = nil
+      if (not ok or not succeeded) and alive() then
+        report_open_error(window, pane, reason)
+      end
+    end)
     return true
   end
 
@@ -312,7 +368,7 @@ function M.new(wezterm, options)
       routes.pane_link_cwd(pane),
       routes.is_nvim(pane) and "nvim" or "terminal",
       pane:get_user_vars()[user_vars.open_socket] or "",
-    }, "No nvim session found for file link: " .. path_info)
+    }, "local_unavailable", pane)
   end
 
   function routes.open_remote_in_nvim(window, pane, remote_host, path_info)
@@ -332,13 +388,14 @@ function M.new(wezterm, options)
       "wezterm",
       routes.pane_scope(pane),
       routes.pane_id(pane),
-    }, "No nvim session found for " .. remote_host .. ": " .. path_info)
+    }, "remote_unavailable", pane)
   end
 
   function routes.open_uri(window, pane, uri)
-    local path_info = uri:match("^nvim%-open://(.+)$")
-    if path_info then
-      path_info = routes.uri_decode(path_info)
+    local path_info = uri:match("^nvim%-open%-raw://(.+)$")
+    local encoded_path = uri:match("^nvim%-open://(.+)$")
+    if encoded_path then
+      path_info = routes.uri_decode(encoded_path)
     end
     local lazygit_path_info = uri:match("^lazygit%-edit://(.+)$")
     if lazygit_path_info then
