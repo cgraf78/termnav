@@ -11,6 +11,37 @@ from pathlib import Path
 from socket import gethostname
 
 
+def rpc_state(result: subprocess.CompletedProcess[str]) -> tuple[str, str, int, int]:
+    """Read a typed RPC snapshot across Neovim's old/new output channels."""
+    states = set()
+    # Neovim 0.8 prints --remote-expr through Lua's message API (stderr);
+    # newer versions use stdout. Accept only the complete expected JSON value,
+    # never a substring of human diagnostics or an unsuccessful command.
+    if result.returncode == 0:
+        for channel in (result.stdout, result.stderr):
+            try:
+                value = json.loads(channel)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(value, list)
+                and len(value) == 4
+                and isinstance(value[0], str)
+                and isinstance(value[1], str)
+                and type(value[2]) is int
+                and type(value[3]) is int
+            ):
+                states.add(tuple(value))
+    assert len(states) == 1, (
+        "RPC did not return one unambiguous editor snapshot",
+        result.args,
+        result.returncode,
+        result.stdout,
+        result.stderr,
+    )
+    return states.pop()
+
+
 def main() -> None:
     """Keep every editor, socket and persistence channel invocation-owned."""
     binary = str(Path(sys.argv[1]).resolve())
@@ -46,17 +77,37 @@ def main() -> None:
             + ").open\n"
         )
 
-        def run(argv: list[str]) -> str:
-            """Run one isolated, bounded helper and return its stdout."""
-            return subprocess.run(
+        def execute(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            """Retain both diagnostic channels when an isolated helper fails."""
+            result = subprocess.run(
                 argv,
                 env=env,
                 cwd=root,
                 capture_output=True,
                 text=True,
-                check=True,
                 timeout=10,
-            ).stdout.strip()
+            )
+            assert result.returncode == 0, (argv, result.returncode, result.stdout, result.stderr)
+            return result
+
+        def run(argv: list[str]) -> str:
+            """Run one isolated, bounded helper and return its stdout."""
+            return execute(argv).stdout.strip()
+
+        def state() -> tuple[str, str, int, int]:
+            """Query initialization and editor state using the native RPC API."""
+            return rpc_state(
+                execute(
+                    [
+                        nvim,
+                        "--server",
+                        socket,
+                        "--remote-expr",
+                        "json_encode([luaeval('type(_G.nvim_tmux_open)'), "
+                        "expand('%:p'), line('.'), col('.')])",
+                    ]
+                )
+            )
 
         editor = subprocess.Popen(
             [
@@ -82,6 +133,12 @@ def main() -> None:
             while not Path(socket).exists():
                 assert editor.poll() is None, editor.stderr.read().decode()
                 assert time.monotonic() < deadline, "editor socket timed out"
+                time.sleep(0.01)
+            # A listening socket alone does not prove the setup command ran.
+            # Wait for the actual callable that every native opener will use.
+            while (ready := state())[0] != "function":
+                assert editor.poll() is None, editor.stderr.read().decode()
+                assert time.monotonic() < deadline, ("editor setup timed out", ready)
                 time.sleep(0.01)
             registry = root / "STATE/nvim-tmux-open"
             registry.mkdir(parents=True)
@@ -178,16 +235,8 @@ assert(routes.open_uri(nil, pane, request.uri) == false, 'URI was not handled')
                     )
                 deadline = time.monotonic() + 3
                 while True:
-                    actual = run(
-                        [
-                            nvim,
-                            "--server",
-                            socket,
-                            "--remote-expr",
-                            "json_encode([expand('%:p'), line('.'), col('.')])",
-                        ]
-                    )
-                    if json.loads(actual) == [str(want), line, column]:
+                    actual = state()
+                    if actual == ("function", str(want), line, column):
                         return
                     assert time.monotonic() < deadline, (router, uri, actual)
                     time.sleep(0.01)
@@ -201,13 +250,15 @@ assert(routes.open_uri(nil, pane, request.uri) == false, 'URI was not handled')
                 # The file URI keeps its literal suffix even after disappearance.
                 opened((root / "missing:2026").as_uri(), router, root / "missing:2026")
 
-            # Minimal distributions need not install hostname(1). Keep only the
-            # actual opener/editor in PATH so system-name routing cannot pass
-            # accidentally through a command supplied by the developer's host.
-            (bin_dir / "nvim").symlink_to(nvim)
+            # Model an unavailable hostname command while preserving platform
+            # wrappers' support programs and loader environment (e.g. Termux).
+            # A symlinked nvim wrapper can also misresolve its own installation.
             original_path = env["PATH"]
-            env["PATH"] = str(bin_dir)
-            assert shutil.which("hostname", path=env["PATH"]) is None
+            hostname_command = bin_dir / "hostname"
+            hostname_command.write_text("#!/bin/sh\nexit 127\n")
+            hostname_command.chmod(0o700)
+            env["PATH"] = str(bin_dir) + os.pathsep + original_path
+            assert subprocess.run(["hostname", "-s"], env=env, check=False).returncode == 127
             for name in dict.fromkeys((gethostname(), hostname)):
                 for router in ("wezterm", "tmux"):
                     opened(f"nvim-remote://{name}{literal}:12:3", router, literal, 12, 3)
@@ -215,7 +266,6 @@ assert(routes.open_uri(nil, pane, request.uri) == false, 'URI was not handled')
 
             # The OS fast path must retain administrator-resolved and explicitly
             # published host aliases, which need not match the kernel's name.
-            hostname_command = bin_dir / "hostname"
             hostname_command.write_text("""#!/bin/sh
 test "$1" = -f || exit 1
 printf '%s\\n' termnav-resolved-name.invalid
