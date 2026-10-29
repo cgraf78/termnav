@@ -1,10 +1,81 @@
 //! Terminal escape construction shared by navigation and tmux context hooks.
 
-use std::fs::{File, OpenOptions};
-use std::io;
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+/// Compare the actual opened device, rather than trusting a reusable tty name.
+pub(crate) fn same_terminal(expected: &Metadata, actual: &Metadata) -> bool {
+    expected.file_type().is_char_device()
+        && actual.file_type().is_char_device()
+        && expected.dev() == actual.dev()
+        && expected.ino() == actual.ino()
+        && expected.rdev() == actual.rdev()
+}
+
+/// Publish one advisory frame without changing a shared/inherited tty's flags.
+///
+/// A fresh nonblocking descriptor bounds backpressure without affecting SSH or
+/// the caller's foreground terminal. A short write is uncertain delivery: do
+/// not replay the frame or append its suffix into another writer's output.
+pub(crate) fn write_attention(
+    path: &Path,
+    expected: &Metadata,
+    frame: &[u8],
+    valid: impl Fn() -> bool,
+) -> io::Result<()> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !same_terminal(expected, &output.metadata()?) {
+        return Err(io::Error::other("attention terminal identity changed"));
+    }
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        if !valid() {
+            return Err(io::Error::other("attention terminal owner changed"));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        match output.write(frame) {
+            Ok(count) if count == frame.len() => return Ok(()),
+            Ok(_) => return Err(io::Error::other("partial attention frame")),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        let mut ready = libc::pollfd {
+            fd: output.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        if millis == 0 {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        // SAFETY: one live owned descriptor, with a bounded absolute deadline.
+        let result = unsafe { libc::poll(&mut ready, 1, millis) };
+        if result == 0 {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(io::Error::other("attention terminal disconnected"));
+        }
+    }
+}
 
 /// Open an existing terminal for output without acquiring it as controlling tty.
 pub(crate) fn open_writer(path: &Path) -> io::Result<File> {
@@ -95,12 +166,48 @@ fn base64(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{TmuxMode, base64, open_writer, tmux_mode, user_var};
+    use super::{TmuxMode, base64, open_writer, tmux_mode, user_var, write_attention};
     use std::ffi::CStr;
     use std::fs::File;
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::Path;
+
+    #[test]
+    fn attention_writer_uses_fresh_flags_and_rejects_partial_frames() {
+        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(fd >= 0);
+        let master = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::grantpt(fd) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(fd) }, 0);
+        let name = unsafe { CStr::from_ptr(libc::ptsname(fd)) }
+            .to_string_lossy()
+            .into_owned();
+        let original = open_writer(Path::new(&name)).unwrap();
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        let identity = original.metadata().unwrap();
+        write_attention(Path::new(&name), &identity, b"small frame", || true).unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) },
+            flags
+        );
+        let mut bytes = [0_u8; 11];
+        File::from(master.try_clone().unwrap())
+            .read_exact(&mut bytes)
+            .unwrap();
+        assert_eq!(&bytes, b"small frame");
+        let error =
+            write_attention(Path::new(&name), &identity, &[b'x'; 262144], || true).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::Other,
+            "partial frame declines without replay"
+        );
+        assert!(write_attention(Path::new(&name), &identity, b"stale", || false).is_err());
+        let wrong = std::fs::metadata("/dev/null").unwrap();
+        assert!(write_attention(Path::new(&name), &wrong, b"wrong", || true).is_err());
+    }
 
     #[test]
     fn tty_writer_omits_append_and_delivers_bytes_to_a_real_pty() {

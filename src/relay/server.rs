@@ -77,6 +77,15 @@ mod attention_foreground_tests {
 
     #[test]
     fn rejects_a_background_process_that_retains_the_terminal() {
+        run_probe("background");
+    }
+
+    #[test]
+    fn attention_declines_a_backpressured_private_terminal_without_hanging() {
+        run_probe("backpressure");
+    }
+
+    fn run_probe(mode: &str) {
         // A child test process owns a private controlling tty. Its background
         // child keeps the same tty but a different foreground group, precisely
         // the condition created by suspending an SSH supervisor with Ctrl-Z.
@@ -89,7 +98,9 @@ mod attention_foreground_tests {
         // SAFETY: plain libc pty allocation, with every result checked and its
         // descriptor immediately transferred to an owned handle.
         let (master, tty) = unsafe {
-            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            let fd = libc::posix_openpt(
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            );
             assert!(fd >= 0);
             let master = OwnedFd::from_raw_fd(fd);
             assert_eq!(libc::grantpt(master.as_raw_fd()), 0);
@@ -107,6 +118,7 @@ mod attention_foreground_tests {
             ])
             .env("TERMNAV_ATTENTION_TEST_ROOT", &root)
             .env("TERMNAV_ATTENTION_TEST_TTY", &tty)
+            .env("TERMNAV_ATTENTION_TEST_MODE", mode)
             .stdin(File::open(&tty).unwrap());
         // SAFETY: only async-signal-safe libc calls run between fork and exec.
         unsafe {
@@ -123,16 +135,41 @@ mod attention_foreground_tests {
         // output_timeout sets a process group before exec, which would make
         // setsid fail here. Own this session-leader fixture directly instead.
         let mut probe = command.spawn().expect("run private tty probe");
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(3);
         let status = loop {
+            if mode == "backpressure" && root.join("complete").exists() {
+                // The operation has returned. Allow fixture descriptor/process
+                // teardown to drain; Darwin can defer tty final close itself.
+                let mut buffer = [0_u8; 65536];
+                while unsafe {
+                    libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                } > 0
+                {}
+            }
             match probe.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 outcome => {
+                    // Darwin can keep a killed tty writer exiting until its
+                    // queued output is drained. Never wait for that writer
+                    // while also withholding the only reader of this PTY.
+                    let mut buffer = [0_u8; 65536];
+                    while unsafe {
+                        libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                    } > 0
+                    {}
                     let _ = probe.kill();
-                    let _ = probe.wait();
+                    let cleanup = Instant::now() + Duration::from_secs(2);
+                    while probe.try_wait().unwrap().is_none() {
+                        while unsafe {
+                            libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+                        } > 0
+                        {}
+                        assert!(Instant::now() < cleanup, "private tty probe did not reap");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     panic!("private tty probe did not finish: {outcome:?}");
                 }
             }
@@ -166,6 +203,34 @@ mod attention_foreground_tests {
             return;
         };
         let tty = std::env::var("TERMNAV_ATTENTION_TEST_TTY").unwrap();
+        if std::env::var("TERMNAV_ATTENTION_TEST_MODE").as_deref() == Ok("backpressure") {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut fill = File::options()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                .open(&tty)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match fill.write(&[b'x'; 4096]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Ok(count) if count > 0 && Instant::now() < deadline => {}
+                    outcome => panic!("private PTY did not reach backpressure: {outcome:?}"),
+                }
+            }
+            let terminal = super::DirectTerminal::captured(
+                std::process::id(),
+                tty.clone(),
+                "xterm-256color".to_owned(),
+                File::options().write(true).open(&tty).unwrap(),
+            );
+            assert!(crate::attention::owner(std::process::id(), &tty));
+            assert!(!terminal.emit_attention("{}"), "full terminal must decline");
+            fs::write(std::path::Path::new(&root).join("complete"), b"returned").unwrap();
+            return;
+        }
         let (reader, _writer) = crate::process::pipe(false).unwrap();
         let lifetime_fd = reader.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -235,14 +300,16 @@ impl DirectTerminal {
         if !crate::attention::owner(self.pid, &self.tty) {
             return false;
         }
-        let mut output = self.output.as_ref();
-        output
-            .write_all(&terminal::user_var(
-                crate::attention::USER_VAR,
-                payload,
-                terminal::tmux_mode(&self.termtype),
-            ))
-            .is_ok()
+        let Ok(identity) = self.output.metadata() else {
+            return false;
+        };
+        terminal::write_attention(
+            Path::new(&self.tty),
+            &identity,
+            &crate::attention::frame(payload, &self.termtype),
+            || crate::attention::owner(self.pid, &self.tty),
+        )
+        .is_ok()
     }
 }
 

@@ -544,11 +544,19 @@ mod tests {
     }
 
     fn file_uri_case(actual: &str, wire: &str, other: Option<&str>) -> (String, Vec<u8>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Parallel tests can observe the same wall-clock tick on macOS.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("termnav-eza-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "termnav-eza-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join(actual), "fixture").unwrap();
         if let Some(other) = other {

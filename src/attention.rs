@@ -155,6 +155,31 @@ fn request(state: State) -> Value {
         "working":state.working,"pending":state.pending,"failed":state.failed})
 }
 
+/// Recover any prior partial advisory escape at each immediate parser boundary.
+pub(crate) fn frame(payload: &str, termtype: &str) -> Vec<u8> {
+    let raw = crate::terminal::user_var(USER_VAR, payload, crate::terminal::TmuxMode::Raw);
+    let mut frame = vec![0x18]; // CAN affects terminal output parsing, never input.
+    if crate::terminal::tmux_mode(termtype) == crate::terminal::TmuxMode::Passthrough {
+        frame.extend_from_slice(b"\x1bPtmux;\x18");
+        for byte in raw {
+            frame.push(byte);
+            if byte == 0x1b {
+                frame.push(byte);
+            }
+        }
+        frame.extend_from_slice(b"\x1b\\");
+    } else {
+        frame.extend_from_slice(&raw);
+    }
+    frame
+}
+
+fn payload(state: State) -> String {
+    json!({"v":1,"working":state.working,"pending":state.pending,
+        "failed":state.failed,"heartbeat":now()})
+    .to_string()
+}
+
 fn forward(parent: Parent, pid: u32, state: State) -> bool {
     match parent {
         Parent::Tmux { socket, pane } => claim(&socket, &pane, pid, state),
@@ -166,39 +191,63 @@ fn forward(parent: Parent, pid: u32, state: State) -> bool {
     }
 }
 
-/// Publish for one exact live client; decline only when no parent route exists.
-///
-/// The caller may write to the validated terminal itself on status 3. Errors
-/// on an existing parent route must never fall through to guessed passthrough.
-pub fn publish(socket: &str, name: &str, pid: u32, created: &str, state: State) -> i32 {
-    let Some(output) = tmux(
+fn client(socket: &str, name: &str, pid: u32, created: &str) -> Option<(String, String)> {
+    let output = tmux(
         socket,
         &[
             "list-clients",
             "-F",
-            "#{client_pid} #{client_created} #{client_control_mode} #{client_tty} #{client_name}",
+            "#{client_pid} #{client_created} #{client_control_mode} #{client_tty} #{client_termname} #{client_name}",
         ],
     )
-    .filter(|output| output.status.success()) else {
-        return 1;
-    };
+    .filter(|output| output.status.success())?;
     let listing = String::from_utf8_lossy(&output.stdout);
-    let exact = listing.lines().any(|line| {
-        let fields = line.splitn(5, ' ').collect::<Vec<_>>();
-        fields.len() == 5
+    listing.lines().find_map(|line| {
+        let fields = line.splitn(6, ' ').collect::<Vec<_>>();
+        (fields.len() == 6
             && fields[0] == pid.to_string()
             && fields[1] == created
             && fields[2] == "0"
-            && fields[4] == name
-            && owner(pid, fields[3])
-    });
-    if !exact {
+            && fields[5] == name
+            && fields[3].starts_with("/dev/")
+            && owner(pid, fields[3]))
+        .then(|| (fields[3].to_owned(), fields[4].to_owned()))
+    })
+}
+
+/// Publish for one exact foreground client, including its direct terminal.
+///
+/// No exit status grants callers permission to implement a tty-write fallback.
+pub fn publish(socket: &str, name: &str, pid: u32, created: &str, state: State) -> i32 {
+    let Some(identity) = client(socket, name, pid, created) else {
+        return 1;
+    };
+    if let Some(parent) = crate::focus::parent_for_client(pid, socket) {
+        return if forward(parent, pid, state) { 0 } else { 1 };
+    }
+    // Present but unusable ancestry is a failed route, not evidence that this
+    // is an outer terminal. Match relay admission instead of escaping a hidden
+    // or malformed parent pane with raw output.
+    if ["TMUX", "TMUX_PANE", "TERMNAV_PARENT_RELAY"]
+        .iter()
+        .any(|name| process::environment(pid, name).is_some())
+    {
         return 1;
     }
-    let Some(parent) = crate::focus::parent_for_client(pid, socket) else {
-        return 3;
+    let path = Path::new(&identity.0);
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 1;
     };
-    if forward(parent, pid, state) { 0 } else { 1 }
+    let frame = frame(&payload(state), &identity.1);
+    if crate::terminal::write_attention(path, &metadata, &frame, || {
+        client(socket, name, pid, created).as_ref() == Some(&identity)
+    })
+    .is_ok()
+    {
+        0
+    } else {
+        1
+    }
 }
 
 /// Route an admitted SSH snapshot through its immediate owning scope.
@@ -228,10 +277,7 @@ pub(crate) fn relay(
     let Some(terminal) = terminal else {
         return json!({"result":protocol::result::DECLINED});
     };
-    let payload = json!({"v":1,"working":state.working,"pending":state.pending,
-        "failed":state.failed,"heartbeat":now()})
-    .to_string();
-    let emitted = terminal.emit_attention(&payload);
+    let emitted = terminal.emit_attention(&payload(state));
     json!({"result": if emitted {protocol::result::EMITTED} else {protocol::result::ERROR}})
 }
 

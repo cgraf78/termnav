@@ -150,14 +150,21 @@ and
 .BR "--working N --pending N --failed N" .
 Counts are nonnegative and bounded at 100000; failed cannot exceed pending.
 The exact client identity and foreground tty ownership are verified. Status 0
-means the parent accepted the snapshot; status 3 means no parent exists, so a
-caller may publish directly to its independently validated client tty. Status 1
-is an error and must not fall back to another terminal; invalid arguments
+means the parent accepted the snapshot or Termnav published to the exact direct
+terminal. Legacy status 3 requires an updated Termnav; callers must not perform
+their own tty writes. Status 1 is an error; invalid arguments
 return 2. Existing local tmux ancestry and SSH relays are reused.
 Child contributions expire after 15 seconds on the receiving host. Direct
 terminals receive the TERM_PANE_STATE OSC user variable. Snapshots are advisory:
 overlapping deliveries may briefly arrive out of order before reconciliation.
 Terminal consumers must expire them using local receipt time.
+Direct attention writes use a fresh nonblocking descriptor, verify its device
+and inode against the captured character terminal, and revalidate foreground
+ownership before writing. Backpressure is bounded to 100 milliseconds; partial
+frames fail without replay. CAN at each immediate parser boundary cancels an
+earlier incomplete attention escape. This affects output parsing only.
+Inherited descriptor flags and navigation commit writes are unchanged.
+Terminal reopen failures decline publication rather than use blocking output.
 .TP
 .B tmux follow-click
 Accepts at most eleven positional fields in this order: HYPERLINK, WORD, LINE,
