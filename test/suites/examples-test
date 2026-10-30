@@ -527,16 +527,28 @@ TMUX="/tmp/termnav-example,1,0" \
   "$TERMNAV_BINARY" \
   tmux follow-click "" "TICKET-42" "" 0 "/tmp" "$_browser_tty"
 
-python3 - "$_browser_tty" <<'PY'
+# A custom detector owns the clicked word even when the surrounding line
+# resembles a path. The line fallback must not silently replace its route.
+_browser_tty_word="$_td/browser-tty-word"
+: >"$_browser_tty_word"
+TMUX="/tmp/termnav-example,1,0" \
+  TERMNAV_EXAMPLE_BROWSER_TTY="$_browser_tty_word" \
+  TERMNAV_TMUX_FOLLOW_EXTENSION_DIR="${DETECTOR_EXAMPLE%/*}" \
+  PATH="$_mock_bin:$PATH" \
+  "$TERMNAV_BINARY" \
+  tmux follow-click "" "TICKET-42" "prefix/TICKET-42" 8 "/tmp" "$_browser_tty_word"
+
+python3 - "$_browser_tty" "$_browser_tty_word" <<'PY'
 import base64
 import re
 import sys
 from pathlib import Path
 
-payload = Path(sys.argv[1]).read_bytes()
-match = re.search(rb"SetUserVar=TERMNAV_OPEN_URL=([A-Za-z0-9+/=]+)", payload)
-assert match, payload
-assert base64.b64decode(match.group(1)) == b"https://issues.example.com/TICKET-42"
+for path in sys.argv[1:]:
+    payload = Path(path).read_bytes()
+    match = re.search(rb"SetUserVar=TERMNAV_OPEN_URL=([A-Za-z0-9+/=]+)", payload)
+    assert match, payload
+    assert base64.b64decode(match.group(1)) == b"https://issues.example.com/TICKET-42"
 PY
 _assert_exit "examples: custom detector registers and routes its token" 0 "$?"
 

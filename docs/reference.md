@@ -247,9 +247,11 @@ percent-encoded characters (256 metadata probes maximum per complete URI).
 Multiple existing interpretations, metadata errors, larger expansions, or a
 URI above 64 KiB disable that explicit link while preserving its displayed
 label. UTF-8 characters are interpreted as whole scalars, never partial bytes.
-Mouse coordinates supplied to `follow-click` are zero-based window cells.
-Supply `TOP` and `LEFT` from the clicked pane and `SOCKET` from `#{socket_path}`;
-Termnav translates to pane cells once and resolves Unicode grapheme widths.
+Mouse coordinates supplied by tmux as `#{mouse_x}` and `#{mouse_y}` are
+zero-based cells relative to the clicked pane. `TOP` and `LEFT` remain accepted
+in the eleven-field click record for compatibility but are not subtracted from
+those cells. Supply `SOCKET` from `#{socket_path}` to identify the exact tmux
+server; Termnav also resolves Unicode grapheme widths.
 
 For WezTerm regex captures, build the replacement with
 `routes.raw_link_uri("$1")`. These are raw filenames, so a literal `%20` is
