@@ -151,6 +151,147 @@ _assert_not_contains "native opener: configured route never scans or types into 
 _assert_not_contains "native opener: configured route never injects tmux prefix keys" \
   'send-keys' "$(cat "$log")"
 
+# A click carries its exact server socket. Capture must use it even when this
+# process inherited a stale TMUX value from an outer or earlier session.
+cat >"$mock_bin/tmux" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${TERMNAV_TMUX_TEST_LOG:?}"
+if [[ $1 == -S && $2 == "$TERMNAV_CLICK_SOCKET" && $3 == capture-pane ]]; then
+  printf 'https://zellij.dev/features/\n'
+  exit 0
+fi
+exit 1
+MOCK
+cat >"$tmp/browser" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >"${TERMNAV_BROWSER_TEST_LOG:?}"
+MOCK
+chmod +x "$mock_bin/tmux" "$tmp/browser"
+log="$tmp/capture.log"
+browser_log="$tmp/browser.log"
+: >"$log"
+TMUX="/tmp/stale-termnav-test.sock,1,0" \
+  PATH="$mock_bin:/usr/bin:/bin" \
+  BROWSER="$tmp/browser" \
+  TERMNAV_TMUX_TEST_LOG="$log" \
+  TERMNAV_CLICK_SOCKET="$tmp/click.sock" \
+  TERMNAV_BROWSER_TEST_LOG="$browser_log" \
+  "$termnav" tmux follow-click --stdin <<EOF
+
+
+
+8
+/tmp
+
+%9
+0
+12
+186
+$tmp/click.sock
+EOF
+_assert_exit "native click: exact socket capture succeeds" 0 "$?"
+_assert_eq "native click: captured URL reaches browser fallback" \
+  'https://zellij.dev/features/' "$(cat "$browser_log" 2>/dev/null)"
+_assert_contains "native click: capture targets clicked server" \
+  "-S $tmp/click.sock capture-pane" "$(cat "$log")"
+
+# A stale outer tmux server must not claim a file URI's remote host as local.
+# The clicked server publishes a different link host, so the exact socket is
+# authoritative for host classification as well as pane capture.
+cat >"$mock_bin/tmux" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${TERMNAV_TMUX_TEST_LOG:?}"
+if [[ $1 == -S && $2 == "$TERMNAV_CLICK_SOCKET" && $3 == show-environment ]]; then
+  printf 'TERMNAV_REMOTE_LINK_HOST=other.example\n'
+  exit 0
+fi
+if [[ $1 == show-environment ]]; then
+  printf 'TERMNAV_REMOTE_LINK_HOST=remote.example\n'
+  exit 0
+fi
+exit 1
+MOCK
+chmod +x "$mock_bin/tmux"
+cat >"$mock_bin/ssh" <<'MOCK'
+#!/usr/bin/env bash
+exit 1
+MOCK
+chmod +x "$mock_bin/ssh"
+log="$tmp/link-host.log"
+: >"$log"
+: >"$remote_helper_log"
+TMUX="/tmp/stale-termnav-test.sock,1,0" \
+  PATH="$mock_bin:$PATH" \
+  TERMNAV_TMUX_TEST_LOG="$log" \
+  TERMNAV_CLICK_SOCKET="$tmp/click.sock" \
+  TERMNAV_SSH_CONTROL_HOSTS=remote.example \
+  TERMNAV_REMOTE_OPEN_HELPER="$remote_helper" \
+  TERMNAV_REMOTE_OPEN_TEST_LOG="$remote_helper_log" \
+  env -u TERMNAV_REMOTE_LINK_HOST "$termnav" tmux follow-click --stdin <<EOF
+file://remote.example/home/alex/.zshrc
+
+
+0
+/home/alex
+
+%9
+0
+0
+0
+$tmp/click.sock
+EOF
+_assert_exit "native click: remote URI classification succeeds" 0 "$?"
+_assert_eq "native click: stale outer host stays remote" \
+  $'<tmux>\n<'"$tmp/click.sock"$'>\n<%9>\n<remote.example>\n</home/alex/.zshrc:1:0>' \
+  "$(cat "$remote_helper_log")"
+_assert_contains "native click: link host comes from clicked server" \
+  "-S $tmp/click.sock show-environment" "$(cat "$log")"
+
+# A stalled tmux server cannot hold a file-link gesture indefinitely. The
+# outer deadline also reaps the pre-fix process group during the red test.
+cat >"$mock_bin/tmux" <<'MOCK'
+#!/usr/bin/env bash
+if [[ " $* " == *" show-environment "* ]]; then
+  exec sleep 30
+fi
+exit 1
+MOCK
+chmod +x "$mock_bin/tmux"
+timeout_result=$(
+  TMUX="/tmp/stale-termnav-test.sock,1,0" \
+    PATH="$mock_bin:$PATH" \
+    TERMNAV_SSH_CONTROL_HOSTS=remote.example \
+    TERMNAV_REMOTE_OPEN_HELPER="$remote_helper" \
+    TERMNAV_REMOTE_OPEN_TEST_LOG="$remote_helper_log" \
+    env -u TERMNAV_REMOTE_LINK_HOST python3 - "$termnav" "$tmp/click.sock" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+payload = f"file://remote.example/home/alex/.zshrc\n\n\n0\n/home/alex\n\n%9\n0\n0\n0\n{sys.argv[2]}\n"
+process = subprocess.Popen(
+    [sys.argv[1], "tmux", "follow-click", "--stdin"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    start_new_session=True,
+    env=os.environ,
+)
+try:
+    _, stderr = process.communicate(payload.encode(), timeout=3)
+except subprocess.TimeoutExpired:
+    os.killpg(process.pid, signal.SIGKILL)
+    process.communicate()
+    raise SystemExit("file-link click exceeded three seconds")
+if process.returncode != 0:
+    raise SystemExit(f"file-link click failed: {stderr.decode(errors='replace')}")
+print("bounded")
+PY
+)
+_assert_eq "native click: stalled link-host lookup is bounded" \
+  bounded "$timeout_result"
+
 cat >"$mock_bin/ssh" <<'MOCK'
 #!/usr/bin/env bash
 if [[ "${1:-}" == -G ]]; then

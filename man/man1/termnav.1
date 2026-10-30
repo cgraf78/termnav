@@ -177,9 +177,10 @@ starting from the client named by TTY; a control-mode or VS Code (xterm.js)
 client declines. A declined or failed request runs
 .B $BROWSER
 with the URL; when nothing opens it, the clicking client shows a message.
-X and Y are zero-based window cell coordinates. TOP and LEFT identify the
-clicked pane's offsets; SOCKET identifies its exact tmux server. File parsing
-uses Unicode grapheme cell widths, preserves genuine a/ and b/ directories,
+X and Y are zero-based cells relative to the clicked pane. TOP and LEFT
+identify its window offsets but are not subtracted from X and Y. SOCKET
+identifies the exact tmux server. File parsing uses Unicode grapheme cell
+widths, preserves genuine a/ and b/ directories,
 and retains colons before a numeric line/column suffix. File URIs carry literal
 filenames: file:///tmp/report:2026 opens the filename report:2026. Diagnostic
 producers must use nvim-open:// or nvim-remote://HOST/PATH:LINE:COLUMN instead

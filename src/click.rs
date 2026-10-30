@@ -21,6 +21,8 @@ use crate::browser;
 use crate::links::percent_decode;
 use crate::nvim::open::LinkKind;
 
+const CLICK_TMUX_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Raw fields supplied by the tmux mouse binding.
 #[derive(Clone, Debug, Default)]
 pub struct Input {
@@ -30,7 +32,7 @@ pub struct Input {
     pub word: String,
     /// Physical line under the pointer.
     pub line: String,
-    /// Horizontal click coordinate.
+    /// Horizontal click coordinate relative to the pane.
     pub x: Option<usize>,
     /// Pane working directory.
     pub cwd: String,
@@ -40,19 +42,12 @@ pub struct Input {
     pub pane: String,
     /// Exact tmux server socket containing the clicked pane.
     pub tmux_socket: String,
-    /// Vertical click coordinate.
+    /// Vertical click coordinate relative to the pane.
     pub y: Option<usize>,
     /// Pane top offset within the window.
     pub pane_top: Option<usize>,
     /// Pane left offset within the window.
     pub pane_left: Option<usize>,
-}
-
-impl Input {
-    /// Translate tmux's window cell coordinate to the clicked pane once.
-    fn pane_x(&self) -> Option<usize> {
-        self.x?.checked_sub(self.pane_left.unwrap_or(0))
-    }
 }
 
 /// Destination selected from click metadata.
@@ -115,7 +110,7 @@ pub fn follow(input: &Input) -> io::Result<()> {
 #[must_use]
 pub fn resolve(input: &Input) -> Option<Target> {
     if !input.hyperlink.is_empty()
-        && let Some(target) = from_hyperlink(&input.hyperlink)
+        && let Some(target) = from_hyperlink(&input.hyperlink, &input.tmux_socket)
     {
         return Some(target);
     }
@@ -133,7 +128,7 @@ pub fn resolve(input: &Input) -> Option<Target> {
         .bytes()
         .any(|byte| matches!(byte, b'\'' | b'"' | b'`'));
     if quoted_line
-        && let Some(x) = input.pane_x()
+        && let Some(x) = input.x
         && let Some(target) = from_line(&input.line, x)
     {
         return Some(target);
@@ -141,15 +136,25 @@ pub fn resolve(input: &Input) -> Option<Target> {
     if !input.word.is_empty()
         && let Some(target) = from_token(&input.word)
     {
+        // mouse_word may be only the path suffix of a scheme URL. Preserve
+        // word detectors and ordinary file clicks, but prefer the complete
+        // URL at this cell over a misleading file fragment.
+        if matches!(target, Target::File { .. })
+            && input.line.contains("://")
+            && let Some(x) = input.x
+            && let Some(url @ Target::Url(_)) = from_line(&input.line, x)
+        {
+            return Some(url);
+        }
         return Some(target);
     }
-    if !quoted_line && let Some(x) = input.pane_x() {
+    if !quoted_line && let Some(x) = input.x {
         return from_line(&input.line, x);
     }
     None
 }
 
-fn from_hyperlink(uri: &str) -> Option<Target> {
+fn from_hyperlink(uri: &str, socket: &str) -> Option<Target> {
     // Regex captures are raw filenames, unlike percent-encoded OSC-8 targets.
     // Keep their provenance explicit so a literal "%20" remains a filename.
     if let Some(value) = uri.strip_prefix("nvim-open-raw://") {
@@ -175,24 +180,31 @@ fn from_hyperlink(uri: &str) -> Option<Target> {
             host,
             percent_decode(&format!("/{path}")),
             LinkKind::Location,
+            socket,
         ));
     }
     if let Some(value) = uri.strip_prefix("file://") {
         if value.starts_with('/') {
-            return Some(file_target("", percent_decode(value), LinkKind::File));
+            return Some(file_target(
+                "",
+                percent_decode(value),
+                LinkKind::File,
+                socket,
+            ));
         }
         let (host, path) = value.split_once('/')?;
         return Some(file_target(
             host,
             percent_decode(&format!("/{path}")),
             LinkKind::File,
+            socket,
         ));
     }
     None
 }
 
-fn file_target(host: &str, target: String, kind: LinkKind) -> Target {
-    if local_file_host(host) {
+fn file_target(host: &str, target: String, kind: LinkKind, socket: &str) -> Target {
+    if local_file_host(host, socket) {
         Target::File {
             target,
             kind,
@@ -334,43 +346,40 @@ enum Capture {
 
 /// Reconstruct wrapping only while the physical snapshot remains unchanged.
 fn from_capture(input: &Input) -> Capture {
-    let Some(x) = input.pane_x() else {
+    let Some(x) = input.x else {
         return Capture::Missing;
     };
-    let Some(physical) = capture(&input.pane, false) else {
+    let Some(physical) = capture(&input.tmux_socket, &input.pane, false) else {
         return Capture::Missing;
     };
-    let Some(joined) = capture(&input.pane, true) else {
+    let Some(joined) = capture(&input.tmux_socket, &input.pane, true) else {
         return Capture::Missing;
     };
     // tmux does not expose both representations atomically. A second physical
     // capture detects streaming/scrolling between them; opening the wrong file
     // is worse than asking the user to click again after output settles.
-    let Some(after) = capture(&input.pane, false) else {
+    let Some(after) = capture(&input.tmux_socket, &input.pane, false) else {
         return Capture::Changed;
     };
     if physical != after {
         return Capture::Changed;
     }
-    let Some(row) = click_row(&physical, input.y, &input.line, input.pane_top) else {
+    let Some(row) = click_row(&physical, input.y, &input.line) else {
         return Capture::Missing;
     };
     from_joined_capture(&physical, &joined, row, x).map_or(Capture::Missing, Capture::Target)
 }
 
-fn capture(pane: &str, joined: bool) -> Option<Vec<String>> {
-    let mut command = Command::new("tmux");
+fn capture(socket: &str, pane: &str, joined: bool) -> Option<Vec<String>> {
+    let mut command = tmux_command(socket);
     command.args(["capture-pane", "-p"]);
     if joined {
         command.arg("-J");
     }
     command.args(["-S", "0", "-E", "-", "-t", pane]);
-    let output = crate::process::output_timeout_limited(
-        &mut command,
-        Duration::from_millis(500),
-        1024 * 1024,
-    )
-    .ok()?;
+    let output =
+        crate::process::output_timeout_limited(&mut command, CLICK_TMUX_TIMEOUT, 1024 * 1024)
+            .ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .lines()
@@ -379,15 +388,10 @@ fn capture(pane: &str, joined: bool) -> Option<Vec<String>> {
     })
 }
 
-fn click_row(
-    physical: &[String],
-    y: Option<usize>,
-    mouse_line: &str,
-    pane_top: Option<usize>,
-) -> Option<usize> {
-    // tmux supplies zero-based window cells. Trying several offsets can choose
-    // a different occurrence of an identical line in a lower split.
-    if let Some(candidate) = y.and_then(|y| y.checked_sub(pane_top.unwrap_or(0)))
+fn click_row(physical: &[String], y: Option<usize>, mouse_line: &str) -> Option<usize> {
+    // tmux mouse_y is already pane-local. Subtracting pane_top can choose a
+    // different occurrence of an identical line in a lower split.
+    if let Some(candidate) = y
         && candidate < physical.len()
         && (mouse_line.is_empty() || physical[candidate] == mouse_line)
     {
@@ -551,7 +555,7 @@ fn trim_token(mut token: &str) -> &str {
     token.trim_end_matches(['"', '\'', '`', ')', ']', '}', '>', '.', ',', ';'])
 }
 
-fn local_file_host(host: &str) -> bool {
+fn local_file_host(host: &str, socket: &str) -> bool {
     let host = host.to_ascii_lowercase();
     if matches!(host.as_str(), "" | "localhost" | "127.0.0.1" | "::1") {
         return true;
@@ -578,21 +582,32 @@ fn local_file_host(host: &str) -> bool {
         return true;
     }
     let published = std::env::var("TERMNAV_REMOTE_LINK_HOST").ok().or_else(|| {
-        std::env::var_os("TMUX").and_then(|_| {
-            Command::new("tmux")
-                .args(["show-environment", "-g", "TERMNAV_REMOTE_LINK_HOST"])
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .trim_start_matches("TERMNAV_REMOTE_LINK_HOST=")
-                        .to_owned()
-                })
-        })
+        (!socket.is_empty() || std::env::var_os("TMUX").is_some())
+            .then(|| {
+                let mut command = tmux_command(socket);
+                command.args(["show-environment", "-g", "TERMNAV_REMOTE_LINK_HOST"]);
+                crate::process::output_timeout_limited(&mut command, CLICK_TMUX_TIMEOUT, 4096)
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| {
+                        String::from_utf8_lossy(&output.stdout)
+                            .trim()
+                            .trim_start_matches("TERMNAV_REMOTE_LINK_HOST=")
+                            .to_owned()
+                    })
+            })
+            .flatten()
     });
     published.is_some_and(|value| value.eq_ignore_ascii_case(&host))
+}
+
+/// Use the clicked server rather than an inherited tmux session when known.
+fn tmux_command(socket: &str) -> Command {
+    let mut command = Command::new("tmux");
+    if !socket.is_empty() {
+        command.args(["-S", socket]).env_remove("TMUX");
+    }
+    command
 }
 
 /// Read the OS name without depending on an optional userland executable.
@@ -758,13 +773,7 @@ fn tell(input: &Input, message: &str) {
         return;
     }
     let escaped = message.replace('#', "##").replace('%', "%%");
-    let tmux = || {
-        let mut command = Command::new("tmux");
-        if !input.tmux_socket.is_empty() {
-            command.args(["-S", &input.tmux_socket]).env_remove("TMUX");
-        }
-        command
-    };
+    let tmux = || tmux_command(&input.tmux_socket);
     let succeeds = |mut command: Command| {
         crate::process::output_timeout(&mut command, Duration::from_secs(2))
             .ok()
@@ -1061,20 +1070,26 @@ mod tests {
     fn the_clicked_row_matches_tmux_line() {
         let physical = screen(&["one", "two https://a.example/", "three"]);
         assert_eq!(
-            click_row(&physical, Some(1), "two https://a.example/", None),
+            click_row(&physical, Some(1), "two https://a.example/"),
             Some(1)
         );
-        // A pane below the window top: y counts from the window.
-        assert_eq!(click_row(&physical, Some(6), "three", Some(4)), Some(2));
+        // A pane below the window top still reports its own row.
+        assert_eq!(click_row(&physical, Some(2), "three"), Some(2));
         // Without tmux's copy of the line the coordinate decides.
-        assert_eq!(click_row(&physical, Some(0), "", None), Some(0));
-        assert_eq!(click_row(&physical, Some(9), "", None), None);
+        assert_eq!(click_row(&physical, Some(0), ""), Some(0));
+        assert_eq!(click_row(&physical, Some(9), ""), None);
     }
 
     #[test]
-    fn bottom_split_does_not_choose_a_repeated_line_at_window_y() {
+    fn bottom_split_uses_pane_row_when_lines_repeat() {
         let physical = screen(&["a", "b", "same", "d", "e", "f", "same"]);
-        assert_eq!(click_row(&physical, Some(6), "same", Some(4)), Some(2));
+        assert_eq!(click_row(&physical, Some(6), "same"), Some(6));
+    }
+
+    #[test]
+    fn bottom_split_uses_pane_row_without_mouse_line() {
+        let physical = screen(&["one", "two", "three"]);
+        assert_eq!(click_row(&physical, Some(1), ""), Some(1));
     }
 
     #[test]
@@ -1083,18 +1098,18 @@ mod tests {
         // does not show. This used to panic indexing an empty match list.
         let physical = screen(&["live one", "live two"]);
         assert_eq!(
-            click_row(&physical, Some(1), "history https://old.example/", None),
+            click_row(&physical, Some(1), "history https://old.example/"),
             None
         );
         // Streaming output moved the clicked line to another unique row.
         let moved = screen(&["new", "clicked https://a.example/", "newer"]);
         assert_eq!(
-            click_row(&moved, Some(0), "clicked https://a.example/", None),
+            click_row(&moved, Some(0), "clicked https://a.example/"),
             Some(1)
         );
         // A line that repeats elsewhere is ambiguous.
         let repeated = screen(&["x", "same", "y", "same"]);
-        assert_eq!(click_row(&repeated, Some(0), "same", None), None);
+        assert_eq!(click_row(&repeated, Some(0), "same"), None);
     }
 
     #[test]
@@ -1203,7 +1218,50 @@ mod tests {
         };
         assert_eq!(
             resolve(&input),
-            Some(super::local_file("/tmp/one.rs".to_owned()))
+            Some(super::local_file("/tmp/two.rs".to_owned()))
+        );
+    }
+
+    #[test]
+    fn right_split_plain_url_click_keeps_pane_relative_column() {
+        let input = Input {
+            word: "zellij".to_owned(),
+            line: "https://zellij.dev/features/".to_owned(),
+            x: Some(9),
+            pane_left: Some(186),
+            ..Input::default()
+        };
+        assert_eq!(
+            resolve(&input),
+            Some(Target::Url("https://zellij.dev/features/".to_owned()))
+        );
+    }
+
+    #[test]
+    fn line_recovers_url_when_mouse_word_is_a_path_fragment() {
+        let input = Input {
+            word: "features/".to_owned(),
+            line: "https://zellij.dev/features/".to_owned(),
+            x: Some(22),
+            ..Input::default()
+        };
+        assert_eq!(
+            resolve(&input),
+            Some(Target::Url("https://zellij.dev/features/".to_owned()))
+        );
+    }
+
+    #[test]
+    fn word_remains_fallback_when_line_has_no_target_at_click() {
+        let input = Input {
+            word: "src/main.rs:17".to_owned(),
+            line: "plain words".to_owned(),
+            x: Some(3),
+            ..Input::default()
+        };
+        assert_eq!(
+            resolve(&input),
+            Some(super::local_file("src/main.rs:17".to_owned()))
         );
     }
 }
