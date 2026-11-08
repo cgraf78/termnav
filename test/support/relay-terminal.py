@@ -960,6 +960,65 @@ class RelayTerminalTest(unittest.TestCase):
         )
         return tmux_socket, source_pane, pane_ids, terminal, relay_socket
 
+    @unittest.skipUnless(shutil.which("nvim"), "Neovim is unavailable")
+    def test_direct_ssh_editor_key_reaches_containing_tmux(self) -> None:
+        """Exercise the editor mapping and native relay without a remote tmux."""
+        tmux_socket, left, panes, terminal, relay_socket = self.top_level(panes=2)
+        ready = self.harness.root / "editor-ready.json"
+        module = pathlib.Path(__file__).resolve().parents[2] / "lib/termnav/nvim/navigation.lua"
+        init = self.harness.root / "editor.lua"
+        init.write_text(
+            f"local nav = dofile({json.dumps(str(module))})\n"
+            f"nav.new({{ executable = {json.dumps(self.termnav)}, mappings = true }}).setup()\n"
+            "vim.schedule(function()\n"
+            "  local context = {\n"
+            "    tmux = vim.env.TMUX or '', pane = vim.env.TMUX_PANE or '',\n"
+            "    relay = vim.env.TERMNAV_PARENT_RELAY or ''\n"
+            "  }\n"
+            "  vim.fn.writefile({vim.json.encode(context)}, " + json.dumps(str(ready)) + ")\n"
+            "end)\n",
+            encoding="utf-8",
+        )
+        # The socket stands in for SSH's forwarded Unix socket. Removing both
+        # tmux variables reproduces sshn's editor context while retaining the
+        # actual mapping, native router, relay and terminal commit barrier.
+        command = shlex.join(
+            [
+                "env",
+                "-u",
+                "TMUX",
+                "-u",
+                "TMUX_PANE",
+                f"TERMNAV_PARENT_RELAY={relay_socket}",
+                shutil.which("nvim"),
+                "--clean",
+                "-u",
+                str(init),
+                "-n",
+                "-i",
+                "NONE",
+            ]
+        )
+        self.harness.tmux(tmux_socket, "respawn-pane", "-k", "-t", left, command)
+        try:
+            wait_for(ready.exists, "direct SSH editor mappings")
+        except AssertionError as error:
+            screen = self.harness.tmux(tmux_socket, "capture-pane", "-p", "-t", left).stdout
+            raise AssertionError(f"{error}; editor screen: {screen}") from error
+        self.assertEqual(
+            {"tmux": "", "pane": "", "relay": relay_socket},
+            json.loads(ready.read_text(encoding="utf-8")),
+        )
+        terminal.drain()
+        terminal.send(b"\x0c")  # Ctrl-L goes through the real Neovim mapping.
+        terminal.read_until(COMMIT_QUERY)
+        self.assertEqual(left, self.harness.active_pane(tmux_socket, "top"))
+        terminal.send(DECRQM_RESPONSES[1])
+        wait_for(
+            lambda: self.harness.active_pane(tmux_socket, "top") == panes[1],
+            "editor key committing to the containing tmux pane",
+        )
+
     def mixed_topology(self, prefix: str, implementations: tuple[str, str, str]):
         """Build inner-to-outer relays using the requested peer sequence."""
 
