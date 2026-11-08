@@ -401,6 +401,35 @@ impl SystemBackend {
         process::environment(pid, name).or_else(|| self.environment.get(name).cloned())
     }
 
+    /// Route a gesture through an already-established parent SSH transport.
+    /// Callers own the process/client identity check; keeping the wire exchange
+    /// shared gives direct remote editors the same result policy as tmux.
+    fn relay_request(path: &str, action: Action, direction: Direction) -> Outcome {
+        let scope = match action {
+            Action::PaneSelect => "pane",
+            Action::PaneMove => return Outcome::Declined,
+            Action::TabSelect => "window",
+            Action::TabMove => "move",
+        };
+        let request = json!({
+            "v": crate::relay::protocol::VERSION,
+            "op": crate::relay::protocol::operation::NAVIGATE,
+            "scope": scope,
+            "direction": direction.as_str(),
+            "nonce": new_nonce(),
+        });
+        let Ok(reply) = send(Path::new(path), &request, Duration::from_secs(8)) else {
+            return Outcome::Error;
+        };
+        match reply.get("result").and_then(Value::as_str) {
+            Some(
+                crate::relay::protocol::result::ARMED | crate::relay::protocol::result::EMITTED,
+            ) => Outcome::Handled,
+            Some(crate::relay::protocol::result::DECLINED) => Outcome::Declined,
+            _ => Outcome::Error,
+        }
+    }
+
     fn vscode_socket(&self, socket: &str, token: &str, direction: Direction) -> bool {
         if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return false;
@@ -748,29 +777,7 @@ impl Backend for SystemBackend {
         if !process::tty_matches(client.pid, &client.tty) {
             return Outcome::Error;
         }
-        let scope = match action {
-            Action::PaneSelect => "pane",
-            Action::PaneMove => return Outcome::Declined,
-            Action::TabSelect => "window",
-            Action::TabMove => "move",
-        };
-        let request = json!({
-            "v": crate::relay::protocol::VERSION,
-            "op": crate::relay::protocol::operation::NAVIGATE,
-            "scope": scope,
-            "direction": direction.as_str(),
-            "nonce": new_nonce(),
-        });
-        let Ok(reply) = send(Path::new(&path), &request, Duration::from_secs(8)) else {
-            return Outcome::Error;
-        };
-        match reply.get("result").and_then(Value::as_str) {
-            Some(
-                crate::relay::protocol::result::ARMED | crate::relay::protocol::result::EMITTED,
-            ) => Outcome::Handled,
-            Some(crate::relay::protocol::result::DECLINED) => Outcome::Declined,
-            _ => Outcome::Error,
-        }
+        Self::relay_request(&path, action, direction)
     }
 
     fn terminal(
@@ -784,6 +791,20 @@ impl Backend for SystemBackend {
             // even if a future router change accidentally offers the action
             // after local ancestry is exhausted.
             return Outcome::Declined;
+        }
+        if client.is_none()
+            && let Some(path) = self
+                .environment
+                .get("TERMNAV_PARENT_RELAY")
+                .filter(|path| !path.is_empty())
+        {
+            // A direct SSH editor has no remote tmux client to carry its
+            // parent relay. Its own inherited environment is authoritative:
+            // Neovim's job has no controlling tty, so it cannot be validated
+            // as though it were a selected tmux client. The relay owns the
+            // remote boundary, including decline/error; never reinterpret its
+            // result as permission to act on a terminal on this host.
+            return Self::relay_request(path, action, direction);
         }
         let (pid, tty, termtype) = client.map_or_else(
             || {
@@ -949,9 +970,201 @@ impl ReadWrite for TcpStream {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::Path;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    use super::{McpConfig, parse_clients};
+    use serde_json::{Value, json};
+
+    use super::{McpConfig, SystemBackend, parse_clients};
+    use crate::navigation::{Action, Backend, Direction, Outcome};
+    use crate::relay::{client::new_nonce, protocol};
+
+    /// Reserve enough pathname space for a socket on macOS even when Cargo
+    /// inherits a deeply nested temporary directory from the test runner.
+    fn relay_socket_path() -> PathBuf {
+        let temporary = std::env::temp_dir();
+        let root = if temporary.as_os_str().len() > 60 && Path::new("/tmp").is_dir() {
+            Path::new("/tmp")
+        } else {
+            &temporary
+        };
+        root.join(format!("tn-nav-{}.sock", new_nonce()))
+    }
+
+    /// Exercise the production socket exchange without touching process-global
+    /// environment or an installed relay. Bound accept as well as I/O so a
+    /// missing request reports a failure rather than hanging the test process.
+    fn terminal_relay(action: Action, direction: Direction, result: &str) -> (Outcome, Value) {
+        assert_eq!(
+            Direction::parse(action, direction.as_str()),
+            Ok(direction),
+            "test requests must use a direction accepted by the real protocol"
+        );
+        let path = relay_socket_path();
+        let listener = UnixListener::bind(&path).expect("bind isolated relay socket");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let reply = json!({ "v": protocol::VERSION, "result": result }).to_string() + "\n";
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "navigation never reached relay");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept relay request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            let mut line = String::new();
+            BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .expect("read request");
+            let request = serde_json::from_str(&line).expect("JSON request");
+            stream
+                .write_all(reply.as_bytes())
+                .expect("reply to navigation");
+            request
+        });
+        let mut backend = SystemBackend::new(HashMap::from([
+            (
+                "TERMNAV_PARENT_RELAY".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ),
+            // A local-terminal fallback would return a different outcome for
+            // tab actions. The inherited relay owns this remote boundary.
+            ("TERM".to_owned(), "xterm.js".to_owned()),
+        ]));
+        let outcome = backend.terminal(None, action, direction);
+        let request = peer.join();
+        std::fs::remove_file(path).expect("remove isolated relay socket");
+        let request = request.expect("relay exchange completes");
+        (outcome, request)
+    }
+
+    #[test]
+    fn terminal_without_tmux_reports_an_unreachable_inherited_relay() {
+        let mut backend = SystemBackend::new(HashMap::from([(
+            "TERMNAV_PARENT_RELAY".to_owned(),
+            relay_socket_path().to_string_lossy().into_owned(),
+        )]));
+
+        assert_eq!(
+            backend.terminal(None, Action::PaneSelect, Direction::Left),
+            Outcome::Error
+        );
+    }
+
+    #[test]
+    fn terminal_without_tmux_relays_pane_selection() {
+        let (outcome, request) =
+            terminal_relay(Action::PaneSelect, Direction::Left, protocol::result::ARMED);
+
+        assert_eq!(outcome, Outcome::Handled);
+        assert_eq!(request["v"], protocol::VERSION);
+        assert_eq!(request["op"], protocol::operation::NAVIGATE);
+        assert_eq!(request["scope"], "pane");
+        assert_eq!(request["direction"], "left");
+        assert_eq!(request["nonce"].as_str().expect("nonce").len(), 12);
+    }
+
+    #[test]
+    fn terminal_without_tmux_relays_tab_selection() {
+        let (outcome, request) = terminal_relay(
+            Action::TabSelect,
+            Direction::Next,
+            protocol::result::EMITTED,
+        );
+
+        assert_eq!(outcome, Outcome::Handled);
+        assert_eq!(request["scope"], "window");
+        assert_eq!(request["direction"], "next");
+    }
+
+    #[test]
+    fn terminal_without_tmux_relays_previous_tab_selection() {
+        let (outcome, request) = terminal_relay(
+            Action::TabSelect,
+            Direction::Previous,
+            protocol::result::ARMED,
+        );
+
+        assert_eq!(outcome, Outcome::Handled);
+        assert_eq!(request["scope"], "window");
+        assert_eq!(request["direction"], "previous");
+    }
+
+    #[test]
+    fn terminal_without_tmux_relays_tab_movement() {
+        let (outcome, request) =
+            terminal_relay(Action::TabMove, Direction::Right, protocol::result::ARMED);
+
+        assert_eq!(outcome, Outcome::Handled);
+        assert_eq!(request["scope"], "move");
+        assert_eq!(request["direction"], "right");
+    }
+
+    #[test]
+    fn terminal_without_tmux_preserves_relay_decline_without_terminal_fallback() {
+        let (outcome, _) = terminal_relay(
+            Action::TabSelect,
+            Direction::Previous,
+            protocol::result::DECLINED,
+        );
+
+        assert_eq!(outcome, Outcome::Declined);
+    }
+
+    #[test]
+    fn terminal_without_tmux_rejects_unknown_relay_result() {
+        let (outcome, _) = terminal_relay(Action::PaneSelect, Direction::Right, "unknown-result");
+
+        assert_eq!(outcome, Outcome::Error);
+    }
+
+    #[test]
+    fn terminal_without_tmux_never_relays_pane_movement() {
+        let path = relay_socket_path();
+        let listener = UnixListener::bind(&path).expect("bind isolated relay socket");
+        listener.set_nonblocking(true).expect("nonblocking accept");
+        let mut backend = SystemBackend::new(HashMap::from([(
+            "TERMNAV_PARENT_RELAY".to_owned(),
+            path.to_string_lossy().into_owned(),
+        )]));
+
+        assert_eq!(
+            backend.terminal(None, Action::PaneMove, Direction::Left),
+            Outcome::Declined
+        );
+        assert_eq!(
+            listener
+                .accept()
+                .expect_err("pane movement must not connect")
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(listener);
+        std::fs::remove_file(path).expect("remove isolated relay socket");
+    }
+
+    #[test]
+    fn terminal_without_tmux_keeps_outermost_pane_selection_harmless() {
+        let mut backend = SystemBackend::new(HashMap::new());
+
+        assert_eq!(
+            backend.terminal(None, Action::PaneSelect, Direction::Left),
+            Outcome::Handled
+        );
+    }
 
     #[test]
     fn client_parser_preserves_route_identity() {

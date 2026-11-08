@@ -233,7 +233,8 @@ pub trait Backend {
     /// Ask the parent SSH transport to continue routing.
     fn relay(&mut self, client: &Client, action: Action, direction: Direction) -> Outcome;
 
-    /// Offer the gesture to the outer terminal application.
+    /// Continue through an inherited SSH relay when no client exists, otherwise
+    /// offer the gesture to the outer terminal application.
     fn terminal(
         &mut self,
         client: Option<&Client>,

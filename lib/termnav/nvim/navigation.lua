@@ -333,9 +333,13 @@ function M.new(options)
     end
 
     if tmux_context() == nil then
-      -- Pane selection intentionally stops at the outermost tmux. Termnav
-      -- does not assume that a terminal application's panes share tmux's
-      -- directional semantics.
+      -- A direct SSH editor has no local tmux scope, but its inherited relay
+      -- still leads to the containing host's tmux pane. Let the shared router
+      -- cross that boundary; a real outermost editor remains a no-op rather
+      -- than inventing directional navigation for terminal application panes.
+      if (vim.env.TERMNAV_PARENT_RELAY or "") ~= "" then
+        return ctx.route("pane-select", direction)
+      end
       return true
     end
 

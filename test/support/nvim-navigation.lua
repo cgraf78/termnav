@@ -28,6 +28,7 @@ local function test(name, callback)
   vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(true, false))
   vim.env.TMUX = nil
   vim.env.TMUX_PANE = nil
+  vim.env.TERMNAV_PARENT_RELAY = nil
   vim.bo.filetype = ""
   callback()
   passed = passed + 1
@@ -124,6 +125,51 @@ test("outermost pane edge does not invent terminal pane navigation", function()
   equal(ctx.pane("left"), true, "outermost edge should be consumed")
   equal(#commands, 0, "no tmux means no local probe")
   equal(#streams, 0, "pane navigation should not target terminal panes implicitly")
+end)
+
+for _, direction in ipairs({ "left", "down", "up", "right" }) do
+  test("SSH editor edge routes " .. direction .. " through its parent relay", function()
+    vim.env.TERMNAV_PARENT_RELAY = "/tmp/termnav-test-relay.sock"
+    local ctx, commands, jobs = fake_context({
+      terminal = function()
+        return "/dev/pts/77"
+      end,
+    })
+
+    equal(ctx.pane(direction), true, "the SSH boundary should accept navigation")
+    equal(#commands, 0, "no remote tmux means no local tmux probe")
+    equal(#jobs, 1, "the editor edge must start the shared router")
+    equal(jobs[1].arguments, {
+      "termnav",
+      "navigate",
+      "--emit-continuation",
+      "pane-select",
+      direction,
+      "--tty",
+      "/dev/pts/77",
+    }, "the router should receive the direction and editor terminal")
+  end)
+end
+
+test("SSH editor keeps local splits ahead of the parent relay", function()
+  vim.env.TERMNAV_PARENT_RELAY = "/tmp/termnav-test-relay.sock"
+  vim.cmd("vsplit")
+  vim.cmd("wincmd h")
+  local before = vim.api.nvim_get_current_win()
+  local ctx, commands, jobs = fake_context()
+
+  equal(ctx.pane("right"), true, "the local split should own navigation")
+  truthy(vim.api.nvim_get_current_win() ~= before, "focus should enter the local split")
+  equal(#commands, 0, "a local split needs no tmux probe")
+  equal(#jobs, 0, "a local split must not route to the SSH parent")
+end)
+
+test("empty parent relay preserves the outermost no-op", function()
+  vim.env.TERMNAV_PARENT_RELAY = ""
+  local ctx, commands, jobs = fake_context()
+  equal(ctx.pane("right"), true, "the outermost edge should be consumed")
+  equal(#commands, 0, "no local tmux probe is needed")
+  equal(#jobs, 0, "an empty relay must not start the router")
 end)
 
 for _, case in ipairs({
