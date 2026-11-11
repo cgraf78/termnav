@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import itertools
 import os
 import pty
 import re
@@ -24,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 WINDOW = 512 * 1024
@@ -513,7 +513,8 @@ def single_layer(harness: Harness, large: int) -> None:
     )
     check(
         "acknowledgements are spaced by 128 KiB",
-        all(b - a >= ACK_INTERVAL for a, b in itertools.pairwise(acks)),
+        # Indexing rather than itertools.pairwise keeps Python 3.9 working.
+        all(acks[i + 1] - acks[i] >= ACK_INTERVAL for i in range(len(acks) - 1)),
         acks,
     )
     check("two images saved", len(images(harness)) == 2)
@@ -682,6 +683,11 @@ def main() -> int:
         except Unsupported as error:
             print(f"SKIP: platform forbids reopening the client PTY: {error}")
             return 0
+        except Exception:  # noqa: BLE001 - report any harness error as a failed scenario
+            # The suite keys on FAIL lines; name the crash so CI logs say
+            # which scenario stopped and why.
+            print(f"  FAIL: scenario raised:\n{traceback.format_exc()}")
+            FAILURES.append("scenario raised")
         finally:
             harness.close()
     if FAILURES:
