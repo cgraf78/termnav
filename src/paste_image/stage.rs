@@ -6,7 +6,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,8 +15,13 @@ use std::time::{Duration, Instant, SystemTime};
 use super::MAX_IMAGE_BYTES;
 use super::protocol;
 
-/// Hard limit for reading the clipboard and writing the staged file.
-pub const TIMEOUT: Duration = Duration::from_secs(2);
+/// Hard limit for the clipboard reader subprocesses of one `stage` run.
+///
+/// It bounds external programs that can wedge (a clipboard owner that never
+/// answers), not Termnav's own validation, hashing, and encoding, which are
+/// linear in the capped image size. WezTerm runs staging asynchronously, so
+/// the limit only delays image pastes, never text.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Environment variable naming a replacement clipboard reader.
 ///
@@ -49,7 +54,7 @@ pub enum Staged {
 /// Returns an error when the clipboard reader fails or times out, the data is
 /// not a PNG within [`MAX_IMAGE_BYTES`], or the staged file cannot be written.
 pub fn stage() -> io::Result<Staged> {
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + READ_TIMEOUT;
     let directory = crate::runtime::private_subdirectory(&[OsStr::new("paste-image")])?;
     prune(&directory, SystemTime::now());
     let png = match read_clipboard(&directory, deadline)? {
@@ -57,13 +62,15 @@ pub fn stage() -> io::Result<Staged> {
         Clipboard::Text => return Ok(Staged::Declined("the clipboard holds text")),
         Clipboard::Empty => return Ok(Staged::Declined("the clipboard holds no PNG image")),
     };
-    let staged = protocol::encode_staged(&png).map_err(io::Error::other)?;
-    if Instant::now() >= deadline {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "staging timed out"));
-    }
+    protocol::validate_png(&png).map_err(io::Error::other)?;
     let path = directory.join(format!("{STAGE_PREFIX}{}.b64", super::random_hex(12)));
-    let mut file = create_private(&path)?;
-    if let Err(error) = file.write_all(staged.as_bytes()) {
+    let result = create_private(&path).and_then(|file| {
+        let mut output = io::BufWriter::with_capacity(256 * 1024, file);
+        protocol::write_staged(&png, &mut output)?;
+        output.into_inner().map_err(|error| error.into_error())?;
+        Ok(())
+    });
+    if let Err(error) = result {
         let _ = fs::remove_file(&path);
         return Err(error);
     }
@@ -138,7 +145,7 @@ fn classify(types: &str) -> Option<Clipboard> {
 
 fn read_clipboard(directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
     if let Some(adapter) = std::env::var_os(ADAPTER_ENV).filter(|value| !value.is_empty()) {
-        return read_with(deadline, |argument| {
+        return read_with(directory, deadline, |argument| {
             let mut command = Command::new(&adapter);
             command.arg(argument);
             command
@@ -200,10 +207,10 @@ end run"#;
 }
 
 #[cfg(not(target_os = "macos"))]
-fn native(_directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
+fn native(directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
     let set = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     if set("WAYLAND_DISPLAY") {
-        let wayland = read_with(deadline, |argument| {
+        let wayland = read_with(directory, deadline, |argument| {
             let mut command = Command::new("wl-paste");
             match argument {
                 "types" => command.arg("--list-types"),
@@ -217,7 +224,7 @@ fn native(_directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
         }
     }
     if set("DISPLAY") {
-        return read_with(deadline, |argument| {
+        return read_with(directory, deadline, |argument| {
             let mut command = Command::new("xclip");
             command.args(["-selection", "clipboard", "-o", "-t"]);
             command.arg(match argument {
@@ -231,7 +238,11 @@ fn native(_directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
 }
 
 /// Run the two-step `types` then `png` protocol shared by every reader.
-fn read_with(deadline: Instant, command: impl Fn(&str) -> Command) -> io::Result<Clipboard> {
+fn read_with(
+    directory: &Path,
+    deadline: Instant,
+    command: impl Fn(&str) -> Command,
+) -> io::Result<Clipboard> {
     let output = run(&mut command("types"), deadline, 64 * 1024)?;
     if !output.status.success() {
         // wl-paste and xclip fail on an empty or ownerless clipboard.
@@ -240,14 +251,57 @@ fn read_with(deadline: Instant, command: impl Fn(&str) -> Command) -> io::Result
     if let Some(decided) = classify(&String::from_utf8_lossy(&output.stdout)) {
         return Ok(decided);
     }
-    let output = run(&mut command("png"), deadline, MAX_IMAGE_BYTES + 1)?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Ok(Clipboard::Empty);
+    let path = directory.join(format!("{STAGE_PREFIX}read-{}.png", super::random_hex(12)));
+    let result = read_png_into(&mut command("png"), &path, deadline);
+    let _ = fs::remove_file(&path);
+    result
+}
+
+/// Run a PNG reader with its stdout redirected to a new owner-only file.
+///
+/// The kernel writes the image straight into the file, so the transfer is
+/// not paced by a polling pipe drain, and a file-size resource limit stops a
+/// runaway reader one byte past the cap.
+fn read_png_into(command: &mut Command, path: &Path, deadline: Instant) -> io::Result<Clipboard> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "clipboard read timed out",
+        ));
     }
-    if output.stdout.len() > MAX_IMAGE_BYTES {
+    let file = create_private(path)?;
+    let limit = (MAX_IMAGE_BYTES + 1) as libc::rlim_t;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(file))
+        .stderr(Stdio::null());
+    // SAFETY: the hook only calls async-signal-safe setrlimit between fork
+    // and exec and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            let bound = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &bound) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = crate::process::status_timeout(command, remaining)?;
+    let size = fs::symlink_metadata(path)?.len();
+    if size > MAX_IMAGE_BYTES as u64 {
         return Err(io::Error::other("image is larger than 16 MiB"));
     }
-    Ok(Clipboard::Image(output.stdout))
+    if !status.success() || size == 0 {
+        return Ok(Clipboard::Empty);
+    }
+    read_capped(path).map(Clipboard::Image)
 }
 
 fn run(
@@ -257,13 +311,15 @@ fn run(
 ) -> io::Result<std::process::Output> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "staging timed out"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "clipboard read timed out",
+        ));
     }
     // stderr shares the byte cap; readers print little there.
     crate::process::output_timeout_limited(command, remaining, max_bytes.saturating_add(4096))
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn read_capped(path: &Path) -> io::Result<Vec<u8>> {
     use std::io::Read;
 

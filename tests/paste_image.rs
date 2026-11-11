@@ -152,21 +152,50 @@ fn invalid_or_oversized_images_fail_without_staging() {
 
 #[test]
 fn exactly_sixteen_mebibytes_is_staged() {
+    // The reader limit bounds the subprocess only, so validating, hashing,
+    // and encoding the largest accepted image cannot time out on a slow host.
     let fixture = Fixture::new();
-    let adapter = fixture.adapter("image/png\\n", &png(16 * 1024 * 1024), None);
+    let size = 16 * 1024 * 1024;
+    let adapter = fixture.adapter("image/png\\n", &png(size), None);
     let output = fixture.stage(Some(&adapter));
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let path = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim_end());
+    let header = format!("{size}:");
+    let staged = fs::read(&path).unwrap();
+    assert!(staged.starts_with(header.as_bytes()));
+    assert_eq!(staged.len(), header.len() + 65 + size.div_ceil(3) * 4);
+    assert_eq!(fs::read_dir(fixture.stage_directory()).unwrap().count(), 1);
 }
 
 #[test]
-fn a_hung_reader_is_bounded_by_the_two_second_limit() {
+fn a_runaway_reader_stops_one_byte_past_the_cap() {
     let fixture = Fixture::new();
-    let adapter = fixture.adapter("image/png\\n", &png(100), Some("30"));
+    let script = fixture.root.join("runaway");
+    fs::write(
+        &script,
+        "#!/bin/sh\ncase \"$1\" in\n  types) printf 'image/png\\n' ;;\n  png) cat /dev/zero ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = fixture.stage(Some(&script));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("larger than 16 MiB"),
+        "{output:?}"
+    );
+    assert_eq!(fs::read_dir(fixture.stage_directory()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_hung_reader_is_bounded_by_the_read_limit() {
+    let fixture = Fixture::new();
+    let adapter = fixture.adapter("image/png\\n", &png(100), Some("60"));
     let started = Instant::now();
     let output = fixture.stage(Some(&adapter));
     assert_eq!(output.status.code(), Some(1), "{output:?}");
+    // The limit is five seconds; the margin only absorbs runner scheduling.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "{:?}",
         started.elapsed()
     );

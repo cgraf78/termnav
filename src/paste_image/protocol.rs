@@ -22,16 +22,30 @@ use super::{MAX_IMAGE_BYTES, PNG_SIGNATURE};
 ///
 /// Returns a reason when the bytes are not a PNG within [`MAX_IMAGE_BYTES`].
 pub fn encode_staged(png: &[u8]) -> Result<String, String> {
-    validate_png(png)?;
+    let mut staged = Vec::with_capacity(png.len().div_ceil(3) * 4 + 96);
+    write_staged(png, &mut staged).map_err(|error| error.to_string())?;
+    String::from_utf8(staged).map_err(|error| error.to_string())
+}
+
+/// Stream the staged text for one PNG into `output`.
+///
+/// Base64 is produced in 3-byte-aligned slices, whose encodings concatenate
+/// to the encoding of the whole image, so a 16 MiB image never needs a
+/// second full-size copy in memory.
+///
+/// # Errors
+///
+/// Returns [`std::io::ErrorKind::InvalidData`] when the bytes are not a PNG
+/// within [`MAX_IMAGE_BYTES`], and any error from `output`.
+pub fn write_staged(png: &[u8], output: &mut impl std::io::Write) -> std::io::Result<()> {
+    validate_png(png)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason))?;
     let digest = Sha256::digest(png);
-    let encoded = crate::terminal::base64(png);
-    let mut staged = String::with_capacity(encoded.len() + 96);
-    staged.push_str(&png.len().to_string());
-    staged.push(':');
-    staged.push_str(&super::hex(&digest));
-    staged.push(':');
-    staged.push_str(&encoded);
-    Ok(staged)
+    write!(output, "{}:{}:", png.len(), super::hex(&digest))?;
+    for slice in png.chunks(48 * 1024) {
+        output.write_all(crate::terminal::base64(slice).as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Check the size cap and PNG signature of a complete image.
@@ -366,6 +380,15 @@ mod tests {
             assert_eq!(parser.consumed(), bytes.len() as u64);
             assert_eq!(parser.finish().unwrap(), image);
         }
+    }
+
+    #[test]
+    fn streamed_base64_matches_whole_image_encoding() {
+        // Crosses several 48 KiB encoding slices and ends unaligned.
+        let image = png(&(0..100_001_u32).map(|i| (i * 7) as u8).collect::<Vec<_>>());
+        let staged = encode_staged(&image).unwrap();
+        let encoded = staged.rsplit(':').next().unwrap();
+        assert_eq!(encoded, crate::terminal::base64(&image));
     }
 
     #[test]

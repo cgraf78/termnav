@@ -254,7 +254,9 @@ written, not that the terminal acted on it. Callers should fall back to their
 own opener on any nonzero status.
 .TP
 .B paste-image stage
-Reads the desktop clipboard within two seconds: on macOS through one
+Reads the desktop clipboard through reader subprocesses limited to five
+seconds in total (validation and encoding follow outside that limit): on
+macOS through one
 .B osascript
 run, on Linux through
 .B wl-paste

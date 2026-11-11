@@ -357,8 +357,12 @@ local tmux layers without a tunnel, port forward, second login, or daemon.
 
 ### Commands
 
-`termnav paste-image stage` reads the desktop clipboard behind a hard
-two-second limit. macOS uses one `osascript` run that inspects the pasteboard
+`termnav paste-image stage` reads the desktop clipboard through reader
+subprocesses that share a hard five-second limit; validation, hashing, and
+encoding follow outside it and are linear in the capped size. WezTerm runs
+staging asynchronously, so the limit can delay only an image paste. A
+reader's output goes straight to an owner-only file, and a file-size limit
+stops it one byte past the cap. macOS uses one `osascript` run that inspects the pasteboard
 classes and writes its PNG class into an owner-only file; Linux uses
 `wl-paste --list-types` and `wl-paste --type image/png` when
 `WAYLAND_DISPLAY` is set (falling back to X when `wl-paste` is missing), or
