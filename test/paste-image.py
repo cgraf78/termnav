@@ -333,13 +333,18 @@ def documented_binding() -> str:
     raise AssertionError("docs/reference.md lacks the paste-image tmux example")
 
 
-def wait_for(path: Path, timeout: float = 10) -> str:
-    """Wait for a status file written by the popup wrapper."""
+def wait_for(path: Path, terminal: FakeWezTerm, timeout: float = 10) -> str:
+    """Wait for a status file written by the popup wrapper.
+
+    The fake terminal keeps draining its pty meanwhile: macOS ptys buffer
+    little, and a receiver announcing `cancel` to an unread client tty would
+    block before it could exit.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists() and path.read_text().endswith("\n"):
             return path.read_text().strip()
-        time.sleep(0.02)
+        terminal.pump(0.02)
     return ""
 
 
@@ -461,7 +466,7 @@ def single_layer(harness: Harness, large: int) -> None:
     terminal.type(TRIGGER)
     result = terminal.transfer(staged)
     check("trigger key opens a receiver that announces done", result["verdict"] == "done", result)
-    check("receive exits 0", wait_for(status) == "0")
+    check("receive exits 0", wait_for(status, terminal) == "0")
     saved = images(harness)
     check("one image is saved", len(saved) == 1, saved)
     if saved:
@@ -503,7 +508,7 @@ def single_layer(harness: Harness, large: int) -> None:
     acks = result["acks"]
     check(
         "larger transfer completes",
-        result["verdict"] == "done" and wait_for(status) == "0",
+        result["verdict"] == "done" and wait_for(status, terminal) == "0",
         result["verdict"],
     )
     check(
@@ -527,7 +532,7 @@ def single_layer(harness: Harness, large: int) -> None:
         outcome = terminal.transfer(staged_bytes, mutate=mutate, cancel_delay=cancel_delay)
         check(f"{name}: receiver cancels", outcome["verdict"] == "cancel", outcome["verdict"])
         # WezTerm's terminator ends the receiver's discard promptly.
-        check(f"{name}: receive exits 1 promptly", wait_for(status, 5) == "1")
+        check(f"{name}: receive exits 1 promptly", wait_for(status, terminal, 5) == "1")
         check(f"{name}: no image is written", images(harness) == before)
         time.sleep(0.3)
         terminal.pump(0.1)
@@ -581,7 +586,7 @@ def single_layer(harness: Harness, large: int) -> None:
         result["verdict"] == "cancel",
         result["verdict"],
     )
-    check("symlinked image directory: receive exits 1", wait_for(status) == "1")
+    check("symlinked image directory: receive exits 1", wait_for(status, terminal) == "1")
     check("symlinked image directory: nothing written", len(list(moved.glob("clip-*"))) == 2)
     directory.unlink()
     moved.rename(directory)
@@ -593,7 +598,7 @@ def single_layer(harness: Harness, large: int) -> None:
     result = terminal.transfer(b"", armed=False, limit=1.5)
     check("unarmed terminal ignores ready", result.get("ready_ignored") is True)
     terminal.type(b"\x1b")
-    code = wait_for(status, 5)
+    code = wait_for(status, terminal, 5)
     check("Esc closes a waiting receiver", code == "1", code)
     check("Esc closes it within the quiet period", time.monotonic() - started < 5)
     check(
@@ -611,7 +616,7 @@ def single_layer(harness: Harness, large: int) -> None:
         elapsed = (result["done_at"] or 0) - (result["ready_at"] or 0)
         check(
             "16 MiB transfer completes",
-            result["verdict"] == "done" and wait_for(status, 30) == "0",
+            result["verdict"] == "done" and wait_for(status, terminal, 30) == "0",
             (result["verdict"], terminal.announcements, result["sent"]),
         )
         newest = max(images(harness), key=lambda path: path.stat().st_mtime_ns)
@@ -625,10 +630,28 @@ def nested_layer(harness: Harness) -> None:
     log = harness.root / "pane-inner.log"
     inner = harness.server("inner", harness.capture_command(log))
     inner_pane = harness.pane(inner)
-    # TMUX= lets the inner client attach from a pane; the shell stays its
-    # parent, carrying the outer pane identity, as an interactive shell does.
+    # An empty TMUX lets the inner client attach from a pane. A Python parent
+    # keeps the outer pane identity in an inspectable environment, as an
+    # interactive shell does: macOS hides the environment of protected
+    # platform binaries such as /bin/sh from `ps`.
+    attach_inner = (
+        "import os, subprocess, sys; "
+        "sys.exit(subprocess.call(['tmux', '-S', sys.argv[1], 'attach-session', '-t', 'inner'], "
+        "env=dict(os.environ, TMUX='')))"
+    )
     outer = harness.server(
-        "outer", f"TMUX= tmux -S {shlex.quote(inner)} attach-session -t inner; true"
+        "outer",
+        f"{shlex.quote(sys.executable)} -c {shlex.quote(attach_inner)} {shlex.quote(inner)}",
+    )
+    # Where the inner client's ancestry cannot be inspected, the route falls
+    # back to one passthrough frame, which tmux 3.3 and later gate behind
+    # this option; tmux 3.2 has no such option and always forwards.
+    subprocess.run(
+        ["tmux", "-S", outer, "set-option", "-g", "allow-passthrough", "on"],
+        env=harness.env,
+        capture_output=True,
+        check=False,
+        timeout=10,
     )
     terminal = harness.attach(outer, "outer")
     deadline = time.monotonic() + 5
@@ -650,7 +673,7 @@ def nested_layer(harness: Harness) -> None:
     check("nested: ready reaches the outermost terminal", result["ready_at"] is not None, result)
     check(
         "nested: transfer completes",
-        result["verdict"] == "done" and wait_for(status) == "0",
+        result["verdict"] == "done" and wait_for(status, terminal) == "0",
         result["verdict"],
     )
     saved = [path for path in images(harness) if path not in before]
