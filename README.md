@@ -29,6 +29,13 @@ the tabs of the terminal that hosts it all.
   already have running, or a URL to have WezTerm open it on your local
   machine, even from inside SSH. Remote file opens reuse an existing SSH
   ControlMaster connection for hosts you allow.
+- **Images:** with the optional WezTerm module, Ctrl-V with a screenshot on
+  the clipboard saves it as a PNG on the host of the innermost tmux, local or
+  one SSH or Eternal Terminal hop away, and pastes its path into the active
+  pane, where coding agents attach it. The image travels through the terminal
+  stream itself; see the
+  [reference](docs/reference.md#clipboard-image-paste) for the tmux binding it
+  needs.
 
 It is one Rust binary plus small Lua and shell adapters. There is no daemon:
 keypresses run short-lived commands, nested tmux clients run one small focus
@@ -188,6 +195,7 @@ request at the current boundary; append the example's
 | `termnav tmux context\|focus\|follow-click ...` | Publish tmux context, maintain nested focus leases, and follow Ctrl-clicks |
 | `termnav link-host` | Print the host of the current terminal context, for hyperlink producers such as ripgrep and eza |
 | `termnav open-url URL` | Ask WezTerm to open an `http`, `https`, or `mailto` URL on the machine it runs on |
+| `termnav paste-image stage\|receive ...` | Stage a desktop clipboard image and receive it in a tmux popup, pasting the saved path |
 | `termnav nvim open MODE ...` | Open a target in the narrowest eligible existing Neovim |
 | `termnav vscode focus ...` | Publish Neovim focus to the VS Code adapter |
 | `termnav eza ...` | Run eza with remote-aware OSC-8 file links compatible with stable WezTerm |
@@ -233,6 +241,8 @@ starts another authenticated connection or guesses among same-host panes.
 - `eza` for `termnav eza`.
 - `ssh` for `termnav nvim ssh-open` when remote file links should reuse an
   existing ControlMaster connection.
+- For `termnav paste-image stage`: `osascript` on macOS, or `wl-paste`
+  (Wayland) or `xclip` (X11) on Linux; tmux 3.2 or newer for its popup.
 - VS Code only for VS Code terminal tabs; see [VS Code (advanced)](#vs-code-advanced).
 
 ## VS Code (advanced)

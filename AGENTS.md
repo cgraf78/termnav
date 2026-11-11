@@ -28,6 +28,9 @@ only from release archives. User-facing contracts live in
   interception only; recursive shim entry is rejected.
 - Relay protocol vocabulary lives in `src/relay/protocol.rs`; the frozen
   Python peer in tests is the cross-version oracle.
+- Paste-image vocabulary and limits live in `src/paste_image/`;
+  `lib/termnav/wezterm/paste-image.lua` mirrors them and
+  `test/suites/paste-image-test` pins the shared names.
 - A VS Code adapter change bumps `package.json` `version`, the
   `share/termnav/vscode/termnav-X.Y.Z` directory name, and its consumers
   together. No test enforces this.

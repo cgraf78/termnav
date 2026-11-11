@@ -16,10 +16,15 @@ if [[ ! -x $termnav ]]; then
 fi
 
 top_help=$($termnav --help)
-for command in navigate relay ssh link-host tmux nvim open-url vscode eza asset-path version; do
+for command in navigate relay ssh link-host tmux nvim open-url paste-image vscode eza \
+  asset-path version; do
   _assert_contains "CLI contract: top-level help exposes $command" \
     "$command" "$top_help"
 done
+
+paste_image_help=$($termnav paste-image --help 2>&1)
+_assert_contains "CLI contract: paste-image documents receive identity" \
+  "receive --target-pane PANE --client-name NAME" "$paste_image_help"
 
 navigate_help=$($termnav navigate --help 2>&1)
 _assert_contains "CLI contract: navigation exposes parent traversal" \

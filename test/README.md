@@ -24,6 +24,12 @@ Suite ownership follows the integration boundary:
   existing Neovim pane from simple interactive-shell file opens.
 - `nvim-navigation-test` covers Neovim's fast-path mappings and boundary
   delegation.
+- `paste-image-test` covers the WezTerm `paste-image.lua` decisions with a
+  stubbed pane, then drives `termnav paste-image` through private tmux
+  servers and a fake WezTerm on a pty (`test/paste-image.py`): delivery
+  through the documented binding, acknowledgements, rejected transfers, an
+  unsafe image directory, cancellation, a nested tmux layer, and a 16 MiB
+  timing (`TERMNAV_PASTE_IMAGE_LARGE_BYTES=0` skips it).
 - `process-contract-test` ensures retired executable and Python implementation
   paths stay absent from production artifacts.
 - `relay-test` covers nested SSH transport, directive storage, and in-band
