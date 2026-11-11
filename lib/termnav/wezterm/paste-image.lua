@@ -9,9 +9,10 @@ M.trigger = "\27[777010u"
 -- An arm lasts this long after Ctrl-V. A `ready` announcement after it, from
 -- another pane, or a second one for the same arm sends nothing.
 local arm_seconds = 10
--- Until a receiver proves it parsed our header, at most this much reaches
--- whatever has focus. A forged `ready` therefore leaks at most 4 KiB.
-local first_window = 4096
+-- Until a receiver acknowledges the header with the digest proof, only the
+-- header (`<id>:<length>:<sha256>:`, digits, hex, and colons) is typed. A
+-- forged `ready` therefore leaks no image data to whatever has focus.
+local proof_length = 16
 -- Bytes in flight after the first acknowledgement. The receiver acknowledges
 -- every 128 KiB, so the window keeps the stream moving without letting a
 -- focus change mid-transfer deliver more than this to another pane.
@@ -160,34 +161,42 @@ function M.new(wezterm, opts)
     if transfer ~= state or state.finished then
       return
     end
-    local limit = state.acked and (state.acked + window) or first_window
-    local budget = math.min(chunk_bytes, limit - state.sent)
+    if not state.file then
+      state.file = open_file(state.path, "rb")
+      local head = state.file and state.file:read(96)
+      local length, digest = (head or ""):match("^([1-9]%d*):([0-9a-f]+):")
+      if not length or #digest ~= 64 or not state.file:seek("set", #length + 66) then
+        abandon(state)
+        return
+      end
+      state.prefix = state.id .. ":" .. length .. ":" .. digest .. ":"
+      state.proof = digest:sub(1, proof_length)
+    end
+    if not state.acked then
+      -- Before a proven acknowledgement only the header may be typed.
+      if state.prefix then
+        local header = state.prefix
+        state.prefix = nil
+        if send(state, header) then
+          state.sent = state.sent + #header
+        end
+      end
+      return
+    end
+    local budget = math.min(chunk_bytes, state.acked + window - state.sent)
     if budget <= 0 then
       -- Wait for an acknowledgement; ack handling reschedules.
       return
     end
-    if not state.file then
-      state.file = open_file(state.path, "rb")
-      if not state.file then
-        abandon(state)
-        return
-      end
-    end
-    local data = ""
-    if state.prefix then
-      data = state.prefix
-      state.prefix = nil
-    end
-    local wanted = budget - #data
-    local piece = wanted > 0 and state.file:read(wanted) or ""
-    piece = piece or ""
-    -- Only staged-header and base64 characters ever leave this module, even
-    -- if the staged file was replaced.
-    if piece:find("[^%w+/=:]") then
+    local wanted = budget
+    local piece = state.file:read(wanted) or ""
+    -- Only base64 characters follow the header, even if the staged file was
+    -- replaced.
+    if piece:find("[^%w+/=]") then
       abandon(state)
       return
     end
-    data = data .. piece
+    local data = piece
     -- A short read means end of file inside this chunk's budget, so the
     -- terminator still fits.
     if #piece < wanted then
@@ -218,7 +227,8 @@ function M.new(wezterm, opts)
       pane = pane,
       id = id,
       path = arm.path,
-      prefix = id .. ":",
+      prefix = nil,
+      proof = nil,
       sent = 0,
       acked = nil,
       ack_generation = 0,
@@ -311,12 +321,28 @@ function M.new(wezterm, opts)
       return true
     end
     local state = transfer
-    if not state or state.id ~= id then
+    if not state or pane_id(pane) ~= pane_id(state.pane) then
+      return true
+    end
+    if kind == "cancel" and rest == "" then
+      -- Any receiver in this pane's tmux rejecting input ends the transfer,
+      -- even under another id: a forged `ready` may have won the race, and
+      -- the real receiver is discarding until the terminator.
+      abandon(state)
+      return true
+    end
+    if state.id ~= id then
       return true
     end
     if kind == "ack" then
-      local offset = tonumber(rest:match("^:(%d+)$") or "")
-      if offset and offset <= state.sent and offset > (state.acked or -1) then
+      local digits, proof = rest:match("^:(%d+):([0-9a-f]+)$")
+      local offset = tonumber(digits or "")
+      if
+        offset
+        and proof == state.proof
+        and offset <= state.sent
+        and offset > (state.acked or -1)
+      then
         state.acked = offset
         state.ack_generation = state.ack_generation + 1
         watch(state)
@@ -324,8 +350,6 @@ function M.new(wezterm, opts)
       end
     elseif kind == "done" and rest == "" then
       finish(state)
-    elseif kind == "cancel" and rest == "" then
-      abandon(state)
     end
     return true
   end

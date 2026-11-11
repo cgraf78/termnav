@@ -283,9 +283,9 @@ The tmux popup endpoint. Announces
 to WezTerm through the exact client's outward route, reads
 .IB ID : LENGTH : SHA256 : BASE64 !
 from raw standard input, rejecting the first byte outside that grammar,
-acknowledges progress with
-.BI ack: ID : OFFSET
-at least every 128 KiB, and checks the length, digest, 16 MiB cap, and PNG
+acknowledges the header and then at least every 128 KiB with
+.BI ack: ID : OFFSET : PROOF ,
+where PROOF is the first 16 characters of SHA256, and checks the length, digest, 16 MiB cap, and PNG
 signature. On success writes
 .BI clip- UTC - RANDOM .png
 (mode 0600) under
@@ -433,9 +433,13 @@ announcements from
 .BR "paste-image receive" .
 It sends image data only for a
 .B ready
-from the pane it armed after Ctrl-V, within 10 seconds and once, sends at
-most 4 KiB before the first acknowledgement and 512 KiB beyond the last, and
-abandons the transfer after five seconds without one. The trigger key is
+from the pane it armed after Ctrl-V, within 10 seconds and once, types only
+the header until an acknowledgement from that pane carries the digest proof,
+keeps at most 512 KiB beyond the last proven acknowledgement in flight, ends
+the transfer with the terminator on any
+.B cancel
+from that pane, and abandons it after five seconds without an
+acknowledgement. The trigger key is
 .BR \e033[777010u ,
 tmux
 .BR user-keys[14] .

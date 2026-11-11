@@ -26,7 +26,6 @@ import tempfile
 import time
 from pathlib import Path
 
-FIRST_WINDOW = 4096
 WINDOW = 512 * 1024
 CHUNK = 32 * 1024
 ACK_INTERVAL = 128 * 1024
@@ -242,10 +241,18 @@ class FakeWezTerm:
             data = data[self.pump(0.05, data) :]
 
     def transfer(
-        self, staged: bytes, *, armed: bool = True, mutate=None, limit: float = 60
+        self,
+        staged: bytes,
+        *,
+        armed: bool = True,
+        mutate=None,
+        limit: float = 60,
+        cancel_delay: float = 0,
     ) -> dict:
         """Answer `ready` like the WezTerm module and return what happened."""
         stream = None
+        header_length = 0
+        proof = ""
         sent = 0
         acked = None
         acks: list[int] = []
@@ -256,7 +263,9 @@ class FakeWezTerm:
         while time.monotonic() < deadline:
             outgoing = b""
             if stream is not None and result["verdict"] is None:
-                window_end = acked + WINDOW if acked is not None else FIRST_WINDOW
+                # Header only until an acknowledgement proves the receiver
+                # read it; then a 512 KiB window.
+                window_end = acked + WINDOW if acked is not None else header_length
                 end = min(len(stream), window_end, sent + CHUNK)
                 outgoing = stream[sent:end]
             written = self.pump(0.02, outgoing)
@@ -265,20 +274,40 @@ class FakeWezTerm:
                 max_in_flight = max(max_in_flight, sent)
             for value in self.announcements[seen:]:
                 kind, _, rest = value.partition(":")
-                announced_id, _, offset = rest.partition(":")
+                announced_id, _, rest = rest.partition(":")
+                offset, _, announced_proof = rest.partition(":")
                 if kind == "ready" and armed and stream is None:
                     stream = announced_id.encode() + b":" + staged + b"!"
                     if mutate:
                         stream = mutate(stream)
+                    # Like the module, take the header and proof from the
+                    # bytes actually sent.
+                    fields = stream.split(b":", 3)
+                    header_length = sum(len(field) + 1 for field in fields[:3])
+                    proof = fields[2][:16].decode()
                     result["ready_at"] = time.monotonic()
                     result["id"] = announced_id
                 elif kind == "ready":
                     result["ready_ignored"] = True
+                elif kind == "cancel" and stream is not None:
+                    # Any cancel from this terminal ends the transfer, even
+                    # under another id.
+                    result["verdict"] = kind
+                    result["done_at"] = time.monotonic()
+                    if sent < len(stream):
+                        pause = time.monotonic() + cancel_delay
+                        while time.monotonic() < pause:
+                            self.pump(0.02)
+                        self.type(b"!")
                 elif stream is not None and announced_id != result["id"]:
                     result["foreign"] = value
                 elif kind == "ack" and stream is not None:
                     acks.append(int(offset))
-                    acked = int(offset)
+                    result["proofs_valid"] = result.get("proofs_valid", True) and (
+                        announced_proof == proof
+                    )
+                    if announced_proof == proof:
+                        acked = int(offset)
                 elif kind in ("done", "cancel") and stream is not None:
                     result["verdict"] = kind
                     result["done_at"] = time.monotonic()
@@ -412,8 +441,7 @@ def single_layer(harness: Harness, large: int) -> None:
     pane = harness.pane(socket)
     status = harness.root / "status"
     # The binding documented in docs/reference.md, recording the receiver's
-    # status. tmux builds a client's key table when it attaches, so it is
-    # sourced first.
+    # status.
     binding = documented_binding().replace(
         "termnav paste-image receive", f"{harness.binary} paste-image receive"
     )
@@ -452,13 +480,16 @@ def single_layer(harness: Harness, large: int) -> None:
             log.read_bytes() == expected,
             log.read_bytes(),
         )
+    header_length = len(result["id"]) + 1 + staged.index(b":", staged.index(b":") + 1) + 1
     check(
-        "first acknowledgement follows the header",
-        bool(result["acks"]) and result["acks"][0] < FIRST_WINDOW,
+        "first acknowledgement is exactly the header",
+        bool(result["acks"]) and result["acks"][0] == header_length,
+        result["acks"][:1],
     )
+    check("acknowledgements carry the digest proof", result.get("proofs_valid") is True)
     check(
-        "nothing beyond 4 KiB before the first acknowledgement",
-        result["first_window_peak"] <= FIRST_WINDOW,
+        "only the header is typed before the first acknowledgement",
+        result["first_window_peak"] <= header_length,
     )
     buffers = harness.tmux(socket, "list-buffers", "-F", "#{buffer_name}")
     check("no paste buffer is left behind", "termnav" not in buffers, buffers)
@@ -487,12 +518,12 @@ def single_layer(harness: Harness, large: int) -> None:
     )
     check("two images saved", len(images(harness)) == 2)
 
-    def failure(name: str, image_bytes: bytes, mutate) -> None:
+    def failure(name: str, image_bytes: bytes, mutate, cancel_delay: float = 0) -> None:
         log.write_bytes(b"")
         before = images(harness)
         staged_bytes = stage(harness, image_bytes)
         open_receiver(harness, socket, terminal, pane, status)
-        outcome = terminal.transfer(staged_bytes, mutate=mutate)
+        outcome = terminal.transfer(staged_bytes, mutate=mutate, cancel_delay=cancel_delay)
         check(f"{name}: receiver cancels", outcome["verdict"] == "cancel", outcome["verdict"])
         # WezTerm's terminator ends the receiver's discard promptly.
         check(f"{name}: receive exits 1 promptly", wait_for(status, 5) == "1")
@@ -521,6 +552,14 @@ def single_layer(harness: Harness, large: int) -> None:
 
     failure("non-PNG payload", png(300_000, 5), gif_signature)
     failure("truncated payload", png(300_000, 6), lambda s: s[:150_000] + b"!")
+
+    def foreign_id(stream: bytes) -> bytes:
+        # A forged ready won the race: the real receiver sees another id.
+        return (b"f" if stream[:1] != b"f" else b"e") + stream[1:]
+
+    # The terminator arrives later than a keystroke's quiet period: the
+    # receiver must keep discarding a foreign transfer until it does.
+    failure("transfer for another receiver", png(300_000, 11), foreign_id, cancel_delay=2.5)
     # Small enough to be in flight whole, terminator included, before the
     # receiver rejects it.
     failure(

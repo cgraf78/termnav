@@ -181,6 +181,17 @@ check("tmux: runs termnav paste-image stage", #children == 1 and children[1][1] 
 check("tmux: sends the trigger after staging", joined(pane) == "\27[777010u")
 
 -- REQ-003: wrong pane, then a ready that starts nothing synchronously.
+local function header_of(id, content)
+  return id .. ":" .. content:match("^(%d+:[0-9a-f]+:)")
+end
+local function proof_of(content)
+  return content:match("^%d+:([0-9a-f]+):"):sub(1, 16)
+end
+local function ack(target, id, offset, proof)
+  local value = "ack:" .. id .. ":" .. offset .. (proof and (":" .. proof) or "")
+  paster:user_var_changed(window, target, "TERMNAV_PASTE_IMAGE", value)
+end
+
 local other_pane = new_pane("p2")
 check("handles its variable", paster:user_var_changed(window, other_pane, "TERMNAV_PASTE_IMAGE", "ready:0123456789abcdef"))
 run_until(now)
@@ -189,8 +200,18 @@ check("ignores other variables", paster:user_var_changed(window, pane, "TERMNAV_
 local id = "00112233aabbccdd"
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
 check("ready sends nothing synchronously", #pane.sent == 1)
+run_until(now + 1)
+local header = header_of(id, staged)
+check("only the header is typed before a proven acknowledgement", joined(pane) == "\27[777010u" .. header)
+ack(pane, id, #header)
 run_until(now)
-check("small transfer is sent whole with terminator", joined(pane) == "\27[777010u" .. id .. ":" .. staged .. "!")
+check("unproven acknowledgement opens nothing", joined(pane) == "\27[777010u" .. header)
+ack(pane, id, #header, "0123456789abcdef")
+run_until(now)
+check("wrong proof opens nothing", joined(pane) == "\27[777010u" .. header)
+ack(pane, id, #header, proof_of(staged))
+run_until(now)
+check("proven acknowledgement sends the rest with terminator", joined(pane) == "\27[777010u" .. id .. ":" .. staged .. "!")
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:ffffffffffffffff")
 run_until(now)
@@ -204,35 +225,39 @@ for i = 1, 1500 * 1024 / 64 do
   body[i] = string.rep(string.char(65 + i % 26), 64)
 end
 staged = "1100000:" .. string.rep("b", 64) .. ":" .. table.concat(body)
+local proof = proof_of(staged)
 path = staged_file(staged)
 pane = new_pane("p3")
 press(pane, path)
 run_until(now)
 pane.sent = {}
 id = "aaaaaaaabbbbbbbb"
+header = header_of(id, staged)
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
 run_until(now + 1)
-local sent = #joined(pane)
-check("at most 4 KiB before the first acknowledgement", sent == 4096)
+check("header alone before the first acknowledgement", joined(pane) == header)
+ack(pane, id, 99999999, proof)
+run_until(now)
+check("acknowledgement beyond what was sent is ignored", joined(pane) == header)
+ack(other_pane, id, #header, proof)
+run_until(now)
+check("acknowledgement from another pane is ignored", joined(pane) == header)
+ack(pane, id, #header, proof)
+local calls = #pane.sent
+run_until(now)
+check("proven acknowledgement opens a 512 KiB window", #joined(pane) == #header + 512 * 1024)
+check("window is filled over several timer callbacks", #pane.sent - calls >= 16)
 for _, chunk in ipairs(pane.sent) do
   check("chunks are bounded", #chunk <= 32 * 1024)
 end
-paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ack:" .. id .. ":99999999")
-run_until(now)
-check("acknowledgement beyond what was sent is ignored", #joined(pane) == 4096)
-paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ack:" .. id .. ":100")
-local calls = #pane.sent
-run_until(now)
-check("acknowledgement opens a 512 KiB window", #joined(pane) == 100 + 512 * 1024)
-check("window is filled over several timer callbacks", #pane.sent - calls >= 16)
-local offset = 100
+local offset = #header
 while true do
   local total = #joined(pane)
   if total >= #id + 1 + #staged + 1 then
     break
   end
   offset = math.min(total, offset + 128 * 1024)
-  paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ack:" .. id .. ":" .. offset)
+  ack(pane, id, offset, proof)
   run_until(now + 1)
 end
 check("whole stream is id, staged text, terminator", joined(pane) == id .. ":" .. staged .. "!")
@@ -248,11 +273,30 @@ pane.sent = {}
 id = "cccccccc11111111"
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
 run_until(now)
+ack(pane, id, #header_of(id, staged), proof)
+run_until(now)
+local before = #joined(pane)
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "cancel:" .. id)
-check("cancel mid-stream sends the terminator", pane.sent[#pane.sent] == "!" and #joined(pane) == 4097)
+check("cancel mid-stream sends the terminator", pane.sent[#pane.sent] == "!" and #joined(pane) == before + 1)
 check("cancel deletes the staged file", not exists(path))
 run_until(now + 30)
-check("cancel stops sending", #joined(pane) == 4097)
+check("cancel stops sending", #joined(pane) == before + 1)
+
+-- A receiver rejecting a transfer under another id (a forged ready won the
+-- race) still ends this pane's transfer; another pane's cancel does not.
+path = staged_file(staged)
+pane = new_pane("p4b")
+press(pane, path)
+run_until(now)
+pane.sent = {}
+id = "cccccccc22222222"
+paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
+run_until(now)
+paster:user_var_changed(window, other_pane, "TERMNAV_PASTE_IMAGE", "cancel:9999999999999999")
+check("another pane's cancel is ignored", exists(path) and joined(pane) == header_of(id, staged))
+paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "cancel:9999999999999999")
+check("foreign-id cancel from this pane sends the terminator", joined(pane) == header_of(id, staged) .. "!")
+check("foreign-id cancel deletes the staged file", not exists(path))
 
 -- No acknowledgement within 5 s abandons the transfer.
 path = staged_file(staged)
@@ -261,11 +305,12 @@ press(pane, path)
 run_until(now)
 pane.sent = {}
 id = "dddddddd22222222"
+header = header_of(id, staged)
 paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
 run_until(now + 4.9)
-check("still waiting before 5 s", #joined(pane) == 4096 and exists(path))
+check("still waiting before 5 s", joined(pane) == header and exists(path))
 run_until(now + 0.2)
-check("abandons with a terminator after 5 s", #joined(pane) == 4097 and pane.sent[#pane.sent] == "!")
+check("abandons with a terminator after 5 s", joined(pane) == header .. "!")
 check("abandonment deletes the staged file", not exists(path))
 
 -- An arm expires after 10 s and deletes its file.
@@ -306,10 +351,22 @@ pane = new_pane("p9")
 press(pane, path)
 run_until(now)
 pane.sent = {}
-paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:ffffffff55555555")
+id = "ffffffff55555555"
+paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:" .. id)
+run_until(now + 1)
+ack(pane, id, #joined(pane), string.rep("a", 16))
 run_until(now + 1)
 check("control bytes are never sent", not joined(pane):find("\27", 1, true))
 check("tampered file is deleted", not exists(path))
+path = staged_file("12:not-a-digest:AAAA")
+pane = new_pane("p10")
+press(pane, path)
+run_until(now)
+pane.sent = {}
+paster:user_var_changed(window, pane, "TERMNAV_PASTE_IMAGE", "ready:ffffffff66666666")
+run_until(now + 1)
+check("malformed staged header types only the terminator", joined(pane) == "!")
+check("malformed staged file is deleted", not exists(path))
 
 -- Without opts.routes the module shares link-routes from its own directory.
 local loaded = paste_image.new(wezterm, {})

@@ -170,6 +170,14 @@ impl Parser {
         self.consumed > 0
     }
 
+    /// First 16 hexadecimal characters of the declared digest, once the
+    /// header is complete. Acknowledgements carry it to prove they come from
+    /// a receiver that read the header WezTerm typed, not from a blind forger.
+    #[must_use]
+    pub fn digest_proof(&self) -> String {
+        super::hex(&self.digest[..8])
+    }
+
     /// Declared decoded length, once the header is complete.
     #[must_use]
     pub fn declared_length(&self) -> usize {
@@ -545,6 +553,7 @@ mod tests {
         parser.feed(b":").unwrap();
         assert!(parser.header_complete());
         assert_eq!(parser.declared_length(), 10);
+        assert_eq!(parser.digest_proof(), "0000000000000000");
         assert_eq!(parser.encoded_length(), 16);
         assert_eq!(parser.remaining_encoded(), 16);
     }

@@ -401,7 +401,7 @@ is invalid syntax.
 | --- | --- |
 | Trigger key | `\033[777010u`, tmux `user-keys[14]` |
 | User variable | `TERMNAV_PASTE_IMAGE` |
-| Announcements | `ready:<id>`, `ack:<id>:<offset>`, `done:<id>`, `cancel:<id>` |
+| Announcements | `ready:<id>`, `ack:<id>:<offset>:<proof>`, `done:<id>`, `cancel:<id>` |
 | Transfer | `<id>:<length>:<sha256>:<base64>!` |
 
 - `<id>` is 16 lowercase hexadecimal characters from the receiver; WezTerm
@@ -414,18 +414,30 @@ is invalid syntax.
 - `<offset>` counts transfer bytes the receiver has accepted, from the first
   id byte. Offsets strictly increase, so every announcement is a distinct
   value; WezTerm fires `user-var-changed` only on change.
+- `<proof>` is the first 16 characters of `<sha256>`, which the receiver
+  could only learn by reading the header WezTerm typed.
 
-Flow control: WezTerm sends at most 4 KiB before the first acknowledgement.
-The receiver acknowledges as soon as it has accepted the header, then at
-least every 128 KiB. WezTerm keeps at most 512 KiB beyond the last
-acknowledged offset in flight, sends at most 32 KiB per timer callback, and
-abandons the transfer, sending `!`, when no acknowledgement arrives for five
-seconds. WezTerm sends `!` as soon as it sees `cancel` mid-stream. The
-receiver gives up after 30 seconds without input. Keys typed into the popup
-before the transfer begins, such as Esc, cancel it.
+Flow control: until an acknowledgement with the matching proof arrives,
+WezTerm types only the header `<id>:<length>:<sha256>:`, at most 139 bytes of
+digits, lowercase hex, and colons. The receiver acknowledges as soon as it
+has accepted the header, then at least every 128 KiB. WezTerm accepts an
+acknowledgement only from the transfer's pane, for its id, with the proof,
+and for an offset it has sent; it then keeps at most 512 KiB beyond that
+offset in flight and sends at most 32 KiB per timer callback. It abandons
+the transfer, sending `!`, when no acknowledgement arrives for five seconds,
+and sends `!` as soon as the transfer's pane announces `cancel` under any id,
+because a receiver rejecting a transfer meant for another id is still
+discarding input until the terminator.
 
-The WezTerm module sends nothing but the staged header and base64
-characters, the id, and the terminator, even if a staged file was replaced.
+The receiver gives up after 30 seconds without input. A first byte that
+cannot start a transfer (not lowercase hex), such as Esc, is the user's
+keystroke: it cancels and discards input for a one-second quiet period. A
+lowercase hex first byte with the wrong id is a transfer meant for another
+receiver: it cancels and discards until `!` or the 30-second idle limit.
+
+The WezTerm module sends nothing but the header, base64 characters, and the
+terminator, even if a staged file was replaced; a malformed staged header
+sends only `!`.
 
 ### Wiring
 
@@ -442,7 +454,7 @@ bind-key -n User14 if-shell -F "#{||:#{pane_in_mode},#{synchronize-panes}}" {
 }
 ```
 
-`user-keys` takes effect for clients that attach after it is set. In WezTerm,
+In WezTerm,
 pass the `link-routes.lua` instance so both modules share one terminal-owner
 policy, bind Ctrl-V, and forward `user-var-changed`:
 
@@ -468,13 +480,17 @@ be sent only by announcing `ready` while WezTerm is armed for the pane that
 leads to it, which requires the user's Ctrl-V there within the last ten
 seconds, and only once per arm. Residual risks, accepted: another visible
 pane, or a same-user process that can write the client's terminal, can forge
-`ready` during that window. Without acknowledgements from a receiver that
-parsed the header, WezTerm then types at most the first 4 KiB of header and
-base64 into whatever has focus before abandoning; a forger that also parses
-the header and acknowledges receives the image the user just pasted. If focus
-moves to another pane mid-transfer, at most the current window (512 KiB, or 4
-KiB before the first acknowledgement) can reach that pane's application
-before acknowledgements stop.
+`ready` during that window. WezTerm then types only the header (digits,
+lowercase hex, and colons) into whatever has focus. A forger that cannot read
+that input cannot produce the proof, so WezTerm abandons after five seconds
+with `!`. A forger that is itself the focused application, or otherwise
+reads what WezTerm types, can produce the proof and receives the image the
+user just pasted. If a forged `ready` wins the race against the real
+receiver, the receiver rejects the foreign id, keeps discarding, and its
+`cancel` makes WezTerm end the transfer, so nothing reaches the pane's
+application. If focus moves to another pane mid-transfer, at most the current
+window (512 KiB beyond the last acknowledgement, or the header before the
+first) can reach that pane's application before acknowledgements stop.
 
 ### Reach and non-goals
 
@@ -487,6 +503,15 @@ declined by routing. A clipboard holding both text and an image pastes the
 text. VS Code's integrated terminal intercepts Ctrl-V itself. Only PNG images
 are supported. A 16 MiB image crossed one local tmux layer in about 3.5
 seconds in the test harness.
+
+Known limitations, shared with pane navigation's forwarding gate: a layer
+can see only the foreground program of its pane. When it forwards the
+trigger into SSH or Eternal Terminal with mouse reporting on but no tmux runs
+on the far side, the remote application receives the trigger key itself:
+remote Neovim inserts a stray character and Vim inserts `2` and leaves insert
+mode. Likewise a remote tmux whose configuration lacks the `user-keys[14]`
+entry passes the raw trigger to its pane's application. No `ready` follows in
+either case, so WezTerm sends nothing else and the arm expires.
 
 ## Neovim integration options
 

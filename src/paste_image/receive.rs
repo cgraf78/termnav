@@ -25,9 +25,11 @@ pub const IDLE_LIMIT: Duration = Duration::from_secs(30);
 /// Saved images older than this are removed by later receivers.
 pub const KEEP_IMAGES: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Quiet period that ends discarding after input the user typed before any
-/// transfer started. WezTerm streams continuously once it has begun, so a
-/// short silence proves nothing is in flight.
+/// Quiet period that ends discarding after a keystroke the user typed before
+/// any transfer started. A transfer always begins with a lowercase hex id, so
+/// a byte outside that alphabet at offset 0 is the user's, and a short silence
+/// proves nothing is in flight. A hex byte with the wrong id is a transfer
+/// meant for another receiver and is drained with the full idle limit.
 const ABORT_QUIET: Duration = Duration::from_secs(1);
 
 /// tmux commands are bounded like other Termnav probes.
@@ -191,8 +193,11 @@ fn receive(
             let index = (parser.consumed() - before) as usize;
             let rest = &buffer[index.min(count)..count];
             let reason = match rejection {
-                // Anything typed before the transfer began is the user's own
-                // keystroke, most likely Esc or Ctrl-C to dismiss the popup.
+                Rejection::InvalidByte { offset: 0, byte } if is_transfer_start(byte) => {
+                    "a transfer for another receiver arrived".to_owned()
+                }
+                // Anything else typed before the transfer began is the user's
+                // own keystroke, most likely Esc or Ctrl-C to dismiss the popup.
                 Rejection::InvalidByte { offset: 0, .. } => "cancelled".to_owned(),
                 Rejection::InvalidByte { byte: b'!', .. } => {
                     "the transfer was truncated".to_owned()
@@ -202,7 +207,7 @@ fn receive(
             let drain = if rest.contains(&b'!') {
                 // The terminator already arrived; nothing is left in flight.
                 Drain::None
-            } else if before == 0 && index == 0 {
+            } else if before == 0 && index == 0 && !is_transfer_start(buffer[0]) {
                 Drain::Until(ABORT_QUIET)
             } else {
                 Drain::Until(IDLE_LIMIT)
@@ -220,7 +225,10 @@ fn receive(
         // full window; later ones are spaced so each value is distinct.
         if acknowledged.is_none_or(|last| consumed - last >= ACK_INTERVAL) {
             if destination
-                .send(USER_VAR, &format!("ack:{id}:{consumed}"))
+                .send(
+                    USER_VAR,
+                    &format!("ack:{id}:{consumed}:{}", parser.digest_proof()),
+                )
                 .is_err()
             {
                 return Err(Failure::new(
@@ -239,6 +247,12 @@ fn receive(
             let _ = progress.flush();
         }
     }
+}
+
+/// Whether `byte` can begin a transfer, whose first field is a lowercase hex
+/// id.
+fn is_transfer_start(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
 
 /// Base64 characters accepted so far.
