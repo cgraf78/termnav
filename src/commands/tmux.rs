@@ -9,7 +9,7 @@ use crate::terminal;
 const HELP: &str = r#"usage:
   termnav tmux context --tty TTY --client-termname TERM [--control-mode 0|1]
   termnav tmux attention --tmux-socket PATH --client-name NAME --client-pid PID
-       --client-created EPOCH --working N --pending N --failed N
+       --client-created EPOCH --working N --pending N --failed N [--waiting N]
   termnav tmux focus claim --parent-tmux PATH --parent-pane ID --token TOKEN --lease-ms N
   termnav tmux focus release --parent-tmux PATH --parent-pane ID --token TOKEN
   termnav tmux focus expire --parent-tmux PATH --parent-pane ID

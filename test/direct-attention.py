@@ -110,8 +110,10 @@ def scenario(term: str, malformed_parent: bool = False) -> None:
                 "--working",
                 "2",
                 "--pending",
-                "1",
+                "2",
                 "--failed",
+                "1",
+                "--waiting",
                 "1",
             ]
             drain()
@@ -144,11 +146,14 @@ def scenario(term: str, malformed_parent: bool = False) -> None:
             assert start >= 0, (term, output)
             end = output.index(suffix, start)
             payload = json.loads(base64.b64decode(output[start + len(prefix) : end]))
-            assert {key: payload[key] for key in ("v", "working", "pending", "failed")} == {
+            assert {
+                key: payload[key] for key in ("v", "working", "pending", "failed", "waiting")
+            } == {
                 "v": 1,
                 "working": 2,
-                "pending": 1,
+                "pending": 2,
                 "failed": 1,
+                "waiting": 1,
             }
             assert isinstance(payload["heartbeat"], int)
             args[args.index("--client-created") + 1] = str(int(created) + 1)
