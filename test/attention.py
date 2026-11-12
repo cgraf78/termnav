@@ -1,5 +1,7 @@
 """Exercise real nested tmux clients without touching the user's server."""
 
+from __future__ import annotations
+
 import json
 import os
 import pathlib
@@ -106,6 +108,25 @@ def main() -> None:
         def tmux(server: str, *args: str) -> subprocess.CompletedProcess[str]:
             return run("tmux", "-S", server, *args, env=env)
 
+        def lease(pane: str) -> tuple[str, str]:
+            """Read the legacy lease and its separate waiting lease."""
+            return tuple(
+                tmux(outer, "show-option", "-pqv", "-t", pane, option).stdout.strip()
+                for option in ("@termnav_child_attention", "@termnav_child_waiting")
+            )
+
+        def assert_lease(pane: str, counts: list[str], waiting: str | None) -> tuple[str, str]:
+            """Keep the legacy four-field shape and share one expiry."""
+            state, extra = lease(pane)
+            fields = state.split(":")
+            assert len(fields) == 4 and fields[0].isdigit(), state
+            assert fields[1:] == counts, state
+            if waiting is None:
+                assert extra == "", extra
+            else:
+                assert extra == fields[0] + ":" + waiting, (state, extra)
+            return state, extra
+
         try:
             # Cleanup is installed before either server starts. The nested
             # client obtains the outer pane as its real controlling terminal.
@@ -144,28 +165,29 @@ def main() -> None:
                 "--working",
                 "2",
                 "--pending",
-                "1",
+                "3",
                 "--failed",
                 "1",
+                "--waiting",
+                "2",
             ]
             sent = run(*args, env=env)
             if sent.returncode != 0:
                 diagnose_client(pid, inner, outer, env)
             assert sent.returncode == 0, (sent.returncode, sent.stderr)
-            state = tmux(
-                outer, "show-option", "-pqv", "-t", "%0", "@termnav_child_attention"
-            ).stdout.strip()
-            assert state.split(":")[1:] == ["2", "1", "1"], state
-            # A changed client generation must not overwrite the prior value.
+            leases = assert_lease("%0", ["2", "3", "1"], "2")
+            # A changed client generation must not overwrite either lease.
             args[args.index("--client-created") + 1] = str(int(created) + 1)
             refused = run(*args, env=env)
             assert refused.returncode == 1, refused.stderr
-            assert (
-                tmux(
-                    outer, "show-option", "-pqv", "-t", "%0", "@termnav_child_attention"
-                ).stdout.strip()
-                == state
-            )
+            assert lease("%0") == leases
+            # An older publisher omits --waiting; that clears the waiting lease.
+            args[args.index("--client-created") + 1] = created
+            older = args[: args.index("--waiting")]
+            older[older.index("--pending") + 1] = "1"
+            sent = run(*older, env=env)
+            assert sent.returncode == 0, (sent.returncode, sent.stderr)
+            assert_lease("%0", ["2", "1", "1"], None)
             # Exercise the real SSH relay dispatch without opening a second
             # authenticated network connection. Its socket remains owner-only.
             relay_path = str(root / "relay")
@@ -183,17 +205,21 @@ def main() -> None:
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline and not pathlib.Path(relay_path).exists():
                 time.sleep(0.03)
+
+            def relay(request: dict[str, object]) -> None:
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(5)
+                    client.connect(relay_path)
+                    client.sendall(json.dumps(request).encode() + b"\n")
+                    response = json.loads(client.makefile("rb").readline())
+                assert response["result"] == "emitted", (request, response)
+
             request = {"v": 2, "op": "attention", "working": 3, "pending": 2, "failed": 1}
-            with socket.socket(socket.AF_UNIX) as client:
-                client.settimeout(5)
-                client.connect(relay_path)
-                client.sendall(json.dumps(request).encode() + b"\n")
-                response = json.loads(client.makefile("rb").readline())
-            assert response["result"] == "emitted", response
-            relayed = tmux(
-                outer, "show-option", "-pqv", "-t", relay_pane, "@termnav_child_attention"
-            ).stdout.strip()
-            assert relayed.split(":")[1:] == ["3", "2", "1"], relayed
+            relay(dict(request, waiting=1))
+            assert_lease(relay_pane, ["3", "2", "1"], "1")
+            # Older relay peers send no waiting field: accepted as zero.
+            relay(request)
+            assert_lease(relay_pane, ["3", "2", "1"], None)
             # Invalid inherited context must not silently pick another route.
             bad_path = str(root / "bad-relay")
             bad_env = dict(env, TMUX="malformed", TMUX_PANE="%0", TERMNAV_PARENT_RELAY=relay_path)

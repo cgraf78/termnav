@@ -616,9 +616,17 @@ Control-mode clients are skipped without requiring terminal metadata.
 `termnav tmux attention` forwards a snapshot from one exact attached client to
 its containing tmux pane or existing SSH relay. It requires `--tmux-socket`,
 `--client-name`, `--client-pid`, `--client-created`, `--working`, `--pending`,
-and `--failed`. Counts are nonnegative integers capped at 100,000; failures
-must be a subset of pending attention. Work and attention remain independent,
-so an unfinished activity does not hide a failure elsewhere in the session.
+and `--failed`, and accepts an optional `--waiting` (default 0). Counts are
+nonnegative integers capped at 100,000, and `failed + waiting` must not exceed
+`pending`.
+
+Counts are per-pane effective states chosen by the publisher; Termnav carries
+them unchanged. tmux-tools' `term-pane-state` counts each pane once, under the
+first match of red (a failed command or blocked agent), yellow (waiting for an
+answer), green (other pending attention), or working. `pending` counts the red,
+yellow, and green panes, `failed` the red ones, `waiting` the yellow ones, and
+`working` only panes without attention. Consumers derive green as
+`pending - failed - waiting`.
 
 The client identity and foreground terminal ownership must still match when
 publishing. Exit status 0 means the parent accepted the snapshot or Termnav
@@ -630,12 +638,28 @@ is opened. The accompanying tmux-tools `term-pane-state` publisher supplies
 these identities and aggregates each layer's local and child counts.
 
 Parent panes receive a 15-second lease in `@termnav_child_attention`, measured
-on the receiving host. A direct terminal receives the `TERM_PANE_STATE` OSC
-user variable. These are advisory snapshots: overlapping deliveries can briefly
-arrive out of order, the next publication reconciles them, and disconnected
-publishers expire. Consumers must expire terminal state by local receipt time
-rather than comparing clocks across machines. The protocol does not acknowledge
-user attention or alter the underlying activity lifecycle.
+on the receiving host, as `EXPIRY:WORKING:PENDING:FAILED`. The waiting count
+travels in a separate `@termnav_child_waiting` lease, `EXPIRY:WAITING`, with
+the same expiry. Both options are written in one tmux command, and the waiting
+lease is removed in that command when the count is 0. A direct terminal
+receives the `TERM_PANE_STATE` OSC user variable, a JSON object with `v` (1),
+`working`, `pending`, `failed`, `waiting`, and `heartbeat`. These are advisory
+snapshots: overlapping deliveries can briefly arrive out of order, the next
+publication reconciles them, and disconnected publishers expire. Consumers
+must expire terminal state by local receipt time rather than comparing clocks
+across machines. The protocol does not acknowledge user attention or alter the
+underlying activity lifecycle.
+
+`waiting` is an additive field: the relay request stays protocol v2 and the
+terminal snapshot stays `"v":1`. Readers treat a request or snapshot without
+`waiting` as 0, and older readers ignore it, so layers can update in any
+order. The main lease keeps its exact four-field shape because older readers
+discard leases with extra fields. An older Termnav renews only the main lease:
+a request it relays to a newer Termnav arrives without `waiting` and clears
+the waiting lease, while its own direct pane writes leave an earlier waiting
+lease to expire. Lease readers should therefore ignore an expired waiting
+lease and clamp it to `pending - failed`. Wherever a layer is older, waiting
+panes still count as pending and display as ordinary attention.
 
 Direct attention writes, including the SSH relay's terminal edge, use a fresh
 nonblocking descriptor with matching character-device, inode, and device

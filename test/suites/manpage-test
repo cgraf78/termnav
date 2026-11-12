@@ -27,6 +27,9 @@ _assert_contains "manpage documents all eleven click identity fields" \
   "LEFT, SOCKET" "$termnav_page"
 _assert_contains "manpage documents complete Neovim route identity" \
   "ROUTE-KIND" "$termnav_page"
+for contract in "--waiting N" @termnav_child_attention @termnav_child_waiting; do
+  _assert_contains "manpage documents attention contract: $contract" "$contract" "$termnav_page"
+done
 
 readme=$(cat "$TERMNAV_REPO_ROOT/README.md")
 _assert_not_contains "README omits nonexistent remote-pane extension" \

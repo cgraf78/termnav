@@ -160,15 +160,27 @@ exact option names.
 Requires
 .B --tmux-socket SOCKET --client-name NAME --client-pid PID --client-created EPOCH
 and
-.BR "--working N --pending N --failed N" .
-Counts are nonnegative and bounded at 100000; failed cannot exceed pending.
+.BR "--working N --pending N --failed N" ,
+and accepts
+.B --waiting N
+(default 0).
+Counts are nonnegative and bounded at 100000; failed plus waiting cannot exceed
+pending. Counts are per-pane effective states chosen by the publisher: each
+pane counts once, in failed (red), waiting (yellow), or other pending (green)
+attention, or else as working.
 The exact client identity and foreground tty ownership are verified. Status 0
 means the parent accepted the snapshot or Termnav published to the exact direct
 terminal. Legacy status 3 requires an updated Termnav; callers must not perform
 their own tty writes. Status 1 is an error; invalid arguments
 return 2. Existing local tmux ancestry and SSH relays are reused.
-Child contributions expire after 15 seconds on the receiving host. Direct
-terminals receive the TERM_PANE_STATE OSC user variable. Snapshots are advisory:
+Child contributions expire after 15 seconds on the receiving host. The parent
+pane option @termnav_child_attention keeps its four-field
+EXPIRY:WORKING:PENDING:FAILED value; @termnav_child_waiting carries
+EXPIRY:WAITING with the same expiry, is set in the same tmux command, and is
+removed when waiting is 0. Lease readers must expire it independently and
+clamp it to pending minus failed. Direct terminals receive the TERM_PANE_STATE
+OSC user variable, including waiting. The waiting field is additive: readers
+treat its absence as 0 and older readers ignore it. Snapshots are advisory:
 overlapping deliveries may briefly arrive out of order before reconciliation.
 Terminal consumers must expire them using local receipt time.
 Direct attention writes use a fresh nonblocking descriptor, verify its device

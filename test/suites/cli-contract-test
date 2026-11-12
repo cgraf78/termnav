@@ -52,6 +52,10 @@ done
 _assert_contains "CLI contract: focus documents exact client syntax" \
   "--client-pid PID" "$focus_help"
 
+tmux_help=$($termnav tmux --help 2>&1)
+_assert_contains "CLI contract: attention documents the optional waiting count" \
+  "--failed N [--waiting N]" "$tmux_help"
+
 nvim_help=$($termnav nvim --help 2>&1)
 _assert_contains "CLI contract: nvim documents cli arity" "cli FILE [CWD]" "$nvim_help"
 _assert_contains "CLI contract: nvim documents exact link route identity" \
@@ -67,6 +71,12 @@ $termnav tmux context unexpected >/dev/null 2>&1
 context_invalid_rc=$?
 $termnav nvim open link one two three four five six seven eight >/dev/null 2>&1
 nvim_link_invalid_rc=$?
+attention=(tmux attention --tmux-socket /nonexistent/termnav-socket --client-name x
+  --client-pid 1 --client-created 1 --working 0 --pending 1 --failed 1)
+$termnav "${attention[@]}" --waiting 1 >/dev/null 2>&1
+attention_waiting_invalid_rc=$?
+$termnav "${attention[@]}" --waiting >/dev/null 2>&1
+attention_waiting_missing_rc=$?
 set -e
 _assert_exit "CLI contract: invalid navigation direction is usage error" \
   2 "$navigate_invalid_rc"
@@ -76,6 +86,10 @@ _assert_exit "CLI contract: invalid context argument is usage error" \
   2 "$context_invalid_rc"
 _assert_exit "CLI contract: link routing rejects surplus identity fields" \
   2 "$nvim_link_invalid_rc"
+_assert_exit "CLI contract: attention rejects failed plus waiting above pending" \
+  2 "$attention_waiting_invalid_rc"
+_assert_exit "CLI contract: attention rejects --waiting without a value" \
+  2 "$attention_waiting_missing_rc"
 
 set +e
 missing_output=$($termnav 2>&1)
