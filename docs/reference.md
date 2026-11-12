@@ -76,6 +76,9 @@ configuration, and `man termnav` has the complete command syntax.
   control-character policy on every `TERMNAV_OPEN_URL` value, because any
   program whose output reaches the terminal can set it; rejected values are
   logged as a warning without the value and never opened.
+- `termnav paste-image stage|receive ...`: give a desktop clipboard image to
+  the program in the active tmux pane, locally or one remote hop away; see
+  [Clipboard image paste](#clipboard-image-paste).
 - `termnav nvim open MODE ...`: open a target in the narrowest eligible editor
   scope. `ssh-open` is the fail-closed existing-ControlMaster transport.
 - `termnav vscode focus ...`: publish ordered, authenticated Neovim focus
@@ -88,8 +91,9 @@ configuration, and `man termnav` has the complete command syntax.
 Complete leaf syntax is available from command-group help and the manpage.
 Exit status `0` means handled/success, `1` means operational failure, and `2`
 means invalid syntax. Navigation and relay-send use `3` for a valid request
-declined at the current boundary, and `open-url` uses it when the destination
-is not known to be WezTerm. `nvim ssh-open` additionally uses `10` for
+declined at the current boundary, `open-url` uses it when the destination
+is not known to be WezTerm, and `paste-image stage` uses it when the clipboard
+holds no image or also holds text. `nvim ssh-open` additionally uses `10` for
 unavailable connection configuration, `11` for an invalid host, `12` for SSH
 failure, and `13` for a disallowed host. `vscode focus` uses `10` when no
 adapter is available. Passthrough commands otherwise preserve child status.
@@ -128,7 +132,10 @@ status. Reusable behavior lives behind focused library interfaces:
   fallback, and mux-only remote reuse;
 - `click` owns mouse-text recognition and returns typed URL/file targets;
 - `browser` owns open-URL validation and delivery of `TERMNAV_OPEN_URL` to
-  the outer terminal;
+  the outer terminal, and resolves the outward route of one exact tmux client
+  for other WezTerm user-variable publishers;
+- `paste_image` owns the clipboard image transfer grammar, the desktop-side
+  `stage` reader, and the popup-side `receive` endpoint;
 - `vscode` owns VS Code window focus publication to the companion extension;
 - `assets` owns installed provider-root discovery;
 - `shell` owns POSIX shell quoting and tmux format escaping at explicit
@@ -156,6 +163,9 @@ constructing protocol objects directly.
 - `lib/termnav/wezterm/link-routes.lua`: WezTerm route handlers. Navigation
   consumers use one pane-owner snapshot per gesture and avoid foreground
   process inspection when current Neovim or tmux metadata is already present.
+- `lib/termnav/wezterm/paste-image.lua`: WezTerm endpoint of
+  `termnav paste-image`: a Ctrl-V action and a `user-var-changed` handler for
+  `TERMNAV_PASTE_IMAGE`. See [Clipboard image paste](#clipboard-image-paste).
 - `lib/termnav/wezterm/public-link-rules.lua`: public WezTerm link rules
   for terminal tokens such as localhost URLs, git SSH remotes, CVEs, and RFCs.
   The module returns fresh rule copies from `public_link_rules()` and appends
@@ -294,10 +304,214 @@ only one request per pane is in flight at once.
 The WezTerm protocol consists of `IS_NVIM`, `NVIM_OPEN_SOCKET`,
 `NVIM_LINK_CWD`, `NVIM_REMOTE_LINK_HOST`, `NVIM_REMOTE_CWD`,
 `NVIM_REMOTE_TMUX`, and `TERMNAV_TMUX` pane metadata plus the
-`TERMNAV_TAB_SELECT`, `TERMNAV_TAB_MOVE`, and `TERMNAV_OPEN_URL` requests.
+`TERMNAV_TAB_SELECT`, `TERMNAV_TAB_MOVE`, and `TERMNAV_OPEN_URL` requests,
+and the `TERMNAV_PASTE_IMAGE` announcements handled by `paste-image.lua`.
 `routes.setup()` owns the request handlers; consumers should use route helpers
 instead of interpreting metadata directly, and should publish open-URL
 requests through `termnav open-url`. There are no `DOT_*` aliases.
+
+## Clipboard image paste
+
+Pressing Ctrl-V in WezTerm while the desktop clipboard holds an image, such as
+a screenshot, gives that image to the program in the active tmux pane, whether
+it runs on the desktop or on a remote host. The image is saved as a PNG on the
+host where the innermost tmux runs and its absolute path is bracket-pasted
+into that pane; coding agents that attach an image when its path is pasted
+pick it up from there. Text paste is unchanged. The image travels in-band
+through the terminal byte stream, so it crosses SSH, Eternal Terminal, and
+local tmux layers without a tunnel, port forward, second login, or daemon.
+
+### Flow
+
+1. **Gesture.** `paste-image.lua`'s Ctrl-V action always performs WezTerm's
+   normal `PasteFrom("Clipboard")` first, immediately. Only when the pane's
+   terminal owner is tmux (the `link-routes.lua` policy) does a scheduled
+   callback run `termnav paste-image stage`. On exit `0` WezTerm arms that
+   pane for 10 seconds with the staged file and sends the private trigger key
+   `\033[777010u` to it. Any other status ends the gesture; a text or mixed
+   clipboard has already been pasted as text.
+2. **Routing.** tmux matches the trigger as `user-keys[14]` (`User14`). Each
+   layer either declines with a message (the active pane is in a mode, panes
+   are synchronized, or the next hop cannot carry the transfer), forwards the
+   key inward with `send-keys -H` into a nested tmux, or, as the innermost
+   layer, opens a popup running `termnav paste-image receive` for its active
+   pane and the client that pressed the key. Forwarding policy belongs to the
+   consumer's tmux configuration.
+3. **Handshake.** The receiver puts its terminal in raw mode, generates a
+   random id, and announces `ready:<id>` to WezTerm through the exact
+   client's outward route, the one `tmux follow-click` uses for URLs, never
+   the session's most recent client.
+4. **Transfer.** WezTerm accepts `ready` only for the armed pane, once, before
+   the arm expires, and types the transfer into the popup in bounded chunks
+   from timer callbacks.
+5. **Delivery.** The receiver rejects the first byte outside the grammar,
+   checks the id, length, SHA-256 digest, size cap, and PNG signature, writes
+   the image atomically, announces `done:<id>`, bracket-pastes the path into
+   the pane through a private tmux buffer (`paste-buffer -p -d`), and exits.
+   On any failure it announces `cancel:<id>`, keeps discarding input until
+   the terminator `!` (or the idle limit) so bytes still in flight never
+   reach the pane, shows a message on the client, and writes nothing.
+6. **Cleanup.** WezTerm deletes the staged file on `done`, `cancel`,
+   abandonment, or expiry. `stage` prunes its own staged files older than ten
+   minutes, and `receive` prunes its own images older than seven days.
+
+### Commands
+
+`termnav paste-image stage` reads the desktop clipboard through reader
+subprocesses that share a hard five-second limit; validation, hashing, and
+encoding follow outside it and are linear in the capped size. WezTerm runs
+staging asynchronously, so the limit can delay only an image paste. A
+reader's output goes straight to an owner-only file, and a file-size limit
+stops it one byte past the cap. macOS uses one `osascript` run that inspects the pasteboard
+classes and writes its PNG class into an owner-only file; Linux uses
+`wl-paste --list-types` and `wl-paste --type image/png` when
+`WAYLAND_DISPLAY` is set (falling back to X when `wl-paste` is missing), or
+`xclip -selection clipboard -o -t TARGETS` and `-t image/png` when `DISPLAY` is
+set. It exits `3`, printing nothing, when the clipboard offers no `image/png`
+or also offers plain text (`text/plain`, `UTF8_STRING`, `STRING`, `TEXT`,
+`COMPOUND_TEXT`, or the macOS string classes). Otherwise it checks the PNG
+signature and the 16 MiB cap, writes `<length>:<sha256-hex>:<base64>` as one
+line without a newline to an owner-only `stage-*.b64` file in
+`$XDG_RUNTIME_DIR/termnav-UID/paste-image/` (the private runtime directory, below the temporary directory when `XDG_RUNTIME_DIR` is unset),
+prints that path, and exits `0`. A reader failure, timeout, non-PNG data, or
+an oversized image exits `1`.
+
+`TERMNAV_PASTE_IMAGE_CLIPBOARD` replaces the platform reader with a command
+run as `COMMAND types` (print offered MIME types, one per line) and
+`COMMAND png` (print the PNG). It exists for tests; it also lets an
+unsupported desktop supply its own reader.
+
+`termnav paste-image receive --target-pane PANE --client-name NAME
+[--client-pid PID --client-tty TTY] [--tmux-socket PATH]` is the popup
+endpoint. `PANE` receives the path; the client identifies where announcements
+go and where messages are shown. Without `--client-pid` and `--client-tty`
+the client is resolved from its name. tmux commands use `--tmux-socket`, or
+the socket in the popup's `$TMUX`, explicitly. Images are written as
+`clip-<UTC timestamp>-<random>.png` (0600) under
+`$XDG_CACHE_HOME/termnav/paste-images`, or `$HOME/.cache/termnav/paste-images`
+when the XDG value is unset or relative. Both Termnav directories are created
+or tightened to 0700, and a directory that is a symlink, not a directory, or
+owned by another user is refused. Exit status `0` means the image was saved
+and its path pasted; `1` means nothing was pasted and a message was shown; `2`
+is invalid syntax.
+
+### Protocol
+
+| Item | Value |
+| --- | --- |
+| Trigger key | `\033[777010u`, tmux `user-keys[14]` |
+| User variable | `TERMNAV_PASTE_IMAGE` |
+| Announcements | `ready:<id>`, `ack:<id>:<offset>:<proof>`, `done:<id>`, `cancel:<id>` |
+| Transfer | `<id>:<length>:<sha256>:<base64>!` |
+
+- `<id>` is 16 lowercase hexadecimal characters from the receiver; WezTerm
+  accepts 8 to 64.
+- `<length>` is the decoded PNG size in decimal without sign or leading zero,
+  from 8 to 16777216 (16 MiB).
+- `<sha256>` is 64 lowercase hexadecimal characters.
+- `<base64>` uses the standard alphabet with mandatory `=` padding on one
+  line: exactly `4 * ceil(length / 3)` characters.
+- `<offset>` counts transfer bytes the receiver has accepted, from the first
+  id byte. Offsets strictly increase, so every announcement is a distinct
+  value; WezTerm fires `user-var-changed` only on change.
+- `<proof>` is the first 16 characters of `<sha256>`, which the receiver
+  could only learn by reading the header WezTerm typed.
+
+Flow control: until an acknowledgement with the matching proof arrives,
+WezTerm types only the header `<id>:<length>:<sha256>:`, at most 139 bytes of
+digits, lowercase hex, and colons. The receiver acknowledges as soon as it
+has accepted the header, then at least every 128 KiB. WezTerm accepts an
+acknowledgement only from the transfer's pane, for its id, with the proof,
+and for an offset it has sent; it then keeps at most 512 KiB beyond that
+offset in flight and sends at most 32 KiB per timer callback. It abandons
+the transfer, sending `!`, when no acknowledgement arrives for five seconds,
+and sends `!` as soon as the transfer's pane announces `cancel` under any id,
+because a receiver rejecting a transfer meant for another id is still
+discarding input until the terminator.
+
+The receiver gives up after 30 seconds without input. A first byte that
+cannot start a transfer (not lowercase hex), such as Esc, is the user's
+keystroke: it cancels and discards input for a one-second quiet period. A
+lowercase hex first byte with the wrong id is a transfer meant for another
+receiver: it cancels and discards until `!` or the 30-second idle limit.
+
+The WezTerm module sends nothing but the header, base64 characters, and the
+terminator, even if a staged file was replaced; a malformed staged header
+sends only `!`.
+
+### Wiring
+
+The innermost tmux layer needs a binding like this. `display-popup` does not
+expand formats in its command, so the binding goes through `run-shell`, which
+does:
+
+```tmux
+set -s user-keys[14] "\e[777010u"
+bind-key -n User14 if-shell -F "#{||:#{pane_in_mode},#{synchronize-panes}}" {
+  display-message "Image paste is unavailable here"
+} {
+  run-shell -b "tmux -S #{q:socket_path} display-popup -c #{q:client_name} -t #{q:pane_id} -w 60 -h 5 -E 'termnav paste-image receive --target-pane #{q:pane_id} --client-name #{q:client_name} --client-pid #{client_pid} --client-tty #{q:client_tty} --tmux-socket #{q:socket_path}'"
+}
+```
+
+In WezTerm,
+pass the `link-routes.lua` instance so both modules share one terminal-owner
+policy, bind Ctrl-V, and forward `user-var-changed`:
+
+```lua
+local routes = dofile(link_routes_path).new(wezterm)
+local paste_image = dofile(paste_image_path).new(wezterm, { routes = routes })
+table.insert(config.keys, { key = "v", mods = "CTRL", action = paste_image:paste_action() })
+wezterm.on("user-var-changed", function(window, pane, name, value)
+  paste_image:user_var_changed(window, pane, name, value)
+end)
+```
+
+`user_var_changed` returns whether the variable belongs to this protocol. Do
+not return that value from the event handler: `false` would stop later
+handlers such as `routes.setup()`'s. `new` also accepts `termnav`, an explicit
+binary path; without it the binary is found as `link-routes.lua` finds it.
+Without `routes`, the module loads `link-routes.lua` from its own directory.
+
+### Security model
+
+The desktop serves nothing on request. A remote process can cause an image to
+be sent only by announcing `ready` while WezTerm is armed for the pane that
+leads to it, which requires the user's Ctrl-V there within the last ten
+seconds, and only once per arm. Residual risks, accepted: another visible
+pane, or a same-user process that can write the client's terminal, can forge
+`ready` during that window. WezTerm then types only the header (digits,
+lowercase hex, and colons) into whatever has focus. A forger that cannot read
+that input cannot produce the proof, so WezTerm abandons after five seconds
+with `!`. A forger that is itself the focused application, or otherwise
+reads what WezTerm types, can produce the proof and receives the image the
+user just pasted. If a forged `ready` wins the race against the real
+receiver, the receiver rejects the foreign id, keeps discarding, and its
+`cancel` makes WezTerm end the transfer, so nothing reaches the pane's
+application. If focus moves to another pane mid-transfer, at most the current
+window (512 KiB beyond the last acknowledgement, or the header before the
+first) can reach that pane's application before acknowledgements stop.
+
+### Reach and non-goals
+
+The receiver's announcements use the outward user-variable route, which
+follows local tmux layers and wraps one passthrough frame for a layer it
+cannot inspect, so the reach is local tmux plus one remote hop; an
+uninspectable layer needs `allow-passthrough`. Remote panes without tmux keep
+plain text paste. mosh is unsuitable for multi-megabyte input and should be
+declined by routing. A clipboard holding both text and an image pastes the
+text. VS Code's integrated terminal intercepts Ctrl-V itself. Only PNG images
+are supported. A 16 MiB image crossed one local tmux layer in about 3.5
+seconds in the test harness.
+
+Known limitations, shared with pane navigation's forwarding gate: a layer
+can see only the foreground program of its pane. When it forwards the
+trigger into SSH or Eternal Terminal with mouse reporting on but no tmux runs
+on the far side, the remote application receives the trigger key itself:
+remote Neovim inserts a stray character and Vim inserts `2` and leaves insert
+mode. Likewise a remote tmux whose configuration lacks the `user-keys[14]`
+entry passes the raw trigger to its pane's application. No `ready` follows in
+either case, so WezTerm sends nothing else and the arm expires.
 
 ## Neovim integration options
 

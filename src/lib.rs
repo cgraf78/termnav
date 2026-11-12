@@ -10,6 +10,7 @@ pub mod focus;
 pub mod links;
 pub mod navigation;
 pub mod nvim;
+pub mod paste_image;
 pub mod process;
 pub mod relay;
 pub mod runtime;

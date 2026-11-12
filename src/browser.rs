@@ -401,7 +401,63 @@ fn request_tmux(url: &Url, tmux: &str) -> Result<(), Undelivered> {
 
 /// Write the request for `client`, following tmux layers outward from it.
 /// `seen` holds the servers already visited.
-fn deliver(url: &Url, mut client: Client, mut seen: Vec<PathBuf>) -> Result<(), Undelivered> {
+fn deliver(url: &Url, client: Client, seen: Vec<PathBuf>) -> Result<(), Undelivered> {
+    Ok(destination(client, seen)?.send(USER_VAR, url.as_str())?)
+}
+
+/// A terminal device known to reach WezTerm, with the framing it needs.
+///
+/// Resolving the route walks tmux and process metadata; a caller that sends
+/// several updates, such as a paste-image receiver acknowledging progress,
+/// resolves once and reuses the result.
+#[derive(Clone, Debug)]
+pub struct Destination {
+    tty: PathBuf,
+    mode: TmuxMode,
+}
+
+impl Destination {
+    /// Write one WezTerm user-variable update to the destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be opened or written.
+    pub fn send(&self, name: &str, value: &str) -> io::Result<()> {
+        write(&self.tty, &terminal::user_var(name, value, self.mode))
+    }
+}
+
+/// Resolve where updates for one exact tmux client reach WezTerm.
+///
+/// This is [`request_click`]'s route without its fallback: the client must
+/// still be attached as `client_tty` (and, when given, with `client_pid`), or
+/// resolution fails instead of choosing the session's most recent client,
+/// which may be another machine's terminal.
+///
+/// # Errors
+///
+/// Returns [`Undelivered::Declined`] when the client or a terminal behind it
+/// is not known to act on user variables, and [`Undelivered::Failed`] when the
+/// server or client cannot be found.
+pub fn exact_client_destination(
+    socket: &str,
+    client_tty: &str,
+    client_pid: Option<u32>,
+) -> Result<Destination, Undelivered> {
+    if socket.is_empty() {
+        return Err(io::Error::other("the tmux server is unknown").into());
+    }
+    let client = match clicking_client(Some(socket), client_tty)? {
+        Clicked::Client(client) if client_pid.is_none_or(|pid| pid == client.pid) => client,
+        Clicked::Ineligible(reason) => return Err(Undelivered::Declined(reason)),
+        _ => return Err(io::Error::other("the tmux client is not attached").into()),
+    };
+    destination(client, vec![canonical_socket(socket)])
+}
+
+/// Follow tmux layers outward from `client` to the terminal that reaches
+/// WezTerm. `seen` holds the servers already visited.
+fn destination(mut client: Client, mut seen: Vec<PathBuf>) -> Result<Destination, Undelivered> {
     for _ in 0..MAX_TMUX_DEPTH {
         let mode = match identify_client(&client) {
             Terminal::WezTerm => terminal::tmux_mode(&client.termname),
@@ -430,7 +486,10 @@ fn deliver(url: &Url, mut client: Client, mut seen: Vec<PathBuf>) -> Result<(), 
                 }
             },
         };
-        return Ok(write(Path::new(&client.tty), &escape(url, mode))?);
+        return Ok(Destination {
+            tty: PathBuf::from(client.tty),
+            mode,
+        });
     }
     Err(Undelivered::Declined(
         "too many nested tmux layers".to_owned(),

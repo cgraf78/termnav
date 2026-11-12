@@ -48,6 +48,19 @@ termnav \- route terminal navigation, focus, links, and editor opens
 .B termnav open-url
 .RI [ --tty " PATH" ] " URL"
 .br
+.B termnav paste-image stage
+.br
+.B termnav paste-image receive --target-pane
+.I PANE
+.B --client-name
+.I NAME
+.RB [ --client-pid
+.I PID
+.B --client-tty
+.IR TTY ]
+.RB [ --tmux-socket
+.IR PATH ]
+.br
 .B termnav vscode focus claim|release
 .I SOURCE CYCLE SEQUENCE OBSERVED
 .br
@@ -251,6 +264,62 @@ before writing. No eligible client or a missing terminal is an operational
 failure (1); standard output is never used. Success means the request was
 written, not that the terminal acted on it. Callers should fall back to their
 own opener on any nonzero status.
+.TP
+.B paste-image stage
+Reads the desktop clipboard through reader subprocesses limited to five
+seconds in total (validation and encoding follow outside that limit): on
+macOS through one
+.B osascript
+run, on Linux through
+.B wl-paste
+when
+.B WAYLAND_DISPLAY
+is set or
+.B xclip
+when
+.B DISPLAY
+is set. Exits 3, printing nothing, when the clipboard offers no
+.B image/png
+or also offers plain text. Otherwise checks the PNG signature and a 16 MiB
+cap, writes
+.I LENGTH:SHA256:BASE64
+as one line to an owner-only file in the private runtime directory, prints
+its path, and exits 0. Reader failure, timeout, or invalid data exits 1. The
+WezTerm module
+.B lib/termnav/wezterm/paste-image.lua
+runs it after Ctrl-V on a tmux pane.
+.TP
+.B paste-image receive
+The tmux popup endpoint. Announces
+.BI ready: ID
+to WezTerm through the exact client's outward route, reads
+.IB ID : LENGTH : SHA256 : BASE64 !
+from raw standard input, rejecting the first byte outside that grammar,
+acknowledges the header and then at least every 128 KiB with
+.BI ack: ID : OFFSET : PROOF ,
+where PROOF is the first 16 characters of SHA256, and checks the length, digest, 16 MiB cap, and PNG
+signature. On success writes
+.BI clip- UTC - RANDOM .png
+(mode 0600) under
+.I $XDG_CACHE_HOME/termnav/paste-images
+(mode 0700; a symlinked or foreign directory is refused), announces
+.BI done: ID ,
+bracket-pastes the absolute path into
+.IR PANE ,
+and exits 0. On failure announces
+.BI cancel: ID ,
+discards input until the terminator, shows a message on the client, writes
+nothing, and exits 1. Gives up after 30 seconds without input. Without
+.B --client-pid
+and
+.B --client-tty
+the client is resolved from
+.IR NAME ;
+without
+.B --tmux-socket
+the server comes from
+.BR $TMUX .
+Saved images older than seven days are pruned.
 .SH SSH RELAY
 Interactive SSH sessions use a remote Unix socket below
 .B /tmp
@@ -286,6 +355,15 @@ per-session environment, and local existing-master cleanup use the same path.
 .B TERMNAV_ASSET_ROOT
 Development/staging override for the installed provider root used by
 .BR asset-path .
+.TP
+.B TERMNAV_PASTE_IMAGE_CLIPBOARD
+Replace the clipboard reader of
+.B paste-image stage
+with a command run as
+.I COMMAND types
+(print offered MIME types, one per line) and
+.I COMMAND png
+(print the PNG). Intended for tests.
 .TP
 .B TERMNAV_PARENT_RELAY
 Connection-scoped Unix relay inherited through an SSH session.
@@ -325,7 +403,9 @@ Invalid syntax.
 .B 3
 Valid navigation or relay-send request declined at this boundary, or an
 .B open-url
-request whose destination is not known to be WezTerm.
+request whose destination is not known to be WezTerm, or a
+.B paste-image stage
+whose clipboard holds no image or also holds text.
 .TP
 .B 10, 11, 12, 13
 .B nvim ssh-open
@@ -358,6 +438,23 @@ registers the open-uri router and handlers for
 .BR TERMNAV_TAB_MOVE ,
 and
 .BR TERMNAV_OPEN_URL .
+.B lib/termnav/wezterm/paste-image.lua
+handles
+.B TERMNAV_PASTE_IMAGE
+announcements from
+.BR "paste-image receive" .
+It sends image data only for a
+.B ready
+from the pane it armed after Ctrl-V, within 10 seconds and once, types only
+the header until an acknowledgement from that pane carries the digest proof,
+keeps at most 512 KiB beyond the last proven acknowledgement in flight, ends
+the transfer with the terminator on any
+.B cancel
+from that pane, and abandons it after five seconds without an
+acknowledgement. The trigger key is
+.BR \e033[777010u ,
+tmux
+.BR user-keys[14] .
 .B termnav open-url
 is the public publisher for TERMNAV_OPEN_URL; integrations should invoke it
 instead of constructing the escape. Because any program whose output reaches
@@ -371,6 +468,10 @@ There are no DOT_* aliases.
 .TP
 .I $XDG_RUNTIME_DIR/termnav-UID
 Owner-only relay, navigation, and focus coordination state.
+.TP
+.I $XDG_CACHE_HOME/termnav/paste-images
+Images saved by
+.BR "paste-image receive" .
 .TP
 .I $XDG_STATE_HOME/nvim-tmux-open
 Neovim socket registry shared with the editor integration.
