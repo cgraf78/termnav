@@ -13,32 +13,58 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Parent-pane contribution, expired using the receiving host's clock.
+///
+/// The value stays `expiry:working:pending:failed`; older readers discard
+/// leases with any other shape, so new counts travel in separate options.
 pub const CHILD_OPTION: &str = "@termnav_child_attention";
+/// Waiting subset of the parent-pane lease as `expiry:waiting`.
+///
+/// Written and removed in the same tmux command as [`CHILD_OPTION`] with the
+/// same receiving-host expiry, and absent when nothing is waiting.
+pub const CHILD_WAITING_OPTION: &str = "@termnav_child_waiting";
 /// Terminal-facing snapshot understood by the WezTerm adapter.
 pub const USER_VAR: &str = "TERM_PANE_STATE";
 const LEASE_SECONDS: u64 = 15;
 
-/// Independent signals: pending attention must not hide concurrent work.
+/// Per-pane effective-state counts chosen by the publisher.
+///
+/// Each pane is counted once, under its most urgent state: tmux-tools'
+/// `term-pane-state` counts red (failed) panes in `failed`, yellow (waiting)
+/// panes in `waiting`, and every attention pane in `pending`; only panes
+/// without attention count as `working`. Consumers derive the remaining
+/// pending panes as `pending - failed - waiting`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct State {
-    /// Number of working activities.
+    /// Number of working panes without attention.
     pub working: u64,
-    /// Number of activities awaiting attention.
+    /// Number of panes awaiting attention, including failed and waiting ones.
     pub pending: u64,
-    /// Number of pending failures.
+    /// Number of pending panes whose attention is a failure.
     pub failed: u64,
+    /// Number of pending panes waiting for an answer; absent in older peers.
+    #[serde(default)]
+    pub waiting: u64,
 }
 
 impl State {
     /// Reject malformed or unbounded metadata before it reaches a terminal.
+    ///
+    /// A missing `waiting` field is an older publisher and means zero; a
+    /// present but malformed one is rejected like any other count.
     #[must_use]
     pub fn parse(request: &Value) -> Option<Self> {
         let state = Self {
             working: request.get("working")?.as_u64()?,
             pending: request.get("pending")?.as_u64()?,
             failed: request.get("failed")?.as_u64()?,
+            waiting: match request.get("waiting") {
+                None => 0,
+                Some(value) => value.as_u64()?,
+            },
         };
-        (state.working <= 100_000 && state.pending <= 100_000 && state.failed <= state.pending)
+        (state.working <= 100_000
+            && state.pending <= 100_000
+            && state.failed.checked_add(state.waiting)? <= state.pending)
             .then_some(state)
     }
 }
@@ -136,23 +162,41 @@ fn claim(socket: &str, pane: &str, pid: u32, state: State) -> bool {
     if !owner(pid, &tty) {
         return false;
     }
-    let value = format!(
-        "{}:{}:{}:{}",
-        now() + LEASE_SECONDS,
-        state.working,
-        state.pending,
-        state.failed
+    let args = lease(pane, now() + LEASE_SECONDS, state);
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    tmux(socket, &args).is_some_and(|output| output.status.success())
+}
+
+/// One tmux command list that replaces both lease options together.
+///
+/// The main lease keeps its exact legacy shape. tmux stops a command list at
+/// the first error, so a missing pane cannot leave a waiting lease behind.
+fn lease(pane: &str, expiry: u64, state: State) -> Vec<String> {
+    let main = format!(
+        "{expiry}:{}:{}:{}",
+        state.working, state.pending, state.failed
     );
-    tmux(
-        socket,
-        &["set-option", "-p", "-t", pane, CHILD_OPTION, &value],
-    )
-    .is_some_and(|output| output.status.success())
+    let waiting = format!("{expiry}:{}", state.waiting);
+    let mut args = vec!["set-option", "-p", "-t", pane, CHILD_OPTION, &main, ";"];
+    if state.waiting == 0 {
+        args.extend(["set-option", "-pu", "-t", pane, CHILD_WAITING_OPTION]);
+    } else {
+        args.extend([
+            "set-option",
+            "-p",
+            "-t",
+            pane,
+            CHILD_WAITING_OPTION,
+            &waiting,
+        ]);
+    }
+    args.into_iter().map(str::to_owned).collect()
 }
 
 fn request(state: State) -> Value {
     json!({"v":protocol::VERSION,"op":protocol::operation::ATTENTION,
-        "working":state.working,"pending":state.pending,"failed":state.failed})
+        "working":state.working,"pending":state.pending,"failed":state.failed,
+        "waiting":state.waiting})
 }
 
 /// Recover any prior partial advisory escape at each immediate parser boundary.
@@ -176,7 +220,7 @@ pub(crate) fn frame(payload: &str, termtype: &str) -> Vec<u8> {
 
 fn payload(state: State) -> String {
     json!({"v":1,"working":state.working,"pending":state.pending,
-        "failed":state.failed,"heartbeat":now()})
+        "failed":state.failed,"waiting":state.waiting,"heartbeat":now()})
     .to_string()
 }
 
@@ -296,6 +340,7 @@ pub fn command(args: &[String], stderr: &mut dyn Write) -> std::io::Result<i32> 
                     | "--working"
                     | "--pending"
                     | "--failed"
+                    | "--waiting"
             )
         {
             writeln!(stderr, "termnav tmux attention: invalid options")?;
@@ -309,11 +354,14 @@ pub fn command(args: &[String], stderr: &mut dyn Write) -> std::io::Result<i32> 
         get("--client-pid"),
         get("--client-created"),
     );
-    let state = State::parse(
-        &json!({"working":get("--working").and_then(|v| v.parse::<u64>().ok()),
-        "pending":get("--pending").and_then(|v| v.parse::<u64>().ok()),
-        "failed":get("--failed").and_then(|v| v.parse::<u64>().ok())}),
-    );
+    let count = |name: &str| get(name).and_then(|v| v.parse::<u64>().ok());
+    let mut counts = json!({"working":count("--working"),"pending":count("--pending"),
+        "failed":count("--failed")});
+    // Omitted means zero; a present but unparsable value stays null and fails.
+    if get("--waiting").is_some() {
+        counts["waiting"] = json!(count("--waiting"));
+    }
+    let state = State::parse(&counts);
     if let (Some(socket), Some(name), Some(pid), Some(created)) = values
         && Path::new(socket).is_absolute()
         && !name.is_empty()
@@ -333,19 +381,36 @@ pub fn command(args: &[String], stderr: &mut dyn Write) -> std::io::Result<i32> 
 
 #[cfg(test)]
 mod tests {
-    use super::{State, foreground_device};
-    use serde_json::json;
+    use super::{
+        CHILD_OPTION, CHILD_WAITING_OPTION, State, command, foreground_device, lease, payload,
+        request,
+    };
+    use serde_json::{Value, json};
+
+    fn state(working: u64, pending: u64, failed: u64, waiting: u64) -> State {
+        State {
+            working,
+            pending,
+            failed,
+            waiting,
+        }
+    }
 
     #[test]
-    fn independent_work_and_attention_survive_the_protocol() {
+    fn effective_state_counts_survive_the_protocol() {
         assert_eq!(
-            State::parse(&json!({"working":2,"pending":1,"failed":1})),
-            Some(State {
-                working: 2,
-                pending: 1,
-                failed: 1
-            })
+            State::parse(&json!({"working":2,"pending":3,"failed":1,"waiting":2})),
+            Some(state(2, 3, 1, 2))
         );
+    }
+
+    #[test]
+    fn older_publishers_without_waiting_mean_zero() {
+        let old = json!({"v":2,"op":"attention","working":2,"pending":1,"failed":1});
+        assert_eq!(State::parse(&old), Some(state(2, 1, 1, 0)));
+        let snapshot: State =
+            serde_json::from_value(json!({"working":2,"pending":1,"failed":1})).unwrap();
+        assert_eq!(snapshot, state(2, 1, 1, 0));
     }
 
     #[test]
@@ -355,9 +420,114 @@ mod tests {
             json!({"working":100001,"pending":1,"failed":0}),
             json!({"working":0,"pending":0,"failed":1}),
             json!({"working":0,"pending":"1","failed":0}),
+            json!({"working":0,"pending":1,"failed":0,"waiting":2}),
+            json!({"working":0,"pending":2,"failed":1,"waiting":2}),
+            json!({"working":0,"pending":1,"failed":1,"waiting":u64::MAX}),
+            json!({"working":0,"pending":1,"failed":0,"waiting":-1}),
+            json!({"working":0,"pending":1,"failed":0,"waiting":"1"}),
+            json!({"working":0,"pending":1,"failed":0,"waiting":null}),
         ] {
-            assert!(State::parse(&value).is_none());
+            assert!(State::parse(&value).is_none(), "{value}");
         }
+    }
+
+    #[test]
+    fn requests_and_snapshots_carry_waiting() {
+        let value = request(state(2, 3, 1, 1));
+        assert_eq!(value["v"], 2);
+        assert_eq!(value["op"], "attention");
+        assert_eq!(State::parse(&value), Some(state(2, 3, 1, 1)));
+        let snapshot: Value = serde_json::from_str(&payload(state(2, 3, 1, 1))).unwrap();
+        assert_eq!(snapshot["v"], 1);
+        assert_eq!(
+            (
+                &snapshot["working"],
+                &snapshot["pending"],
+                &snapshot["failed"],
+                &snapshot["waiting"]
+            ),
+            (&json!(2), &json!(3), &json!(1), &json!(1))
+        );
+        assert!(snapshot["heartbeat"].is_u64());
+    }
+
+    #[test]
+    fn lease_sets_both_options_in_one_command_list() {
+        assert_eq!(
+            lease("%3", 1000, state(2, 3, 1, 2)),
+            [
+                "set-option",
+                "-p",
+                "-t",
+                "%3",
+                CHILD_OPTION,
+                "1000:2:3:1",
+                ";",
+                "set-option",
+                "-p",
+                "-t",
+                "%3",
+                CHILD_WAITING_OPTION,
+                "1000:2",
+            ]
+        );
+    }
+
+    #[test]
+    fn lease_unsets_waiting_in_the_same_command_list_when_zero() {
+        assert_eq!(
+            lease("%3", 1000, state(2, 1, 1, 0)),
+            [
+                "set-option",
+                "-p",
+                "-t",
+                "%3",
+                CHILD_OPTION,
+                "1000:2:1:1",
+                ";",
+                "set-option",
+                "-pu",
+                "-t",
+                "%3",
+                CHILD_WAITING_OPTION,
+            ]
+        );
+    }
+
+    #[test]
+    fn cli_validates_waiting_before_routing() {
+        let base = [
+            "--tmux-socket",
+            "/nonexistent/termnav-test-socket",
+            "--client-name",
+            "/dev/pts/999",
+            "--client-pid",
+            "1",
+            "--client-created",
+            "1",
+            "--working",
+            "0",
+            "--pending",
+            "1",
+            "--failed",
+            "1",
+        ];
+        for waiting in [&["--waiting", "1"][..], &["--waiting", "x"], &["--waiting"]] {
+            let args = base
+                .iter()
+                .chain(waiting)
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>();
+            let mut stderr = Vec::new();
+            assert_eq!(command(&args, &mut stderr).unwrap(), 2, "{waiting:?}");
+        }
+        // A valid count passes validation and fails only at the absent client.
+        let args = base
+            .iter()
+            .chain(&["--waiting", "0"])
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(command(&args, &mut Vec::new()).unwrap(), 1);
     }
 
     #[test]
