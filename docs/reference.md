@@ -650,6 +650,17 @@ must expire terminal state by local receipt time rather than comparing clocks
 across machines. The protocol does not acknowledge user attention or alter the
 underlying activity lifecycle.
 
+Termnav writes a lease as two `set-option` commands sent from its own tmux
+client, the main lease first. A publisher renews the lease, typically every
+few seconds, with a later expiry and usually the same counts. A parent tmux
+that forwards only from a periodic status job therefore adds up to one
+interval per nested layer. To forward a change at once, a parent config can
+hook `after-set-option`: tmux 3.2 and later run it after each client
+`set-option` with the command's pane as its target and its arguments in
+`#{hook_arguments}`, but not after commands run by hooks. Matching the two
+option names there and comparing the counts without their expiry with the
+last ones seen on that pane keeps renewals process-free.
+
 `waiting` is an additive field: the relay request stays protocol v2 and the
 terminal snapshot stays `"v":1`. Readers treat a request or snapshot without
 `waiting` as 0, and older readers ignore it, so layers can update in any

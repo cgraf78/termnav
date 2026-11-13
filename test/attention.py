@@ -150,6 +150,17 @@ def main() -> None:
                 time.sleep(0.03)
             assert listing, "nested client did not attach before deadline"
             name, pid, created = listing.split("|")
+            # Parent configs may forward a changed lease from after-set-option,
+            # which fires only for set-option commands a client sends. Record
+            # each one's arguments; a hook's own set-option never refires.
+            hooked = tmux(
+                outer,
+                "set-hook",
+                "-g",
+                "after-set-option",
+                "set-option -gaF @lease_writes '#{hook_arguments}|'",
+            )
+            assert hooked.returncode == 0, hooked.stderr
             args = [
                 sys.argv[1],
                 "tmux",
@@ -176,6 +187,16 @@ def main() -> None:
                 diagnose_client(pid, inner, outer, env)
             assert sent.returncode == 0, (sent.returncode, sent.stderr)
             leases = assert_lease("%0", ["2", "3", "1"], "2")
+            writes = tmux(outer, "show-option", "-gqv", "@lease_writes").stdout.strip()
+            # tmux before 3.2 has no hook_arguments and records only separators.
+            if writes.strip("|"):
+                options = [
+                    word
+                    for entry in writes.split("|")
+                    for word in entry.split()
+                    if word.startswith("@termnav_child_")
+                ]
+                assert options == ["@termnav_child_attention", "@termnav_child_waiting"], writes
             # A changed client generation must not overwrite either lease.
             args[args.index("--client-created") + 1] = str(int(created) + 1)
             refused = run(*args, env=env)
