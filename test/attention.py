@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import socket
 import subprocess
@@ -127,6 +128,27 @@ def main() -> None:
                 assert extra == fields[0] + ":" + waiting, (state, extra)
             return state, extra
 
+        # tmux 3.2 added #{hook_arguments}; development builds name no release.
+        version = re.search(r"(\d+)\.(\d+)", run("tmux", "-V", env=env).stdout)
+        hook_arguments = version is None or (int(version[1]), int(version[2])) >= (3, 2)
+
+        def assert_writes(expected: list[str]) -> None:
+            """Require the lease set-options a client sent since the last check."""
+            writes = tmux(outer, "show-option", "-gqv", "@lease_writes").stdout.strip()
+            tmux(outer, "set-option", "-gu", "@lease_writes")
+            if not hook_arguments:
+                return
+            # Keep each command's flag and option name; quoting of the target
+            # pane differs between tmux versions.
+            seen = [
+                f"{words[0]} {word}"
+                for entry in writes.split("|")
+                if (words := entry.split())
+                for word in words
+                if word.startswith("@termnav_child_")
+            ]
+            assert seen == expected, writes
+
         try:
             # Cleanup is installed before either server starts. The nested
             # client obtains the outer pane as its real controlling terminal.
@@ -187,16 +209,7 @@ def main() -> None:
                 diagnose_client(pid, inner, outer, env)
             assert sent.returncode == 0, (sent.returncode, sent.stderr)
             leases = assert_lease("%0", ["2", "3", "1"], "2")
-            writes = tmux(outer, "show-option", "-gqv", "@lease_writes").stdout.strip()
-            # tmux before 3.2 has no hook_arguments and records only separators.
-            if writes.strip("|"):
-                options = [
-                    word
-                    for entry in writes.split("|")
-                    for word in entry.split()
-                    if word.startswith("@termnav_child_")
-                ]
-                assert options == ["@termnav_child_attention", "@termnav_child_waiting"], writes
+            assert_writes(["-p @termnav_child_attention", "-p @termnav_child_waiting"])
             # A changed client generation must not overwrite either lease.
             args[args.index("--client-created") + 1] = str(int(created) + 1)
             refused = run(*args, env=env)
@@ -209,6 +222,8 @@ def main() -> None:
             sent = run(*older, env=env)
             assert sent.returncode == 0, (sent.returncode, sent.stderr)
             assert_lease("%0", ["2", "1", "1"], None)
+            # A zero waiting count unsets its lease in the same command list.
+            assert_writes(["-p @termnav_child_attention", "-pu @termnav_child_waiting"])
             # Exercise the real SSH relay dispatch without opening a second
             # authenticated network connection. Its socket remains owner-only.
             relay_path = str(root / "relay")

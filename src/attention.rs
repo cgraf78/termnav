@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const CHILD_OPTION: &str = "@termnav_child_attention";
 /// Waiting subset of the parent-pane lease as `expiry:waiting`.
 ///
-/// Written and removed in the same tmux command as [`CHILD_OPTION`] with the
+/// Written and removed in the same tmux command list as [`CHILD_OPTION`] with the
 /// same receiving-host expiry, and absent when nothing is waiting.
 pub const CHILD_WAITING_OPTION: &str = "@termnav_child_waiting";
 /// Terminal-facing snapshot understood by the WezTerm adapter.

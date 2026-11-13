@@ -176,7 +176,7 @@ return 2. Existing local tmux ancestry and SSH relays are reused.
 Child contributions expire after 15 seconds on the receiving host. The parent
 pane option @termnav_child_attention keeps its four-field
 EXPIRY:WORKING:PENDING:FAILED value; @termnav_child_waiting carries
-EXPIRY:WAITING with the same expiry, is set in the same tmux command, and is
+EXPIRY:WAITING with the same expiry, is set in the same tmux command list, and is
 removed when waiting is 0. Lease readers must expire it independently and
 clamp it to pending minus failed. Direct terminals receive the TERM_PANE_STATE
 OSC user variable, including waiting. The waiting field is additive: readers
