@@ -640,8 +640,8 @@ these identities and aggregates each layer's local and child counts.
 Parent panes receive a 15-second lease in `@termnav_child_attention`, measured
 on the receiving host, as `EXPIRY:WORKING:PENDING:FAILED`. The waiting count
 travels in a separate `@termnav_child_waiting` lease, `EXPIRY:WAITING`, with
-the same expiry. Both options are written in one tmux command, and the waiting
-lease is removed in that command when the count is 0. A direct terminal
+the same expiry. Both options are written in one tmux command list, and the
+waiting lease is removed in that list when the count is 0. A direct terminal
 receives the `TERM_PANE_STATE` OSC user variable, a JSON object with `v` (1),
 `working`, `pending`, `failed`, `waiting`, and `heartbeat`. These are advisory
 snapshots: overlapping deliveries can briefly arrive out of order, the next
@@ -649,6 +649,20 @@ publication reconciles them, and disconnected publishers expire. Consumers
 must expire terminal state by local receipt time rather than comparing clocks
 across machines. The protocol does not acknowledge user attention or alter the
 underlying activity lifecycle.
+
+That command list holds two `set-option` commands, the main lease first, sent
+from Termnav's own tmux client. Each publish renews the lease with a later
+expiry; tmux-tools' `term-pane-state` publishes from a status job every few
+seconds, usually with the same counts. A parent tmux that forwards only from
+its own status job therefore adds up to one interval per nested layer. To
+forward a change at once, a parent config can hook `after-set-option`: tmux
+3.2 and later run it after each `set-option` a client sends, with the
+command's pane as its target and its arguments in `#{hook_arguments}`.
+Commands a hook runs synchronously, such as those inside `if-shell -F`, do
+not fire it again, while background `if-shell -b` or `run-shell -b -C`
+commands started from a hook do. Matching the two option names and comparing
+the counts without their expiry with the last ones seen on that pane keeps
+renewals process-free.
 
 `waiting` is an additive field: the relay request stays protocol v2 and the
 terminal snapshot stays `"v":1`. Readers treat a request or snapshot without
