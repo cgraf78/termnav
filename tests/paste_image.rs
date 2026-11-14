@@ -44,6 +44,13 @@ impl Fixture {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        // A delayed reader sleeps before answering `types`, so probing it
+        // would wait out the sleep; its test tolerates an immediate
+        // `ExecutableFileBusy` failure (it asserts only exit code 1 and a
+        // 30s bound), so only prompt readers get the readiness probe.
+        if delay.is_none() {
+            wait_for_adapter_ready(&script);
+        }
         script
     }
 
@@ -85,6 +92,55 @@ fn png(size: usize) -> Vec<u8> {
     let mut bytes = PNG_SIGNATURE.to_vec();
     bytes.extend((0..size - PNG_SIGNATURE.len()).map(|index| (index * 31 % 251) as u8));
     bytes
+}
+
+/// Wait until a freshly written adapter script is executable.
+///
+/// A filesystem can retain a write handle briefly after the fixture is
+/// published, so the first execution fails with `ExecutableFileBusy` even
+/// though no writer remains in this process: the Nov 14 CentOS scheduled
+/// run hit exactly this, with `a_runaway_reader_stops_one_byte_past_the_cap`
+/// failing 3ms after its script was written (`termnav paste-image stage:
+/// Text file busy (os error 26)`), on a head that passed the same job the
+/// day before. Poll only that condition, with the adapter's exact `types`
+/// invocation, until the fixture is executable; every other outcome is a
+/// broken fixture and fails here instead of inside the run under test. The
+/// adapter's `types` step is a pure `printf`, so probing it is idempotent,
+/// and the staged run still executes and is asserted exactly once
+/// afterwards. Production code is unchanged.
+///
+/// The probe waits for the `types` invocation to complete, so callers must
+/// only pass adapters whose `types` step returns promptly; the delayed
+/// reader is excluded at the `adapter()` call site for exactly this reason.
+fn wait_for_adapter_ready(adapter: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match Command::new(adapter).arg("types").output() {
+            Ok(output) => {
+                assert!(
+                    output.status.success(),
+                    "adapter fixture {adapter:?} should run (status {}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                panic!(
+                    "adapter fixture {adapter:?} still busy after 1s (ExecutableFileBusy): {error}"
+                );
+            }
+            Err(error) => {
+                panic!("adapter fixture {adapter:?} should be executable: {error}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -177,6 +233,7 @@ fn a_runaway_reader_stops_one_byte_past_the_cap() {
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    wait_for_adapter_ready(&script);
     let output = fixture.stage(Some(&script));
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(
@@ -184,6 +241,41 @@ fn a_runaway_reader_stops_one_byte_past_the_cap() {
         "{output:?}"
     );
     assert_eq!(fs::read_dir(fixture.stage_directory()).unwrap().count(), 0);
+}
+
+/// The readiness probe retries while the fixture is busy, not just once.
+///
+/// On Linux, `execve` of a file open for writing deterministically fails
+/// with `ExecutableFileBusy`, which is the same `deny_write_access`
+/// mechanism behind the CentOS flake. Hold the script open for writing in
+/// a thread that releases it after 100ms; the probe must wait it out and
+/// return, with ~10x margin against its 1s deadline. A future refactor
+/// that breaks the retry arm would fail here instead of at the next flake.
+#[cfg(target_os = "linux")]
+#[test]
+fn adapter_readiness_waits_out_a_busy_fixture() {
+    let fixture = Fixture::new();
+    let script = fixture.root.join("busy");
+    fs::write(&script, "#!/bin/sh\nprintf 'image/png\\n'\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let handle = fs::File::options().write(true).open(&script).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(handle);
+    });
+    let started = Instant::now();
+    wait_for_adapter_ready(&script);
+    assert!(
+        started.elapsed() >= Duration::from_millis(50),
+        "probe should have waited out the busy window, not sailed through: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "probe should return once the fixture is released: {:?}",
+        started.elapsed()
+    );
+    releaser.join().unwrap();
 }
 
 #[test]
