@@ -96,6 +96,7 @@ if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
     "${tooling_shell_files[@]}" \
     "$test_dir/termnav-test" \
     "$test_dir/helpers.sh" \
+    "$test_dir/tmux-version.sh" \
     "$test_dir"/suites/*-test
 fi
 
@@ -103,8 +104,10 @@ fi
 # wherever it runs these suites, turns a missing or unsupported tmux into a
 # failure rather than skipped cases. Feature gates inside suites (send-keys -K
 # needs 3.4, and so on) stay ordinary skips.
-# shellcheck source=helpers.sh
-. "$test_dir/helpers.sh"
+# Only the version rule: helpers.sh sets up a suite's own temporary HOME,
+# XDG and TMPDIR roots and EXIT trap, which must not nest under the runner's.
+# shellcheck source=tmux-version.sh
+. "$test_dir/tmux-version.sh"
 TERMNAV_TMUX=$(_termnav_tmux_state)
 export TERMNAV_TMUX
 if [[ $TERMNAV_TMUX != ok ]]; then

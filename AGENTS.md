@@ -59,6 +59,11 @@ only from release archives. User-facing contracts live in
   `XDG_RUNTIME_DIR`, and unsets `TMUX`, `NVIM`, `SSH_*`, and WezTerm
   variables. `test/suites/test-isolation-test` seeds live-looking
   sentinels and must keep passing.
+- Only suites source `test/helpers.sh`. `test/termnav-test` sources just
+  `test/tmux-version.sh`, which holds function definitions only: a runner
+  that sourced helpers.sh would nest every suite's roots under its own,
+  and Termux's read-only `/tmp` then catches the too-long socket paths.
+  test-isolation-test checks both.
 - Real tmux runs only on private servers, killed on exit. The Python
   harnesses use `-S <tmp>`. `test/relay-performance.py`,
   `examples-test`, and `navigation-cli-test` use a unique `-L` name in

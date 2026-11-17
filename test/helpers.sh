@@ -609,66 +609,9 @@ _require_compatible_libc() {
 # Summary
 # ---------------------------------------------------------------------------
 
-# The tmux floor, read from its one source, src/tmux_version.rs, as
-# "MAJOR MINOR".
-_tmux_floor() {
-  sed -n 's/^pub(crate) const TMUX_MINIMUM: (u32, u32) = (\([0-9]*\), \([0-9]*\));$/\1 \2/p' \
-    "${BASH_SOURCE[0]%/*}/../src/tmux_version.rs"
-}
-
-# How a tmux version reads, as src/tmux_version.rs reads it: "MAJOR MINOR",
-# "newest" for master and openbsd-*, or "unknown".
-_tmux_release() {
-  local version=${1#tmux } major minor
-  case $version in master | openbsd-*)
-    echo newest
-    return
-    ;;
-  esac
-  version=${version#next-}
-  major=${version%%.*}
-  minor=${version#*.}
-  minor=${minor%%[!0-9]*}
-  if [[ $version == *.* && $major =~ ^[0-9]+$ && -n $minor ]]; then
-    echo "$((10#$major)) $((10#$minor))"
-  else
-    echo unknown
-  fi
-}
-
-# Whether tmux VERSION meets the floor; newest and unknown builds do.
-_tmux_supported() {
-  local release floor
-  release=$(_tmux_release "$1")
-  case $release in newest | unknown) return 0 ;; esac
-  floor=$(_tmux_floor)
-  # shellcheck disable=SC2086 # Split into the four numbers.
-  set -- $release $floor
-  (($1 > $3 || ($1 == $3 && $2 >= $4)))
-}
-
-# "ok", "missing", or "unsupported VERSION" for the tmux on PATH.
-# test/termnav-test settles this once in TERMNAV_TMUX for every suite.
-_termnav_tmux_state() {
-  local version
-  command -v tmux >/dev/null 2>&1 || {
-    echo missing
-    return
-  }
-  version=$(tmux -V 2>/dev/null)
-  version=${version#tmux }
-  if _tmux_supported "$version"; then
-    echo ok
-  else
-    echo "unsupported $version"
-  fi
-}
-
-# Whether this run has a supported tmux; suites skip their tmux cases when it
-# does not.
-_tmux_usable() {
-  [[ ${TERMNAV_TMUX:-$(_termnav_tmux_state)} == ok ]]
-}
+# The tmux version rule, also sourced on its own by test/termnav-test.
+# shellcheck source=tmux-version.sh
+. "${BASH_SOURCE[0]%/*}/tmux-version.sh"
 
 _test_summary() {
   echo ""
