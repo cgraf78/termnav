@@ -21,6 +21,12 @@ pub(crate) fn same_terminal(expected: &Metadata, actual: &Metadata) -> bool {
 /// A fresh nonblocking descriptor bounds backpressure without affecting SSH or
 /// the caller's foreground terminal. A short write is uncertain delivery: do
 /// not replay the frame or append its suffix into another writer's output.
+///
+/// `valid` proves the terminal's owner before the first write and again after
+/// every wait, so a frame never reaches a terminal whose owner changed. The
+/// 100 ms deadline starts after the first proof and bounds waiting for the
+/// terminal to accept output: on hosts without /proc the proof runs tmux and
+/// ps, which alone can take longer than that on a loaded machine.
 pub(crate) fn write_attention(
     path: &Path,
     expected: &Metadata,
@@ -34,14 +40,11 @@ pub(crate) fn write_attention(
     if !same_terminal(expected, &output.metadata()?) {
         return Err(io::Error::other("attention terminal identity changed"));
     }
+    if !valid() {
+        return Err(io::Error::other("attention terminal owner changed"));
+    }
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
-        if !valid() {
-            return Err(io::Error::other("attention terminal owner changed"));
-        }
-        if Instant::now() >= deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
         match output.write(frame) {
             Ok(count) if count == frame.len() => return Ok(()),
             Ok(_) => return Err(io::Error::other("partial attention frame")),
@@ -54,25 +57,32 @@ pub(crate) fn write_attention(
             events: libc::POLLOUT,
             revents: 0,
         };
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
-        if millis == 0 {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        // SAFETY: one live owned descriptor, with a bounded absolute deadline.
-        let result = unsafe { libc::poll(&mut ready, 1, millis) };
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+            if millis == 0 {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            // SAFETY: one live owned descriptor, with a bounded absolute deadline.
+            let result = unsafe { libc::poll(&mut ready, 1, millis) };
+            if result >= 0 {
+                break result;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        };
         if result == 0 {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
         if ready.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             return Err(io::Error::other("attention terminal disconnected"));
+        }
+        // The terminal can take output again; its owner may have changed while
+        // this waited.
+        if !valid() {
+            return Err(io::Error::other("attention terminal owner changed"));
         }
     }
 }
@@ -164,25 +174,25 @@ pub(crate) fn base64(input: &[u8]) -> String {
     output
 }
 
+/// ptsname returns process-global storage, so every test in this binary that
+/// names a PTY copies the name under this lock.
+#[cfg(test)]
+pub(crate) static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::{TmuxMode, base64, open_writer, tmux_mode, user_var, write_attention};
+    use std::cell::Cell;
     use std::ffi::CStr;
-    use std::fs::File;
+    use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
     #[test]
     fn attention_writer_uses_fresh_flags_and_rejects_partial_frames() {
-        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-        assert!(fd >= 0);
-        let master = unsafe { OwnedFd::from_raw_fd(fd) };
-        assert_eq!(unsafe { libc::grantpt(fd) }, 0);
-        assert_eq!(unsafe { libc::unlockpt(fd) }, 0);
-        let name = unsafe { CStr::from_ptr(libc::ptsname(fd)) }
-            .to_string_lossy()
-            .into_owned();
+        let (master, name) = pty();
         let original = open_writer(Path::new(&name)).unwrap();
         let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) };
         assert_eq!(flags & libc::O_NONBLOCK, 0);
@@ -209,26 +219,113 @@ mod tests {
         assert!(write_attention(Path::new(&name), &wrong, b"wrong", || true).is_err());
     }
 
+    /// A PTY master and its slave's name.
+    fn pty() -> (OwnedFd, String) {
+        let fd = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(fd >= 0, "open PTY master");
+        let master = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(unsafe { libc::grantpt(fd) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(fd) }, 0);
+        let _guard = super::PTSNAME.lock().expect("lock PTY name");
+        let name = unsafe { libc::ptsname(fd) };
+        assert!(!name.is_null(), "name PTY slave");
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        (master, name)
+    }
+
+    /// Everything the master can read now, without waiting.
+    fn drain(master: &OwnedFd) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let mut ready = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut ready, 1, 50) } <= 0 {
+                return bytes;
+            }
+            let count =
+                unsafe { libc::read(master.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
+            if count <= 0 {
+                return bytes;
+            }
+            bytes.extend_from_slice(&chunk[..count as usize]);
+        }
+    }
+
+    #[test]
+    fn a_slow_owner_proof_does_not_use_up_the_write_deadline() {
+        // On hosts without /proc the proof runs tmux and ps; the frame must
+        // still go out when that alone takes longer than the deadline.
+        let (master, name) = pty();
+        let identity = open_writer(Path::new(&name)).unwrap().metadata().unwrap();
+        write_attention(Path::new(&name), &identity, b"slow proof", || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            true
+        })
+        .unwrap();
+        assert_eq!(drain(&master), b"slow proof");
+    }
+
+    #[test]
+    fn a_failed_first_owner_proof_writes_nothing() {
+        let (master, name) = pty();
+        let identity = open_writer(Path::new(&name)).unwrap().metadata().unwrap();
+        let error =
+            write_attention(Path::new(&name), &identity, b"not yours", || false).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(drain(&master).is_empty());
+    }
+
+    #[test]
+    fn an_owner_change_while_waiting_writes_nothing() {
+        // Fill the PTY so the frame waits; drain it from another thread so
+        // the wait ends; the owner has changed by then.
+        let (master, name) = pty();
+        let filler = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(&name)
+            .unwrap();
+        let identity = filler.metadata().unwrap();
+        let mut filled = 0;
+        while (&filler).write(&[b'x'; 1024]).is_ok_and(|count| {
+            filled += count;
+            count > 0
+        }) {}
+        assert!(filled > 0, "fill the PTY");
+        let reader = master.try_clone().unwrap();
+        let draining = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drain(&reader)
+        });
+        let proofs = Cell::new(0);
+        let error = write_attention(Path::new(&name), &identity, b"FRAME", || {
+            proofs.set(proofs.get() + 1);
+            proofs.get() == 1
+        })
+        .unwrap_err();
+        let mut seen = draining.join().unwrap();
+        seen.extend(drain(&master));
+        assert_eq!(error.kind(), std::io::ErrorKind::Other, "{error}");
+        assert_eq!(
+            proofs.get(),
+            2,
+            "proved once before writing and once after the wait"
+        );
+        assert!(!seen.windows(5).any(|window| window == b"FRAME"));
+    }
+
     #[test]
     fn tty_writer_omits_append_and_delivers_bytes_to_a_real_pty() {
         // Android's tty policy can reject O_APPEND even when O_WRONLY is
         // permitted. Inspect the actual descriptor, not just successful output
         // on Linux where both opens happen to work.
-        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-        assert!(master >= 0, "open PTY master");
-        let master = unsafe { OwnedFd::from_raw_fd(master) };
-        assert_eq!(unsafe { libc::grantpt(master.as_raw_fd()) }, 0);
-        assert_eq!(unsafe { libc::unlockpt(master.as_raw_fd()) }, 0);
-        // ptsname uses process-global storage, so copy it while locked.
-        static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let name = {
-            let _guard = PTSNAME.lock().expect("lock PTY name");
-            let name = unsafe { libc::ptsname(master.as_raw_fd()) };
-            assert!(!name.is_null(), "name PTY slave");
-            unsafe { CStr::from_ptr(name) }
-                .to_string_lossy()
-                .into_owned()
-        };
+        let (master, name) = pty();
         let mut writer = open_writer(Path::new(&name)).expect("open PTY writer");
         let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
         assert_ne!(flags, -1, "read writer flags");

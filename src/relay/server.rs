@@ -120,6 +120,7 @@ mod attention_foreground_tests {
             let master = OwnedFd::from_raw_fd(fd);
             assert_eq!(libc::grantpt(master.as_raw_fd()), 0);
             assert_eq!(libc::unlockpt(master.as_raw_fd()), 0);
+            let _guard = crate::terminal::PTSNAME.lock().expect("lock PTY name");
             let name = libc::ptsname(master.as_raw_fd());
             assert!(!name.is_null());
             (master, CStr::from_ptr(name).to_str().unwrap().to_owned())
