@@ -644,8 +644,7 @@ def nested_layer(harness: Harness) -> None:
         f"{shlex.quote(sys.executable)} -c {shlex.quote(attach_inner)} {shlex.quote(inner)}",
     )
     # Where the inner client's ancestry cannot be inspected, the route falls
-    # back to one passthrough frame, which tmux 3.3 and later gate behind
-    # this option; tmux 3.2 has no such option and always forwards.
+    # back to one passthrough frame, which tmux gates behind this option.
     subprocess.run(
         ["tmux", "-S", outer, "set-option", "-g", "allow-passthrough", "on"],
         env=harness.env,

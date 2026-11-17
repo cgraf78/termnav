@@ -754,19 +754,17 @@ fn browser_commands(value: &str, url: &str) -> Vec<(String, Vec<String>)> {
 ///
 /// tmux expands both `#{...}` formats and strftime `%` sequences in
 /// display-message, so both are doubled; a URL's `%2F` would otherwise print
-/// as a date. `-d` needs tmux 3.2, so a refusal retries without it.
+/// as a date.
 ///
-/// `-c` names the clicking client. tmux 3.2 rejects it with a usage error
-/// (later releases accept it, and show nothing for a client that has gone).
-/// Without `-c`, tmux shows the message on the client it considers current:
-/// one of the session the pane in `TMUX_PANE` resolves to, or, when that
-/// session has no client, the most recently active client of any session. A
-/// linked window or a grouped session can make the pane resolve to another
-/// session. A click's URL must not reach another session's screen, so the
-/// retry names the clicked pane and runs only while that pane resolves to an
-/// attached session that is the clicking client's own (any attached session
-/// when the click names no client). The check and the display are separate
-/// tmux calls, so a client that detaches between them is a residual race.
+/// `-c` names the clicking client. tmux drops a message for a client that
+/// has gone, with status 0, so the message never reaches anyone else. Only a
+/// click that names no client goes without `-c`: tmux then shows the message
+/// on the client it considers current, one of the session the pane in
+/// `TMUX_PANE` resolves to, or, when that session has no client, the most
+/// recently active client of any session. So that message names the clicked
+/// pane and is shown only while that pane's session is attached. The check
+/// and the display are separate tmux calls, so a session that detaches
+/// between them is a residual race.
 fn tell(input: &Input, message: &str) {
     if input.tmux_socket.is_empty() && std::env::var_os("TMUX").is_none() {
         eprintln!("{message}");
@@ -780,7 +778,7 @@ fn tell(input: &Input, message: &str) {
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     };
-    let display = |client: Option<&str>, pane: Option<&str>, delay: bool| {
+    let display = |client: Option<&str>, pane: Option<&str>| {
         let mut command = tmux();
         match pane {
             Some(pane) => command.env("TMUX_PANE", pane),
@@ -790,55 +788,22 @@ fn tell(input: &Input, message: &str) {
         if let Some(client) = client {
             command.args(["-c", client]);
         }
-        if delay {
-            command.args(["-d", "10000"]);
-        }
-        command.arg(&escaped);
+        command.args(["-d", "10000"]).arg(&escaped);
         succeeds(command).is_some()
     };
-    let client = (!input.client_tty.is_empty()).then_some(input.client_tty.as_str());
-    if client.is_some()
-        && [true, false]
-            .into_iter()
-            .any(|delay| display(client, None, delay))
-    {
+    if !input.client_tty.is_empty() {
+        if !display(Some(&input.client_tty), None) {
+            eprintln!("{message}");
+        }
         return;
     }
     let pane = browser::valid_pane(&input.pane).then_some(input.pane.as_str());
     let attached = pane.is_some_and(|pane| {
         let mut command = tmux();
-        command.args([
-            "display-message",
-            "-p",
-            "-t",
-            pane,
-            "#{session_id} #{session_attached}",
-        ]);
-        let Some(state) = succeeds(command) else {
-            return false;
-        };
-        let Some((session, count)) = state.split_once(' ') else {
-            return false;
-        };
-        if !count.parse::<u32>().is_ok_and(|count| count > 0) {
-            return false;
-        }
-        let Some(client) = client else {
-            return true;
-        };
-        let mut command = tmux();
-        command.args(["list-clients", "-F", "#{client_tty} #{session_id}"]);
-        succeeds(command).is_some_and(|listing| {
-            listing
-                .lines()
-                .any(|line| line.split_once(' ') == Some((client, session)))
-        })
+        command.args(["display-message", "-p", "-t", pane, "#{session_attached}"]);
+        succeeds(command).is_some_and(|count| count.parse::<u32>().is_ok_and(|count| count > 0))
     });
-    if attached
-        && [true, false]
-            .into_iter()
-            .any(|delay| display(None, pane, delay))
-    {
+    if attached && display(None, pane) {
         return;
     }
     eprintln!("{message}");

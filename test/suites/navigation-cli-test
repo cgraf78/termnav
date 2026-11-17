@@ -468,7 +468,7 @@ tmux -L "$socket_name" select-pane -t "$left_pane"
 # Selecting the session's window and pane updates the server immediately, but
 # older tmux clients can publish their visible pane one redraw later. Parent
 # traversal validates that live client view, so wait for the observable state
-# instead of racing the redraw on slower releases such as tmux 3.2.
+# instead of racing the redraw on a slow host.
 visible_client_count=$(wait_for_client_panes "$left_pane" 2)
 if [[ "$visible_client_count" -ne 2 ]]; then
   report_client_state
