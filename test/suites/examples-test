@@ -207,7 +207,7 @@ SH
   # rows read must be every row in the block.
   _assert_eq "examples: every VECTORS row parses" \
     "$(sed -n '/^    const VECTORS: /,/^    \];$/p' "$TERMNAV_TEST_DIR/../src/tmux_version.rs" |
-      grep -c '^ *("')" \
+      grep -c '^ *(')" \
     "$(grep -c . <<<"$_vectors")"
   _next_major="$((_floor_major + 1)).0"
   while IFS= read -r _vector; do
