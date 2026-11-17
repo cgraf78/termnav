@@ -1113,11 +1113,10 @@ class NestedFocusTest(unittest.TestCase):
 
         Starting the nested client in a clientless outer server races the PTY
         attachment: when the nested client enables focus reporting, an
-        unfocused outer pane answers with a focus-out. tmux releases without
-        client-focus-in (CentOS Stream 9 ships 3.2a) then never restart the
-        publisher that focus-out stopped. Launching the nested client only after
-        the outer client is focused mirrors normal use and makes the initial
-        focus report deterministic on every tmux version.
+        unfocused outer pane answers with a focus-out, which stops the
+        publisher until the outer client next reports focus. Launching the
+        nested client only after the outer client is focused mirrors normal
+        use and makes the initial focus report deterministic.
         """
         inner = self.new_server(f"{name}-inner", "sleep 30")
         outer = self.new_server(f"{name}-outer", "sleep 30")

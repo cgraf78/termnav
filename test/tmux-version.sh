@@ -6,10 +6,17 @@
 # too. test-isolation-test checks both.
 
 # The tmux floor, read from its one source, src/tmux_version.rs, as
-# "MAJOR MINOR".
+# "MAJOR MINOR". The pattern is the const's exact text, so a reworded const
+# fails here, by name, rather than as an arithmetic error downstream.
 _tmux_floor() {
-  sed -n 's/^pub(crate) const TMUX_MINIMUM: (u32, u32) = (\([0-9]*\), \([0-9]*\));$/\1 \2/p' \
-    "${BASH_SOURCE[0]%/*}/../src/tmux_version.rs"
+  local source=${BASH_SOURCE[0]%/*}/../src/tmux_version.rs floor
+  floor=$(sed -n 's/^pub(crate) const TMUX_MINIMUM: (u32, u32) = (\([0-9][0-9]*\), \([0-9][0-9]*\));$/\1 \2/p' \
+    "$source")
+  if [[ ! $floor =~ ^[0-9]+\ [0-9]+$ ]]; then
+    printf 'tmux-version.sh: no TMUX_MINIMUM in %s\n' "$source" >&2
+    return 1
+  fi
+  printf '%s\n' "$floor"
 }
 
 # How a tmux version reads, as src/tmux_version.rs reads it: "MAJOR MINOR",
@@ -37,7 +44,7 @@ _tmux_supported() {
   local release floor
   release=$(_tmux_release "$1")
   case $release in newest | unknown) return 0 ;; esac
-  floor=$(_tmux_floor)
+  floor=$(_tmux_floor) || return 1
   # shellcheck disable=SC2086 # Split into the four numbers.
   set -- $release $floor
   (($1 > $3 || ($1 == $3 && $2 >= $4)))

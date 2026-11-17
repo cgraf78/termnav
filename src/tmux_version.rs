@@ -129,6 +129,8 @@ mod tests {
         ("master", "newest"),
         ("openbsd-7.6", "newest"),
         ("openbsd-7.6-current", "newest"),
+        ("3.x", "unknown"),
+        ("3.", "unknown"),
         ("", "unknown"),
     ];
 
@@ -307,13 +309,32 @@ mod tests {
 
     #[test]
     fn nothing_names_a_tmux_older_than_the_floor() {
+        // Samples built from the floor, so they stay true after a bump.
+        let (major, minor) = TMUX_MINIMUM;
+        assert!(minor > 0, "the samples cannot express a floor of {major}.0");
+        let below = format!("{major}.{}", minor - 1);
+        let older = format!("{}.0", major - 1);
         assert_eq!(
-            old_mentions("needs tmux\n/// 3.2a here"),
+            old_mentions(&format!("needs tmux\n/// {below}a here")),
             Vec::<String>::new()
         );
-        assert_eq!(old_mentions(&joined("needs tmux\n/// 3.2a here")).len(), 1);
-        assert_eq!(old_mentions("tmux before 3.1 and tmux >= 3.2").len(), 2);
-        assert_eq!(old_mentions("tmux 3.3a, tmux 3.10, tmux v3.4").len(), 0);
+        assert_eq!(
+            old_mentions(&joined(&format!("needs tmux\n/// {below}a here"))).len(),
+            1
+        );
+        assert_eq!(
+            old_mentions(&format!("tmux before {older} and tmux >= {below}")).len(),
+            2
+        );
+        assert_eq!(
+            old_mentions(&format!(
+                "tmux {major}.{minor}a, tmux {major}.{}, tmux v{major}.{}",
+                minor + 7,
+                minor + 1
+            ))
+            .len(),
+            0
+        );
         let mut files = vec![root().join("README.md")];
         for directory in [
             "docs", "man", "examples", "src", "test", "tests", "lib", "share",

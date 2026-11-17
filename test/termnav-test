@@ -108,6 +108,7 @@ fi
 # XDG and TMPDIR roots and EXIT trap, which must not nest under the runner's.
 # shellcheck source=tmux-version.sh
 . "$test_dir/tmux-version.sh"
+_tmux_floor >/dev/null || exit 1
 TERMNAV_TMUX=$(_termnav_tmux_state)
 export TERMNAV_TMUX
 if [[ $TERMNAV_TMUX != ok ]]; then

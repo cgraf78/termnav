@@ -190,14 +190,25 @@ SH
   # evaluated here for each canonical vector and the rows at the floor's edge.
   _guard=$(sed -n 's/^%if "\(.*\)"$/\1/p' "$TMUX_EXAMPLE")
   read -r _floor_major _floor_minor <<<"$(_tmux_floor)"
+  if ((_floor_minor == 0)); then
+    _fail "examples: the floor-edge rows cannot express a floor of $_floor_major.0"
+  fi
   _below="$_floor_major.$((_floor_minor - 1))"
   _floor="$_floor_major.$_floor_minor"
+  _above="$_floor_major.$((_floor_minor + 1))"
   # The canonical vectors, shared verbatim by every repository that checks
-  # the tmux floor (floor-free), then the rows at this floor's edge.
-  for _version in 1.8 2.9a next-2.9 3.0 3.1c 3.2 3.2a 3.2-rc3 next-3.2 next-3.2-rc \
-    3.3 3.3a 3.3-rc next-3.3 3.4 3.10 next-3.10 master openbsd-7.6 \
-    openbsd-7.6-current '' "$_below" "${_below}a" "${_below}-rc" "next-$_below" \
-    "$_floor" "$_floor_major.$((_floor_minor + 1))"; do
+  # the tmux floor: each version and how it reads. Then the rows at this
+  # floor's edge.
+  for _vector in 1.8:1.8 2.9a:2.9 next-2.9:2.9 3.0:3.0 3.1c:3.1 3.2:3.2 3.2a:3.2 \
+    3.2-rc3:3.2 next-3.2:3.2 next-3.2-rc:3.2 3.3:3.3 3.3a:3.3 3.3-rc:3.3 \
+    next-3.3:3.3 3.4:3.4 3.10:3.10 next-3.10:3.10 master:newest \
+    openbsd-7.6:newest openbsd-7.6-current:newest 3.x:unknown 3.:unknown \
+    :unknown "$_below:$_below" "${_below}a:$_below" "${_below}-rc:$_below" \
+    "next-$_below:$_below" "$_floor:$_floor" "$_above:$_above"; do
+    _version=${_vector%:*}
+    _reads=${_vector##*:}
+    case $_reads in newest | unknown) ;; *) _reads="${_reads%%.*} ${_reads#*.}" ;; esac
+    _assert_eq "examples: the shell rule reads '$_version'" "$_reads" "$(_tmux_release "$_version")"
     _want=0
     _tmux_supported "$_version" || _want=1
     _assert_eq "examples: the tmux guard reads '$_version' as the floor rule does" \
