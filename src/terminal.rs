@@ -192,16 +192,23 @@ pub(crate) fn base64(input: &[u8]) -> String {
 ///
 /// Keep the slave open while reading the master: macOS discards unread output
 /// once the last slave descriptor closes. ptsname returns process-global
-/// storage, so every test copies its name under one lock.
+/// storage, so every test copies its name under one lock. Both descriptors are
+/// close-on-exec whatever `flags` says, so child processes that tests running
+/// alongside spawn do not inherit them.
 #[cfg(test)]
 pub(crate) fn test_pty(flags: libc::c_int) -> (std::os::fd::OwnedFd, String, File) {
     use std::os::fd::FromRawFd;
 
     static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let fd = unsafe { libc::posix_openpt(flags) };
+    let fd = unsafe { libc::posix_openpt(flags | libc::O_CLOEXEC) };
     assert!(fd >= 0, "open PTY master");
     // SAFETY: a successful posix_openpt returns a newly owned descriptor.
     let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let descriptor_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(
+        descriptor_flags & libc::FD_CLOEXEC != 0,
+        "PTY master is close-on-exec"
+    );
     assert_eq!(unsafe { libc::grantpt(fd) }, 0, "grant PTY");
     assert_eq!(unsafe { libc::unlockpt(fd) }, 0, "unlock PTY");
     let name = {
@@ -326,7 +333,8 @@ mod tests {
     /// than `wait`, leaves one proof and nothing to observe. Retry those; a
     /// writer that skips the proof after its wake, or whose wait has run out
     /// before it starts waiting, also leaves one, every time, so the retries
-    /// cannot hide it.
+    /// cannot hide it. A writer that never proves before its first write
+    /// never releases the drain, and is reported at once rather than retried.
     fn woken(
         frame: &[u8],
         wait: Duration,
@@ -340,7 +348,11 @@ mod tests {
             let draining = {
                 let reader = reader.try_clone().unwrap();
                 std::thread::spawn(move || {
-                    released.recv().unwrap();
+                    // Closed unsent: the first proof never ran, so there is
+                    // nothing to release.
+                    if released.recv().is_err() {
+                        return Vec::new();
+                    }
                     std::thread::sleep(DRAIN_DELAY);
                     drain(&reader)
                 })
@@ -355,9 +367,12 @@ mod tests {
                 }
                 after_wake()
             });
+            // Without this, a writer that never proved first would leave the
+            // thread waiting for a release forever, and this join with it.
+            drop(release);
             let mut seen = draining.join().unwrap();
             seen.extend(drain(&reader));
-            if proofs.get() > 1 {
+            if proofs.get() != 1 {
                 return Woken {
                     result,
                     proofs: proofs.get(),
@@ -409,7 +424,7 @@ mod tests {
 
     #[test]
     fn an_owner_change_while_waiting_writes_nothing() {
-        let woken = woken(b"FRAME", Duration::from_secs(10), || {}, || false);
+        let woken = woken(b"FRAME", Duration::from_secs(1), || {}, || false);
         let error = woken.result.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Other, "{error}");
         assert_eq!(
