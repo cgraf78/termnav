@@ -312,15 +312,27 @@ mod tests {
         seen: Vec<u8>,
     }
 
-    /// Write `frame` into a full pipe that a thread drains after the first
-    /// proof, with `after_wake` as every later proof.
+    /// How long the draining thread in [`woken`] waits after the first
+    /// proof. It is unrelated to [`ATTENTION_WAIT`]: it only needs to be
+    /// long enough that the first write meets the full pipe, and shorter
+    /// than each test's `wait`.
+    const DRAIN_DELAY: Duration = Duration::from_millis(100);
+
+    /// Write `frame` into a full pipe that a thread drains [`DRAIN_DELAY`]
+    /// after the first proof, which runs `first` and succeeds, with
+    /// `after_wake` as every later proof.
     ///
-    /// The drain waits 100 ms past the first proof so the first write meets
-    /// the full pipe, but that is timing: a write later than that, or a wake
-    /// later than `wait`, leaves one proof and nothing to observe. Retry
-    /// those; a writer that skips the proof after its wake also leaves one,
-    /// every time, so the retries cannot hide it.
-    fn woken(frame: &[u8], wait: Duration, after_wake: impl Fn() -> bool) -> Woken {
+    /// That delay is timing: a first write later than it, or a wake later
+    /// than `wait`, leaves one proof and nothing to observe. Retry those; a
+    /// writer that skips the proof after its wake, or whose wait has run out
+    /// before it starts waiting, also leaves one, every time, so the retries
+    /// cannot hide it.
+    fn woken(
+        frame: &[u8],
+        wait: Duration,
+        first: impl Fn(),
+        after_wake: impl Fn() -> bool,
+    ) -> Woken {
         for _ in 0..5 {
             let (reader, mut output) = pipe();
             fill(&output);
@@ -329,7 +341,7 @@ mod tests {
                 let reader = reader.try_clone().unwrap();
                 std::thread::spawn(move || {
                     released.recv().unwrap();
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(DRAIN_DELAY);
                     drain(&reader)
                 })
             };
@@ -337,6 +349,7 @@ mod tests {
             let result = write_proven(&mut output, frame, wait, || {
                 proofs.set(proofs.get() + 1);
                 if proofs.get() == 1 {
+                    first();
                     release.send(()).unwrap();
                     return true;
                 }
@@ -367,6 +380,20 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_first_proof_does_not_use_up_the_wait_for_a_full_pipe() {
+        // The first proof outlasts the wait; the wait starts after it, so the
+        // frame still waits for the drain and goes out.
+        let wait = Duration::from_secs(1);
+        let woken = woken(b"FRAME", wait, || std::thread::sleep(wait * 3 / 2), || true);
+        woken.result.unwrap();
+        assert_eq!(
+            woken.proofs, 2,
+            "proved before the write and after the wake"
+        );
+        assert!(woken.seen.windows(5).any(|window| window == b"FRAME"));
+    }
+
+    #[test]
     fn a_failed_first_proof_writes_nothing() {
         let (reader, mut output) = pipe();
         let proofs = Cell::new(0);
@@ -382,7 +409,7 @@ mod tests {
 
     #[test]
     fn an_owner_change_while_waiting_writes_nothing() {
-        let woken = woken(b"FRAME", Duration::from_secs(10), || false);
+        let woken = woken(b"FRAME", Duration::from_secs(10), || {}, || false);
         let error = woken.result.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Other, "{error}");
         assert_eq!(
@@ -397,10 +424,15 @@ mod tests {
         // The wait is over by the time this proof returns; the write cannot
         // block, so it still goes ahead.
         let wait = Duration::from_secs(1);
-        let woken = woken(b"FRAME", wait, || {
-            std::thread::sleep(wait * 3 / 2);
-            true
-        });
+        let woken = woken(
+            b"FRAME",
+            wait,
+            || {},
+            || {
+                std::thread::sleep(wait * 3 / 2);
+                true
+            },
+        );
         woken.result.unwrap();
         assert_eq!(woken.proofs, 2);
         assert!(woken.seen.windows(5).any(|window| window == b"FRAME"));
