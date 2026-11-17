@@ -12,7 +12,8 @@ use std::time::Duration;
 /// The oldest tmux release Termnav supports, as (major, minor).
 ///
 /// The README, the man page, docs/reference.md and examples/tmux.conf state
-/// it; this module's tests keep them in step.
+/// it; this module's tests keep them in step. test/tmux-version.sh and
+/// tests/common/mod.rs parse this exact line, so keep its form.
 pub(crate) const TMUX_MINIMUM: (u32, u32) = (3, 3);
 
 /// What a tmux version string says about its release.
@@ -271,17 +272,27 @@ mod tests {
             .join(" ")
     }
 
-    /// Every "tmux <version>" mention, case-insensitive, with an optional
-    /// `-`, `>=`, `before` or `v` in between, that names a release below the
-    /// floor.
+    /// Every "tmux <version>" or "older than <version>" mention,
+    /// case-insensitive, that names a release below the floor. After "tmux",
+    /// an optional `-`, `>=`, `before` or `v` may come between the two.
+    /// "older than" catches the floor stated without the word tmux, which
+    /// would go stale silently after a bump.
     fn old_mentions(text: &str) -> Vec<String> {
         let lower = text.to_ascii_lowercase();
         let mut found = Vec::new();
+        for key in ["tmux", "older than"] {
+            found.extend(mentions_after(text, &lower, key));
+        }
+        found
+    }
+
+    fn mentions_after(text: &str, lower: &str, key: &str) -> Vec<String> {
+        let mut found = Vec::new();
         let mut start = 0;
-        while let Some(offset) = lower[start..].find("tmux") {
+        while let Some(offset) = lower[start..].find(key) {
             let at = start + offset;
-            start = at + 4;
-            let mut rest = &lower[at + 4..];
+            start = at + key.len();
+            let mut rest = &lower[at + key.len()..];
             rest = rest.strip_prefix([' ', '-']).unwrap_or(rest);
             for word in [">= ", ">=", "before ", "v"] {
                 if let Some(after) = rest.strip_prefix(word) {
@@ -303,12 +314,30 @@ mod tests {
         found
     }
 
+    /// Whether the crate root is the top of a Git checkout. A source tree
+    /// outside Git, which build.rs supports through TERMNAV_BUILD_COMMIT, has
+    /// no tracked files to scan; nor does one unpacked inside another repo.
+    fn is_checkout() -> bool {
+        let Ok(top) = Command::new("git")
+            .args(["-C"])
+            .arg(root())
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+        else {
+            return false;
+        };
+        let top = String::from_utf8_lossy(&top.stdout);
+        let same = |path: &std::path::Path| std::fs::canonicalize(path).ok();
+        !top.trim().is_empty() && same(top.trim().as_ref()) == same(&root())
+    }
+
     #[test]
     fn nothing_names_a_tmux_older_than_the_floor() {
         // Samples built from the floor, so they stay true after a bump.
         let (major, minor) = TMUX_MINIMUM;
         assert!(minor > 0, "the samples cannot express a floor of {major}.0");
         let below = format!("{major}.{}", minor - 1);
+        let at = format!("{major}.{minor}");
         let older = format!("{}.0", major - 1);
         assert_eq!(
             old_mentions(&format!("needs tmux\n/// {below}a here")),
@@ -323,6 +352,14 @@ mod tests {
             2
         );
         assert_eq!(
+            old_mentions(&joined(&format!("The server is older\n/// than {below}."))).len(),
+            1
+        );
+        assert_eq!(
+            old_mentions(&format!("older than {at}, older than tmux {at}")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
             old_mentions(&format!(
                 "tmux {major}.{minor}a, tmux {major}.{}, tmux v{major}.{}",
                 minor + 7,
@@ -331,6 +368,10 @@ mod tests {
             .len(),
             0
         );
+        if !is_checkout() {
+            eprintln!("note: not a Git checkout, so the old-tmux lint is skipped");
+            return;
+        }
         // Every tracked file, so no directory can drop out of the scan.
         let listed = Command::new("git")
             .args(["-C"])
