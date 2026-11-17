@@ -694,7 +694,7 @@ def main() -> int:
     binary = str(Path(sys.argv[1]).resolve())
     large = int(os.environ.get("TERMNAV_PASTE_IMAGE_LARGE_BYTES", str(16 * 1024 * 1024)))
     # test/termnav-test settles whether this run has a supported tmux.
-    if os.environ.get("TERMNAV_TMUX", "ok" if shutil.which("tmux") else "missing") != "ok":
+    if os.environ.get("TERMNAV_TEST_TMUX", "ok" if shutil.which("tmux") else "missing") != "ok":
         print("SKIP: paste-image tests require a supported tmux")
         return 0
     parent = "/tmp" if Path("/tmp").is_dir() and os.access("/tmp", os.W_OK) else None

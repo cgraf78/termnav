@@ -435,26 +435,9 @@ fn a_browser_that_keeps_running_is_left_running() {
     );
 }
 
-/// The tmux floor, read from its one source, so this test follows a bump.
-fn termnav_floor() -> (u32, u32) {
-    let source = include_str!("../src/tmux_version.rs");
-    let pair = source
-        .lines()
-        .find_map(|line| line.strip_prefix("pub(crate) const TMUX_MINIMUM: (u32, u32) = ("))
-        .and_then(|rest| rest.strip_suffix(");"))
-        .expect("src/tmux_version.rs states TMUX_MINIMUM");
-    let (major, minor) = pair.split_once(", ").expect("TMUX_MINIMUM is a pair");
-    let floor = (major.parse().unwrap(), minor.parse().unwrap());
-    assert!(
-        floor.1 > 0,
-        "a release below the floor cannot be built from {pair}"
-    );
-    floor
-}
-
 #[test]
 fn a_click_on_an_unsupported_tmux_tells_the_client_and_opens_nothing() {
-    let (major, minor) = termnav_floor();
+    let (major, minor) = common::tmux_floor();
     let older = format!("{major}.{}a", minor - 1);
     let root = temporary_root();
     let bin = root.join("bin");

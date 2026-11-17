@@ -109,11 +109,11 @@ fi
 # shellcheck source=tmux-version.sh
 . "$test_dir/tmux-version.sh"
 _tmux_floor >/dev/null || exit 1
-TERMNAV_TMUX=$(_termnav_tmux_state)
-export TERMNAV_TMUX
-if [[ $TERMNAV_TMUX != ok ]]; then
+TERMNAV_TEST_TMUX=$(_termnav_tmux_state)
+export TERMNAV_TEST_TMUX
+if [[ $TERMNAV_TEST_TMUX != ok ]]; then
   read -r floor_major floor_minor <<<"$(_tmux_floor)"
-  reason="tmux $floor_major.$floor_minor or newer is required (${TERMNAV_TMUX})"
+  reason="tmux $floor_major.$floor_minor or newer is required (${TERMNAV_TEST_TMUX})"
   if [[ ${TERMNAV_REQUIRE_TMUX:-0} == 1 ]]; then
     printf 'termnav-test: FAIL: %s\n' "$reason" >&2
     exit 1

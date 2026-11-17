@@ -51,7 +51,7 @@ _tmux_supported() {
 }
 
 # "ok", "missing", or "unsupported VERSION" for the tmux on PATH.
-# test/termnav-test settles this once in TERMNAV_TMUX for every suite.
+# test/termnav-test settles this once in TERMNAV_TEST_TMUX for every suite.
 _termnav_tmux_state() {
   local version
   command -v tmux >/dev/null 2>&1 || {
@@ -70,5 +70,5 @@ _termnav_tmux_state() {
 # Whether this run has a supported tmux; suites skip their tmux cases when it
 # does not.
 _tmux_usable() {
-  [[ ${TERMNAV_TMUX:-$(_termnav_tmux_state)} == ok ]]
+  [[ ${TERMNAV_TEST_TMUX:-$(_termnav_tmux_state)} == ok ]]
 }

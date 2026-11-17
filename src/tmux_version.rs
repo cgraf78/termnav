@@ -102,7 +102,7 @@ pub(crate) fn check_server(mut command: Command) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{TMUX_MINIMUM, TmuxVersion, check_server, tmux_supported};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
 
     /// The canonical vectors, shared verbatim by every repository that checks
@@ -131,6 +131,7 @@ mod tests {
         ("openbsd-7.6-current", "newest"),
         ("3.x", "unknown"),
         ("3.", "unknown"),
+        ("foo-2.9", "unknown"),
         ("", "unknown"),
     ];
 
@@ -144,6 +145,9 @@ mod tests {
         let below = format!("{major}.{}", minor - 1);
         let floor = format!("{major}.{minor}");
         let above = format!("{major}.{}", minor + 1);
+        // The next major's first release, which a comparison of the minor
+        // alone would refuse.
+        let next_major = format!("{}.0", major + 1);
         [
             (below.clone(), below.clone()),
             (format!("{below}a"), below.clone()),
@@ -151,6 +155,7 @@ mod tests {
             (format!("next-{below}"), below),
             (floor.clone(), floor),
             (above.clone(), above),
+            (next_major.clone(), next_major),
         ]
         .into_iter()
         .collect()
@@ -218,11 +223,13 @@ mod tests {
 
     #[test]
     fn the_server_check_refuses_only_an_old_server_that_answers() {
-        assert!(check_server(server("2.9a", 0)).is_err());
-        assert!(check_server(server("3.6b", 0)).is_ok());
-        assert!(check_server(server("next-3.9", 0)).is_ok());
+        let (major, minor) = TMUX_MINIMUM;
+        let older = format!("{major}.{}a", minor - 1);
+        assert!(check_server(server(&older, 0)).is_err());
+        assert!(check_server(server(&format!("{major}.{minor}b"), 0)).is_ok());
+        assert!(check_server(server(&format!("next-{major}.{}", minor + 1), 0)).is_ok());
         // No answer: the caller's own commands report that.
-        assert!(check_server(server("2.9a", 1)).is_ok());
+        assert!(check_server(server(&older, 1)).is_ok());
     }
 
     fn root() -> PathBuf {
@@ -296,17 +303,6 @@ mod tests {
         found
     }
 
-    fn walk(directory: &Path, files: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(directory).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                walk(&path, files);
-            } else {
-                files.push(path);
-            }
-        }
-    }
-
     #[test]
     fn nothing_names_a_tmux_older_than_the_floor() {
         // Samples built from the floor, so they stay true after a bump.
@@ -335,22 +331,22 @@ mod tests {
             .len(),
             0
         );
-        let mut files = vec![root().join("README.md")];
-        for directory in [
-            "docs", "man", "examples", "src", "test", "tests", "lib", "share",
-        ] {
-            walk(&root().join(directory), &mut files);
-        }
+        // Every tracked file, so no directory can drop out of the scan.
+        let listed = Command::new("git")
+            .args(["-C"])
+            .arg(root())
+            .args(["ls-files", "-z"])
+            .output()
+            .expect("run git ls-files");
+        assert!(listed.status.success(), "git ls-files: {listed:?}");
+        let tracked = String::from_utf8(listed.stdout).expect("UTF-8 file names");
+        assert!(tracked.split('\0').any(|file| file == "AGENTS.md"));
         let mut offenders = Vec::new();
-        for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+        for relative in tracked.split('\0').filter(|file| !file.is_empty()) {
+            // Binary files and submodules are not text.
+            let Ok(text) = std::fs::read_to_string(root().join(relative)) else {
                 continue;
             };
-            let relative = path
-                .strip_prefix(root())
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
             // This file's own tests spell out what they reject.
             if relative == "src/tmux_version.rs" {
                 continue;
