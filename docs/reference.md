@@ -679,9 +679,9 @@ Direct attention writes, including the SSH relay's terminal edge, use a fresh
 nonblocking descriptor with matching character-device, inode, and device
 identity. Client and foreground ownership are checked again after opening and
 after every wait for the terminal to accept output. Backpressure is limited to
-100 milliseconds of waiting, counted from that first check, which can itself
-take longer where it runs `ps`; a partial frame fails without replay.
-Inherited descriptors and navigation commit writes are unchanged.
+100 milliseconds of waiting, counted after that first check, so a slow check
+does not use it up; a partial frame fails without replay. Inherited
+descriptors and navigation commit writes are unchanged.
 Attention frames begin with CAN at each immediate parser boundary (outside
 and inside a tmux passthrough frame) so a later snapshot cancels an earlier
 incomplete escape. This is terminal output parsing recovery, not terminal
