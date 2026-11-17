@@ -185,7 +185,8 @@ overlapping deliveries may briefly arrive out of order before reconciliation.
 Terminal consumers must expire them using local receipt time.
 Direct attention writes use a fresh nonblocking descriptor, verify its device
 and inode against the captured character terminal, and revalidate foreground
-ownership before writing. Backpressure is bounded to 100 milliseconds; partial
+ownership before writing and after every wait. Backpressure is bounded to 100
+milliseconds of waiting, counted after the first ownership check; partial
 frames fail without replay. CAN at each immediate parser boundary cancels an
 earlier incomplete attention escape. This affects output parsing only.
 Inherited descriptor flags and navigation commit writes are unchanged.

@@ -59,9 +59,8 @@ pub struct DirectTerminal {
 
 #[cfg(test)]
 mod attention_foreground_tests {
-    use std::ffi::CStr;
     use std::fs::{self, File};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
     use std::time::{Duration, Instant};
@@ -110,28 +109,10 @@ mod attention_foreground_tests {
             crate::relay::client::new_nonce()
         ));
         fs::create_dir(&root).expect("private fixture directory");
-        // SAFETY: plain libc pty allocation, with every result checked and its
-        // descriptor immediately transferred to an owned handle.
-        let (master, tty) = unsafe {
-            let fd = libc::posix_openpt(
-                libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            );
-            assert!(fd >= 0);
-            let master = OwnedFd::from_raw_fd(fd);
-            assert_eq!(libc::grantpt(master.as_raw_fd()), 0);
-            assert_eq!(libc::unlockpt(master.as_raw_fd()), 0);
-            let name = libc::ptsname(master.as_raw_fd());
-            assert!(!name.is_null());
-            (master, CStr::from_ptr(name).to_str().unwrap().to_owned())
-        };
-        use std::os::unix::fs::OpenOptionsExt;
-        let resume = ResumeOutput(
-            File::options()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-                .open(&tty)
-                .unwrap(),
+        let (master, tty, slave) = crate::terminal::test_pty(
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC,
         );
+        let resume = ResumeOutput(slave);
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
