@@ -262,7 +262,10 @@ mod tests {
         // On hosts without /proc the proof runs tmux and ps; the frame must
         // still go out when that alone takes longer than the deadline.
         let (master, name) = pty();
-        let identity = open_writer(Path::new(&name)).unwrap().metadata().unwrap();
+        // Keep a slave open while draining: macOS discards unread PTY output
+        // once the last slave descriptor closes.
+        let slave = open_writer(Path::new(&name)).unwrap();
+        let identity = slave.metadata().unwrap();
         write_attention(Path::new(&name), &identity, b"slow proof", || {
             std::thread::sleep(std::time::Duration::from_millis(150));
             true
@@ -274,7 +277,10 @@ mod tests {
     #[test]
     fn a_failed_first_owner_proof_writes_nothing() {
         let (master, name) = pty();
-        let identity = open_writer(Path::new(&name)).unwrap().metadata().unwrap();
+        // An open slave keeps any written bytes readable on macOS, so the
+        // empty drain below proves nothing was written.
+        let slave = open_writer(Path::new(&name)).unwrap();
+        let identity = slave.metadata().unwrap();
         let error =
             write_attention(Path::new(&name), &identity, b"not yours", || false).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
