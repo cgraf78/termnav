@@ -17,5 +17,6 @@ pub mod runtime;
 pub mod shell;
 pub mod ssh;
 pub mod terminal;
+pub(crate) mod tmux_version;
 pub mod version;
 pub mod vscode;

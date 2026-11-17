@@ -1,9 +1,11 @@
 # Test Harness
 
 `test/termnav-test` is the shell-suite entrypoint; CI's main test command runs
-it after the Rust tests as `cargo test --locked && test/termnav-test`. It
-loads shared helpers from `test/helpers.sh`, uses fixtures under
-`test/fixtures/`, and runs focused suites from `test/suites/`.
+it after the Rust tests, with `TERMNAV_REQUIRE_TMUX=1`. It loads only the
+tmux version rule, `test/tmux-version.sh`, to settle tmux once, and runs the
+focused suites from `test/suites/`; each suite loads the shared helpers from
+`test/helpers.sh`, which give it its own temporary roots, and uses fixtures
+under `test/fixtures/`.
 
 Suite ownership follows the integration boundary:
 

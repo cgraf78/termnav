@@ -644,8 +644,7 @@ def nested_layer(harness: Harness) -> None:
         f"{shlex.quote(sys.executable)} -c {shlex.quote(attach_inner)} {shlex.quote(inner)}",
     )
     # Where the inner client's ancestry cannot be inspected, the route falls
-    # back to one passthrough frame, which tmux 3.3 and later gate behind
-    # this option; tmux 3.2 has no such option and always forwards.
+    # back to one passthrough frame, which tmux gates behind this option.
     subprocess.run(
         ["tmux", "-S", outer, "set-option", "-g", "allow-passthrough", "on"],
         env=harness.env,
@@ -694,8 +693,9 @@ def main() -> int:
     """Run every scenario under one isolated scratch root."""
     binary = str(Path(sys.argv[1]).resolve())
     large = int(os.environ.get("TERMNAV_PASTE_IMAGE_LARGE_BYTES", str(16 * 1024 * 1024)))
-    if not shutil.which("tmux"):
-        print("SKIP: paste-image tests require tmux")
+    # test/termnav-test settles whether this run has a supported tmux.
+    if os.environ.get("TERMNAV_TEST_TMUX", "ok" if shutil.which("tmux") else "missing") != "ok":
+        print("SKIP: paste-image tests require a supported tmux")
         return 0
     parent = "/tmp" if Path("/tmp").is_dir() and os.access("/tmp", os.W_OK) else None
     with tempfile.TemporaryDirectory(prefix="tn-paste-", dir=parent) as root:

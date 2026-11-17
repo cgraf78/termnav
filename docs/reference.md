@@ -30,7 +30,7 @@ configuration, and `man termnav` has the complete command syntax.
   editor target. A URL target is delivered the way `open-url` delivers, but
   starting from the exact client that received the click instead of the most
   recent one, so it crosses a local or SSH-separated outer tmux; like
-  `open-url`, it identifies WezTerm across SSH by tmux 3.2's XTVERSION record.
+  `open-url`, it identifies WezTerm across SSH by tmux's XTVERSION record.
   A clicking control-mode or VS Code (xterm.js) client declines rather than
   receiving the request. When the request is declined or fails, `$BROWSER`
   runs with the URL (the shared convention: `:`-separated entries, each a
@@ -656,8 +656,8 @@ expiry; tmux-tools' `term-pane-state` publishes from a status job every few
 seconds, usually with the same counts. A parent tmux that forwards only from
 its own status job therefore adds up to one interval per nested layer. To
 forward a change at once, a parent config can hook `after-set-option`: tmux
-3.2 and later run it after each `set-option` a client sends, with the
-command's pane as its target and its arguments in `#{hook_arguments}`.
+runs it after each `set-option` a client sends, with the command's pane as
+its target and its arguments in `#{hook_arguments}`.
 Commands a hook runs synchronously, such as those inside `if-shell -F`, do
 not fire it again, while background `if-shell -b` or `run-shell -b -C`
 commands started from a hook do. Matching the two option names and comparing
@@ -719,11 +719,15 @@ fails closed when the last renewal expires.
 client rather than the client that raised the event, so a second client of a
 shared session could start the busier client's publisher and never claim its
 own parent pane. Those hooks pass `#{hook_client}` instead. Termnav ignores a
-named client that has gone, as in a detach hook, and a control-mode client.
-tmux 3.2 has no `#{hook_client}`; there the example falls back to the exact
-identity, which the attach hook resolves to the attaching client. Command hooks
+named client that has gone, as in a detach hook, and a control-mode client;
+the example runs a notification hook only when it names a client. Command hooks
 such as `after-select-pane` run with the invoking client and keep the exact
 form, which older configurations use for every hook.
+
+Termnav's tmux integration needs tmux 3.3 or newer. `termnav tmux
+follow-click` and `termnav paste-image receive` ask their server for its
+version and refuse an older one with that message; the example config shows it
+once as each client attaches and loads nothing else.
 
 The rendering path remains entirely inside tmux. Border and label formats can
 combine `pane_active`, the current client's `focused` flag, and the absence of

@@ -215,4 +215,25 @@ else
   _pass "test isolation: interrupted timeout supervisor cleans up its process group"
 fi
 
+# test/termnav-test runs every suite, so it must not source helpers.sh: the
+# suites' temporary roots would nest under its own, and its HOME, XDG and
+# TMPDIR overrides and EXIT trap would reach them. It sources only the tmux
+# version rule, which must define functions and do nothing else.
+runner_sources=$(grep -E '^[[:space:]]*(\.|source)[[:space:]]' "$TERMNAV_TEST_DIR/termnav-test")
+# shellcheck disable=SC2016 # The runner's own source line, verbatim.
+_assert_eq "test isolation: the runner sources only the tmux version rule" \
+  '. "$test_dir/tmux-version.sh"' "$(printf '%s\n' "$runner_sources" | sed 's/^[[:space:]]*//')"
+# shellcheck disable=SC2016 # The inner script expands its own variables.
+rule_effects=$(
+  env -i PATH="$PATH" HOME=/rule-home TMPDIR=/rule-tmp bash --norc --noprofile -c '
+    state() { trap -p; export -p; compgen -v | grep -Evx "BASH_.*|FUNCNAME|_|PIPESTATUS|LINENO|SECONDS|RANDOM|SRANDOM|EPOCH.*|BASHPID|before|after"; }
+    before=$(state)
+    . "$1"
+    after=$(state)
+    [[ $before == "$after" ]] || diff <(printf "%s\n" "$before") <(printf "%s\n" "$after")
+    declare -F | grep -c " _tmux_usable$"
+  ' rule "$TERMNAV_TEST_DIR/tmux-version.sh" 2>&1
+)
+_assert_eq "test isolation: the tmux version rule only defines functions" 1 "$rule_effects"
+
 _test_summary

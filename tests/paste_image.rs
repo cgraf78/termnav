@@ -1,7 +1,8 @@
-//! `termnav paste-image stage` against fake clipboard readers.
+//! `termnav paste-image stage` against fake clipboard readers, and the
+//! receiver's tmux version gate against a fake tmux.
 //!
-//! Receiver behavior needs a real tmux client and terminal; it is covered by
-//! `test/paste-image.py` through `test/suites/paste-image-test`.
+//! The rest of the receiver needs a real tmux client and terminal; it is
+//! covered by `test/paste-image.py` through `test/suites/paste-image-test`.
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -342,4 +343,59 @@ fn usage_errors_exit_two() {
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
     }
+}
+
+#[test]
+fn a_receiver_on_an_unsupported_tmux_tells_the_client_and_does_nothing_else() {
+    let (major, minor) = common::tmux_floor();
+    let older = format!("{major}.{}a", minor - 1);
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = fixture.root.join("tmux.log");
+    let tmux = bin.join("tmux");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n\
+             case \" $* \" in *\" display-message -p #{{version}} \"*) echo {older};; esac\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
+        .args([
+            "paste-image",
+            "receive",
+            "--target-pane",
+            "%3",
+            "--client-name",
+            "/dev/pts/receiver",
+            "--tmux-socket",
+            "/tmp/termnav-fake.sock",
+        ])
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("HOME", fixture.root.join("home"))
+        .env("TMPDIR", fixture.root.join("tmp"))
+        .env("XDG_RUNTIME_DIR", fixture.root.join("run"))
+        .output()
+        .unwrap();
+    let refusal = format!("needs tmux {major}.{minor} or newer (server is {older})");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("termnav paste-image: {refusal}")),
+        "{output:?}"
+    );
+    // The version query and the message, and nothing else: no lookup, no
+    // paste.
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        format!(
+            "-S /tmp/termnav-fake.sock display-message -p #{{version}}\n\
+             -S /tmp/termnav-fake.sock display-message -c /dev/pts/receiver -d 5000 termnav: {refusal}\n"
+        )
+    );
 }

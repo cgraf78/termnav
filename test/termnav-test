@@ -96,7 +96,44 @@ if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
     "${tooling_shell_files[@]}" \
     "$test_dir/termnav-test" \
     "$test_dir/helpers.sh" \
+    "$test_dir/tmux-version.sh" \
     "$test_dir"/suites/*-test
+fi
+
+# Settle tmux once for every suite. TERMNAV_REQUIRE_TMUX=1, which CI sets
+# wherever it runs these suites, turns a missing or unsupported tmux into a
+# failure rather than skipped cases. Feature gates inside suites (send-keys -K
+# needs 3.4, and so on) stay ordinary skips.
+# Only the version rule: helpers.sh sets up a suite's own temporary HOME,
+# XDG and TMPDIR roots and EXIT trap, which must not nest under the runner's.
+# shellcheck source=tmux-version.sh
+. "$test_dir/tmux-version.sh"
+_tmux_floor >/dev/null || exit 1
+TERMNAV_TEST_TMUX=$(_termnav_tmux_state)
+export TERMNAV_TEST_TMUX
+if [[ $TERMNAV_TEST_TMUX != ok ]]; then
+  read -r floor_major floor_minor <<<"$(_tmux_floor)"
+  reason="tmux $floor_major.$floor_minor or newer is required (${TERMNAV_TEST_TMUX})"
+  if [[ ${TERMNAV_REQUIRE_TMUX:-0} == 1 ]]; then
+    printf 'termnav-test: FAIL: %s\n' "$reason" >&2
+    exit 1
+  fi
+  printf 'termnav-test: SKIP: tmux cases: %s\n' "$reason"
+fi
+# The CI floor profile names the floor it provides, and, on the leg that built
+# it, that this run must use exactly that release.
+if [[ -n ${CI_TMUX_FLOOR:-} ]]; then
+  read -r floor_major floor_minor <<<"$(_tmux_floor)"
+  if [[ $(_tmux_release "$CI_TMUX_FLOOR") != "$floor_major $floor_minor" ]]; then
+    printf 'termnav-test: FAIL: CI provides tmux %s, but the floor is %s.%s\n' \
+      "$CI_TMUX_FLOOR" "$floor_major" "$floor_minor" >&2
+    exit 1
+  fi
+  if [[ ${CI_TMUX_FLOOR_EXACT:-} == 1 && $(tmux -V 2>/dev/null) != "tmux $CI_TMUX_FLOOR" ]]; then
+    printf 'termnav-test: FAIL: this leg built tmux %s, but runs %s\n' \
+      "$CI_TMUX_FLOOR" "$(tmux -V 2>&1)" >&2
+    exit 1
+  fi
 fi
 
 for suite in "$test_dir"/suites/*-test; do

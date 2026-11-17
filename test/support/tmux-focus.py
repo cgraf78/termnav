@@ -907,14 +907,10 @@ class NestedFocusTest(unittest.TestCase):
         self.environment["XDG_RUNTIME_DIR"] = str(self.runtime)
         self.environment["PATH"] = f"{self.focus.parent}:{self.environment['PATH']}"
         # Mirror examples/tmux.conf. Notification hooks can expand #{client_*}
-        # for another client, so they name the client that raised them, with
-        # tmux 3.2's exact-identity fallback; command hooks run with the
-        # invoking client.
-        client = (
-            "#{?hook_client,--client-name #{q:hook_client},"
-            "--client-pid #{client_pid} --client-tty #{q:client_tty}}"
-        )
-        guard = "#{||:#{hook_client},#{==:#{client_control_mode},0}}"
+        # for another client, so they name the client that raised them;
+        # command hooks run with the invoking client.
+        client = "--client-name #{q:hook_client}"
+        guard = "#{!=:#{hook_client},}"
         command = (
             f"{shlex.quote(str(self.focus))} watch "
             f"--tmux-socket #{{q:socket_path}} {client} --lease-ms 600 --interval-ms 150"
@@ -1061,21 +1057,6 @@ class NestedFocusTest(unittest.TestCase):
         self.assertTrue(pid.isdigit() and tty, value)
         return int(pid), tty
 
-    def supports_client_focus_hooks(self, socket_path: pathlib.Path) -> bool:
-        """Return whether tmux exposes terminal focus transition hooks."""
-        hooks = self.tmux(socket_path, "show-hooks", "-g")
-        names = {
-            line.split(maxsplit=1)[0].partition("[")[0]
-            for line in hooks.splitlines()
-            if line.strip()
-        }
-        return {"client-focus-in", "client-focus-out"}.issubset(names)
-
-    def require_client_focus_hooks(self, socket_path: pathlib.Path) -> None:
-        """Skip behavior that the installed tmux cannot observe."""
-        if not self.supports_client_focus_hooks(socket_path):
-            self.skipTest("tmux does not expose client focus transition hooks")
-
     def visual_leaf_count(self, *socket_paths: pathlib.Path) -> int:
         # This is the consumer-side invariant in its smallest form. It contains
         # no nesting heuristic: each server knows only whether its own client is
@@ -1132,11 +1113,10 @@ class NestedFocusTest(unittest.TestCase):
 
         Starting the nested client in a clientless outer server races the PTY
         attachment: when the nested client enables focus reporting, an
-        unfocused outer pane answers with a focus-out. tmux releases without
-        client-focus-in (CentOS Stream 9 ships 3.2a) then never restart the
-        publisher that focus-out stopped. Launching the nested client only after
-        the outer client is focused mirrors normal use and makes the initial
-        focus report deterministic on every tmux version.
+        unfocused outer pane answers with a focus-out, which stops the
+        publisher until the outer client next reports focus. Launching the
+        nested client only after the outer client is focused mirrors normal
+        use and makes the initial focus report deterministic.
         """
         inner = self.new_server(f"{name}-inner", "sleep 30")
         outer = self.new_server(f"{name}-outer", "sleep 30")
@@ -1285,7 +1265,6 @@ class NestedFocusTest(unittest.TestCase):
         self,
     ) -> None:
         inner = self.new_server("inner", "sleep 30")
-        self.require_client_focus_hooks(inner)
         inner_active = self.tmux(inner, "display-message", "-p", "#{pane_id}")
         self.tmux(inner, "split-window", "-d", "sleep 30")
         outer = self.new_server(
@@ -1333,7 +1312,6 @@ class NestedFocusTest(unittest.TestCase):
 
     def test_direct_client_focus_changes_repaint_its_active_leaf(self) -> None:
         direct = self.new_server("direct", "sleep 30")
-        self.require_client_focus_hooks(direct)
         pane = self.tmux(direct, "display-message", "-p", "#{pane_id}")
         client = PtyClient(direct, self.environment)
         self.clients.append(client)
@@ -1413,7 +1391,6 @@ class NestedFocusTest(unittest.TestCase):
 
     def test_three_levels_keep_exactly_one_highlighted_leaf(self) -> None:
         deepest = self.new_server("deepest", "sleep 30")
-        self.require_client_focus_hooks(deepest)
         deepest_other = self.tmux(
             deepest,
             "split-window",
@@ -1513,7 +1490,6 @@ class NestedFocusTest(unittest.TestCase):
 
     def test_shared_inner_session_keeps_outer_attachments_independent(self) -> None:
         inner = self.new_server("shared-inner", "sleep 30")
-        self.require_client_focus_hooks(inner)
         self.tmux(inner, "split-window", "-d", "sleep 30")
         attach = f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus"
         outer_one = self.new_server("outer-one", attach)
@@ -1596,7 +1572,6 @@ class NestedFocusTest(unittest.TestCase):
         for variable in ("LANG", "LC_ALL", "LC_CTYPE"):
             self.environment.pop(variable, None)
         inner = self.new_server("recent-inner", "cat")
-        self.require_client_focus_hooks(inner)
         inner_pane = self.tmux(inner, "display-message", "-p", "#{pane_id}")
         attach = f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus"
         outer_one = self.new_server("recent-outer-one", attach)
@@ -1667,7 +1642,6 @@ class NestedFocusTest(unittest.TestCase):
         # guard on #{client_control_mode}, which described another client, so
         # termnav must skip them by name itself.
         inner = self.new_server("control-inner", "sleep 30")
-        self.require_client_focus_hooks(inner)
         outer = self.new_server(
             "control-outer",
             f"tmux -S {shlex.quote(str(inner))} -C attach-session -t focus",
@@ -1754,7 +1728,6 @@ class NestedFocusTest(unittest.TestCase):
 
     def test_publisher_crash_expires_then_next_focus_recovers(self) -> None:
         inner = self.new_server("crash-inner", "sleep 30")
-        self.require_client_focus_hooks(inner)
         outer = self.new_server(
             "crash-outer",
             f"env TERM=tmux-256color tmux -S {shlex.quote(str(inner))} attach-session -t focus",

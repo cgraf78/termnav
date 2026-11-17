@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import re
 import shlex
 import socket
 import subprocess
@@ -128,16 +127,10 @@ def main() -> None:
                 assert extra == fields[0] + ":" + waiting, (state, extra)
             return state, extra
 
-        # tmux 3.2 added #{hook_arguments}; development builds name no release.
-        version = re.search(r"(\d+)\.(\d+)", run("tmux", "-V", env=env).stdout)
-        hook_arguments = version is None or (int(version[1]), int(version[2])) >= (3, 2)
-
         def assert_writes(expected: list[str]) -> None:
             """Require the lease set-options a client sent since the last check."""
             writes = tmux(outer, "show-option", "-gqv", "@lease_writes").stdout.strip()
             tmux(outer, "set-option", "-gu", "@lease_writes")
-            if not hook_arguments:
-                return
             # Keep each command's flag and option name; quoting of the target
             # pane differs between tmux versions.
             seen = [

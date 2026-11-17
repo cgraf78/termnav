@@ -142,7 +142,7 @@ else
   echo "  SKIP: Neovim example requires Neovim"
 fi
 
-if command -v tmux >/dev/null 2>&1; then
+if _tmux_usable; then
   _td=${_td:-$(_tmpdir)}
   _socket="termnav-example-$$"
   _tmux_client_launcher=""
@@ -186,6 +186,43 @@ SH
     PATH="$_stub_bin:$PATH" \
     tmux -L "$_socket" -f "$TMUX_EXAMPLE" new-session -d -s example
   _assert_exit "examples: tmux config loads" 0 "$?"
+  # The guard refuses exactly the versions below the floor. Its expression is
+  # evaluated here for each canonical vector and the rows at the floor's edge.
+  _guard=$(sed -n 's/^%if "\(.*\)"$/\1/p' "$TMUX_EXAMPLE")
+  read -r _floor_major _floor_minor <<<"$(_tmux_floor)"
+  if ((_floor_minor == 0)); then
+    _fail "examples: the floor-edge rows cannot express a floor of $_floor_major.0"
+  fi
+  _below="$_floor_major.$((_floor_minor - 1))"
+  _floor="$_floor_major.$_floor_minor"
+  _above="$_floor_major.$((_floor_minor + 1))"
+  # The canonical vectors, read from src/tmux_version.rs's VECTORS (each
+  # version and how it reads), then the rows at this floor's edge, including
+  # the next major's first release.
+  _vectors=$(sed -n '/^    const VECTORS: /,/^    \];$/s/^        ("\([^"]*\)", "\([^"]*\)"),$/\1:\2/p' \
+    "$TERMNAV_TEST_DIR/../src/tmux_version.rs")
+  _assert_eq "examples: VECTORS reads as version:reads rows" 1 \
+    "$(grep -c '^openbsd-7.6:newest$' <<<"$_vectors")"
+  # A row in any other form, such as one rustfmt splits across lines, would
+  # drop out of the parse silently, so the rows read must be every row in
+  # the block, counted by their opening parenthesis.
+  _assert_eq "examples: every VECTORS row parses" \
+    "$(sed -n '/^    const VECTORS: /,/^    \];$/p' "$TERMNAV_TEST_DIR/../src/tmux_version.rs" |
+      grep -c '^ *(')" \
+    "$(grep -c . <<<"$_vectors")"
+  _next_major="$((_floor_major + 1)).0"
+  while IFS= read -r _vector; do
+    _version=${_vector%:*}
+    _reads=${_vector##*:}
+    case $_reads in newest | unknown) ;; *) _reads="${_reads%%.*} ${_reads#*.}" ;; esac
+    _assert_eq "examples: the shell rule reads '$_version'" "$_reads" "$(_tmux_release "$_version")"
+    _want=0
+    _tmux_supported "$_version" || _want=1
+    _assert_eq "examples: the tmux guard reads '$_version' as the floor rule does" \
+      "$_want" "$(tmux -L "$_socket" display-message -p "${_guard//\#\{version\}/$_version}")"
+  done < <(printf '%s\n' "$_vectors" "$_below:$_below" "${_below}a:$_below" \
+    "${_below}-rc:$_below" "next-$_below:$_below" "$_floor:$_floor" \
+    "$_above:$_above" "$_next_major:$_next_major")
   _assert_eq "examples: tmux config enables mouse routing" "on" \
     "$(tmux -L "$_socket" show-options -gv mouse)"
   # Older tmux releases accept a key argument to list-keys but print no
@@ -206,47 +243,25 @@ SH
     '#{socket_path}' "$_tmux_keys"
   _assert_contains "examples: tmux click identity uses the event pane" \
     '#{mouse_pane}' "$_tmux_keys"
-  # tmux 3.2 accepts these hooks but cannot filter `show-hooks` by one hook
-  # name. Inspect the complete global table, as with the root key table above,
-  # so the example stays testable on the oldest supported distro package.
-  _tmux_hooks=$(tmux -L "$_socket" show-hooks -g)
-  _tmux_focus_hooks=$(printf '%s\n' "$_tmux_hooks" |
-    awk '$1 ~ /^client-focus-in(\[[^]]+\])?$/')
-  _tmux_attach_hooks=$(printf '%s\n' "$_tmux_hooks" |
-    awk '$1 ~ /^client-attached(\[[^]]+\])?$/')
-  _tmux_focus_sync_hook=$(printf '%s\n' "$_tmux_hooks" |
-    awk '$1 ~ /^after-select-pane(\[[^]]+\])?$/')
+  _tmux_focus_hooks=$(tmux -L "$_socket" show-hooks -g client-focus-in)
+  _tmux_focus_sync_hook=$(tmux -L "$_socket" show-hooks -g after-select-pane)
   # Notification hooks can expand #{client_*} for another client; only
-  # #{hook_client} names the client that raised them. tmux 3.2 lacks it, so the
-  # exact identity remains as a fallback there, behind the control-mode guard.
-  _tmux_focus_client='#{?hook_client,--client-name #{q:hook_client},--client-pid #{client_pid} --client-tty #{q:client_tty}}'
-  _tmux_focus_guard='#{||:#{hook_client},#{==:#{client_control_mode},0}}'
-  if [[ -n $_tmux_focus_hooks ]]; then
-    _assert_contains "examples: tmux config registers client focus" \
-      "client-focus-in" "$_tmux_focus_hooks"
-    _assert_contains "examples: tmux config publishes nested focus" \
-      "termnav tmux focus watch" "$_tmux_focus_hooks"
-    for _hook in client-attached client-focus-in client-focus-out client-detached client-session-changed; do
-      _tmux_hook=$(printf '%s\n' "$_tmux_hooks" |
-        awk -v hook="$_hook" 'index($1, hook "[110]") == 1')
-      _assert_contains "examples: $_hook names its triggering client" \
-        "--tmux-socket #{q:socket_path} $_tmux_focus_client" "$_tmux_hook"
-      _assert_contains "examples: $_hook guards only the exact-identity fallback" \
-        "$_tmux_focus_guard" "$_tmux_hook"
-    done
-  else
-    # tmux 3.2 accepts the newer hook in a config but does not expose it in the
-    # supported hook table. Preserve coverage through the attach hook instead
-    # of claiming that terminal focus transitions exist on that release.
-    _assert_contains "examples: old tmux registers client attachment" \
-      "client-attached" "$_tmux_attach_hooks"
-    _assert_contains "examples: old tmux publishes initial nested focus" \
-      "termnav tmux focus watch" "$_tmux_attach_hooks"
-    _assert_contains "examples: old tmux attachment falls back to its exact client" \
-      "$_tmux_focus_client" "$_tmux_attach_hooks"
-    _assert_contains "examples: old tmux attachment excludes control clients" \
-      "$_tmux_focus_guard" "$_tmux_attach_hooks"
-  fi
+  # #{hook_client} names the client that raised them, and a hook that names
+  # none starts nothing.
+  _tmux_focus_client='--client-name #{q:hook_client}'
+  _tmux_focus_guard='#{!=:#{hook_client},}'
+  _assert_contains "examples: tmux config registers client focus" \
+    "client-focus-in" "$_tmux_focus_hooks"
+  _assert_contains "examples: tmux config publishes nested focus" \
+    "termnav tmux focus watch" "$_tmux_focus_hooks"
+  for _hook in client-attached client-focus-in client-focus-out client-detached client-session-changed; do
+    _tmux_hook=$(tmux -L "$_socket" show-hooks -g "$_hook" |
+      awk -v hook="$_hook" 'index($1, hook "[110]") == 1')
+    _assert_contains "examples: $_hook names its triggering client" \
+      "--tmux-socket #{q:socket_path} $_tmux_focus_client" "$_tmux_hook"
+    _assert_contains "examples: $_hook runs only for a named client" \
+      "$_tmux_focus_guard" "$_tmux_hook"
+  done
   _assert_contains "examples: tmux config registers pane focus repair" \
     "after-select-pane" "$_tmux_focus_sync_hook"
   _assert_contains "examples: stale pane dimming is repaired on selection" \
@@ -498,7 +513,7 @@ SH
   _stop_examples_tmux
   trap _cleanup EXIT
 else
-  echo "  SKIP: tmux config example requires tmux"
+  echo "  SKIP: tmux config example requires a supported tmux"
 fi
 
 # Run the extension through the native click router rather than sourcing it.

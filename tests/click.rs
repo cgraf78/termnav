@@ -425,7 +425,63 @@ fn a_browser_that_keeps_running_is_left_running() {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     assert!(survived, "the browser was killed");
-    assert!(!calls.contains("display-message"), "calls: {calls}");
+    // The only display-message is the server version check: no message.
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("display-message"))
+            .all(|line| line == "display-message -p #{version}"),
+        "calls: {calls}"
+    );
+}
+
+#[test]
+fn a_click_on_an_unsupported_tmux_tells_the_client_and_opens_nothing() {
+    let (major, minor) = common::tmux_floor();
+    let older = format!("{major}.{}a", minor - 1);
+    let root = temporary_root();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create fake bin");
+    let _cleanup = Cleanup(root.clone());
+    let log = root.join("tmux.log");
+    let opened = root.join("opened");
+    let browser = root.join("browser");
+    script(&browser, &format!("touch '{}'\n", opened.display()));
+    script(
+        &bin.join("tmux"),
+        &format!(
+            "printf '%s\\n' \"$*\" >>'{log}'\n\
+             case \" $* \" in *\" display-message -p #{{version}} \"*) echo {older};; esac\nexit 0\n",
+            log = log.display()
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
+        .args([
+            "tmux",
+            "follow-click",
+            "https://example.com/refused",
+            "",
+            "",
+            "0",
+            "/repo",
+            "/dev/pts/clicked",
+            "%3",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("TMUX", "/tmp/termnav-fake.sock,1,0")
+        .env_remove("TMUX_PANE")
+        .env("BROWSER", &browser)
+        .output()
+        .expect("route browser target");
+    assert_eq!(output.status.code(), Some(1));
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains(&format!(
+            "display-message -c /dev/pts/clicked -d 10000 termnav: needs tmux {major}.{minor} or newer (server is {older})"
+        )),
+        "calls: {calls}"
+    );
+    assert!(!opened.exists(), "the browser ran");
 }
 
 #[test]
@@ -520,13 +576,13 @@ fn the_browser_never_inherits_a_stale_pane() {
     );
 }
 
-/// Run a click that ends in the message, through a fake tmux that rejects
-/// `display-message -c` as tmux 3.2 does. The clicking client
-/// (`/dev/pts/clicked`, or none when `tty` is empty) is in session `$1`, and
-/// another client is in `$2`; the clicked pane's session check answers
-/// `check` (`ID COUNT`, empty, or `fail`), and only when it names pane `%3`.
+/// Run a click that ends in the message, through a fake tmux that behaves as
+/// every supported tmux does: `display-message -c` for a client it does not
+/// know succeeds and shows nothing, unless `client_flag_fails` makes it fail
+/// (an unreachable server). The clicked pane's session check answers `check`
+/// (`COUNT`, empty, or `fail`), and only when it names pane `%3`.
 /// Returns the tmux calls with their `TMUX_PANE`, and termnav's stderr.
-fn tell_without_client_flag(tty: &str, check: &str) -> (String, String) {
+fn tell_through(tty: &str, check: &str, client_flag_fails: bool) -> (String, String) {
     let root = temporary_root();
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create fake bin");
@@ -537,14 +593,18 @@ fn tell_without_client_flag(tty: &str, check: &str) -> (String, String) {
     } else {
         format!("echo '{check}'")
     };
+    let client_flag = if client_flag_fails {
+        "exit 1"
+    } else {
+        "exit 0"
+    };
     script(
         &bin.join("tmux"),
         &format!(
             "printf '%s|TMUX_PANE=%s\\n' \"$*\" \"${{TMUX_PANE-unset}}\" >>'{log}'\n\
              case \" $* \" in\n\
-             *\" list-clients -F #{{client_tty}} #{{session_id}} \"*) printf '/dev/pts/clicked $1\\n/dev/pts/other $2\\n';;\n\
              *\" list-clients \"*) printf '0\\txterm.js(6.1.0)\\t/dev/pts/clicked\\txterm-256color\\t0\\n';;\n\
-             *\" -c \"*) echo 'usage: display-message' >&2; exit 1;;\n\
+             *\" display-message -c \"*) {client_flag};;\n\
              *\" -t %3 \"*session_attached*) {answer};;\n\
              *session_attached*) exit 1;;\n\
              esac\nexit 0\n",
@@ -578,63 +638,65 @@ fn tell_without_client_flag(tty: &str, check: &str) -> (String, String) {
     )
 }
 
-/// The message calls made without `-c`.
-fn retries(calls: &str) -> Vec<&str> {
+/// The message calls, as (targeted at a client, `TMUX_PANE`).
+fn messages(calls: &str) -> Vec<(bool, &str)> {
     calls
         .lines()
-        .filter(|line| line.starts_with("display-message") && !line.contains(" -c "))
-        .filter(|line| line.contains("https://example.com/told"))
+        .filter(|line| {
+            line.starts_with("display-message") && line.contains("https://example.com/told")
+        })
+        .map(|line| {
+            (
+                line.contains(" -c "),
+                line.rsplit_once("|TMUX_PANE=").map_or("", |(_, pane)| pane),
+            )
+        })
         .collect()
 }
 
 #[test]
-fn a_message_tmux_will_not_target_goes_to_the_clicked_pane_session() {
-    let (calls, stderr) = tell_without_client_flag("/dev/pts/clicked", "$1 1");
-    let retries = retries(&calls);
-    assert!(!retries.is_empty(), "no retry: {calls}");
+fn a_message_for_the_clicking_client_goes_only_to_that_client() {
+    // tmux drops a message for a client that has gone, with status 0: nothing
+    // else is tried, and no other session is asked about.
+    let (calls, stderr) = tell_through("/dev/pts/clicked", "1", false);
+    assert_eq!(messages(&calls), [(true, "unset")], "calls: {calls}");
     assert!(
-        retries.iter().all(|line| line.ends_with("|TMUX_PANE=%3")),
-        "retries: {retries:?}"
-    );
-    assert!(
-        calls
-            .lines()
-            .filter(|line| line.contains(" -c "))
-            .all(|line| line.ends_with("|TMUX_PANE=unset")),
+        calls.contains("display-message -c /dev/pts/clicked -d 10000 "),
         "calls: {calls}"
     );
+    assert!(!calls.contains("session_attached"), "calls: {calls}");
     assert!(stderr.is_empty(), "stderr: {stderr}");
 }
 
 #[test]
-fn a_message_never_reaches_another_session() {
-    // The pane's session is detached; the pane resolves to another session,
-    // as a linked window or grouped session can make it; the check fails; the
-    // pane is gone, which real tmux reports with no output and status 0.
-    for check in ["$1 0", "$2 1", "fail", ""] {
-        let (calls, stderr) = tell_without_client_flag("/dev/pts/clicked", check);
-        assert!(retries(&calls).is_empty(), "{check}: {calls}");
+fn a_message_tmux_cannot_show_its_client_goes_to_stderr_only() {
+    let (calls, stderr) = tell_through("/dev/pts/clicked", "1", true);
+    assert_eq!(messages(&calls), [(true, "unset")], "calls: {calls}");
+    assert!(
+        stderr.contains("https://example.com/told"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_message_for_a_click_without_a_client_goes_to_the_pane_session() {
+    let (calls, stderr) = tell_through("", "1", false);
+    assert_eq!(messages(&calls), [(false, "%3")], "calls: {calls}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
+}
+
+#[test]
+fn a_message_without_a_client_needs_the_pane_session_attached() {
+    // The pane's session is detached; the check fails; the pane is gone,
+    // which real tmux reports with no output and status 0.
+    for check in ["0", "fail", ""] {
+        let (calls, stderr) = tell_through("", check, false);
+        assert!(messages(&calls).is_empty(), "{check}: {calls}");
         assert!(
             stderr.contains("https://example.com/told"),
             "{check}: {stderr}"
         );
     }
-}
-
-#[test]
-fn a_message_for_a_click_without_a_client_goes_to_the_pane_session() {
-    let (calls, stderr) = tell_without_client_flag("", "$1 1");
-    let retries = retries(&calls);
-    assert!(!retries.is_empty(), "no retry: {calls}");
-    assert!(
-        retries.iter().all(|line| line.ends_with("|TMUX_PANE=%3")),
-        "retries: {retries:?}"
-    );
-    assert!(
-        !calls.contains("#{client_tty} #{session_id}"),
-        "calls: {calls}"
-    );
-    assert!(stderr.is_empty(), "stderr: {stderr}");
 }
 
 #[test]

@@ -269,7 +269,7 @@ class TerminalClient:
     def _finish_initialization(self) -> None:
         # New tmux versions probe for terminal capability passthrough with DSR
         # ?996, while older releases do not. The bound sentinel is the portable
-        # readiness contract. tmux 3.2 can list a client before its input path
+        # readiness contract. tmux can list a client before its input path
         # honors key bindings, so retry the harmless probe while answering
         # capability queries instead of depending on one precisely timed key.
         payload = bytearray()

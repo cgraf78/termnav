@@ -17,14 +17,17 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@6ecbf5dafaeb9483aeeba3915321544b31572172
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@e767cb36e31553674db90a611fb033e7f00b0516
     with:
       matrix-set: full
       msrv-toolchain: "1.88"
-      profiles: base,shellcheck,zsh,lua,neovim,tmux,python,openssh-netcat-lsof
-      test-command: cargo test --locked && test/termnav-test
-      termux-profiles: base,zsh,neovim,tmux,python,openssh-netcat-lsof
-      termux-command: TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test
+      # tmux-floor builds the oldest supported tmux on the leg whose
+      # distribution ships an older one; TERMNAV_REQUIRE_TMUX=1 turns a
+      # skipped tmux suite into a failure.
+      profiles: base,shellcheck,zsh,lua,neovim,tmux-floor,python,openssh-netcat-lsof
+      test-command: export TERMNAV_REQUIRE_TMUX=1 && cargo test --locked && test/termnav-test
+      termux-profiles: base,zsh,neovim,tmux-floor,python,openssh-netcat-lsof
+      termux-command: TERMNAV_REQUIRE_TMUX=1 TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test
       termux-host-command: |
         archive=$(
           CARGO_TARGET_DIR="$RUNNER_TEMP/termnav-termux-target" \
@@ -61,7 +64,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@6ecbf5dafaeb9483aeeba3915321544b31572172
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e767cb36e31553674db90a611fb033e7f00b0516
 
   vscode-adapter:
     name: VS Code adapter / Ubuntu

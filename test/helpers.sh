@@ -609,6 +609,10 @@ _require_compatible_libc() {
 # Summary
 # ---------------------------------------------------------------------------
 
+# The tmux version rule, also sourced on its own by test/termnav-test.
+# shellcheck source=tmux-version.sh
+. "${BASH_SOURCE[0]%/*}/tmux-version.sh"
+
 _test_summary() {
   echo ""
   if $_TEST_PRETTY; then

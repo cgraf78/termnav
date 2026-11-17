@@ -14,6 +14,24 @@ pub(crate) fn temporary_root(label: &str) -> PathBuf {
         .join(format!("termnav-{label}-{}-{sequence}", std::process::id()))
 }
 
+/// The tmux floor, read from its one source, so a test follows a bump.
+#[allow(dead_code)] // Only the version-gate suites need it.
+pub(crate) fn tmux_floor() -> (u32, u32) {
+    let source = include_str!("../../src/tmux_version.rs");
+    let pair = source
+        .lines()
+        .find_map(|line| line.strip_prefix("pub(crate) const TMUX_MINIMUM: (u32, u32) = ("))
+        .and_then(|rest| rest.strip_suffix(");"))
+        .expect("src/tmux_version.rs states TMUX_MINIMUM");
+    let (major, minor) = pair.split_once(", ").expect("TMUX_MINIMUM is a pair");
+    let floor = (major.parse().unwrap(), minor.parse().unwrap());
+    assert!(
+        floor.1 > 0,
+        "a release below the floor cannot be built from {pair}"
+    );
+    floor
+}
+
 /// Own an unsigned child whose environment remains inspectable on macOS 27.
 #[allow(dead_code)] // Only environment-dependent suites need this shared fixture.
 pub(crate) fn environment_fixture() -> std::process::Command {

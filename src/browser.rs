@@ -172,7 +172,7 @@ fn identify(environment: &Environment<'_>) -> Terminal {
 
 /// Identify the terminal behind one tmux client.
 ///
-/// tmux 3.2 and later record the terminal's XTVERSION reply, and nothing
+/// Every supported tmux records the terminal's XTVERSION reply, and nothing
 /// else, as `client_termtype`, which also survives SSH; WezTerm answers
 /// `WezTerm <version>` and tmux answers `tmux <version>`. Without a reply
 /// (older tmux, a non-xterm `TERM`, or a terminal that ignores the query) the
