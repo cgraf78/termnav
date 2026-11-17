@@ -369,6 +369,11 @@ mod tests {
             0
         );
         if !is_checkout() {
+            // CI always has a checkout, so the lint can never be skipped there.
+            assert!(
+                !matches!(std::env::var_os("GITHUB_ACTIONS"), Some(ci) if !ci.is_empty()),
+                "not a Git checkout under GitHub Actions"
+            );
             eprintln!("note: not a Git checkout, so the old-tmux lint is skipped");
             return;
         }
