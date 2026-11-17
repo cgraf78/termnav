@@ -99,8 +99,8 @@ if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
     "$test_dir"/suites/*-test
 fi
 
-# Settle tmux once for every suite. TERMNAV_REQUIRE_TMUX=1, which CI sets on
-# every job that installs tmux, turns a missing or unsupported tmux into a
+# Settle tmux once for every suite. TERMNAV_REQUIRE_TMUX=1, which CI sets
+# wherever it runs these suites, turns a missing or unsupported tmux into a
 # failure rather than skipped cases. Feature gates inside suites (send-keys -K
 # needs 3.4, and so on) stay ordinary skips.
 # shellcheck source=helpers.sh

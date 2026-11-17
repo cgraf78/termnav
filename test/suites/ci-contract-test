@@ -35,15 +35,15 @@ release_content=$(<"$release_workflow")
   fail "daily matrix does not retain its portfolio offset"
 [[ "$content" == *"cgraf78/actions/.github/workflows/rust-ci.yml@$actions_sha"* ]] ||
   fail "Rust CI does not use the locked actions revision"
-[[ "$content" == *'profiles: base,shellcheck,zsh,lua,neovim,tmux,python,openssh-netcat-lsof'* ]] ||
+[[ "$content" == *'profiles: base,shellcheck,zsh,lua,neovim,tmux-floor,python,openssh-netcat-lsof'* ]] ||
   fail "Rust CI does not install the integration-test profiles"
 [[ "$content" == *'matrix-set: full'* ]] ||
   fail "Rust CI does not run the full pull-request platform matrix"
-[[ "$content" == *'termux-profiles: base,zsh,neovim,tmux,python,openssh-netcat-lsof'* ]] ||
+[[ "$content" == *'termux-profiles: base,zsh,neovim,tmux-floor,python,openssh-netcat-lsof'* ]] ||
   fail "Termux CI does not install the full integration-test profiles"
-[[ "$content" == *'termux-command: TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test'* ]] ||
+[[ "$content" == *'termux-command: TERMNAV_REQUIRE_TMUX=1 TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test'* ]] ||
   fail "Termux CI does not run the packaged binary through the full suite"
-[[ "$content" == *'test-command: cargo test --locked && test/termnav-test'* ]] ||
+[[ "$content" == *'test-command: export TERMNAV_REQUIRE_TMUX=1 && cargo test --locked && test/termnav-test'* ]] ||
   fail "Rust CI does not run the native and integration suites together"
 [[ "$retry_content" == *"cgraf78/actions/.github/actions/infra-retry@$actions_sha"* ]] ||
   fail "infrastructure retry does not use the locked actions revision"
