@@ -203,8 +203,9 @@ SH
     "$TERMNAV_TEST_DIR/../src/tmux_version.rs")
   _assert_eq "examples: VECTORS reads as version:reads rows" 1 \
     "$(grep -c '^openbsd-7.6:newest$' <<<"$_vectors")"
-  # A row in any other form would drop out of the parse silently, so the
-  # rows read must be every row in the block.
+  # A row in any other form, such as one rustfmt splits across lines, would
+  # drop out of the parse silently, so the rows read must be every row in
+  # the block, counted by their opening parenthesis.
   _assert_eq "examples: every VECTORS row parses" \
     "$(sed -n '/^    const VECTORS: /,/^    \];$/p' "$TERMNAV_TEST_DIR/../src/tmux_version.rs" |
       grep -c '^ *(')" \
