@@ -142,7 +142,7 @@ else
   echo "  SKIP: Neovim example requires Neovim"
 fi
 
-if command -v tmux >/dev/null 2>&1; then
+if _tmux_usable; then
   _td=${_td:-$(_tmpdir)}
   _socket="termnav-example-$$"
   _tmux_client_launcher=""
@@ -186,6 +186,23 @@ SH
     PATH="$_stub_bin:$PATH" \
     tmux -L "$_socket" -f "$TMUX_EXAMPLE" new-session -d -s example
   _assert_exit "examples: tmux config loads" 0 "$?"
+  # The guard refuses exactly the versions below the floor. Its expression is
+  # evaluated here for each canonical vector and the rows at the floor's edge.
+  _guard=$(sed -n 's/^%if "\(.*\)"$/\1/p' "$TMUX_EXAMPLE")
+  read -r _floor_major _floor_minor <<<"$(_tmux_floor)"
+  _below="$_floor_major.$((_floor_minor - 1))"
+  _floor="$_floor_major.$_floor_minor"
+  # The canonical vectors, shared verbatim by every repository that checks
+  # the tmux floor (floor-free), then the rows at this floor's edge.
+  for _version in 1.8 2.9a next-2.9 3.0 3.1c 3.2 3.2a 3.2-rc3 next-3.2 next-3.2-rc \
+    3.3 3.3a 3.3-rc next-3.3 3.4 3.10 next-3.10 master openbsd-7.6 \
+    openbsd-7.6-current '' "$_below" "${_below}a" "${_below}-rc" "next-$_below" \
+    "$_floor" "$_floor_major.$((_floor_minor + 1))"; do
+    _want=0
+    _tmux_supported "$_version" || _want=1
+    _assert_eq "examples: the tmux guard reads '$_version' as the floor rule does" \
+      "$_want" "$(tmux -L "$_socket" display-message -p "${_guard//\#\{version\}/$_version}")"
+  done
   _assert_eq "examples: tmux config enables mouse routing" "on" \
     "$(tmux -L "$_socket" show-options -gv mouse)"
   # Older tmux releases accept a key argument to list-keys but print no
@@ -476,7 +493,7 @@ SH
   _stop_examples_tmux
   trap _cleanup EXIT
 else
-  echo "  SKIP: tmux config example requires tmux"
+  echo "  SKIP: tmux config example requires a supported tmux"
 fi
 
 # Run the extension through the native click router rather than sourcing it.

@@ -70,7 +70,7 @@ _assert_contains "navigation CLI: an empty terminal path is actionable" \
   "--tty requires a path" "$empty_tty_output"
 _assert_contains "navigation CLI: names the terminal option" "--tty PATH" "$help_output"
 
-if [[ ! -x "$navigate" ]] || ! command -v tmux >/dev/null 2>&1; then
+if [[ ! -x "$navigate" ]] || ! _tmux_usable; then
   _test_summary
 fi
 

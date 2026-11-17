@@ -231,8 +231,9 @@ starts another authenticated connection or guesses among same-host panes.
   recovered without Git metadata. The crate is not published to crates.io.
 - Bash only for sourceable shell integration and optional click-detector
   extensions; navigation gestures do not start a shell or Python interpreter.
-- `tmux` for `termnav tmux follow-click`, pane capture, mouse forwarding, and
-  tmux-aware Neovim targeting.
+- tmux 3.3 or newer for `termnav tmux follow-click`, pane capture, mouse
+  forwarding, and tmux-aware Neovim targeting. Click and paste-image check
+  their server and refuse an older one.
 - Neovim with a server/socket setup for `termnav nvim open` to open file targets
   in an existing editor session.
 - WezTerm for the Lua link-route modules, OSC user-variable context
@@ -242,7 +243,7 @@ starts another authenticated connection or guesses among same-host panes.
 - `ssh` for `termnav nvim ssh-open` when remote file links should reuse an
   existing ControlMaster connection.
 - For `termnav paste-image stage`: `osascript` on macOS, or `wl-paste`
-  (Wayland) or `xclip` (X11) on Linux; tmux 3.2 or newer for its popup.
+  (Wayland) or `xclip` (X11) on Linux.
 - VS Code only for VS Code terminal tabs; see [VS Code (advanced)](#vs-code-advanced).
 
 ## VS Code (advanced)

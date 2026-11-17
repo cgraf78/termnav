@@ -17,6 +17,11 @@ fn tmux(socket: &PathBuf, arguments: &[&str]) -> std::process::Output {
 #[test]
 fn claim_dims_the_parent_and_release_restores_its_style() {
     if Command::new("tmux").arg("-V").output().is_err() {
+        // CI sets TERMNAV_REQUIRE_TMUX on every job that installs tmux.
+        assert!(
+            std::env::var_os("TERMNAV_REQUIRE_TMUX").is_none_or(|value| value != "1"),
+            "TERMNAV_REQUIRE_TMUX=1, but tmux does not run"
+        );
         return;
     }
     let socket = std::env::temp_dir().join(format!("termnav-focus-{}.sock", std::process::id()));

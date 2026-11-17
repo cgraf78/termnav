@@ -95,6 +95,9 @@ fn follow_click(arguments: &[String], stderr: &mut dyn Write) -> io::Result<i32>
         pane_left: number(9),
         tmux_socket: field(10),
     };
+    if !crate::click::server_supported(&input) {
+        return Ok(1);
+    }
     crate::click::follow(&input)?;
     Ok(0)
 }

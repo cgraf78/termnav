@@ -68,6 +68,22 @@ pub enum Target {
     },
 }
 
+/// Whether the click's tmux server is one Termnav supports. A refusal is
+/// shown as any other click message is, and the click does nothing.
+#[must_use]
+pub fn server_supported(input: &Input) -> bool {
+    if input.tmux_socket.is_empty() && std::env::var_os("TMUX").is_none() {
+        return true;
+    }
+    match crate::tmux_version::check_server(tmux_command(&input.tmux_socket)) {
+        Ok(()) => true,
+        Err(reason) => {
+            tell(input, &format!("termnav: {reason}"));
+            false
+        }
+    }
+}
+
 /// Resolve and dispatch one click. Unrecognized text is intentionally a no-op.
 pub fn follow(input: &Input) -> io::Result<()> {
     let Some(target) = resolve(input) else {

@@ -150,9 +150,6 @@ and
 .B #{client_tty}
 describe the session's most recently active client rather than the client that
 raised the event; a named client that is gone or in control mode is ignored.
-tmux 3.2 has no
-.BR #{hook_client} ,
-so the example falls back to the exact identity there.
 Watch also accepts lease and interval options. Command-group help prints the
 exact option names.
 .TP
@@ -476,6 +473,12 @@ Images saved by
 .TP
 .I $XDG_STATE_HOME/nvim-tmux-open
 Neovim socket registry shared with the editor integration.
+.SH COMPATIBILITY
+The tmux integration needs tmux 3.3 or newer.
+.B termnav tmux follow-click
+and
+.B termnav paste-image receive
+ask their server for its version and refuse an older one.
 .SH SEE ALSO
 .BR tmux (1),
 .BR ssh (1),

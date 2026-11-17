@@ -17,8 +17,6 @@ pub mod runtime;
 pub mod shell;
 pub mod ssh;
 pub mod terminal;
-// The tool checks that use it arrive with the floor's tool gating.
-#[allow(dead_code)]
 pub(crate) mod tmux_version;
 pub mod version;
 pub mod vscode;

@@ -425,7 +425,61 @@ fn a_browser_that_keeps_running_is_left_running() {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
     assert!(survived, "the browser was killed");
-    assert!(!calls.contains("display-message"), "calls: {calls}");
+    // The only display-message is the server version check: no message.
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("display-message"))
+            .all(|line| line == "display-message -p #{version}"),
+        "calls: {calls}"
+    );
+}
+
+#[test]
+fn a_click_on_an_unsupported_tmux_tells_the_client_and_opens_nothing() {
+    let root = temporary_root();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create fake bin");
+    let _cleanup = Cleanup(root.clone());
+    let log = root.join("tmux.log");
+    let opened = root.join("opened");
+    let browser = root.join("browser");
+    script(&browser, &format!("touch '{}'\n", opened.display()));
+    script(
+        &bin.join("tmux"),
+        &format!(
+            "printf '%s\\n' \"$*\" >>'{log}'\n\
+             case \" $* \" in *\" display-message -p #{{version}} \"*) echo 3.2a;; esac\nexit 0\n",
+            log = log.display()
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
+        .args([
+            "tmux",
+            "follow-click",
+            "https://example.com/refused",
+            "",
+            "",
+            "0",
+            "/repo",
+            "/dev/pts/clicked",
+            "%3",
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("TMUX", "/tmp/termnav-fake.sock,1,0")
+        .env_remove("TMUX_PANE")
+        .env("BROWSER", &browser)
+        .output()
+        .expect("route browser target");
+    assert_eq!(output.status.code(), Some(1));
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains(
+            "display-message -c /dev/pts/clicked -d 10000 termnav: needs tmux 3.3 or newer (server is 3.2a)"
+        ),
+        "calls: {calls}"
+    );
+    assert!(!opened.exists(), "the browser ran");
 }
 
 #[test]

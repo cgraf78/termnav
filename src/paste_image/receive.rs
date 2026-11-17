@@ -95,6 +95,11 @@ pub fn run(options: &Options, progress: &mut dyn Write) -> i32 {
         client_name: &options.client_name,
         pane: &options.target_pane,
     };
+    if let Err(reason) = crate::tmux_version::check_server(tmux.command()) {
+        let _ = writeln!(progress, "termnav paste-image: {reason}");
+        tmux.tell(&reason);
+        return 1;
+    }
     let destination = match resolve(&socket, options) {
         Ok(destination) => destination,
         Err(reason) => {
@@ -420,26 +425,18 @@ impl Tmux<'_> {
         ))
     }
 
-    /// Show a short message on the client that pasted, or, when none is
-    /// named, on the pane's session.
-    ///
-    /// tmux drops a message for a client that has gone, with status 0, so a
-    /// named client's message never reaches anyone else.
+    /// Show a short message on the client that pasted. tmux drops a message
+    /// for a client that has gone, with status 0, so it never reaches anyone
+    /// else.
     fn tell(&self, message: &str) {
         // display-message expands formats and strftime sequences.
         let escaped = format!("termnav: {message}")
             .replace('#', "##")
             .replace('%', "%%");
-        let target: [&str; 4] = if self.client_name.is_empty() {
-            ["-t", self.pane, "-d", "5000"]
-        } else {
-            ["-c", self.client_name, "-d", "5000"]
-        };
-        if target[1].is_empty() {
-            return;
-        }
         let mut command = self.command();
-        command.arg("display-message").args(target).arg(&escaped);
+        command
+            .args(["display-message", "-c", self.client_name, "-d", "5000"])
+            .arg(&escaped);
         let _ = Self::succeeds(command);
     }
 }

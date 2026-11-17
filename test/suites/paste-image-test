@@ -391,8 +391,8 @@ _assert_contains "paste-image protocol: Rust trigger matches the module" \
 
 echo
 echo "=== paste-image: receiver through private tmux ==="
-if ! command -v tmux >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-  echo "  SKIP: receiver tests require tmux and python3"
+if ! _tmux_usable || ! command -v python3 >/dev/null 2>&1; then
+  echo "  SKIP: receiver tests require a supported tmux and python3"
 else
   receiver_output=$(_with_timeout 5m python3 "$test_dir/paste-image.py" "$termnav" 2>&1)
   receiver_rc=$?
