@@ -6,6 +6,8 @@
 
 mod blocks;
 mod decode;
+mod sixel;
 
 pub use blocks::blocks;
 pub use decode::{BACKGROUND, DecodeError, Thumbnail, decode, fit};
+pub use sixel::{quantize, sixel};

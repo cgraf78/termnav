@@ -1,0 +1,206 @@
+//! Fixed-palette DEC sixel rendering of a thumbnail.
+
+use std::fmt::Write;
+
+use super::Thumbnail;
+
+/// Registers 0..216 are the 6x6x6 colour cube, 216..240 are greys.
+const CUBE_REGISTERS: usize = 216;
+const REGISTERS: usize = 240;
+
+/// Pixel rows encoded by one sixel band.
+const BAND_ROWS: usize = 6;
+
+/// Shortest run worth the `!<count><char>` form; shorter runs are smaller literally.
+const MIN_RLE_RUN: usize = 4;
+
+/// Returns the RGB value of palette register `index` (0..240).
+fn color(index: usize) -> [u8; 3] {
+    if index < CUBE_REGISTERS {
+        // Cube levels are 0, 51, ..., 255, with red the most significant digit.
+        let level = |digit: usize| (digit * 51) as u8;
+        [level(index / 36), level(index / 6 % 6), level(index % 6)]
+    } else {
+        [8 + 10 * (index - CUBE_REGISTERS) as u8; 3]
+    }
+}
+
+/// Returns the palette register nearest to `rgb` by squared RGB distance.
+///
+/// The fixed palette needs no per-image analysis, so output is deterministic
+/// and tmux can re-encode it cheaply per client. Ties go to the lower index,
+/// which prefers the cube over the greys.
+pub fn quantize(rgb: [u8; 3]) -> u8 {
+    let distance = |index| {
+        color(index)
+            .iter()
+            .zip(rgb)
+            .map(|(&p, c)| (i32::from(p) - i32::from(c)).pow(2))
+            .sum::<i32>()
+    };
+    // `min_by_key` returns the first minimum, giving the tie-break above.
+    (0..REGISTERS).min_by_key(|&i| distance(i)).unwrap_or(0) as u8
+}
+
+/// Renders `thumbnail` as a standard DEC sixel sequence.
+///
+/// Sixel has no truecolor, so pixels snap to [`quantize`]'s palette. The
+/// introducer's `P2 = 0` keeps the background opaque, and the raster
+/// attributes tell the terminal the exact pixel size so it need not guess.
+/// An empty thumbnail yields an empty string.
+pub fn sixel(thumbnail: &Thumbnail) -> String {
+    let width = thumbnail.width as usize;
+    let height = thumbnail.height as usize;
+    if width == 0 || height == 0 {
+        return String::new();
+    }
+    let indexed: Vec<u8> = thumbnail.pixels.iter().map(|&p| quantize(p)).collect();
+
+    let mut used = [false; REGISTERS];
+    for &i in &indexed {
+        used[usize::from(i)] = true;
+    }
+    let mut out = format!("\x1bP0;0;0q\"1;1;{width};{height}");
+    // All registers are defined up front so each band can select by number.
+    for (index, _) in used.iter().enumerate().filter(|&(_, &u)| u) {
+        let [r, g, b] = color(index).map(percent);
+        // Writing to a String cannot fail.
+        let _ = write!(out, "#{index};2;{r};{g};{b}");
+    }
+
+    let bands = height.div_ceil(BAND_ROWS);
+    for band in 0..bands {
+        let rows = band * BAND_ROWS..(band * BAND_ROWS + BAND_ROWS).min(height);
+        // One sixel mask per column for each colour present in this band.
+        let mut masks: Vec<Option<Vec<u8>>> = vec![None; REGISTERS];
+        for (bit, y) in rows.enumerate() {
+            for x in 0..width {
+                let index = usize::from(indexed[y * width + x]);
+                masks[index].get_or_insert_with(|| vec![0; width])[x] |= 1 << bit;
+            }
+        }
+        let mut present = masks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.as_ref().map(|m| (i, m)))
+            .peekable();
+        while let Some((index, mask)) = present.next() {
+            let _ = write!(out, "#{index}");
+            push_runs(&mut out, mask);
+            // Carriage return so the next colour overlays the same band.
+            if present.peek().is_some() {
+                out.push('$');
+            }
+        }
+        if band + 1 < bands {
+            out.push('-');
+        }
+    }
+    out.push_str("\x1b\\");
+    out
+}
+
+/// Converts an 8-bit channel to the 0..=100 percent sixel uses, rounding half up.
+fn percent(component: u8) -> u8 {
+    ((u32::from(component) * 200 + 255) / 510) as u8
+}
+
+/// Appends `masks` as sixel characters, run-length encoded.
+///
+/// Trailing empty sixels are dropped: the terminal leaves those columns
+/// untouched anyway, so emitting them only costs bytes.
+fn push_runs(out: &mut String, masks: &[u8]) {
+    let end = masks.iter().rposition(|&m| m != 0).map_or(0, |i| i + 1);
+    for run in masks[..end].chunk_by(|a, b| a == b) {
+        let ch = char::from(63 + run[0]);
+        if run.len() >= MIN_RLE_RUN {
+            let _ = write!(out, "!{}{ch}", run.len());
+        } else {
+            out.extend(std::iter::repeat_n(ch, run.len()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn thumb(width: u32, height: u32, pixels: Vec<[u8; 3]>) -> Thumbnail {
+        Thumbnail {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    const RED: [u8; 3] = [255, 0, 0];
+
+    #[test]
+    fn quantize_pure_colours() {
+        assert_eq!(quantize([0, 0, 0]), 0);
+        assert_eq!(quantize([255, 255, 255]), 215);
+        assert_eq!(quantize(RED), 180);
+    }
+
+    #[test]
+    fn quantize_prefers_grey_when_closer() {
+        // 128 sits between cube levels 102 and 153 but exactly on grey 8 + 10 * 12.
+        assert_eq!(quantize([128, 128, 128]), 216 + 12);
+    }
+
+    #[test]
+    fn sixel_one_pixel_exact() {
+        assert_eq!(
+            sixel(&thumb(1, 1, vec![RED])),
+            "\x1bP0;0;0q\"1;1;1;1#180;2;100;0;0#180@\x1b\\"
+        );
+    }
+
+    #[test]
+    fn sixel_two_colours_share_a_band() {
+        let t = thumb(2, 1, vec![[0, 0, 0], RED]);
+        assert_eq!(
+            sixel(&t),
+            "\x1bP0;0;0q\"1;1;2;1#0;2;0;0;0#180;2;100;0;0#0@$#180?@\x1b\\"
+        );
+    }
+
+    #[test]
+    fn sixel_partial_last_band() {
+        let t = thumb(1, 7, vec![RED; 7]);
+        assert_eq!(
+            sixel(&t),
+            "\x1bP0;0;0q\"1;1;1;7#180;2;100;0;0#180~-#180@\x1b\\"
+        );
+    }
+
+    #[test]
+    fn sixel_run_length_boundary() {
+        let short = sixel(&thumb(3, 1, vec![RED; 3]));
+        assert!(short.contains("#180@@@\x1b\\"), "{short:?}");
+        let long = sixel(&thumb(4, 1, vec![RED; 4]));
+        assert!(long.contains("#180!4@\x1b\\"), "{long:?}");
+    }
+
+    #[test]
+    fn sixel_register_count_capped() {
+        let pixels = (0..64 * 64)
+            .map(|i| [(i % 64 * 4) as u8, (i / 64 * 4) as u8, (i % 251) as u8])
+            .collect();
+        let out = sixel(&thumb(64, 64, pixels));
+        assert!(out.matches(";2;").count() <= 240);
+    }
+
+    #[test]
+    fn sixel_deterministic() {
+        let t = thumb(2, 2, vec![RED, [0, 255, 0], [0, 0, 255], [9, 9, 9]]);
+        assert_eq!(sixel(&t), sixel(&t));
+    }
+
+    #[test]
+    fn sixel_empty_thumbnail_is_empty() {
+        assert_eq!(sixel(&thumb(0, 0, vec![])), "");
+        assert_eq!(sixel(&thumb(3, 0, vec![])), "");
+        assert_eq!(sixel(&thumb(0, 3, vec![])), "");
+    }
+}
