@@ -1,8 +1,9 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+mod common;
 
 fn directory(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("termnav-nvim-ssh-{}-{name}", std::process::id()));
@@ -15,7 +16,7 @@ fn remote_open_uses_one_exact_mux_attempt_without_a_check_race() {
     let root = directory("arguments");
     let binary = root.join("ssh");
     let log = root.join("ssh.log");
-    fs::write(
+    common::write_executable(
         &binary,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -25,9 +26,7 @@ if [[ ${1:-} == -G ]]; then
 fi
 printf '<%s>\n' "$@" >"$TERMNAV_TEST_SSH_LOG"
 "#,
-    )
-    .expect("write fake ssh");
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("chmod fake ssh");
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
         .args(["nvim", "ssh-open", "duo-host", "/tmp/example.txt:4"])
@@ -63,15 +62,13 @@ fn vanished_master_cannot_reach_the_configured_proxy_or_authentication() {
         ),
     )
     .expect("write ssh config");
-    fs::write(
+    common::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/usr/bin/env bash\nexec /usr/bin/ssh -F '{}' \"$@\"\n",
             config.display()
         ),
-    )
-    .expect("write ssh wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+    );
 
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_termnav"))

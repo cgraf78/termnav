@@ -1,8 +1,9 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod common;
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -25,7 +26,7 @@ fn fixture() -> (PathBuf, PathBuf, PathBuf, Cleanup) {
     let bin = root.join("ssh");
     let log = root.join("ssh.log");
     fs::create_dir_all(&root).expect("create fixture");
-    fs::write(
+    common::write_executable(
         &bin,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -43,9 +44,7 @@ done
 printf '%s\n' "$kind" >>"$TERMNAV_TEST_SSH_LOG"
 printf '<%s>\n' "$@" >>"$TERMNAV_TEST_SSH_LOG"
 "#,
-    )
-    .expect("write fake ssh");
-    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("chmod fake ssh");
+    );
     let cleanup = Cleanup(root.clone());
     (root, bin, log, cleanup)
 }
@@ -126,7 +125,7 @@ fn path_lookup_skips_a_non_executable_ssh_shadow() {
 fn failed_session_spawn_joins_and_removes_the_connection_relay() {
     let (root, binary, log, _cleanup) = fixture();
     fs::create_dir(root.join("runtime")).expect("create XDG runtime root");
-    fs::write(
+    common::write_executable(
         &binary,
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -138,8 +137,7 @@ if [[ ${1:-} == -G ]]; then
 fi
 exit 99
 "#,
-    )
-    .expect("replace fake ssh");
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
         .args(["ssh", "-t", "gone.example.invalid"])
         .env("PATH", format!("{}:/usr/bin:/bin", root.display()))

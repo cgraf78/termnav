@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -129,7 +128,7 @@ fn remote_eza_streams_rewritten_binary_output_and_preserves_stderr_and_status() 
     fs::write(&early_stderr_path, &early_stderr).expect("write early stderr");
     fs::write(&payload_path, &payload).expect("write large stdout payload");
     fs::write(&stderr_path, &stderr).expect("write large stderr payload");
-    fs::write(
+    common::write_executable(
         &fake_eza,
         r#"#!/bin/sh
 if [ "${2-}" = "--version" ] || [ "${1-}" = "--version" ]; then
@@ -145,10 +144,7 @@ cat "$TERMNAV_TEST_EZA_PAYLOAD"
 cat "$TERMNAV_TEST_EZA_STDERR" >&2
 exit 37
 "#,
-    )
-    .expect("write fake eza");
-    fs::set_permissions(&fake_eza, fs::Permissions::from_mode(0o700))
-        .expect("make fake eza executable");
+    );
 
     let host = "remote.example";
     let mut child = ChildCleanup(
@@ -237,7 +233,7 @@ fn downstream_write_failure_stops_the_complete_eza_process_group() {
     let ready_path = root.join("ready");
     let release_path = root.join("release");
     let pids_path = root.join("pids");
-    fs::write(
+    common::write_executable(
         &fake_eza,
         r#"#!/bin/sh
 if [ "${2-}" = "--version" ] || [ "${1-}" = "--version" ]; then
@@ -251,10 +247,7 @@ while [ ! -e "$TERMNAV_TEST_EZA_RELEASE" ]; do sleep 0.01; done
 printf '\033]8;;file:///tmp/failure\033\\failure\n'
 wait "$child"
 "#,
-    )
-    .expect("write failing-output eza fixture");
-    fs::set_permissions(&fake_eza, fs::Permissions::from_mode(0o700))
-        .expect("make failing-output eza executable");
+    );
 
     let mut child = ChildCleanup(
         Command::new(env!("CARGO_BIN_EXE_termnav"))

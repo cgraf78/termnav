@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -207,33 +206,9 @@ fn browser_targets_are_returned_to_the_exact_click_client() {
     assert!(std::fs::read(&other).expect("read other client").is_empty());
 }
 
-/// Write an executable `#!/bin/sh` script.
-///
-/// Tests run on parallel threads. A thread that spawns a process while this
-/// one holds a script open for writing hands that descriptor to its child
-/// until the child execs, and running the script meanwhile fails with
-/// ETXTBSY ("Text file busy"). A short-lived `sh` writes the file instead,
-/// so no test thread ever holds it open. Concurrent spawns can inherit the
-/// pipe to it, which only delays its end of input until they exec.
+/// Write an executable `#!/bin/sh` script; see `common::write_executable`.
 fn script(path: &std::path::Path, body: &str) {
-    let mut writer = Command::new("/bin/sh")
-        .args(["-c", "cat >\"$1\" && chmod 755 \"$1\"", "sh"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("start script writer");
-    writer
-        .stdin
-        .take()
-        .expect("script writer stdin")
-        .write_all(format!("#!/bin/sh\n{body}").as_bytes())
-        .expect("write script");
-    let status = writer.wait().expect("wait for script writer");
-    assert!(
-        status.success(),
-        "writing {} failed: {status}",
-        path.display()
-    );
+    common::write_executable(path, &format!("#!/bin/sh\n{body}"));
 }
 
 /// Run one URL click through a fake tmux. A plain `list-clients` prints
