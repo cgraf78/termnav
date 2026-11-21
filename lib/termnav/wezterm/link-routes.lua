@@ -43,8 +43,8 @@ local open_errors = {
 -- The release archive installs bin/termnav beside lib/, three directories
 -- above this file. A WezTerm launched from the macOS Dock or a desktop menu
 -- inherits a minimal PATH such as /usr/bin:/bin:/usr/sbin:/sbin, so a bare
--- helper name would not resolve there and every helper call would fail
--- silently. Copies of this file outside that layout (such as configs copied
+-- helper name would not resolve there: file opens would report an error and
+-- Ctrl-V image paste would silently do nothing. Copies of this file outside that layout (such as configs copied
 -- for native Windows) find no sibling and keep the bare name.
 local function installed_bin_dir()
   if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then
