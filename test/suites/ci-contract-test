@@ -147,15 +147,17 @@ done
 for contract in \
   'name: Required' \
   'if: ${{ always() }}' \
-  'needs: [rust, vscode-adapter, eza-current, relay-performance, relay-performance-macos]' \
+  'needs: [rust, vscode-adapter, eza-current, image-paste, relay-performance, relay-performance-macos]' \
   'RUST_RESULT: ${{ needs.rust.result }}' \
   'VSCODE_ADAPTER_RESULT: ${{ needs.vscode-adapter.result }}' \
   'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
+  'IMAGE_PASTE_RESULT: ${{ needs.image-paste.result }}' \
   'RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}' \
   'RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}' \
   'test "$RUST_RESULT" = success' \
   'test "$VSCODE_ADAPTER_RESULT" = success' \
   'test "$EZA_CURRENT_RESULT" = success' \
+  'test "$IMAGE_PASTE_RESULT" = success' \
   'success | skipped) ;;' \
   '*) exit 1 ;;'; do
   [[ "$required_job" == *"$contract"* ]] ||
@@ -163,6 +165,18 @@ for contract in \
 done
 [[ "$required_job" == *"case \"\$RELAY_PERFORMANCE_MACOS_RESULT\" in"* ]] ||
   fail "Required aggregate does not validate the macOS performance result"
+
+image_paste_job=$(awk '
+  /^  image-paste:$/ { in_image_paste = 1 }
+  in_image_paste && /^  [^ ]/ && $0 != "  image-paste:" { exit }
+  in_image_paste { print }
+' "$workflow")
+# shellcheck disable=SC2016 # Commands are inspected as literal workflow text.
+for contract in \
+  'python3 test/paste-image.py "$package/bin/termnav" --preview "$package"' \
+  'python3 test/paste-image-gui.py "$package/bin/termnav" "$package"'; do
+  [[ "$image_paste_job" == *"$contract"* ]] || fail "image paste CI is missing: $contract"
+done
 
 # Process-heavy integration fixtures intentionally own subprocess trees. Keep
 # their outer deadline in the portable process-group wrapper so a child that
