@@ -1414,27 +1414,28 @@ _assert_eq "open-url: Rust publisher and WezTerm handler share one scheme allowl
   "http,https,mailto|http,https,mailto" "$open_url_schemes_output"
 
 # A Dock-launched WezTerm has a minimal PATH, so helpers must resolve to the
-# release archive's bin/ beside lib/ instead of relying on PATH lookup.
+# installer's ~/.local/bin instead of relying on PATH lookup. WezTerm's
+# embedded Lua has no `debug` library; remove it here so a lookup that
+# depends on it fails this test instead of only failing inside WezTerm.
 helper_command_test=$(_tmpdir)/helper-command-test.lua
 cat >"$helper_command_test" <<'EOF'
+debug = nil -- luacheck: ignore
 local routes = dofile(arg[1]).new({}, {})
 print(routes.helper_command("termnav"))
 EOF
-helper_install=$(_tmpdir)/install
-mkdir -p "$helper_install/lib/termnav/wezterm"
-cp "$wezterm_routes" "$helper_install/lib/termnav/wezterm/link-routes.lua"
-helper_routes="$helper_install/lib/termnav/wezterm/link-routes.lua"
-_assert_eq "helper command: installed layout without bin/termnav keeps the bare name" \
+helper_home=$(_tmpdir)/home
+mkdir -p "$helper_home"
+_assert_eq "helper command: without ~/.local/bin/termnav keeps the bare name" \
   "termnav" \
-  "$(unset TERMNAV_BIN_DIR && _run_lua "$helper_command_test" "$helper_routes")"
-mkdir -p "$helper_install/bin"
-: >"$helper_install/bin/termnav"
-_assert_eq "helper command: installed layout resolves the sibling bin/termnav" \
-  "$helper_install/bin/termnav" \
-  "$(unset TERMNAV_BIN_DIR && _run_lua "$helper_command_test" "$helper_routes")"
-_assert_eq "helper command: TERMNAV_BIN_DIR overrides the installed sibling" \
+  "$(unset TERMNAV_BIN_DIR && HOME=$helper_home _run_lua "$helper_command_test" "$wezterm_routes")"
+mkdir -p "$helper_home/.local/bin"
+: >"$helper_home/.local/bin/termnav"
+_assert_eq "helper command: resolves the installer's ~/.local/bin/termnav" \
+  "$helper_home/.local/bin/termnav" \
+  "$(unset TERMNAV_BIN_DIR && HOME=$helper_home _run_lua "$helper_command_test" "$wezterm_routes")"
+_assert_eq "helper command: TERMNAV_BIN_DIR overrides ~/.local/bin" \
   "/override/termnav" \
-  "$(export TERMNAV_BIN_DIR=/override/ && _run_lua "$helper_command_test" "$helper_routes")"
+  "$(export TERMNAV_BIN_DIR=/override/ && HOME=$helper_home _run_lua "$helper_command_test" "$wezterm_routes")"
 
 open_url_handler_test=$(_tmpdir)/open-url-handler-test.lua
 cat >"$open_url_handler_test" <<'EOF'

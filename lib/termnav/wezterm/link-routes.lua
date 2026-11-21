@@ -40,23 +40,19 @@ local open_errors = {
   request_busy = "A file-open request is already in progress in this pane. Please try again when it finishes.",
 }
 
--- The release archive installs bin/termnav beside lib/, three directories
--- above this file. A WezTerm launched from the macOS Dock or a desktop menu
--- inherits a minimal PATH such as /usr/bin:/bin:/usr/sbin:/sbin, so a bare
--- helper name would not resolve there: file opens would report an error and
--- Ctrl-V image paste would silently do nothing. Copies of this file outside that layout (such as configs copied
--- for native Windows) find no sibling and keep the bare name.
-local function installed_bin_dir()
-  if type(debug) ~= "table" or type(debug.getinfo) ~= "function" then
+-- A WezTerm launched from the macOS Dock or a desktop menu inherits a minimal
+-- PATH such as /usr/bin:/bin:/usr/sbin:/sbin, so a bare helper name would not
+-- resolve there: file opens would report an error and Ctrl-V image paste
+-- would silently do nothing. The installer's default command directory is
+-- ~/.local/bin, so look there before falling back to PATH. This module cannot locate its own install root
+-- instead: WezTerm's embedded Lua has no `debug` library.
+local function default_bin_dir()
+  local home = os.getenv("HOME")
+  if not home or home == "" then
     return nil
   end
-  local info = debug.getinfo(1, "S")
-  local source = (info and info.source or ""):gsub("^@", ""):gsub("\\", "/")
-  local root = source:match("^(.*)/lib/termnav/wezterm/[^/]+$")
-  return root and (root .. "/bin") or nil
+  return (home:gsub("[/\\]$", "")) .. "/.local/bin"
 end
-
-local bin_dir = installed_bin_dir()
 
 local function readable(path)
   local file = io.open(path, "r")
@@ -326,13 +322,14 @@ function M.new(wezterm, options)
     return basename(name)
   end
 
-  -- An explicit TERMNAV_BIN_DIR wins, then the installed sibling bin/, then
+  -- An explicit TERMNAV_BIN_DIR wins, then the installer's ~/.local/bin, then
   -- PATH lookup of the bare name.
   function routes.helper_command(name)
     local override = os.getenv("TERMNAV_BIN_DIR")
     if override and override ~= "" then
       return override:gsub("/$", "") .. "/" .. name
     end
+    local bin_dir = default_bin_dir()
     if bin_dir and readable(bin_dir .. "/" .. name) then
       return bin_dir .. "/" .. name
     end
