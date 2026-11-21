@@ -160,9 +160,11 @@ fn read_clipboard(directory: &Path, deadline: Instant) -> io::Result<Clipboard> 
 /// test can execute it against fabricated lists without touching the real
 /// pasteboard.
 ///
-/// Variable names must avoid AppleScript's reserved terms: `kind`, for
-/// example, is a Standard Additions property, and assigning to it fails at
-/// run time ("Can't set kind to ...") on every non-empty clipboard.
+/// Variable names here and in [`READ_SCRIPT`] must avoid AppleScript's
+/// reserved terms: `kind`, for example, is a Standard Additions property, and
+/// assigning to it fails at run time ("Can't set kind to ...") on every
+/// non-empty clipboard. Only this handler runs in tests; the run handler is
+/// merely compiled, so keep its logic minimal.
 #[cfg(target_os = "macos")]
 const DECIDE_SCRIPT: &str = r#"on decide(entries)
   set hasImage to false
@@ -461,11 +463,14 @@ mod tests {
             decide("{{«class @PNG@», 75}, {TIFF picture, 3542}}"),
             "image"
         );
+        // PNG alone proves the spliced class code matches without TIFF's help.
+        assert_eq!(decide("{{«class @PNG@», 75}}"), "image");
         assert_eq!(decide("{{TIFF picture, 3542}}"), "image");
         assert_eq!(
             decide("{{«class utf8», 0}, {«class ut16», 2}, {string, 0}}"),
             "text"
         );
+        assert_eq!(decide("{{«class ut16», 2}}"), "text");
         assert_eq!(
             decide("{{«class @PNG@», 75}, {«class utf8», 5}}"),
             "text",
