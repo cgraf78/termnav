@@ -224,8 +224,10 @@ jobs:
             --output "$wezterm_package"
           printf '%s  %s\n' '86358dab5794a4fb63f7c91dd68d4fdc3da58faad648a58fc77d2bd51c7b0686' "$wezterm_package" | sha256sum --check --strict
           sudo apt-get update
+          # WezTerm loads EGL dynamically, even with software rendering.
           sudo apt-get install -y --no-install-recommends \
-            "$wezterm_package" fonts-dejavu-core musl-tools openssh-server x11-apps xclip xdotool xvfb zsh
+            "$wezterm_package" fonts-dejavu-core libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+            musl-tools openssh-server x11-apps xclip xdotool xvfb zsh
 
           tmux_archive="$RUNNER_TEMP/tmux.tar.gz"
           curl --fail --location --silent --show-error --retry 3 \

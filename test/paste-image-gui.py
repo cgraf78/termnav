@@ -177,7 +177,7 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
     lua, config = write_config(root, mode)
     write_zshrc(server / "home", assets)
     # Only the local GUI receives DISPLAY. Remote Zsh cannot read the clipboard.
-    gui_env.update(DISPLAY=display, TERMNAV_TEST_ASSETS=str(assets))
+    gui_env.update(DISPLAY=display, LIBGL_ALWAYS_SOFTWARE="1", TERMNAV_TEST_ASSETS=str(assets))
     socket = str(root / "tmux.sock")
     tmux = ["tmux", "-S", socket]
     raw = root / "client.raw"
