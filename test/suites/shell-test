@@ -772,8 +772,14 @@ ZSH
     local expected=$1 deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
       result=$(preview_tmux capture-pane -p -J -t "$pane") || return 1
-      # The command that sets a prompt can appear in tmux before ZLE is ready.
-      [[ $'\n'$result == *$'\n'"$expected"* ]] && return 0
+      if [[ ${2-} == active ]]; then
+        # For Ctrl-C, wait for zsh to return to an empty primary prompt.
+        # Earlier prompts in the capture do not prove the interrupt landed.
+        [[ $(awk 'NF { row=$0 } END { sub(/[[:space:]]+$/, "", row); print row }' <<<"$result") == "$expected" ]] && return 0
+      else
+        # The command that sets a prompt can appear before ZLE is ready.
+        [[ $'\n'$result == *$'\n'"$expected"* ]] && return 0
+      fi
       sleep 0.05
     done
     printf 'Timed out waiting for %s in private pane:\n%s\n' "$expected" "$result" >&2
@@ -910,6 +916,7 @@ ZSH
   _assert_contains "paste preview: enters continuation ZLE context" $'cont\n' "$(<"$preview_root/buffer")"$'\n'
   _assert_eq "paste preview: ignores a match in a continuation prompt" "sixel:$image" "$(read_preview_mark)"
   preview_tmux send-keys -t "$pane" C-c || return 1
+  wait_preview_pane 'reporting>' active || return 1
   preview_send 'fixture_value=; vared -p "fixture-vared> " fixture_value' || return 1
   wait_preview_pane 'fixture-vared>' || return 1
   preview_paste "$image" || return 1
@@ -918,6 +925,7 @@ ZSH
   _assert_eq "paste preview: writes nothing in either secondary context" "" "$(<"$preview_root/args")"
 
   preview_tmux send-keys -t "$pane" C-c || return 1
+  wait_preview_pane 'reporting>' active || return 1
   # shellcheck disable=SC2016 # The interactive zsh expands these variables.
   preview_send 'command "$PREVIEW_TEST_ZSH" -f' || return 1
   # shellcheck disable=SC2016
