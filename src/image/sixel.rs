@@ -25,21 +25,46 @@ fn color(index: usize) -> [u8; 3] {
     }
 }
 
+/// Squared RGB distance from `rgb` to palette register `index`.
+fn distance(index: usize, rgb: [u8; 3]) -> i32 {
+    color(index)
+        .iter()
+        .zip(rgb)
+        .map(|(&p, c)| (i32::from(p) - i32::from(c)).pow(2))
+        .sum()
+}
+
 /// Returns the palette register nearest to `rgb` by squared RGB distance.
 ///
 /// The fixed palette needs no per-image analysis, so output is deterministic
 /// and tmux can re-encode it cheaply per client. Ties go to the lower index,
 /// which prefers the cube over the greys.
+///
+/// Thumbnails hold hundreds of thousands of pixels, so this avoids scanning
+/// all 240 entries: distance is separable per channel, so the nearest cube
+/// entry is the nearest level in each channel, and the nearest grey is one
+/// of the two greys bracketing the channel mean.
 pub fn quantize(rgb: [u8; 3]) -> u8 {
-    let distance = |index| {
-        color(index)
-            .iter()
-            .zip(rgb)
-            .map(|(&p, c)| (i32::from(p) - i32::from(c)).pow(2))
-            .sum::<i32>()
-    };
-    // `min_by_key` returns the first minimum, giving the tie-break above.
-    (0..REGISTERS).min_by_key(|&i| distance(i)).unwrap_or(0) as u8
+    // Levels are 51 apart (odd), so a channel never ties between two levels.
+    let level = |c: u8| (usize::from(c) + 25) / 51;
+    let [r, g, b] = rgb.map(level);
+    let mut best = 36 * r + 6 * g + b;
+
+    // Grey k sits at 8 + 10k, so the real-valued optimum is (sum - 24) / 30.
+    let sum: i32 = rgb.iter().map(|&c| i32::from(c)).sum();
+    let low = ((sum - 24).div_euclid(30)).clamp(0, 23) as usize;
+    let high = (low + 1).min(23);
+    let mut best_distance = distance(best, rgb);
+    // Strict `<` keeps the cube, then the lower grey, on ties.
+    for k in [low, high] {
+        let index = CUBE_REGISTERS + k;
+        let d = distance(index, rgb);
+        if d < best_distance {
+            best = index;
+            best_distance = d;
+        }
+    }
+    best as u8
 }
 
 /// Renders `thumbnail` as a standard DEC sixel sequence.
@@ -134,6 +159,49 @@ mod tests {
     }
 
     const RED: [u8; 3] = [255, 0, 0];
+
+    /// Exhaustive scan that defines the nearest-with-ties-to-cube rule.
+    fn quantize_reference(rgb: [u8; 3]) -> u8 {
+        // `min_by_key` returns the first minimum, so ties go to the lower index.
+        (0..REGISTERS).min_by_key(|&i| distance(i, rgb)).unwrap() as u8
+    }
+
+    #[test]
+    fn quantize_matches_reference_on_lattice() {
+        for r in (0..=255u8).step_by(5) {
+            for g in (0..=255u8).step_by(5) {
+                for b in (0..=255u8).step_by(5) {
+                    assert_eq!(
+                        quantize([r, g, b]),
+                        quantize_reference([r, g, b]),
+                        "{r},{g},{b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_matches_reference_on_greys_and_palette() {
+        for v in 0..=255u8 {
+            assert_eq!(quantize([v; 3]), quantize_reference([v; 3]), "grey {v}");
+        }
+        for i in 0..REGISTERS {
+            assert_eq!(
+                quantize(color(i)),
+                quantize_reference(color(i)),
+                "register {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn sixel_large_gradient_completes() {
+        let pixels = (0..1500 * 360)
+            .map(|i| [(i % 1500 / 6) as u8, (i / 1500) as u8, (i % 251) as u8])
+            .collect();
+        assert!(sixel(&thumb(1500, 360, pixels)).ends_with("\x1b\\"));
+    }
 
     #[test]
     fn quantize_pure_colours() {
