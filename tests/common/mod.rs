@@ -3,7 +3,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// Write an executable fixture (mode 755) holding `contents`.
+///
+/// Tests run on parallel threads. A thread that spawns a process while this
+/// one holds a file open for writing hands that descriptor to its child
+/// until the child execs, and executing the file meanwhile fails with
+/// ETXTBSY ("Text file busy"). Debian CI hit exactly this in `open_url`
+/// after an in-process `fs::write`. A short-lived `sh` writes the file
+/// instead, so no test thread ever holds it open. Concurrent spawns can
+/// inherit the pipe to it, which only delays its end of input until they
+/// exec.
+#[allow(dead_code)] // Only suites with executable fixtures need it.
+pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::io::Write;
+
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat >\"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("start executable fixture writer");
+    writer
+        .stdin
+        .take()
+        .expect("executable fixture writer stdin")
+        .write_all(contents.as_bytes())
+        .expect("write executable fixture");
+    let status = writer.wait().expect("wait for executable fixture writer");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
+}
+
 /// Return a process-unique root for concurrently executing integration tests.
+#[allow(dead_code)] // Suites that keep their own fixture roots skip it.
 pub(crate) fn temporary_root(label: &str) -> PathBuf {
     // Hosted macOS can return the same wall-clock timestamp to neighboring test
     // threads. PID plus an atomic sequence provides uniqueness without sleeps,
