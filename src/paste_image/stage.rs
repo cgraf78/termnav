@@ -154,20 +154,34 @@ fn read_clipboard(directory: &Path, deadline: Instant) -> io::Result<Clipboard> 
     native(directory, deadline)
 }
 
+/// AppleScript handler that classifies a `clipboard info` list as "text",
+/// "image", or "none". Text classes win as on other platforms; PNG and TIFF
+/// screenshots both coerce to PNG. It is separate from the run handler so a
+/// test can execute it against fabricated lists without touching the real
+/// pasteboard.
+///
+/// Variable names must avoid AppleScript's reserved terms: `kind`, for
+/// example, is a Standard Additions property, and assigning to it fails at
+/// run time ("Can't set kind to ...") on every non-empty clipboard.
 #[cfg(target_os = "macos")]
-fn native(directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
-    // One osascript run decides and reads: each launch costs ~100 ms. Text
-    // classes win as on other platforms; PNG and TIFF screenshots both
-    // coerce to PNG. The script writes into a file this process created
-    // owner-only, so the image never passes through a world-readable path.
-    const SCRIPT: &str = r#"on run argv
+const DECIDE_SCRIPT: &str = r#"on decide(entries)
   set hasImage to false
-  repeat with entry in (clipboard info)
-    set kind to item 1 of entry
-    if kind is in {string, Unicode text, «class utf8», «class ut16»} then return "text"
-    if kind is in {«class @PNG@», TIFF picture} then set hasImage to true
+  repeat with entry in entries
+    set entryClass to item 1 of entry
+    if entryClass is in {string, Unicode text, «class utf8», «class ut16»} then return "text"
+    if entryClass is in {«class @PNG@», TIFF picture} then set hasImage to true
   end repeat
-  if not hasImage then return "none"
+  if hasImage then return "image"
+  return "none"
+end decide"#;
+
+/// Run handler: decide from the live clipboard, then write its PNG into the
+/// path given as the first argument. The file is one this process created
+/// owner-only, so the image never passes through a world-readable path.
+#[cfg(target_os = "macos")]
+const READ_SCRIPT: &str = r#"on run argv
+  set decision to decide(clipboard info)
+  if decision is not "image" then return decision
   set target to open for access (POSIX file (item 1 of argv)) with write permission
   try
     set eof target to 0
@@ -179,14 +193,23 @@ fn native(directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
   end try
   return "png"
 end run"#;
+
+/// Join the decide handler with a run handler into one osascript program.
+#[cfg(target_os = "macos")]
+fn apple_script(run_handler: &str) -> String {
+    // The pasteboard's PNG class code is spliced in so spell checkers do not
+    // read the four-character code as a misspelled word.
+    format!("{DECIDE_SCRIPT}\n\n{run_handler}").replace("@PNG@", concat!("PNG", "f"))
+}
+
+#[cfg(target_os = "macos")]
+fn native(directory: &Path, deadline: Instant) -> io::Result<Clipboard> {
+    // One osascript run decides and reads: each launch costs ~100 ms.
     let path = directory.join(format!("{STAGE_PREFIX}read-{}.png", super::random_hex(12)));
     drop(create_private(&path)?);
     let result = (|| {
         let mut command = Command::new("osascript");
-        // The pasteboard's PNG class code is spliced in so spell checkers do
-        // not read the four-character code as a misspelled word.
-        let script = SCRIPT.replace("@PNG@", concat!("PNG", "f"));
-        command.arg("-e").arg(script).arg(&path);
+        command.arg("-e").arg(apple_script(READ_SCRIPT)).arg(&path);
         let output = run(&mut command, deadline, 64)?;
         if !output.status.success() {
             // An empty pasteboard is a successful "none"; failure here means
@@ -408,5 +431,73 @@ mod tests {
         std::os::unix::fs::symlink(&big, &link).unwrap();
         assert!(read_capped(&link).is_err());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Run the production decide handler under real osascript against a
+    /// fabricated `clipboard info` list, leaving the pasteboard untouched.
+    #[cfg(target_os = "macos")]
+    fn decide(entries: &str) -> String {
+        let run_handler = format!("on run\n  return decide({entries})\nend run");
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(super::apple_script(&run_handler))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "osascript failed for {entries}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_decide_runs_and_classifies_clipboard_info() {
+        // The shapes below mirror real `clipboard info` output: a screenshot
+        // offers PNG and TIFF, text offers UTF-8 and UTF-16 classes, and an
+        // empty or image-free pasteboard declines.
+        assert_eq!(
+            decide("{{«class @PNG@», 75}, {TIFF picture, 3542}}"),
+            "image"
+        );
+        assert_eq!(decide("{{TIFF picture, 3542}}"), "image");
+        assert_eq!(
+            decide("{{«class utf8», 0}, {«class ut16», 2}, {string, 0}}"),
+            "text"
+        );
+        assert_eq!(
+            decide("{{«class @PNG@», 75}, {«class utf8», 5}}"),
+            "text",
+            "text beside an image still pastes as text"
+        );
+        assert_eq!(decide("{{JPEG picture, 777}}"), "none");
+        assert_eq!(decide("{}"), "none");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_read_script_compiles() {
+        // osacompile parses without running, so the run handler is checked for
+        // syntax without reading or writing the pasteboard.
+        let dir = std::env::temp_dir().join(format!(
+            "termnav-stage-osacompile-{}-{}",
+            std::process::id(),
+            crate::paste_image::random_hex(4)
+        ));
+        fs::create_dir(&dir).unwrap();
+        let output = std::process::Command::new("osacompile")
+            .arg("-o")
+            .arg(dir.join("read.scpt"))
+            .arg("-e")
+            .arg(super::apple_script(super::READ_SCRIPT))
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            output.status.success(),
+            "osacompile failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 }
