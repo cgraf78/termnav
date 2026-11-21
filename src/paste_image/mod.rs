@@ -13,9 +13,20 @@
 //! grammar and limits it relies on are defined here and documented in
 //! `docs/reference.md`.
 
+pub mod preview;
 pub mod protocol;
 pub mod receive;
 pub mod stage;
+
+/// tmux pane option that holds the last saved clip as `<mode>:<path>`.
+pub const PREVIEW_OPTION: &str = "@termnav-paste-preview";
+
+/// Environment setting that picks the preview: `auto`, `sixel`, `blocks`, or
+/// `off`.
+pub const PREVIEW_SETTING: &str = "TERMNAV_PASTE_IMAGE_PREVIEW";
+
+/// Environment setting for the preview's maximum height in text rows.
+pub const PREVIEW_ROWS_SETTING: &str = "TERMNAV_PASTE_IMAGE_PREVIEW_ROWS";
 
 /// WezTerm user variable that carries receiver announcements.
 pub const USER_VAR: &str = "TERMNAV_PASTE_IMAGE";

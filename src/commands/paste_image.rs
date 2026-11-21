@@ -2,13 +2,15 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
-use crate::paste_image::{receive, stage};
+use crate::paste_image::{preview, receive, stage};
 
 const HELP: &str = r#"usage:
   termnav paste-image stage
   termnav paste-image receive --target-pane PANE --client-name NAME
        [--client-pid PID --client-tty TTY] [--tmux-socket PATH]
+  termnav paste-image preview [--mode sixel|blocks] [--rows N] -- PATH
 "#;
 
 /// Parse and execute paste-image commands.
@@ -44,6 +46,15 @@ pub fn run(
         Some("stage") => usage(stderr, "stage accepts no arguments"),
         Some("receive") => match parse_receive(&arguments[1..]) {
             Ok(options) => Ok(receive::run(&options, stdout)),
+            Err(message) => usage(stderr, &message),
+        },
+        Some("preview") => match parse_preview(&arguments[1..]) {
+            Ok(options) => Ok(preview::run(
+                &options.path,
+                options.mode,
+                options.rows,
+                stdout,
+            )),
             Err(message) => usage(stderr, &message),
         },
         Some(command) => usage(stderr, &format!("unknown paste-image command: {command}")),
@@ -90,6 +101,56 @@ fn parse_receive(arguments: &[String]) -> Result<receive::Options, String> {
         return Err("--client-pid and --client-tty must be given together".to_owned());
     }
     Ok(options)
+}
+
+/// Parsed `preview` arguments.
+struct PreviewOptions {
+    mode: preview::Mode,
+    rows: Option<u16>,
+    path: PathBuf,
+}
+
+/// Parse `[--mode M] [--rows N] -- PATH`; the `--` is required so a path
+/// that looks like an option is never misread.
+fn parse_preview(arguments: &[String]) -> Result<PreviewOptions, String> {
+    let mut mode = preview::Mode::Blocks;
+    let mut rows = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let name = arguments[index].as_str();
+        if name == "--" {
+            return match &arguments[index + 1..] {
+                [path] if !path.is_empty() => Ok(PreviewOptions {
+                    mode,
+                    rows,
+                    path: PathBuf::from(path),
+                }),
+                [] => Err("preview requires a PATH".to_owned()),
+                _ => Err("preview takes exactly one PATH".to_owned()),
+            };
+        }
+        let Some(value) = arguments.get(index + 1) else {
+            return Err(format!("{name} requires a value"));
+        };
+        match name {
+            "--mode" => {
+                mode = preview::Mode::parse(value)
+                    .ok_or_else(|| "mode must be sixel or blocks".to_owned())?;
+            }
+            "--rows" => {
+                rows = Some(
+                    value
+                        .parse()
+                        .ok()
+                        .filter(|rows| *rows > 0)
+                        .ok_or_else(|| "rows must be a positive integer".to_owned())?,
+                );
+            }
+            _ => return Err(format!("unknown preview option: {name}")),
+        }
+        index += 2;
+    }
+    Err("preview requires -- before PATH".to_owned())
 }
 
 fn usage(stderr: &mut dyn Write, message: &str) -> io::Result<i32> {

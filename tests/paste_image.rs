@@ -301,3 +301,173 @@ fn a_receiver_on_an_unsupported_tmux_tells_the_client_and_does_nothing_else() {
         )
     );
 }
+
+/// Preview tests run the binary with stdout piped, so the size falls back to
+/// 80x24 cells of 10x20 pixels. The environment is cleared, which also keeps
+/// the tmux size fallback away from any real server.
+struct Preview {
+    fixture: Fixture,
+}
+
+impl Preview {
+    fn new() -> Self {
+        let fixture = Fixture::new();
+        let directory = fixture.clips();
+        fs::create_dir_all(&directory).unwrap();
+        for path in [directory.parent().unwrap(), &directory] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        Self { fixture }
+    }
+
+    /// Write a valid PNG named `name` into the clip directory.
+    fn clip(&self, name: &str, width: u32, height: u32) -> PathBuf {
+        let path = self.fixture.clips().join(name);
+        fs::write(&path, gradient(width, height)).unwrap();
+        path
+    }
+
+    fn run(&self, arguments: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_termnav"))
+            .arg("paste-image")
+            .arg("preview")
+            .args(arguments)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", self.fixture.root.join("home"))
+            .env("TMPDIR", self.fixture.root.join("tmp"))
+            .env("XDG_RUNTIME_DIR", self.fixture.root.join("run"))
+            .env("XDG_CACHE_HOME", self.fixture.root.join("cache"))
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .unwrap()
+    }
+}
+
+impl Fixture {
+    fn clips(&self) -> PathBuf {
+        self.root.join("cache/termnav/paste-images")
+    }
+}
+
+/// An RGB PNG with a diagonal gradient, so every thumbnail cell differs.
+fn gradient(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    let data: Vec<u8> = (0..height)
+        .flat_map(|y| (0..width).flat_map(move |x| [(x % 256) as u8, (y % 256) as u8, 128]))
+        .collect();
+    writer.write_image_data(&data).unwrap();
+    writer.finish().unwrap();
+    bytes
+}
+
+#[test]
+fn preview_blocks_renders_a_clip() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-aaaaaaaaaaaa.png", 800, 600);
+    let output = preview.run(&["--mode", "blocks", "--", clip.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("\x1b[38;2;"), "{stdout:?}");
+    assert!(stdout.ends_with('\n'));
+    assert!(stdout.lines().count() <= 12, "{}", stdout.lines().count());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn preview_sixel_renders_a_clip() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-bbbbbbbbbbbb.png", 800, 600);
+    let output = preview.run(&["--mode", "sixel", "--", clip.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("\x1bP"), "{stdout:?}");
+    assert!(stdout.ends_with("\x1b\\\n"), "{stdout:?}");
+}
+
+#[test]
+fn preview_rejections_are_silent() {
+    let preview = Preview::new();
+    let directory = preview.fixture.clips();
+    let missing = directory.join("clip-20260101T000000Z-cccccccccccc.png");
+    let outside_directory = preview.fixture.root.join("outside");
+    fs::create_dir_all(&outside_directory).unwrap();
+    let outside = outside_directory.join("clip-20260101T000000Z-dddddddddddd.png");
+    fs::write(&outside, gradient(10, 10)).unwrap();
+    let not_png = directory.join("clip-20260101T000000Z-eeeeeeeeeeee.png");
+    fs::write(&not_png, b"GIF89a not a png").unwrap();
+    let removed = preview.clip("clip-20260101T000000Z-ffffffffffff.png", 10, 10);
+    fs::remove_file(&removed).unwrap();
+    for path in [&missing, &outside, &not_png, &removed] {
+        for mode in ["blocks", "sixel"] {
+            let output = preview.run(&["--mode", mode, "--", path.to_str().unwrap()]);
+            assert_eq!(output.status.code(), Some(0), "{path:?}: {output:?}");
+            assert!(output.stdout.is_empty(), "{path:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{path:?}: {output:?}");
+        }
+    }
+}
+
+#[test]
+fn preview_rows_option_limits_height() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-111111111111.png", 800, 800);
+    let output = preview.run(&["--rows", "4", "--", clip.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let lines = String::from_utf8(output.stdout).unwrap().lines().count();
+    assert!((1..=4).contains(&lines), "{lines}");
+}
+
+#[test]
+fn preview_environment_rows_apply_unless_invalid() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-222222222222.png", 800, 800);
+    let path = clip.to_str().unwrap();
+    let run = |rows: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_termnav"))
+            .args(["paste-image", "preview", "--", path])
+            .env_clear()
+            .env("HOME", preview.fixture.root.join("home"))
+            .env("XDG_CACHE_HOME", preview.fixture.root.join("cache"))
+            .env("TERMNAV_PASTE_IMAGE_PREVIEW_ROWS", rows)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().lines().count()
+    };
+    assert!((1..=3).contains(&run("3")));
+    for invalid in ["0", "x", ""] {
+        assert!(run(invalid) > 3, "{invalid:?} falls back to 12");
+    }
+}
+
+#[test]
+fn preview_usage_errors() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-333333333333.png", 10, 10);
+    let path = clip.to_str().unwrap();
+    for arguments in [
+        &[][..],
+        &["--"],
+        &["--mode", "auto", "--", path],
+        &["--mode", "bogus", "--", path],
+        &["--rows", "0", "--", path],
+        &["--rows", "x", "--", path],
+        &["--bogus", "--", path],
+        &["--mode"],
+        &["--", path, "extra"],
+        &[path],
+    ] {
+        let output = preview.run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("usage:"),
+            "{arguments:?}: {output:?}"
+        );
+    }
+}

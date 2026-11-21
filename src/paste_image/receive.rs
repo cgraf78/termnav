@@ -496,6 +496,14 @@ pub(crate) fn write_image(directory: &Path, image: &[u8], now: SystemTime) -> io
     result
 }
 
+/// Whether `name` is a saved image's file name, `clip-*.png`.
+///
+/// Shared by [`prune`] and the previewer so both agree on which files in the
+/// image directory are this receiver's.
+pub(crate) fn is_clip_name(name: &str) -> bool {
+    name.starts_with("clip-") && name.ends_with(".png")
+}
+
 /// Remove this receiver's images and leftovers older than [`KEEP_IMAGES`].
 pub(crate) fn prune(directory: &Path, now: SystemTime) {
     let Ok(entries) = fs::read_dir(directory) else {
@@ -505,8 +513,7 @@ pub(crate) fn prune(directory: &Path, now: SystemTime) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let owned = (name.starts_with("clip-") && name.ends_with(".png"))
-            || (name.starts_with(".clip-") && name.ends_with(".tmp"));
+        let owned = is_clip_name(&name) || (name.starts_with(".clip-") && name.ends_with(".tmp"));
         if !owned {
             continue;
         }
@@ -560,7 +567,7 @@ pub(crate) fn utc_timestamp(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEEP_IMAGES, prune, socket_of, utc_timestamp, write_image};
+    use super::{KEEP_IMAGES, is_clip_name, prune, socket_of, utc_timestamp, write_image};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -609,6 +616,21 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "no temporary file");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn clip_names_are_exactly_clip_star_png() {
+        assert!(is_clip_name("clip-20260101T000000Z-abc.png"));
+        assert!(is_clip_name("clip-.png"));
+        for other in [
+            "clip-a.txt",
+            ".clip-a.png.tmp",
+            "clip.png",
+            "xclip-a.png",
+            "",
+        ] {
+            assert!(!is_clip_name(other), "{other}");
+        }
     }
 
     #[test]
