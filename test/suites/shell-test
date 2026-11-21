@@ -679,7 +679,9 @@ _assert_not_contains "tmux context: embedded Neovim terminals publish no shell s
   'SetUserVar=TERMNAV_TMUX=' "$nvim_publication"
 
 _paste_preview_checks() (
-  local preview_root pane image='/tmp/x y/clip-1-a.png' mark result
+  local preview_root pane mark result
+  # Wrap the first input across rows with the fixture's 100-column pane.
+  local image='/tmp/x y/very-long-clipboard-cache-directory-for-testing-a-path-that-wraps-around-the-prompt/clip-1-a.png'
   local FAIL=0
   preview_root=$(_tmpdir) || return 1
   export PREVIEW_TEST_ROOT="$preview_root" SHELL_INTEGRATION="$shell_integration"
@@ -721,13 +723,26 @@ export PATH="$PREVIEW_TEST_ROOT/bin:$PATH"
 export NVIM=/tmp/termnav-test-nvim
 PS1='preview> '
 PS2='continued> '
+fixture_postedit=$'CUSTOM-POSTEDIT\n'
 bindkey -e
+fixture_complete_path() { compadd -U -S .png -r / -- /tmp/fixture-clip; }
+zle -C fixture_completion expand-or-complete fixture_complete_path
 fixture_original() {
   local before=$LBUFFER
-  zle .bracketed-paste "$@"
+  if [[ $fixture_complete == yes ]]; then
+    local raw
+    zle .bracketed-paste raw
+    zle fixture_completion
+  else
+    zle .bracketed-paste "$@"
+  fi
   print -r -- original >>"$PREVIEW_TEST_ROOT/chain"
   if [[ $fixture_quote == yes ]]; then
     LBUFFER="$before${(q)${LBUFFER#"$before"}}"
+  fi
+  if [[ $fixture_report == yes ]]; then
+    zle -I
+    print -r -- WIDGET-OUTPUT >/dev/tty
   fi
   return ${fixture_status:-0}
 }
@@ -756,7 +771,7 @@ ZSH
   wait_preview_pane() {
     local expected=$1 deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
-      result=$(preview_tmux capture-pane -p -t "$pane") || return 1
+      result=$(preview_tmux capture-pane -p -J -t "$pane") || return 1
       # The command that sets a prompt can appear in tmux before ZLE is ready.
       [[ $'\n'$result == *$'\n'"$expected"* ]] && return 0
       sleep 0.05
@@ -814,6 +829,8 @@ ZSH
   # The snapshot's key prefix can be echoed while ZLE redraws the prompt.
   wait_preview_pane $'PREVIEW-MARK\npreview> before:'"$image:after" || return 1
   _pass "paste preview: writes to the terminal above the redrawn prompt"
+  _assert_not_contains "paste preview: leaves no duplicate path above the image" \
+    "$image" "${result%%$'\nPREVIEW-MARK\n'*}"
   preview_snapshot || return 1
   _assert_eq "paste preview: passes the exact path as a single argument" \
     $'<paste-image>\n<preview>\n<--mode>\n<blocks>\n<-->\n<'"$image>" "$(<"$preview_root/args")"
@@ -859,6 +876,30 @@ ZSH
   _assert_eq "paste preview: plugin observes the original widget status" "23" "$(<"$preview_root/plugin-status")"
   _assert_eq "paste preview: reload keeps a single original invocation" "original" "$(<"$preview_root/chain")"
   _assert_eq "paste preview: consumes the full literal mark" "" "$(read_preview_mark)"
+
+  : >"$preview_root/args"
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  preview_send 'fixture_quote=no; fixture_complete=yes; PS1="completion> "' || return 1
+  wait_preview_pane 'completion>' || return 1
+  preview_mark 'blocks:/tmp/fixture-clip.png' || return 1
+  preview_inject '/tmp/fixture-clip.png' || return 1
+  preview_tmux send-keys -l -t "$pane" / || return 1
+  preview_snapshot || return 1
+  _assert_eq "paste preview: keeps the chained widget's removable completion suffix" \
+    $'start\n</tmp/fixture-clip/>\n<>' "$(<"$preview_root/buffer")"
+  _assert_contains "paste preview: still renders during pending completion" \
+    '</tmp/fixture-clip.png>' "$(<"$preview_root/args")"
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  # shellcheck disable=SC2016 # The interactive zsh expands its own POSTEDIT.
+  preview_send 'fixture_complete=no; fixture_report=yes; PS1="reporting> "; POSTEDIT=$fixture_postedit' || return 1
+  wait_preview_pane 'reporting>' || return 1
+  preview_mark 'blocks:/tmp/report-clip.png' || return 1
+  preview_inject '/tmp/report-clip.png' || return 1
+  wait_preview_pane $'PREVIEW-MARK\nreporting> /tmp/report-clip.png' || return 1
+  _assert_contains "paste preview: preserves output from the chained widget" 'WIDGET-OUTPUT' "$result"
+  _assert_contains "paste preview: retains the shell's POSTEDIT output" $'CUSTOM-POSTEDIT\nPREVIEW-MARK' "$result"
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  preview_send 'fixture_report=no; unset POSTEDIT' || return 1
 
   : >"$preview_root/args"
   preview_tmux send-keys -t "$pane" C-x C-u || return 1
