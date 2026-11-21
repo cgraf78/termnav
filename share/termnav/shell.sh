@@ -374,6 +374,11 @@ _termnav_wezterm_register_hooks() {
   fi
 }
 
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+  # shellcheck source=/dev/null # The ZLE adapter uses Zsh syntax.
+  . "$_termnav_shell_dir/paste-preview.zsh" || return 1
+fi
+
 if _termnav_wezterm_active; then
   _termnav_wezterm_register_hooks
   # No source-time publish: the first precmd performs the initial
