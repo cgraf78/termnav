@@ -475,7 +475,9 @@ binary path; without it the binary is found as `link-routes.lua` finds it:
 `~/.local/bin/termnav` (the installer's default command directory) when it
 exists, otherwise `termnav` on WezTerm's own `PATH`. A WezTerm started from the
 macOS Dock or a desktop menu has a minimal `PATH`, so an install with a custom
-`--bin-dir` should set `TERMNAV_BIN_DIR` in WezTerm's launch environment.
+`--bin-dir` should pass `termnav` to `new` above, or set `TERMNAV_BIN_DIR` in
+WezTerm's own launch environment (for the Dock, `launchctl setenv`; a value in
+`set_environment_variables` reaches only the panes WezTerm starts).
 Without `routes`, the module loads `link-routes.lua` from its own directory.
 
 ### Security model

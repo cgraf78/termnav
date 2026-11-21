@@ -44,8 +44,7 @@ local open_errors = {
 -- PATH such as /usr/bin:/bin:/usr/sbin:/sbin, so a bare helper name would not
 -- resolve there: file opens would report an error and Ctrl-V image paste
 -- would silently do nothing. The installer's default command directory is
--- ~/.local/bin (shdeps links the command there too), so look there before
--- falling back to PATH. This module cannot locate its own install root
+-- ~/.local/bin, so look there before falling back to PATH. This module cannot locate its own install root
 -- instead: WezTerm's embedded Lua has no `debug` library.
 local function default_bin_dir()
   local home = os.getenv("HOME")
