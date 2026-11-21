@@ -472,21 +472,23 @@ impl Tmux<'_> {
         // window in each client's session, including ones it may switch to
         // while this preview is visible. Read the target and the clients in
         // one tmux command queue so both refer to the same server snapshot.
+        // A non-UTF-8 tmux command client sanitizes controls (including tabs).
+        // Use printable separators between these machine-readable fields.
         let report = self
             .query(&[
                 "display-message",
                 "-p",
                 "-t",
                 self.pane,
-                "#{sixel_support}\t#{window_id}\t#{window_cell_width}\t#{window_cell_height}",
+                "#{sixel_support}|#{window_id}|#{window_cell_width}|#{window_cell_height}",
                 ";",
                 "list-clients",
                 "-F",
-                "#{W:#{window_id} }\t#{client_termfeatures}\t#{client_cell_width}\t#{client_cell_height}\t#{client_termname}",
+                "#{W:#{window_id} }|#{client_termfeatures}|#{client_cell_width}|#{client_cell_height}|#{client_termname}",
             ])
             .unwrap_or_default();
         let mut lines = report.lines();
-        let mut target = lines.next().unwrap_or_default().split('\t');
+        let mut target = lines.next().unwrap_or_default().split('|');
         let support = target.next().unwrap_or_default();
         let window = target.next().unwrap_or_default();
         let cell = cell_pixels(&mut target);
@@ -698,7 +700,7 @@ impl ClientCaps {
     /// Read the capabilities of a client attached to any session linking the
     /// target. An unknown window list cannot rule the client out, so it vetoes sixel.
     fn for_window(line: &str, window: &str) -> Option<Self> {
-        let (windows, capabilities) = line.split_once('\t').unwrap_or_default();
+        let (windows, capabilities) = line.split_once('|').unwrap_or_default();
         if windows.trim().is_empty() {
             return Some(Self::default());
         }
@@ -708,10 +710,10 @@ impl ClientCaps {
             .then(|| Self::parse(capabilities))
     }
 
-    /// Parse one `features<TAB>width<TAB>height<TAB>termname` line; malformed numbers
+    /// Parse one `features|width|height|termname` line; malformed numbers
     /// become 0 so the client counts as unable to show sixel.
     fn parse(line: &str) -> Self {
-        let mut fields = line.split('\t');
+        let mut fields = line.splitn(4, '|');
         let features = fields.next().unwrap_or_default().to_owned();
         let cell = cell_pixels(&mut fields);
         Self {
@@ -911,11 +913,11 @@ mod tests {
     #[test]
     fn client_lines_parse_with_zero_for_bad_numbers() {
         assert_eq!(
-            ClientCaps::parse("a,sixel\t9\t18\txterm-256color"),
+            ClientCaps::parse("a,sixel|9|18|xterm-256color"),
             caps("a,sixel", 9, 18)
         );
         assert_eq!(
-            ClientCaps::parse("sixel\tx\t\txterm-256color"),
+            ClientCaps::parse("sixel|x||xterm-256color"),
             caps("sixel", 0, 0)
         );
         assert_eq!(ClientCaps::parse(""), ClientCaps::default());
@@ -923,7 +925,7 @@ mod tests {
 
     #[test]
     fn client_window_ids_match_exactly() {
-        let report = "@0 @10 \tsixel\t9\t18\txterm-256color";
+        let report = "@0 @10 |sixel|9|18|xterm-256color";
         assert_eq!(
             ClientCaps::for_window(report, "@10"),
             Some(caps("sixel", 9, 18))
@@ -946,13 +948,13 @@ mod tests {
 
     #[test]
     fn unknown_client_terminal_vetoes_sixel() {
-        assert!(!ClientCaps::parse("sixel\t10\t20").sixel((10, 20)));
+        assert!(!ClientCaps::parse("sixel|10|20").sixel((10, 20)));
     }
 
     #[test]
     fn unknown_client_windows_veto_sixel() {
         assert_eq!(
-            ClientCaps::for_window("\tsixel\t9\t18", "@0"),
+            ClientCaps::for_window("|sixel|9|18", "@0"),
             Some(ClientCaps::default())
         );
     }

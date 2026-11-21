@@ -454,6 +454,9 @@ def linked_preview(harness: Harness) -> None:
     if harness.tmux(socket, "display-message", "-pt", pane, "#{sixel_support}").strip() != "1":
         print("SKIP: linked sixel preview requires a sixel-enabled tmux")
         return
+    # In the C locale a tmux command client replaces tab characters with
+    # underscores. Exercise that path even when the test runner uses UTF-8.
+    harness.tmux(socket, "set-environment", "-g", "LC_ALL", "C")
     harness.tmux(socket, "new-session", "-d", "-s", "other", "sleep 300")
     harness.attach(socket, "other")
     capable = harness.attach(socket, "preview", sixel=True)
@@ -564,11 +567,11 @@ def single_layer(harness: Harness, large: int) -> None:
             socket,
             "list-clients",
             "-F",
-            "#{client_termfeatures}\t#{client_cell_width}\t#{client_cell_height}",
+            "#{client_termfeatures}|#{client_cell_width}|#{client_cell_height}",
         ).splitlines()
 
         def sixel_client(line: str) -> bool:
-            features, width, height = (line.split("\t") + ["0", "0"])[:3]
+            features, width, height = (line.split("|") + ["0", "0"])[:3]
             return (
                 "sixel" in features.split(",")
                 and width.isdigit()
