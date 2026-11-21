@@ -26,6 +26,9 @@ paste_image_help=$($termnav paste-image --help 2>&1)
 _assert_contains "CLI contract: paste-image documents receive identity" \
   "receive --target-pane PANE --client-name NAME" "$paste_image_help"
 
+_assert_contains "CLI contract: paste-image documents preview syntax" \
+  "preview [--mode sixel|blocks] [--rows N] -- PATH" "$paste_image_help"
+
 navigate_help=$($termnav navigate --help 2>&1)
 _assert_contains "CLI contract: navigation exposes parent traversal" \
   "--parent" "$navigate_help"

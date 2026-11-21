@@ -7,6 +7,7 @@ pub mod cli;
 pub mod click;
 pub mod commands;
 pub mod focus;
+pub mod image;
 pub mod links;
 pub mod navigation;
 pub mod nvim;

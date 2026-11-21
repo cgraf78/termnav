@@ -678,4 +678,224 @@ nvim_publication=$(
 _assert_not_contains "tmux context: embedded Neovim terminals publish no shell state" \
   'SetUserVar=TERMNAV_TMUX=' "$nvim_publication"
 
+_paste_preview_checks() (
+  local preview_root pane image='/tmp/x y/clip-1-a.png' mark result
+  local FAIL=0
+  preview_root=$(_tmpdir) || return 1
+  export PREVIEW_TEST_ROOT="$preview_root" SHELL_INTEGRATION="$shell_integration"
+  export PREVIEW_TEST_TMUX PREVIEW_TEST_ZSH
+  PREVIEW_TEST_TMUX=$(command -v tmux) || return 1
+  PREVIEW_TEST_ZSH=$(command -v zsh) || return 1
+  export ZDOTDIR="$HOME" TERM=xterm-256color
+
+  preview_tmux() { "$PREVIEW_TEST_TMUX" -S "$preview_root/t" "$@"; }
+  trap 'preview_tmux kill-server >/dev/null 2>&1 || true' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  mkdir "$preview_root/bin"
+  printf '#!%s\n' "$BASH" >"$preview_root/bin/tmux"
+  cat >>"$preview_root/bin/tmux" <<'SH'
+case "$1" in
+  show-options|show)
+    printf 'read\n' >>"$PREVIEW_TEST_ROOT/tmux-reads"
+    if [[ -f $PREVIEW_TEST_ROOT/replace-mark ]]; then
+      "$PREVIEW_TEST_TMUX" "$@" || exit
+      exec "$PREVIEW_TEST_TMUX" set-option -p -t "$TMUX_PANE" @termnav-paste-preview \
+        "$(<"$PREVIEW_TEST_ROOT/replace-mark")"
+    fi
+    ;;
+esac
+exec "$PREVIEW_TEST_TMUX" "$@"
+SH
+  printf '#!%s\n' "$BASH" >"$preview_root/bin/termnav"
+  cat >>"$preview_root/bin/termnav" <<'SH'
+printf '<%s>\n' "$@" >>"$PREVIEW_TEST_ROOT/args"
+printf 'PREVIEW-MARK\n'
+SH
+  chmod +x "$preview_root/bin/"{tmux,termnav}
+
+  cat >"$preview_root/setup.zsh" <<'ZSH'
+export PATH="$PREVIEW_TEST_ROOT/bin:$PATH"
+# Exercise the independent hook even when WezTerm publication is disabled.
+export NVIM=/tmp/termnav-test-nvim
+PS1='preview> '
+PS2='continued> '
+bindkey -e
+fixture_original() {
+  local before=$LBUFFER
+  zle .bracketed-paste "$@"
+  print -r -- original >>"$PREVIEW_TEST_ROOT/chain"
+  if [[ $fixture_quote == yes ]]; then
+    LBUFFER="$before${(q)${LBUFFER#"$before"}}"
+  fi
+  return ${fixture_status:-0}
+}
+fixture_plugin() {
+  zle fixture_saved "$@"
+  local saved_status=$?
+  print -r -- "$saved_status" >>"$PREVIEW_TEST_ROOT/plugin-status"
+  return "$saved_status"
+}
+fixture_snapshot() {
+  printf '%s\n<%s>\n<%s>\n' "$CONTEXT" "$LBUFFER" "$RBUFFER" >"$PREVIEW_TEST_ROOT/pending"
+  command mv "$PREVIEW_TEST_ROOT/pending" "$PREVIEW_TEST_ROOT/buffer"
+}
+fixture_clear() { BUFFER=; }
+zle -N fixture_snapshot
+zle -N fixture_clear
+bindkey '^X^D' fixture_snapshot
+bindkey '^X^U' fixture_clear
+source "$SHELL_INTEGRATION"
+source "$SHELL_INTEGRATION"
+# Simulate plugins that bind widgets after the loader is sourced.
+zle -N bracketed-paste fixture_original
+setopt allexport
+ZSH
+
+  wait_preview_pane() {
+    local expected=$1 deadline=$((SECONDS + 5))
+    while ((SECONDS < deadline)); do
+      result=$(preview_tmux capture-pane -p -t "$pane") || return 1
+      # The command that sets a prompt can appear in tmux before ZLE is ready.
+      [[ $'\n'$result == *$'\n'"$expected"* ]] && return 0
+      sleep 0.05
+    done
+    printf 'Timed out waiting for %s in private pane:\n%s\n' "$expected" "$result" >&2
+    return 1
+  }
+
+  preview_send() {
+    preview_tmux send-keys -t "$pane" -l -- "$1" &&
+      preview_tmux send-keys -t "$pane" Enter
+  }
+
+  preview_inject() {
+    printf '%s' "$1" | preview_tmux load-buffer -b fixture - || return 1
+    preview_tmux paste-buffer -d -p -b fixture -t "$pane"
+  }
+
+  preview_snapshot() {
+    local deadline=$((SECONDS + 5))
+    rm -f "$preview_root/buffer"
+    preview_tmux send-keys -t "$pane" C-x C-d || return 1
+    # The probe key runs after the paste widget, including any preview attempt.
+    while ((SECONDS < deadline)); do
+      [[ -f $preview_root/buffer ]] && return 0
+      sleep 0.05
+    done
+    printf 'Timed out waiting for paste to finish in private pane:\n' >&2
+    preview_tmux capture-pane -p -t "$pane" >&2
+    return 1
+  }
+
+  preview_paste() {
+    preview_inject "$1" || return 1
+    preview_snapshot
+  }
+
+  preview_mark() { preview_tmux set-option -p -t "$pane" @termnav-paste-preview "$1"; }
+  read_preview_mark() { preview_tmux show-options -pqv -t "$pane" @termnav-paste-preview; }
+
+  # shellcheck disable=SC2016 # The pane launcher expands its own environment.
+  pane=$(preview_tmux -f /dev/null new-session -d -P -F '#{pane_id}' -x 100 -y 35 \
+    'exec "$PREVIEW_TEST_ZSH" -f') || return 1
+  [[ $pane =~ ^%[0-9]+$ ]] || return 1
+  # shellcheck disable=SC2016 # The interactive zsh expands this variable.
+  preview_send 'source "$PREVIEW_TEST_ROOT/setup.zsh"' || return 1
+  wait_preview_pane 'preview>' || return 1
+
+  : >"$preview_root/args"
+  : >"$preview_root/tmux-reads"
+  preview_mark "blocks:$image" || return 1
+  preview_tmux send-keys -t "$pane" -l 'before::after' || return 1
+  preview_tmux send-keys -t "$pane" C-b C-b C-b C-b C-b C-b || return 1
+  preview_inject "$image" || return 1
+  # The snapshot's key prefix can be echoed while ZLE redraws the prompt.
+  wait_preview_pane $'PREVIEW-MARK\npreview> before:'"$image:after" || return 1
+  _pass "paste preview: writes to the terminal above the redrawn prompt"
+  preview_snapshot || return 1
+  _assert_eq "paste preview: passes the exact path as a single argument" \
+    $'<paste-image>\n<preview>\n<--mode>\n<blocks>\n<-->\n<'"$image>" "$(<"$preview_root/args")"
+  _assert_eq "paste preview: reads the pane option once" "read" "$(<"$preview_root/tmux-reads")"
+  _assert_eq "paste preview: consumes a matching pane mark" "" "$(read_preview_mark)"
+  _assert_eq "paste preview: original widget runs once" "original" "$(<"$preview_root/chain")"
+  _assert_eq "paste preview: inserts the path at the cursor" \
+    $'start\n<before:'"$image"$'>\n<:after>' "$(<"$preview_root/buffer")"
+  : >"$preview_root/args"
+  preview_mark "blocks:$image" || return 1
+  for mark in 'ordinary text' "$image.bak" "$image"$'\nsecond line'; do
+    preview_tmux send-keys -t "$pane" C-x C-u || return 1
+    preview_paste "$mark" || return 1
+    _assert_eq "paste preview: leaves a non-matching mark alone" "blocks:$image" "$(read_preview_mark)"
+  done
+  _assert_eq "paste preview: does not render unrelated text" "" "$(<"$preview_root/args")"
+
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  preview_mark "unknown:$image" || return 1
+  preview_paste "$image" || return 1
+  _assert_eq "paste preview: leaves an invalid preview mode untouched" "unknown:$image" "$(read_preview_mark)"
+  _assert_eq "paste preview: does not render an invalid mode" "" "$(<"$preview_root/args")"
+
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  preview_mark "blocks:$image" || return 1
+  printf '%s\n' "sixel:$image" >"$preview_root/replace-mark"
+  preview_paste "$image" || return 1
+  rm -f "$preview_root/replace-mark"
+  _assert_eq "paste preview: does not consume a concurrently replaced mark" "sixel:$image" "$(read_preview_mark)"
+  _assert_eq "paste preview: does not render a concurrently replaced mark" "" "$(<"$preview_root/args")"
+
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  # shellcheck disable=SC2016 # The interactive zsh expands this variable.
+  preview_send 'zle -A bracketed-paste fixture_saved; zle -N bracketed-paste fixture_plugin; source "$SHELL_INTEGRATION"; fixture_quote=yes; fixture_status=23; PS1="rewrapped> "' || return 1
+  wait_preview_pane 'rewrapped>' || return 1
+  : >"$preview_root/chain"
+  # shellcheck disable=SC2016 # The fixture is a literal command-like path.
+  image='/tmp/x #[fg=red] #{pane_id},} $(:) y/clip-2-a.png'
+  preview_mark "sixel:$image" || return 1
+  preview_paste "$image" || return 1
+  _assert_eq "paste preview: unwraps a quoted paste after a plugin rewrap and reload" \
+    $'<paste-image>\n<preview>\n<--mode>\n<sixel>\n<-->\n<'"$image>" "$(<"$preview_root/args")"
+  _assert_eq "paste preview: plugin observes the original widget status" "23" "$(<"$preview_root/plugin-status")"
+  _assert_eq "paste preview: reload keeps a single original invocation" "original" "$(<"$preview_root/chain")"
+  _assert_eq "paste preview: consumes the full literal mark" "" "$(read_preview_mark)"
+
+  : >"$preview_root/args"
+  preview_tmux send-keys -t "$pane" C-x C-u || return 1
+  preview_send 'if true; then' || return 1
+  wait_preview_pane 'continued>' || return 1
+  preview_mark "sixel:$image" || return 1
+  preview_paste "$image" || return 1
+  _assert_contains "paste preview: enters continuation ZLE context" $'cont\n' "$(<"$preview_root/buffer")"$'\n'
+  _assert_eq "paste preview: ignores a match in a continuation prompt" "sixel:$image" "$(read_preview_mark)"
+  preview_tmux send-keys -t "$pane" C-c || return 1
+  preview_send 'fixture_value=; vared -p "fixture-vared> " fixture_value' || return 1
+  wait_preview_pane 'fixture-vared>' || return 1
+  preview_paste "$image" || return 1
+  _assert_contains "paste preview: enters vared ZLE context" $'vared\n' "$(<"$preview_root/buffer")"$'\n'
+  _assert_eq "paste preview: ignores a match in vared" "sixel:$image" "$(read_preview_mark)"
+  _assert_eq "paste preview: writes nothing in either secondary context" "" "$(<"$preview_root/args")"
+
+  preview_tmux send-keys -t "$pane" C-c || return 1
+  # shellcheck disable=SC2016 # The interactive zsh expands these variables.
+  preview_send 'command "$PREVIEW_TEST_ZSH" -f' || return 1
+  # shellcheck disable=SC2016
+  preview_send 'source "$SHELL_INTEGRATION"; PS1="nested> "' || return 1
+  wait_preview_pane 'nested>' || return 1
+  preview_inject "$image" || return 1
+  wait_preview_pane "nested> $image" || return 1
+  _assert_eq "paste preview: a nested shell binds independently under ALLEXPORT" "" "$(read_preview_mark)"
+
+  [[ $FAIL == 0 ]]
+)
+
+echo
+echo "=== zsh paste-image preview ==="
+if _tmux_usable && command -v zsh >/dev/null 2>&1; then
+  _paste_preview_checks
+  _assert_exit "paste preview: private tmux scenarios pass" 0 "$?"
+else
+  echo "  - skipping zsh paste-image preview tests (zsh or supported tmux unavailable)"
+fi
+
 _test_summary

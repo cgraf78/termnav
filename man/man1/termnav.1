@@ -61,6 +61,14 @@ termnav \- route terminal navigation, focus, links, and editor opens
 .RB [ --tmux-socket
 .IR PATH ]
 .br
+.B termnav paste-image preview
+.RB [ --mode
+.IR sixel | blocks ]
+.RB [ --rows
+.IR N ]
+.B --
+.I PATH
+.br
 .B termnav vscode focus claim|release
 .I SOURCE CYCLE SEQUENCE OBSERVED
 .br
@@ -318,6 +326,31 @@ without
 the server comes from
 .BR $TMUX .
 Saved images older than seven days are pruned.
+.TP
+.B paste-image preview
+Draws a saved image inline on standard output, as truecolor half blocks
+.RB ( --mode
+.BR blocks ,
+the default) or DEC sixel
+.RB ( --mode
+.BR sixel ).
+Only a regular
+.BI clip- ... .png
+file owned by the current user and located directly in
+.I $XDG_CACHE_HOME/termnav/paste-images
+is drawn; its name must match Termnav's saved clip format. The preview fits
+the pane width and at most
+.I N
+rows (default 12, or
+.BR $TERMNAV_PASTE_IMAGE_PREVIEW_ROWS
+when that is a positive integer), capped at half the pane height and at the
+pane height minus two. The pane size comes from the terminal on standard
+output, then from tmux through
+.BR $TMUX_PANE ,
+then defaults to 80 by 24 cells. Small images round to visible cells in blocks
+mode. The terminal is never queried. Any
+rejected or undecodable image prints nothing and exits 0; only invalid
+arguments exit 2.
 .SH SSH RELAY
 Interactive SSH sessions use a remote Unix socket below
 .B /tmp

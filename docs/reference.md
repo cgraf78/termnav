@@ -76,9 +76,9 @@ configuration, and `man termnav` has the complete command syntax.
   control-character policy on every `TERMNAV_OPEN_URL` value, because any
   program whose output reaches the terminal can set it; rejected values are
   logged as a warning without the value and never opened.
-- `termnav paste-image stage|receive ...`: give a desktop clipboard image to
-  the program in the active tmux pane, locally or one remote hop away; see
-  [Clipboard image paste](#clipboard-image-paste).
+- `termnav paste-image stage|receive|preview ...`: deliver a desktop
+  clipboard image to the active tmux pane and preview it at a zsh prompt;
+  see [Clipboard image paste](#clipboard-image-paste).
 - `termnav nvim open MODE ...`: open a target in the narrowest eligible editor
   scope. `ssh-open` is the fail-closed existing-ControlMaster transport.
 - `termnav vscode focus ...`: publish ordered, authenticated Neovim focus
@@ -320,6 +320,42 @@ into that pane; coding agents that attach an image when its path is pasted
 pick it up from there. Text paste is unchanged. The image travels in-band
 through the terminal byte stream, so it crosses SSH, Eternal Terminal, and
 local tmux layers without a tunnel, port forward, second login, or daemon.
+
+### Preview
+
+At an interactive zsh prompt using Termnav's shell integration, Ctrl-V
+draws a thumbnail directly above the prompt and leaves the saved path on the
+command line. In other shells and terminal applications, the pane receives
+the path as usual.
+
+Set `TERMNAV_PASTE_IMAGE_PREVIEW` in the tmux global environment to choose
+the preview mode. For example, put
+`set-environment -g TERMNAV_PASTE_IMAGE_PREVIEW blocks` in `tmux.conf`.
+
+| Setting | Behavior |
+| --- | --- |
+| `auto` (default), `sixel` | Use sixel when the tmux server supports it and every attached client whose session contains the window advertises sixel and reports a nonzero cell size. Fall back to truecolor half blocks otherwise. |
+| `blocks` | Always use truecolor half blocks. |
+| `off` | Paste the path without a preview. |
+
+Sixel preview requires tmux 3.6 or later built with `--enable-sixel`. Check
+the running server with `tmux display-message -p '#{sixel_support}'`, which
+prints `1` when sixel is available. In a nested setup with sixel support in
+every layer, configure each inner server with
+`set -as terminal-features 'tmux*:sixel'`. A nested tmux client also needs to
+report the same cell dimensions as the window. Otherwise the inner server
+uses half blocks to keep a rescaled sixel sequence from overflowing the next
+server's input buffer.
+
+The thumbnail fits the pane width without enlarging the image, apart from
+rounding to a visible cell in blocks mode. Set
+`TERMNAV_PASTE_IMAGE_PREVIEW_ROWS` in the receiving shell to change the
+default height of 12 rows. The preview takes at most half the pane height
+and leaves at least two rows free. It accepts Termnav's own saved PNG files
+up to 16 MiB, with each side at most 16,384 pixels and up to 64 Mi pixels total.
+Tmux can discard sixel previews when they scroll out of view, the pane is
+resized, zoomed or split, or the screen is cleared. The server keeps at most
+20 sixel images.
 
 ### Flow
 

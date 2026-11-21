@@ -20,6 +20,7 @@ runtime_shell_files=(
   "$root/lib/termnav/nvim-open/launcher.sh"
   "$root/lib/termnav/shell/file-links.sh"
   "$root/lib/termnav/shell/wezterm-vars.sh"
+  "$root/share/termnav/paste-preview.zsh"
   "$root/share/termnav/shell.sh"
   "$root/share/termnav/shims/ssh"
 )
@@ -53,7 +54,7 @@ check_runtime_shell_inventory() {
       # that CI will see from the resulting commit.
       [[ -f "$root/$file" ]] || continue
       case "$file" in
-        *.sh | *.sh.template)
+        *.sh | *.sh.template | *.zsh)
           printf '%s\n' "$file"
           continue
           ;;
@@ -73,7 +74,7 @@ check_runtime_shell_inventory() {
         "$first_line" == '# shellcheck shell=sh' ]]; then
         printf '%s\n' "$file"
       fi
-    done < <(git -C "$root" ls-files -- bin lib share)
+    done < <(git -C "$root" ls-files --cached --others --exclude-standard -- bin lib share)
   )
   discovered=$(printf '%s\n' "$discovered" | sed '/^$/d' | LC_ALL=C sort)
 
@@ -87,11 +88,23 @@ check_runtime_shell_inventory() {
 }
 
 check_runtime_shell_inventory
+# ShellCheck does not support Zsh. Syntax-check that adapter with Zsh itself.
+shellcheck_runtime_files=()
+for file in "${runtime_shell_files[@]}"; do
+  case "$file" in
+    *.zsh)
+      if command -v zsh >/dev/null 2>&1; then
+        zsh -fn "$file"
+      fi
+      ;;
+    *) shellcheck_runtime_files+=("$file") ;;
+  esac
+done
 # CI's matrix legs lint here. Only the Termux leg sets TERMNAV_SKIP_SHELLCHECK=1,
 # because its dependency profile has no ShellCheck.
 if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
-    "${runtime_shell_files[@]}" \
+    "${shellcheck_runtime_files[@]}" \
     "${example_shell_files[@]}" \
     "${tooling_shell_files[@]}" \
     "$test_dir/termnav-test" \

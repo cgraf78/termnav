@@ -10,6 +10,7 @@ and an isolated environment; the user's tmux is never contacted.
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import os
 import pty
@@ -19,9 +20,11 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import traceback
 from pathlib import Path
@@ -150,12 +153,17 @@ class Harness:
         script.write_text(CAPTURE)
         return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(log))}"
 
-    def attach(self, socket: str, session: str) -> FakeWezTerm:
+    def attach(self, socket: str, session: str, *, sixel: bool = False) -> FakeWezTerm:
         """Attach a client on a pty that impersonates WezTerm."""
         child, master = pty.fork()
         if child == 0:
             environment = dict(self.env, TERM_PROGRAM="WezTerm")
-            os.execvpe("tmux", ["tmux", "-S", socket, "attach-session", "-t", session], environment)
+            arguments = ["tmux", "-S", socket]
+            if sixel:
+                # The receiver requires both the client feature and known cell pixels.
+                fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 1000, 600))
+                arguments.extend(["-T", "sixel"])
+            os.execvpe("tmux", [*arguments, "attach-session", "-t", session], environment)
         self.clients.append(child)
         os.set_blocking(master, False)
         terminal = FakeWezTerm(master)
@@ -439,6 +447,72 @@ def open_receiver(
     )
 
 
+def linked_preview(harness: Harness) -> None:
+    """A mixed-capability client affects only windows linked to its session."""
+    socket = harness.server("preview", harness.capture_command(harness.root / "preview.log"))
+    pane = harness.pane(socket)
+    if harness.tmux(socket, "display-message", "-pt", pane, "#{sixel_support}").strip() != "1":
+        print("SKIP: linked sixel preview requires a sixel-enabled tmux")
+        return
+    # In the C locale a tmux command client replaces tab characters with
+    # underscores. Exercise that path even when the test runner uses UTF-8.
+    harness.tmux(socket, "set-environment", "-g", "LC_ALL", "C")
+    harness.tmux(socket, "new-session", "-d", "-s", "other", "sleep 300")
+    harness.attach(socket, "other")
+    capable = harness.attach(socket, "preview", sixel=True)
+    status = harness.root / "preview-status"
+    staged = stage(harness, png(5000, 12))
+
+    def expect(name: str, mode: str) -> None:
+        """Read the preview mode chosen by the receiver for a real paste."""
+        open_receiver(harness, socket, capable, pane, status)
+        outcome = capable.transfer(staged)
+        assert outcome["verdict"] == "done" and wait_for(status, capable) == "0", outcome
+        mark = harness.tmux(socket, "show-options", "-pqv", "-t", pane, "@termnav-paste-preview")
+        check(name, mark.partition(":")[0] == mode, mark)
+
+    expect("an unrelated client leaves the capable session in sixel mode", "sixel")
+    harness.tmux(socket, "link-window", "-d", "-s", pane, "-t", "other:")
+    expect("an incapable client in a linked session selects blocks", "blocks")
+    harness.tmux(socket, "kill-session", "-t", "other")
+
+    # Keep the direct client's window geometry while a real outer tmux
+    # attaches to it. A nested client will re-encode at its own font size.
+    outer = harness.server(
+        "preview-outer",
+        f"env TMUX= tmux -S {shlex.quote(socket)} -T sixel attach -f ignore-size -t preview",
+    )
+    nested = harness.attach(outer, "preview-outer", sixel=True)
+    geometry = harness.tmux(
+        socket, "display-message", "-pt", pane, "#{window_cell_width} #{window_cell_height}"
+    )
+    width, height = map(int, geometry.split())
+    assert width > 0 and height > 0, geometry
+    for factor, mode in [(2, "blocks"), (1, "sixel")]:
+        cols, rows = 100 + factor, 30 + factor
+        cw, ch = width * factor, height * factor
+        fcntl.ioctl(
+            nested.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, cols * cw, rows * ch)
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            nested.pump(0.02)
+            clients = harness.tmux(
+                socket,
+                "list-clients",
+                "-F",
+                "#{client_termname} #{client_cell_width} #{client_cell_height}",
+            )
+            if any(
+                line.startswith(("tmux", "screen")) and line.endswith(f" {cw} {ch}")
+                for line in clients.splitlines()
+            ):
+                break
+        else:
+            raise AssertionError(f"nested client never reported {cw}x{ch}: {clients!r}")
+        expect(f"a nested client at {factor}x the window cell size selects {mode}", mode)
+
+
 def single_layer(harness: Harness, large: int) -> None:
     """Cover delivery, validation failures, and timing on one server."""
     log = harness.root / "pane-a.log"
@@ -485,6 +559,55 @@ def single_layer(harness: Harness, large: int) -> None:
             log.read_bytes() == expected,
             log.read_bytes(),
         )
+    if saved:
+        # The receiver picks sixel only when this server and every attached
+        # client prove it; derive the expectation from the same server.
+        support = harness.tmux(socket, "display-message", "-p", "-t", pane, "#{sixel_support}")
+        listed = harness.tmux(
+            socket,
+            "list-clients",
+            "-F",
+            "#{client_termfeatures}|#{client_cell_width}|#{client_cell_height}",
+        ).splitlines()
+
+        def sixel_client(line: str) -> bool:
+            features, width, height = (line.split("|") + ["0", "0"])[:3]
+            return (
+                "sixel" in features.split(",")
+                and width.isdigit()
+                and height.isdigit()
+                and int(width) > 0
+                and int(height) > 0
+            )
+
+        mode = (
+            "sixel"
+            if support.strip() == "1" and listed and all(map(sixel_client, listed))
+            else "blocks"
+        )
+        marked = harness.tmux(socket, "show-options", "-pqv", "-t", pane, "@termnav-paste-preview")
+        check(
+            "pane is marked with the preview mode and saved path",
+            marked.strip() == f"{mode}:{saved[0]}",
+            (marked, mode),
+        )
+        harness.tmux(socket, "set-environment", "-g", "TERMNAV_PASTE_IMAGE_PREVIEW", "off")
+        log.write_bytes(b"")
+        open_receiver(harness, socket, terminal, pane, status)
+        off_result = terminal.transfer(stage(harness, png(70_000, 3)))
+        check(
+            "paste with previews off still succeeds",
+            off_result["verdict"] == "done" and wait_for(status, terminal) == "0",
+            off_result["verdict"],
+        )
+        marked = harness.tmux(socket, "show-options", "-pqv", "-t", pane, "@termnav-paste-preview")
+        check("previews off clears the pane mark", marked.strip() == "", marked)
+        harness.tmux(socket, "set-environment", "-gu", "TERMNAV_PASTE_IMAGE_PREVIEW")
+        # Later checks count saved images and pasted bytes from this first one.
+        for extra in images(harness):
+            if extra != saved[0]:
+                extra.unlink()
+        log.write_bytes(b"")
     header_length = len(result["id"]) + 1 + staged.index(b":", staged.index(b":") + 1) + 1
     check(
         "first acknowledgement is exactly the header",
@@ -703,6 +826,7 @@ def main() -> int:
         try:
             single_layer(harness, large)
             nested_layer(harness)
+            linked_preview(harness)
         except Unsupported as error:
             print(f"SKIP: platform forbids reopening the client PTY: {error}")
             return 0
