@@ -471,10 +471,11 @@ end)
 not return that value from the event handler: `false` would stop later
 handlers such as `routes.setup()`'s. `new` also accepts `termnav`, an explicit
 binary path; without it the binary is found as `link-routes.lua` finds it:
-`$TERMNAV_BIN_DIR/termnav` when that variable is set, otherwise the
-`bin/termnav` the release archive installs beside the module's `lib/` tree,
-otherwise `termnav` on WezTerm's own `PATH`. A WezTerm started from the macOS
-Dock or a desktop menu has a minimal `PATH`, so the installed sibling matters.
+`$TERMNAV_BIN_DIR/termnav` when that variable is set, otherwise
+`~/.local/bin/termnav` (the installer's default command directory) when it
+exists, otherwise `termnav` on WezTerm's own `PATH`. A WezTerm started from the
+macOS Dock or a desktop menu has a minimal `PATH`, so an install with a custom
+`--bin-dir` should set `TERMNAV_BIN_DIR` in WezTerm's launch environment.
 Without `routes`, the module loads `link-routes.lua` from its own directory.
 
 ### Security model
