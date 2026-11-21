@@ -1,5 +1,4 @@
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -100,10 +99,7 @@ fn tmux_claim_targets_only_the_focused_client_showing_the_editor_pane() {
     let _cleanup = Cleanup(root.clone());
 
     let tmux = bin.join("tmux");
-    std::fs::write(&tmux, "#!/bin/sh\nprintf '%b' \"$TERMNAV_TMUX_CLIENTS\"\n")
-        .expect("write fake tmux");
-    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake tmux executable");
+    common::write_executable(&tmux, "#!/bin/sh\nprintf '%b' \"$TERMNAV_TMUX_CLIENTS\"\n");
 
     let socket_root = common::socket_root();
     let _socket_cleanup = Cleanup(socket_root.clone());

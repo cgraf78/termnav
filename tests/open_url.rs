@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -70,9 +70,9 @@ impl Fixture {
         // UTF-8 (no `-u` among the options before the command, no `TMUX`, no
         // UTF-8 locale) prints control characters such as tabs as `_`. `run` pins `LC_ALL=C` so the model
         // behaves the same on every host.
-        std::fs::write(
+        common::write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$*\" >>\"$TERMNAV_TEST_LOG\"\n\
                  utf8=\n\
@@ -89,10 +89,7 @@ impl Fixture {
                  printf '%s\\n' \"$out\" | tr '\\t' '_'\n\
                  exit $status\n"
             ),
-        )
-        .expect("write fake tmux");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("make fake tmux executable");
+        );
         Self {
             root,
             tty,
