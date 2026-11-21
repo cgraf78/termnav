@@ -231,9 +231,9 @@ jobs:
 
           tmux_archive="$RUNNER_TEMP/tmux.tar.gz"
           curl --fail --location --silent --show-error --retry 3 \
-            https://github.com/cgraf78/tmux-builds/releases/download/v3.6b-1/tmux-3.6b-linux-x86_64.tar.gz \
+            https://github.com/cgraf78/tmux-builds/releases/download/v3.8-1/tmux-3.8-linux-x86_64.tar.gz \
             --output "$tmux_archive"
-          printf '%s  %s\n' '2ff103181224f4af1b4fe20ebaf687439005b2426cb76514f655aa1f178d42f5' "$tmux_archive" | sha256sum --check --strict
+          printf '%s  %s\n' 'ab4827c7f5990f43227911ee7fdc9848244fdfe46dee69a4fc9bfb0bd1357db7' "$tmux_archive" | sha256sum --check --strict
           mkdir "$RUNNER_TEMP/tmux-bin"
           tar -xzf "$tmux_archive" -C "$RUNNER_TEMP/tmux-bin" tmux
           printf '%s\n' "$RUNNER_TEMP/tmux-bin" >> "$GITHUB_PATH"
