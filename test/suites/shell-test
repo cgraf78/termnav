@@ -775,10 +775,9 @@ ZSH
     preview_tmux paste-buffer -d -p -b fixture -t "$pane"
   }
 
-  preview_paste() {
+  preview_snapshot() {
     local deadline=$((SECONDS + 5))
     rm -f "$preview_root/buffer"
-    preview_inject "$1" || return 1
     preview_tmux send-keys -t "$pane" C-x C-d || return 1
     # The probe key runs after the paste widget, including any preview attempt.
     while ((SECONDS < deadline)); do
@@ -788,6 +787,11 @@ ZSH
     printf 'Timed out waiting for paste to finish in private pane:\n' >&2
     preview_tmux capture-pane -p -t "$pane" >&2
     return 1
+  }
+
+  preview_paste() {
+    preview_inject "$1" || return 1
+    preview_snapshot
   }
 
   preview_mark() { preview_tmux set-option -p -t "$pane" @termnav-paste-preview "$1"; }
@@ -806,7 +810,11 @@ ZSH
   preview_mark "blocks:$image" || return 1
   preview_tmux send-keys -t "$pane" -l 'before::after' || return 1
   preview_tmux send-keys -t "$pane" C-b C-b C-b C-b C-b C-b || return 1
-  preview_paste "$image" || return 1
+  preview_inject "$image" || return 1
+  # The snapshot's key prefix can be echoed while ZLE redraws the prompt.
+  wait_preview_pane $'PREVIEW-MARK\npreview> before:'"$image:after" || return 1
+  _pass "paste preview: writes to the terminal above the redrawn prompt"
+  preview_snapshot || return 1
   _assert_eq "paste preview: passes the exact path as a single argument" \
     $'<paste-image>\n<preview>\n<--mode>\n<blocks>\n<-->\n<'"$image>" "$(<"$preview_root/args")"
   _assert_eq "paste preview: reads the pane option once" "read" "$(<"$preview_root/tmux-reads")"
@@ -814,10 +822,6 @@ ZSH
   _assert_eq "paste preview: original widget runs once" "original" "$(<"$preview_root/chain")"
   _assert_eq "paste preview: inserts the path at the cursor" \
     $'start\n<before:'"$image"$'>\n<:after>' "$(<"$preview_root/buffer")"
-  result=$(preview_tmux capture-pane -p -t "$pane") || return 1
-  _assert_contains "paste preview: writes to the terminal above the redrawn prompt" \
-    $'PREVIEW-MARK\npreview> before:'"$image:after" "$result"
-
   : >"$preview_root/args"
   preview_mark "blocks:$image" || return 1
   for mark in 'ordinary text' "$image.bak" "$image"$'\nsecond line'; do
