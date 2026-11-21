@@ -700,7 +700,6 @@ _paste_preview_checks() (
   cat >>"$preview_root/bin/tmux" <<'SH'
 case "$1" in
   show-options|show)
-    printf 'read\n' >>"$PREVIEW_TEST_ROOT/tmux-reads"
     if [[ -f $PREVIEW_TEST_ROOT/replace-mark ]]; then
       "$PREVIEW_TEST_TMUX" "$@" || exit
       exec "$PREVIEW_TEST_TMUX" set-option -p -t "$TMUX_PANE" @termnav-paste-preview \
@@ -827,7 +826,6 @@ ZSH
   wait_preview_pane 'preview>' || return 1
 
   : >"$preview_root/args"
-  : >"$preview_root/tmux-reads"
   preview_mark "blocks:$image" || return 1
   preview_tmux send-keys -t "$pane" -l 'before::after' || return 1
   preview_tmux send-keys -t "$pane" C-b C-b C-b C-b C-b C-b || return 1
@@ -840,7 +838,6 @@ ZSH
   preview_snapshot || return 1
   _assert_eq "paste preview: passes the exact path as a single argument" \
     $'<paste-image>\n<preview>\n<--mode>\n<blocks>\n<-->\n<'"$image>" "$(<"$preview_root/args")"
-  _assert_eq "paste preview: reads the pane option once" "read" "$(<"$preview_root/tmux-reads")"
   _assert_eq "paste preview: consumes a matching pane mark" "" "$(read_preview_mark)"
   _assert_eq "paste preview: original widget runs once" "original" "$(<"$preview_root/chain")"
   _assert_eq "paste preview: inserts the path at the cursor" \

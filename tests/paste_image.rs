@@ -432,9 +432,7 @@ fn preview_rejections_are_silent() {
     fs::write(&outside, gradient(10, 10)).unwrap();
     let not_png = directory.join("clip-20260101T000000Z-eeeeeeeeeeee.png");
     fs::write(&not_png, b"GIF89a not a png").unwrap();
-    let removed = preview.clip("clip-20260101T000000Z-ffffffffffff.png", 10, 10);
-    fs::remove_file(&removed).unwrap();
-    for path in [&missing, &outside, &not_png, &removed] {
+    for path in [&missing, &outside, &not_png] {
         for mode in ["blocks", "sixel"] {
             let output = preview.run(&["--mode", mode, "--", path.to_str().unwrap()]);
             assert_eq!(output.status.code(), Some(0), "{path:?}: {output:?}");

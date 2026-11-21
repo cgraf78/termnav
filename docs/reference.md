@@ -477,11 +477,14 @@ sends only `!`.
 
 ### Wiring
 
-The innermost tmux layer needs a binding like this. `display-popup` does not
-expand formats in its command, so the binding goes through `run-shell`, which
-does:
+In the innermost tmux layer, use `run-shell` to expand tmux formats in the
+`display-popup` command. Disable the fast-input paste heuristic in that tmux
+server. On X11, WezTerm can send an empty bracketed text paste directly
+before the image trigger. If both arrive together, the heuristic can send the
+trigger to the pane as literal input. Bracketed text pastes still work.
 
 ```tmux
+set -g assume-paste-time 0
 set -s user-keys[14] "\e[777010u"
 bind-key -n User14 if-shell -F "#{||:#{pane_in_mode},#{synchronize-panes}}" {
   display-message "Image paste is unavailable here"

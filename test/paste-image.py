@@ -9,6 +9,7 @@ and an isolated environment; the user's tmux is never contacted.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import fcntl
 import hashlib
@@ -28,6 +29,8 @@ import termios
 import time
 import traceback
 from pathlib import Path
+
+from paste_preview import PROMPT, SIXEL_FRAME, documented_binding, sample_png, write_zshrc
 
 WINDOW = 512 * 1024
 CHUNK = 32 * 1024
@@ -152,6 +155,10 @@ class Harness:
         script = self.root / "capture.py"
         script.write_text(CAPTURE)
         return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))} {shlex.quote(str(log))}"
+
+    def screen(self, socket: str, pane: str) -> str:
+        """Join wrapped rows in the visible pane, where the user sees the preview."""
+        return self.tmux(socket, "capture-pane", "-pJ", "-t", pane)
 
     def attach(self, socket: str, session: str, *, sixel: bool = False) -> FakeWezTerm:
         """Attach a client on a pty that impersonates WezTerm."""
@@ -332,15 +339,6 @@ class FakeWezTerm:
         return result
 
 
-def documented_binding() -> str:
-    """Return the innermost-layer tmux example from docs/reference.md."""
-    reference = Path(__file__).resolve().parent.parent / "docs" / "reference.md"
-    for block in re.findall(r"```tmux\n(.*?)```", reference.read_text(), re.DOTALL):
-        if "user-keys[14]" in block:
-            return block
-    raise AssertionError("docs/reference.md lacks the paste-image tmux example")
-
-
 def wait_for(path: Path, terminal: FakeWezTerm, timeout: float = 10) -> str:
     """Wait for a status file written by the popup wrapper.
 
@@ -511,6 +509,78 @@ def linked_preview(harness: Harness) -> None:
         else:
             raise AssertionError(f"nested client never reported {cw}x{ch}: {clients!r}")
         expect(f"a nested client at {factor}x the window cell size selects {mode}", mode)
+
+
+def composed_preview(harness: Harness, asset_root: Path) -> None:
+    """Drive a real staged PNG from the documented binding through ZLE to the attached PTY."""
+    home = Path(harness.env["HOME"])
+    write_zshrc(home, asset_root)
+    # Both the binding and the widget run the requested binary by its public name.
+    bindir = harness.root / "bin"
+    bindir.mkdir()
+    (bindir / "termnav").symlink_to(harness.binary)
+    harness.env.update(PATH=f"{bindir}:{harness.env['PATH']}", ZDOTDIR=str(home), SHELL="/bin/sh")
+    binding = harness.root / "binding.conf"
+    binding.write_text(documented_binding())
+    image = sample_png()
+    staged = stage(harness, image)
+    for mode in ("blocks", "sixel"):
+        socket = harness.server(mode, "exec zsh -d -i")
+        pane = harness.pane(socket)
+        harness.tmux(socket, "source-file", str(binding))
+        harness.tmux(socket, "set-environment", "-g", "TERMNAV_PASTE_IMAGE_PREVIEW", mode)
+        terminal = harness.attach(socket, mode, sixel=True)
+
+        deadline = time.monotonic() + 5
+        while PROMPT.rstrip() not in (
+            line.rstrip() for line in harness.screen(socket, pane).splitlines()
+        ):
+            assert time.monotonic() < deadline, (
+                f"{mode}: Zsh prompt never appeared: {harness.screen(socket, pane)!r}"
+            )
+            terminal.pump(0.05)
+        before = set(images(harness))
+        terminal.type(TRIGGER)
+        outcome = terminal.transfer(staged, limit=15)
+        assert outcome["verdict"] == "done", (mode, outcome)
+        saved = set(images(harness)) - before
+        assert len(saved) == 1, (mode, saved)
+        clip = saved.pop()
+        assert clip.read_bytes() == image, f"{mode}: saved PNG differs from staged PNG"
+        path = str(clip)
+        deadline = time.monotonic() + 10
+        while True:
+            terminal.pump(0.05)
+            display = harness.screen(socket, pane)
+            above, prompt, _ = display.partition(PROMPT + path)
+            frame = SIXEL_FRAME.search(terminal.output)
+            drawn = "▀" in above if mode == "blocks" else frame is not None
+            if prompt and drawn:
+                break
+            assert time.monotonic() < deadline, (
+                f"{mode}: no rendered image and redrawn prompt; sixel frame={bool(frame)}, "
+                f"pane={display!r}"
+            )
+        assert display.count(path) == 1, (mode, display)
+        if frame:
+            assert mode == "sixel", "blocks produced a sixel frame"
+            assert b";2;100;0;0" in frame[0] and b";2;0;0;100" in frame[0], frame[0][:200]
+        mark = harness.tmux(socket, "show-options", "-pqv", "-t", pane, "@termnav-paste-preview")
+        assert not mark.strip(), (mode, mark)
+
+        snapshot = home / "buffer"
+        snapshot.unlink(missing_ok=True)
+        terminal.type(b"\x18\x04")
+        deadline = time.monotonic() + 5
+        while not snapshot.exists():
+            assert time.monotonic() < deadline, (
+                f"{mode}: no ZLE buffer snapshot: {harness.screen(socket, pane)!r}"
+            )
+            terminal.pump(0.05)
+        assert snapshot.read_bytes() == os.fsencode(clip), (mode, snapshot.read_bytes())
+        print(
+            f"  PASS: {mode} renders the received PNG and leaves its path once on screen and in ZLE"
+        )
 
 
 def single_layer(harness: Harness, large: int) -> None:
@@ -813,23 +883,35 @@ def nested_layer(harness: Harness) -> None:
 
 
 def main() -> int:
-    """Run every scenario under one isolated scratch root."""
-    binary = str(Path(sys.argv[1]).resolve())
+    """Run the transport suite or the required composed previews in an isolated scratch root."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument(
+        "--preview",
+        metavar="ASSET_ROOT",
+        type=Path,
+        help="require block and sixel previews using these extracted shell assets",
+    )
+    args = parser.parse_args()
+    binary = str(args.binary.resolve())
     large = int(os.environ.get("TERMNAV_PASTE_IMAGE_LARGE_BYTES", str(16 * 1024 * 1024)))
     # test/termnav-test settles whether this run has a supported tmux.
     if os.environ.get("TERMNAV_TEST_TMUX", "ok" if shutil.which("tmux") else "missing") != "ok":
-        print("SKIP: paste-image tests require a supported tmux")
-        return 0
+        print(f"{'FAIL' if args.preview else 'SKIP'}: paste-image tests require a supported tmux")
+        return int(args.preview is not None)
     parent = "/tmp" if Path("/tmp").is_dir() and os.access("/tmp", os.W_OK) else None
     with tempfile.TemporaryDirectory(prefix="tn-paste-", dir=parent) as root:
         harness = Harness(binary, Path(root).resolve())
         try:
-            single_layer(harness, large)
-            nested_layer(harness)
-            linked_preview(harness)
+            if args.preview:
+                composed_preview(harness, args.preview.resolve())
+            else:
+                single_layer(harness, large)
+                nested_layer(harness)
+                linked_preview(harness)
         except Unsupported as error:
-            print(f"SKIP: platform forbids reopening the client PTY: {error}")
-            return 0
+            print(f"{'FAIL' if args.preview else 'SKIP'}: cannot reopen the client PTY: {error}")
+            return int(args.preview is not None)
         except Exception:  # noqa: BLE001 - report any harness error as a failed scenario
             # The suite keys on FAIL lines; name the crash so CI logs say
             # which scenario stopped and why.
