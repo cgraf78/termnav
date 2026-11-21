@@ -34,7 +34,13 @@ _termnav_bracketed_paste() {
     "set-option -pu -t $pane $option; display-message -p 1" 2>/dev/null) || return "$saved_status"
   [[ $consumed == 1 ]] || return "$saved_status"
 
-  zle -I
+  # Refresh to measure the current wrapping, even if the original widget
+  # already yielded the terminal. ZLE runs POSTEDIT after moving below the
+  # buffer. Reuse those rows before running the user's existing POSTEDIT.
+  # Editing LBUFFER here would cancel pending completion state.
+  zle -R || return "$saved_status"
+  local POSTEDIT=$'\e['${BUFFERLINES}$'A\r\e[J'${POSTEDIT-}
+  zle -I || return "$saved_status"
   command termnav paste-image preview --mode "$mode" -- "$image" 2>/dev/null </dev/null >/dev/tty || true
   return "$saved_status"
 }
