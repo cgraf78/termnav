@@ -485,6 +485,55 @@ def single_layer(harness: Harness, large: int) -> None:
             log.read_bytes() == expected,
             log.read_bytes(),
         )
+    if saved:
+        # The receiver picks sixel only when this server and every attached
+        # client prove it; derive the expectation from the same server.
+        support = harness.tmux(socket, "display-message", "-p", "-t", pane, "#{sixel_support}")
+        listed = harness.tmux(
+            socket,
+            "list-clients",
+            "-F",
+            "#{client_termfeatures}\t#{client_cell_width}\t#{client_cell_height}",
+        ).splitlines()
+
+        def sixel_client(line: str) -> bool:
+            features, width, height = (line.split("\t") + ["0", "0"])[:3]
+            return (
+                "sixel" in features.split(",")
+                and width.isdigit()
+                and height.isdigit()
+                and int(width) > 0
+                and int(height) > 0
+            )
+
+        mode = (
+            "sixel"
+            if support.strip() == "1" and listed and all(map(sixel_client, listed))
+            else "blocks"
+        )
+        marked = harness.tmux(socket, "show-options", "-pqv", "-t", pane, "@termnav-paste-preview")
+        check(
+            "pane is marked with the preview mode and saved path",
+            marked.strip() == f"{mode}:{saved[0]}",
+            (marked, mode),
+        )
+        harness.tmux(socket, "set-environment", "-g", "TERMNAV_PASTE_IMAGE_PREVIEW", "off")
+        log.write_bytes(b"")
+        open_receiver(harness, socket, terminal, pane, status)
+        off_result = terminal.transfer(stage(harness, png(70_000, 3)))
+        check(
+            "paste with previews off still succeeds",
+            off_result["verdict"] == "done" and wait_for(status, terminal) == "0",
+            off_result["verdict"],
+        )
+        marked = harness.tmux(socket, "show-options", "-pqv", "-t", pane, "@termnav-paste-preview")
+        check("previews off clears the pane mark", marked.strip() == "", marked)
+        harness.tmux(socket, "set-environment", "-gu", "TERMNAV_PASTE_IMAGE_PREVIEW")
+        # Later checks count saved images and pasted bytes from this first one.
+        for extra in images(harness):
+            if extra != saved[0]:
+                extra.unlink()
+        log.write_bytes(b"")
     header_length = len(result["id"]) + 1 + staged.index(b":", staged.index(b":") + 1) + 1
     check(
         "first acknowledgement is exactly the header",

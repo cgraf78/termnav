@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::preview::Mode;
 use super::protocol::{Fed, Parser, Rejection};
-use super::{ACK_INTERVAL, MAX_IMAGE_BYTES, USER_VAR};
+use super::{ACK_INTERVAL, MAX_IMAGE_BYTES, PREVIEW_OPTION, PREVIEW_SETTING, USER_VAR};
 use crate::browser::{self, Destination};
 
 /// Give up after this long without receiving a byte.
@@ -123,6 +124,13 @@ pub fn run(options: &Options, progress: &mut dyn Write) -> i32 {
     match outcome {
         Ok(path) => {
             let _ = destination.send(USER_VAR, &format!("done:{id}"));
+            // Mark before pasting so the widget sees the option by the time
+            // the path arrives. With previews off the mark is cleared so a
+            // stale one from an earlier paste cannot survive.
+            let mark = tmux
+                .preview_mode()
+                .map(|mode| format!("{}:{}", mode.as_str(), path.display()));
+            tmux.mark_preview(mark.as_deref());
             if let Err(error) = tmux.paste(&path) {
                 tmux.tell(&format!(
                     "Saved {} but could not paste it: {error}",
@@ -425,6 +433,76 @@ impl Tmux<'_> {
         ))
     }
 
+    /// Run a tmux query and return its stdout, or `None` on any failure.
+    fn query(&self, arguments: &[&str]) -> Option<String> {
+        let mut command = self.command();
+        command.args(arguments);
+        let output = crate::process::output_timeout(&mut command, TMUX_TIMEOUT).ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The preview setting: the server's global environment, then this
+    /// process's, then `auto`. The server is asked first because the popup's
+    /// own environment predates any `set-environment` the user ran later.
+    fn preview_setting(&self) -> String {
+        let from_server = self
+            .query(&["show-environment", "-g", PREVIEW_SETTING])
+            .and_then(|line| {
+                line.trim_end()
+                    .strip_prefix(PREVIEW_SETTING)?
+                    .strip_prefix('=')
+                    .map(str::to_owned)
+            });
+        from_server
+            .or_else(|| std::env::var(PREVIEW_SETTING).ok())
+            .unwrap_or_else(|| "auto".to_owned())
+    }
+
+    /// Choose the preview mode for the target pane from tmux formats alone;
+    /// the terminal is never queried. A failed query means the safe `blocks`.
+    fn preview_mode(&self) -> Option<Mode> {
+        let setting = self.preview_setting();
+        if setting == "off" {
+            return None;
+        }
+        let sixel_support = self
+            .query(&["display-message", "-p", "-t", self.pane, "#{sixel_support}"])
+            .unwrap_or_default();
+        // `list-clients -t` takes a session; tmux resolves a pane id to the
+        // session that holds it.
+        let clients = self
+            .query(&[
+                "list-clients",
+                "-t",
+                self.pane,
+                "-F",
+                "#{client_termfeatures}\t#{client_cell_width}\t#{client_cell_height}",
+            ])
+            .unwrap_or_default();
+        let clients: Vec<ClientCaps> = clients
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(ClientCaps::parse)
+            .collect();
+        preview_mode(&setting, sixel_support.trim(), &clients)
+    }
+
+    /// Set (or, for `None`, unset) the pane option the zsh widget reads.
+    /// Failures are ignored: a missing preview must never affect the paste.
+    fn mark_preview(&self, value: Option<&str>) {
+        let mut command = self.command();
+        match value {
+            Some(value) => {
+                command.args(["set-option", "-p", "-t", self.pane, PREVIEW_OPTION, value])
+            }
+            None => command.args(["set-option", "-pu", "-t", self.pane, PREVIEW_OPTION]),
+        };
+        let _ = Self::succeeds(command);
+    }
+
     /// Show a short message on the client that pasted. tmux drops a message
     /// for a client that has gone, with status 0, so it never reaches anyone
     /// else.
@@ -565,9 +643,66 @@ pub(crate) fn utc_timestamp(time: SystemTime) -> String {
     )
 }
 
+/// One attached tmux client's graphics-relevant capabilities.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ClientCaps {
+    /// `#{client_termfeatures}`: comma-separated feature names.
+    pub features: String,
+    /// `#{client_cell_width}` in pixels; 0 when unknown.
+    pub cell_width: u32,
+    /// `#{client_cell_height}` in pixels; 0 when unknown.
+    pub cell_height: u32,
+}
+
+impl ClientCaps {
+    /// Parse one `features<TAB>width<TAB>height` line; malformed numbers
+    /// become 0 so the client counts as unable to show sixel.
+    fn parse(line: &str) -> Self {
+        let mut fields = line.split('\t');
+        let features = fields.next().unwrap_or_default().to_owned();
+        let mut number = || fields.next().and_then(|f| f.trim().parse().ok());
+        Self {
+            features,
+            cell_width: number().unwrap_or(0),
+            cell_height: number().unwrap_or(0),
+        }
+    }
+
+    /// Whether this client reports sixel and a usable cell size.
+    fn sixel(&self) -> bool {
+        self.features.split(',').any(|feature| feature == "sixel")
+            && self.cell_width > 0
+            && self.cell_height > 0
+    }
+}
+
+/// Choose the preview mode, or `None` when previews are off.
+///
+/// Sixel needs the tmux server to pass it through (`sixel_support`) and every
+/// attached client to advertise it with a known cell size, since any client
+/// may be the one showing the pane. Anything unproven falls back to blocks,
+/// which every truecolor terminal draws. Unknown settings behave as `auto`.
+pub(crate) fn preview_mode(
+    setting: &str,
+    sixel_support: &str,
+    clients: &[ClientCaps],
+) -> Option<Mode> {
+    match setting {
+        "off" => return None,
+        "blocks" => return Some(Mode::Blocks),
+        _ => {}
+    }
+    let capable =
+        sixel_support == "1" && !clients.is_empty() && clients.iter().all(ClientCaps::sixel);
+    Some(if capable { Mode::Sixel } else { Mode::Blocks })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{KEEP_IMAGES, is_clip_name, prune, socket_of, utc_timestamp, write_image};
+    use super::{
+        ClientCaps, KEEP_IMAGES, Mode, is_clip_name, preview_mode, prune, socket_of, utc_timestamp,
+        write_image,
+    };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -616,6 +751,78 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1, "no temporary file");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn caps(features: &str, width: u32, height: u32) -> ClientCaps {
+        ClientCaps {
+            features: features.to_owned(),
+            cell_width: width,
+            cell_height: height,
+        }
+    }
+
+    #[test]
+    fn preview_off() {
+        let clients = [caps("sixel", 10, 20)];
+        assert_eq!(preview_mode("off", "1", &clients), None);
+    }
+
+    #[test]
+    fn preview_forced_blocks() {
+        let clients = [caps("sixel", 10, 20)];
+        assert_eq!(preview_mode("blocks", "1", &clients), Some(Mode::Blocks));
+    }
+
+    #[test]
+    fn preview_auto_all_capable_is_sixel() {
+        let clients = [caps("256,sixel,RGB", 10, 20), caps("sixel", 8, 16)];
+        assert_eq!(preview_mode("auto", "1", &clients), Some(Mode::Sixel));
+        assert_eq!(preview_mode("sixel", "1", &clients), Some(Mode::Sixel));
+    }
+
+    #[test]
+    fn preview_auto_one_client_lacks_sixel_is_blocks() {
+        let clients = [caps("sixel", 10, 20), caps("256,RGB", 10, 20)];
+        assert_eq!(preview_mode("auto", "1", &clients), Some(Mode::Blocks));
+    }
+
+    #[test]
+    fn preview_zero_cell_size_is_blocks() {
+        for clients in [[caps("sixel", 0, 20)], [caps("sixel", 10, 0)]] {
+            assert_eq!(preview_mode("auto", "1", &clients), Some(Mode::Blocks));
+        }
+    }
+
+    #[test]
+    fn preview_no_server_sixel_is_blocks() {
+        let clients = [caps("sixel", 10, 20)];
+        assert_eq!(preview_mode("auto", "0", &clients), Some(Mode::Blocks));
+        assert_eq!(preview_mode("sixel", "", &clients), Some(Mode::Blocks));
+    }
+
+    #[test]
+    fn preview_no_clients_is_blocks() {
+        assert_eq!(preview_mode("auto", "1", &[]), Some(Mode::Blocks));
+    }
+
+    #[test]
+    fn preview_unknown_setting_is_auto() {
+        let clients = [caps("sixel", 10, 20)];
+        assert_eq!(preview_mode("bogus", "1", &clients), Some(Mode::Sixel));
+        assert_eq!(preview_mode("bogus", "0", &clients), Some(Mode::Blocks));
+    }
+
+    #[test]
+    fn preview_feature_match_is_exact() {
+        let clients = [caps("nosixel,sixel2", 10, 20)];
+        assert_eq!(preview_mode("auto", "1", &clients), Some(Mode::Blocks));
+    }
+
+    #[test]
+    fn client_lines_parse_with_zero_for_bad_numbers() {
+        assert_eq!(ClientCaps::parse("a,sixel\t9\t18"), caps("a,sixel", 9, 18));
+        assert_eq!(ClientCaps::parse("sixel\tx"), caps("sixel", 0, 0));
+        assert_eq!(ClientCaps::parse(""), caps("", 0, 0));
     }
 
     #[test]
