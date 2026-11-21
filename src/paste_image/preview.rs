@@ -65,10 +65,50 @@ struct Pane {
     cell: (u16, u16),
 }
 
-impl Pane {
-    /// Build a pane, rejecting any zero (terminals report 0 when unknown).
-    fn new(cols: u16, rows: u16, cell: (u16, u16)) -> Option<Pane> {
-        (cols > 0 && rows > 0 && cell.0 > 0 && cell.1 > 0).then_some(Pane { cols, rows, cell })
+/// One source's report of the pane size. Terminals and tmux report 0 for
+/// what they do not know, so each half is kept only when fully non-zero and
+/// the halves are merged independently: a tty that knows its columns but not
+/// its pixels must still bound the width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Measured {
+    cells: Option<(u16, u16)>,
+    cell_pixels: Option<(u16, u16)>,
+}
+
+impl Measured {
+    fn new(cols: u16, rows: u16, cell: (u16, u16)) -> Measured {
+        let both = |pair: (u16, u16)| (pair.0 > 0 && pair.1 > 0).then_some(pair);
+        Measured {
+            cells: both((cols, rows)),
+            cell_pixels: both(cell),
+        }
+    }
+
+    fn complete(self) -> bool {
+        self.cells.is_some() && self.cell_pixels.is_some()
+    }
+}
+
+/// Combine the tty report with a lazy tmux one, then the defaults.
+///
+/// `tmux` runs at most once, and only when the tty left something unknown.
+fn merge(tty: Measured, tmux: impl FnOnce() -> Measured) -> Pane {
+    let fallback = if tty.complete() {
+        Measured::default()
+    } else {
+        tmux()
+    };
+    let (cols, rows) = tty
+        .cells
+        .or(fallback.cells)
+        .unwrap_or((FALLBACK.cols, FALLBACK.rows));
+    Pane {
+        cols,
+        rows,
+        cell: tty
+            .cell_pixels
+            .or(fallback.cell_pixels)
+            .unwrap_or(FALLBACK.cell),
     }
 }
 
@@ -87,8 +127,9 @@ fn rejected() -> io::Error {
 /// the file must be named like a clip and sit directly in the image directory
 /// (compared after canonicalizing both parents). It is opened `O_NOFOLLOW`
 /// so a planted symlink is refused, and `O_NONBLOCK` so a FIFO cannot hang
-/// the open; the descriptor is then checked rather than the path, which
-/// leaves no window between check and use.
+/// the open. The parent comparison is path-based; the file type, owner and
+/// size checks use the opened descriptor, so they describe the file that will
+/// be read.
 ///
 /// # Errors
 ///
@@ -115,30 +156,34 @@ pub fn open_clip(path: &Path, directory: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-/// Size of the terminal on stdout, or `None` when it is not a sized tty.
-fn tty_size() -> Option<Pane> {
+/// What the terminal on stdout reports; empty when it is not a tty.
+fn tty_size() -> Measured {
     // SAFETY: `winsize` is plain old data, and the ioctl only fills it.
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut size) } != 0 {
-        return None;
+        return Measured::default();
     }
-    let width = size.ws_xpixel.checked_div(size.ws_col)?;
-    let height = size.ws_ypixel.checked_div(size.ws_row)?;
-    Pane::new(size.ws_col, size.ws_row, (width, height))
+    let width = size.ws_xpixel.checked_div(size.ws_col).unwrap_or(0);
+    let height = size.ws_ypixel.checked_div(size.ws_row).unwrap_or(0);
+    Measured::new(size.ws_col, size.ws_row, (width, height))
 }
 
 /// Parse `#{pane_width} #{pane_height} #{window_cell_width} #{window_cell_height}`.
-fn parse_tmux(text: &str) -> Option<Pane> {
+fn parse_tmux(text: &str) -> Option<Measured> {
     let mut fields = text.split_whitespace().map(|field| field.parse::<u16>());
     let mut next = || fields.next()?.ok();
-    let pane = Pane::new(next()?, next()?, (next()?, next()?));
+    let measured = Measured::new(next()?, next()?, (next()?, next()?));
     // Extra fields mean the format changed under us; do not guess.
-    pane.filter(|_| fields.next().is_none())
+    fields.next().is_none().then_some(measured)
 }
 
 /// Ask tmux for the size of `$TMUX_PANE`, for when stdout is not the tty
 /// (the widget redirects it, and tmux may not forward pixel sizes).
-fn tmux_size() -> Option<Pane> {
+fn tmux_size() -> Measured {
+    query_tmux().unwrap_or_default()
+}
+
+fn query_tmux() -> Option<Measured> {
     let pane = std::env::var("TMUX_PANE")
         .ok()
         .filter(|pane| !pane.is_empty())?;
@@ -181,7 +226,7 @@ fn environment_rows() -> Option<u16> {
 /// Decode and draw the clip, or `None` on any rejection.
 fn render(path: &Path, mode: Mode, rows: Option<u16>) -> Option<String> {
     let file = open_clip(path, &image_directory().ok()?).ok()?;
-    let pane = tty_size().or_else(tmux_size).unwrap_or(FALLBACK);
+    let pane = merge(tty_size(), tmux_size);
     let rows = rows_for(
         rows.or_else(environment_rows).unwrap_or(DEFAULT_ROWS),
         pane.rows,
@@ -228,7 +273,7 @@ pub fn run(path: &Path, mode: Mode, rows: Option<u16>, out: &mut dyn Write) -> i
 
 #[cfg(test)]
 mod tests {
-    use super::{Mode, open_clip, owned_regular, parse_tmux, rows_for};
+    use super::{Measured, Mode, Pane, merge, open_clip, owned_regular, parse_tmux, rows_for};
     use std::ffi::CString;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -256,18 +301,71 @@ mod tests {
 
     #[test]
     fn tmux_sizes_parse_strictly() {
-        let pane = parse_tmux("120 40 9 18\n").unwrap();
-        assert_eq!((pane.cols, pane.rows, pane.cell), (120, 40, (9, 18)));
-        for invalid in [
-            "",
-            "120 40 9",
-            "120 40 0 18",
-            "120 40 9 18 1",
-            "a b c d",
-            "0 0 0 0",
-        ] {
+        assert_eq!(parse_tmux("120 40 9 18\n"), Some(full(120, 40, 9, 18)));
+        // Zeros are valid reports of "unknown", kept per half.
+        assert_eq!(
+            parse_tmux("120 40 0 18"),
+            Some(Measured {
+                cells: Some((120, 40)),
+                cell_pixels: None
+            })
+        );
+        for invalid in ["", "120 40 9", "120 40 9 18 1", "a b c d"] {
             assert_eq!(parse_tmux(invalid), None, "{invalid:?}");
         }
+    }
+
+    fn full(cols: u16, rows: u16, w: u16, h: u16) -> Measured {
+        Measured::new(cols, rows, (w, h))
+    }
+
+    fn pane(cols: u16, rows: u16, w: u16, h: u16) -> Pane {
+        Pane {
+            cols,
+            rows,
+            cell: (w, h),
+        }
+    }
+
+    fn never() -> Measured {
+        panic!("tmux must not be queried")
+    }
+
+    #[test]
+    fn complete_tty_report_skips_tmux() {
+        assert_eq!(merge(full(100, 30, 8, 16), never), pane(100, 30, 8, 16));
+    }
+
+    #[test]
+    fn tty_cells_without_pixels_take_tmux_cell_size() {
+        let merged = merge(full(60, 20, 0, 0), || full(200, 50, 7, 14));
+        assert_eq!(merged, pane(60, 20, 7, 14));
+    }
+
+    #[test]
+    fn missing_tty_uses_tmux_in_full() {
+        let merged = merge(Measured::default(), || full(90, 33, 9, 18));
+        assert_eq!(merged, pane(90, 33, 9, 18));
+    }
+
+    #[test]
+    fn zero_tmux_cell_size_defaults_but_keeps_cells() {
+        assert_eq!(
+            merge(Measured::default(), || full(90, 33, 0, 0)),
+            pane(90, 33, 10, 20)
+        );
+        assert_eq!(
+            merge(full(60, 20, 0, 0), || full(90, 33, 0, 0)),
+            pane(60, 20, 10, 20)
+        );
+    }
+
+    #[test]
+    fn nothing_known_gives_defaults() {
+        assert_eq!(
+            merge(Measured::default(), Measured::default),
+            pane(80, 24, 10, 20)
+        );
     }
 
     #[test]
