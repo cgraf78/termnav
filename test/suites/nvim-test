@@ -715,6 +715,11 @@ NVIM_TMUX_OPEN_EXPECTED=$(realpath "$NVIM_TMUX_OPEN_TMP/terminal-cwd/clicked.txt
 result=$(_nvim_lua "
   local opener = dofile('$opener_module')
   vim.cmd('edit $NVIM_TMUX_OPEN_TMP/editor.txt')
+  -- :terminal starts 'shell', which defaults to the developer's SHELL. Under
+  -- the suite's empty HOME an interactive zsh runs zsh-newuser-install, whose
+  -- menu eats the typed 'c' and turns the command into 'd ...'. Pin a shell
+  -- with no first-run prompt so the typed cd reaches a plain command line.
+  vim.o.shell = 'sh'
   vim.cmd('terminal')
   local job = vim.b.terminal_job_id
   vim.fn.chansend(job, 'cd $NVIM_TMUX_OPEN_TMP/terminal-cwd\n')
@@ -722,7 +727,11 @@ result=$(_nvim_lua "
     return opener.terminal_cwd(0) == '$NVIM_TMUX_OPEN_TERMINAL_CWD'
   end)
   if not ready then
-    print('terminal cwd not ready: ' .. tostring(opener.terminal_cwd(0)))
+    local screen = vim.tbl_filter(function(line)
+      return line ~= ''
+    end, vim.api.nvim_buf_get_lines(0, 0, -1, false))
+    print('terminal cwd not ready: ' .. tostring(opener.terminal_cwd(0))
+      .. ' screen: ' .. table.concat(screen, ' | '))
     return
   end
   local win = vim.api.nvim_get_current_win()
