@@ -380,6 +380,18 @@ fn preview_blocks_renders_a_clip() {
 }
 
 #[test]
+fn preview_blocks_respects_small_image_physical_size() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-abcdef123456.png", 16, 16);
+    let output = preview.run(&["--mode", "blocks", "--", clip.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    // Fallback cells measure 10x20 px. At most one half-cell of rounding.
+    assert_eq!(text.lines().count(), 1);
+    assert_eq!(text.matches('▀').count(), 2);
+}
+
+#[test]
 fn preview_sixel_renders_a_clip() {
     let preview = Preview::new();
     let clip = preview.clip("clip-20260101T000000Z-bbbbbbbbbbbb.png", 800, 600);
@@ -388,6 +400,25 @@ fn preview_sixel_renders_a_clip() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("\x1bP"), "{stdout:?}");
     assert!(stdout.ends_with("\x1b\\\n"), "{stdout:?}");
+}
+
+#[test]
+fn preview_sixel_fits_whole_bands_in_the_row_limit() {
+    let preview = Preview::new();
+    let clip = preview.clip("clip-20260101T000000Z-aabbccddeeff.png", 40, 20);
+    let output = preview.run(&[
+        "--mode",
+        "sixel",
+        "--rows",
+        "1",
+        "--",
+        clip.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    // The fallback 20px cell fits three complete sixel bands. tmux 3.6
+    // reserves space for the full last band even when some bits are clear.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("\"1;1;36;18#"), "{stdout:?}");
 }
 
 #[test]

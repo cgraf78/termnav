@@ -5,8 +5,10 @@
 //! No terminal is ever queried: the size comes from `TIOCGWINSZ` on stdout,
 //! then tmux, then fixed defaults.
 
-use std::fs::{File, Metadata, OpenOptions};
+use std::ffi::CString;
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::Command;
@@ -125,31 +127,47 @@ fn rejected() -> io::Error {
 ///
 /// The path text can come from an editable shell buffer, so it is untrusted:
 /// the file must be named like a clip and sit directly in the image directory
-/// (compared after canonicalizing both parents). It is opened `O_NOFOLLOW`
-/// so a planted symlink is refused, and `O_NONBLOCK` so a FIFO cannot hang
-/// the open. The parent comparison is path-based; the file type, owner and
-/// size checks use the opened descriptor, so they describe the file that will
-/// be read.
+/// (compared by device and inode). Opening the basename relative to the
+/// trusted directory descriptor keeps it there even if an alias or ancestor
+/// changes after the comparison. `O_NOFOLLOW` rejects a final symlink and
+/// `O_NONBLOCK` keeps a FIFO from hanging the open.
 ///
 /// # Errors
 ///
 /// Returns an error for any file that fails those checks, is owned by
 /// another user, or exceeds [`MAX_IMAGE_BYTES`].
 pub fn open_clip(path: &Path, directory: &Path) -> io::Result<File> {
-    let name = path.file_name().and_then(|name| name.to_str());
-    if !name.is_some_and(is_clip_name) {
-        return Err(rejected());
-    }
-    let parent = path.parent().ok_or_else(rejected)?.canonicalize()?;
-    if parent != directory.canonicalize()? {
-        return Err(rejected());
-    }
-    let file = OpenOptions::new()
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| is_clip_name(name))
+        .ok_or_else(rejected)?;
+    let directory = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(directory)?;
+    let trusted = directory.metadata()?;
     let uid = unsafe { libc::getuid() };
+    let parent = fs::metadata(path.parent().ok_or_else(rejected)?)?;
+    if trusted.uid() != uid || (parent.dev(), parent.ino()) != (trusted.dev(), trusted.ino()) {
+        return Err(rejected());
+    }
+    let name = CString::new(name).map_err(|_| rejected())?;
+    // SAFETY: both the directory descriptor and the NUL-terminated basename
+    // stay live for openat. Without O_CREAT this call takes no mode argument.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh descriptor, handed to this sole owner.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
     if !owned_regular(&metadata, uid) || metadata.len() > MAX_IMAGE_BYTES as u64 {
         return Err(rejected());
     }
@@ -231,16 +249,22 @@ fn render(path: &Path, mode: Mode, rows: Option<u16>) -> Option<String> {
         rows.or_else(environment_rows).unwrap_or(DEFAULT_ROWS),
         pane.rows,
     )?;
-    // A half block is one pixel wide and two tall, so blocks mode fits in
-    // those units; sixel needs the terminal's real cell size.
-    let cell = match mode {
-        Mode::Blocks => (1, 2),
-        Mode::Sixel => pane.cell,
-    };
-    // The target must always come from `fit` so memory stays proportional
-    // to the thumbnail, never to the source image.
+    let (cell_width, cell_height) = (u32::from(pane.cell.0), u32::from(pane.cell.1));
+    let width_limit = u32::from(pane.cols) * cell_width;
+    let mut height_limit = u32::from(rows) * cell_height;
+    if mode == Mode::Sixel {
+        // tmux 3.6 reserves the height of the full final band. Fit only as
+        // many bands as the requested rows can physically hold.
+        height_limit -= height_limit % image::BAND_ROWS as u32;
+    }
     let thumbnail = image::decode(file.take(MAX_IMAGE_BYTES as u64), |width, height| {
-        image::fit((width, height), (pane.cols, rows), cell)
+        let (w, h) = image::fit((width, height), (width_limit, height_limit))?;
+        Some(match mode {
+            Mode::Sixel => (w, h),
+            // Sample in physical pixels first: font cells are not necessarily
+            // twice as tall as wide. Round up so sub-cell images stay visible.
+            Mode::Blocks => (w.div_ceil(cell_width), (2 * h).div_ceil(cell_height)),
+        })
     })
     .ok()?;
     let mut text = match mode {
@@ -279,6 +303,8 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    const CLIP: &str = "clip-20261121T000000Z-012345abcdef.png";
 
     fn scratch(label: &str) -> PathBuf {
         let root =
@@ -380,7 +406,7 @@ mod tests {
     #[test]
     fn rejects_outside_directory() {
         let root = scratch("outside");
-        let file = root.join("clip-a.png");
+        let file = root.join(CLIP);
         fs::write(&file, b"x").unwrap();
         assert!(open_clip(&file, &root.join("clips")).is_err());
     }
@@ -388,9 +414,9 @@ mod tests {
     #[test]
     fn rejects_symlink() {
         let root = scratch("symlink");
-        let target = root.join("clips/clip-real.png");
+        let target = root.join("clips/other.png");
         fs::write(&target, b"x").unwrap();
-        let link = root.join("clips/clip-link.png");
+        let link = root.join("clips").join(CLIP);
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(open_clip(&link, &root.join("clips")).is_err());
     }
@@ -398,7 +424,7 @@ mod tests {
     #[test]
     fn rejects_fifo_without_blocking() {
         let root = scratch("fifo");
-        let fifo = root.join("clips/clip-fifo.png");
+        let fifo = root.join("clips").join(CLIP);
         let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let start = Instant::now();
@@ -409,7 +435,7 @@ mod tests {
     #[test]
     fn rejects_wrong_name() {
         let root = scratch("name");
-        for name in ["clip-x.txt", ".clip-a.tmp", "other.png"] {
+        for name in ["clip-x.txt", ".clip-a.tmp", "other.png", "clip-.png"] {
             let file = root.join("clips").join(name);
             fs::write(&file, b"x").unwrap();
             assert!(open_clip(&file, &root.join("clips")).is_err(), "{name}");
@@ -421,7 +447,7 @@ mod tests {
         let root = scratch("subdir");
         let nested = root.join("clips/nested");
         fs::create_dir_all(&nested).unwrap();
-        let file = nested.join("clip-a.png");
+        let file = nested.join(CLIP);
         fs::write(&file, b"x").unwrap();
         assert!(open_clip(&file, &root.join("clips")).is_err());
     }
@@ -429,15 +455,25 @@ mod tests {
     #[test]
     fn rejects_directory_named_like_a_clip() {
         let root = scratch("dirclip");
-        let directory = root.join("clips/clip-dir.png");
+        let directory = root.join("clips").join(CLIP);
         fs::create_dir(&directory).unwrap();
         assert!(open_clip(&directory, &root.join("clips")).is_err());
     }
 
     #[test]
+    fn rejects_a_symlink_as_the_trusted_directory() {
+        let root = scratch("linked-dir");
+        let actual = root.join("clips");
+        fs::write(actual.join(CLIP), b"x").unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        assert!(open_clip(&alias.join(CLIP), &alias).is_err());
+    }
+
+    #[test]
     fn accepts_owned_clip() {
         let root = scratch("ok");
-        let file = root.join("clips/clip-a.png");
+        let file = root.join("clips").join(CLIP);
         fs::write(&file, b"x").unwrap();
         assert!(open_clip(&file, &root.join("clips")).is_ok());
     }
@@ -445,7 +481,7 @@ mod tests {
     #[test]
     fn rejects_oversized_clip() {
         let root = scratch("big");
-        let file = root.join("clips/clip-big.png");
+        let file = root.join("clips").join(CLIP);
         let handle = fs::File::create(&file).unwrap();
         handle
             .set_len(crate::paste_image::MAX_IMAGE_BYTES as u64 + 1)
@@ -456,7 +492,7 @@ mod tests {
     #[test]
     fn owner_must_match() {
         let root = scratch("owner");
-        let file = root.join("clips/clip-a.png");
+        let file = root.join("clips").join(CLIP);
         fs::write(&file, b"x").unwrap();
         let metadata = fs::metadata(&file).unwrap();
         let uid = unsafe { libc::getuid() };

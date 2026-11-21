@@ -9,10 +9,19 @@ const CUBE_REGISTERS: usize = 216;
 const REGISTERS: usize = 240;
 
 /// Pixel rows encoded by one sixel band.
-const BAND_ROWS: usize = 6;
+pub(crate) const BAND_ROWS: usize = 6;
 
 /// Shortest run worth the `!<count><char>` form; shorter runs are smaller literally.
 const MIN_RLE_RUN: usize = 4;
+
+/// tmux accepts at most 10,000 pixels on either axis. Its 3.6 decoder
+/// allocates complete six-row bands, including the final partial band.
+const MAX_WIDTH: usize = 10_000;
+const MAX_HEIGHT: usize = MAX_WIDTH / BAND_ROWS * BAND_ROWS;
+
+/// A same-size tmux re-encoding pads to cell boundaries and can add a '-'
+/// for each empty band. Even 10,000 padded rows add fewer than 2 KiB.
+const MAX_SEQUENCE_BYTES: usize = 1024 * 1024 - 2048;
 
 /// Returns the RGB value of palette register `index` (0..240).
 fn color(index: usize) -> [u8; 3] {
@@ -79,6 +88,26 @@ pub fn sixel(thumbnail: &Thumbnail) -> String {
     if width == 0 || height == 0 {
         return String::new();
     }
+    // Only complete sequences reach the terminal. Each retry visits at most
+    // half as many samples, and a single pixel always fits the budget.
+    let mut source = thumbnail;
+    let mut smaller;
+    loop {
+        if let Some(text) = encode(source) {
+            return text;
+        }
+        smaller = source.half();
+        source = &smaller;
+    }
+}
+
+/// Encode one candidate, stopping at the buffer limit before the next layer.
+fn encode(thumbnail: &Thumbnail) -> Option<String> {
+    let width = thumbnail.width as usize;
+    let height = thumbnail.height as usize;
+    if width > MAX_WIDTH || height > MAX_HEIGHT {
+        return None;
+    }
     let indexed: Vec<u8> = thumbnail.pixels.iter().map(|&p| quantize(p)).collect();
 
     let mut used = [false; REGISTERS];
@@ -87,10 +116,14 @@ pub fn sixel(thumbnail: &Thumbnail) -> String {
     }
     let mut out = format!("\x1bP0;0;0q\"1;1;{width};{height}");
     // All registers are defined up front so each band can select by number.
-    for (index, _) in used.iter().enumerate().filter(|&(_, &u)| u) {
+    // A nested tmux can re-emit undefined intermediate registers with an
+    // invalid colour type. Number only the used colours, without gaps.
+    let mut registers = [0usize; REGISTERS];
+    for (register, index) in (0..REGISTERS).filter(|&i| used[i]).enumerate() {
+        registers[index] = register;
         let [r, g, b] = color(index).map(percent);
         // Writing to a String cannot fail.
-        let _ = write!(out, "#{index};2;{r};{g};{b}");
+        let _ = write!(out, "#{register};2;{r};{g};{b}");
     }
 
     let bands = height.div_ceil(BAND_ROWS);
@@ -110,8 +143,12 @@ pub fn sixel(thumbnail: &Thumbnail) -> String {
             .filter_map(|(i, m)| m.as_ref().map(|m| (i, m)))
             .peekable();
         while let Some((index, mask)) = present.next() {
-            let _ = write!(out, "#{index}");
+            let _ = write!(out, "#{}", registers[index]);
             push_runs(&mut out, mask);
+            // Reserve space for a band separator and the two-byte terminator.
+            if out.len() + 3 > MAX_SEQUENCE_BYTES {
+                return None;
+            }
             // Carriage return so the next colour overlays the same band.
             if present.peek().is_some() {
                 out.push('$');
@@ -122,7 +159,7 @@ pub fn sixel(thumbnail: &Thumbnail) -> String {
         }
     }
     out.push_str("\x1b\\");
-    out
+    Some(out)
 }
 
 /// Converts an 8-bit channel to the 0..=100 percent sixel uses, rounding half up.
@@ -204,6 +241,39 @@ mod tests {
     }
 
     #[test]
+    fn detailed_image_fits_tmux_input_buffer() {
+        // At native resolution this deterministic texture takes 1,047,212
+        // bytes, inside tmux's input limit but without room for re-encoding.
+        let mut state = 17_u32;
+        let pixels = (0..1053 * 210)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let [r, g, b, _] = state.to_le_bytes();
+                [r, g, b]
+            })
+            .collect();
+        let text = sixel(&thumb(1053, 210, pixels));
+        assert!(text.starts_with("\x1bP") && text.ends_with("\x1b\\"));
+        assert!(text.len() <= 1024 * 1024 - 2048, "{} bytes", text.len());
+    }
+
+    #[test]
+    fn tmux_width_limit_applies_even_when_a_run_is_small() {
+        let image = |width| sixel(&thumb(width, 1, vec![RED; width as usize]));
+        assert!(image(10_000).contains("\"1;1;10000;1#"));
+        assert!(image(10_001).contains("\"1;1;5001;1#"));
+    }
+
+    #[test]
+    fn tmux_height_limit_counts_complete_sixel_bands() {
+        let image = |height| sixel(&thumb(1, height, vec![RED; height as usize]));
+        assert!(image(9996).contains("\"1;1;1;9996#"));
+        assert!(image(9997).contains("\"1;1;1;4999#"));
+    }
+
+    #[test]
     fn quantize_pure_colours() {
         assert_eq!(quantize([0, 0, 0]), 0);
         assert_eq!(quantize([255, 255, 255]), 215);
@@ -220,7 +290,7 @@ mod tests {
     fn sixel_one_pixel_exact() {
         assert_eq!(
             sixel(&thumb(1, 1, vec![RED])),
-            "\x1bP0;0;0q\"1;1;1;1#180;2;100;0;0#180@\x1b\\"
+            "\x1bP0;0;0q\"1;1;1;1#0;2;100;0;0#0@\x1b\\"
         );
     }
 
@@ -229,25 +299,22 @@ mod tests {
         let t = thumb(2, 1, vec![[0, 0, 0], RED]);
         assert_eq!(
             sixel(&t),
-            "\x1bP0;0;0q\"1;1;2;1#0;2;0;0;0#180;2;100;0;0#0@$#180?@\x1b\\"
+            "\x1bP0;0;0q\"1;1;2;1#0;2;0;0;0#1;2;100;0;0#0@$#1?@\x1b\\"
         );
     }
 
     #[test]
     fn sixel_partial_last_band() {
         let t = thumb(1, 7, vec![RED; 7]);
-        assert_eq!(
-            sixel(&t),
-            "\x1bP0;0;0q\"1;1;1;7#180;2;100;0;0#180~-#180@\x1b\\"
-        );
+        assert_eq!(sixel(&t), "\x1bP0;0;0q\"1;1;1;7#0;2;100;0;0#0~-#0@\x1b\\");
     }
 
     #[test]
     fn sixel_run_length_boundary() {
         let short = sixel(&thumb(3, 1, vec![RED; 3]));
-        assert!(short.contains("#180@@@\x1b\\"), "{short:?}");
+        assert!(short.contains("#0@@@\x1b\\"), "{short:?}");
         let long = sixel(&thumb(4, 1, vec![RED; 4]));
-        assert!(long.contains("#180!4@\x1b\\"), "{long:?}");
+        assert!(long.contains("#0!4@\x1b\\"), "{long:?}");
     }
 
     #[test]

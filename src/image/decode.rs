@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 
-use png::{ColorType, Decoder, DecodingError, Limits, Transformations};
+use png::{ColorType, DecodeOptions, Decoder, DecodingError, Limits, Transformations};
 
 /// Background that transparent pixels are composited onto.
 ///
@@ -15,6 +15,9 @@ const MAX_SIDE: u32 = 16384;
 /// Largest accepted pixel count, which bounds the interlaced buffer.
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 
+/// Bounds the averaging arrays to 14 MiB even with unusually large tty geometry.
+const MAX_THUMBNAIL_PIXELS: u32 = 512 * 1024;
+
 /// Allocation budget handed to the PNG decoder for its own buffers.
 const LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
@@ -27,6 +30,20 @@ pub struct Thumbnail {
     pub height: u32,
     /// `width * height` pixels in row-major order.
     pub pixels: Vec<[u8; 3]>,
+}
+
+impl Thumbnail {
+    /// Halve both dimensions for a smaller terminal encoding, preserving
+    /// the mean colour of narrow lines and odd-sized edges.
+    pub(super) fn half(&self) -> Thumbnail {
+        let source = (self.width, self.height);
+        let target = (self.width.div_ceil(2), self.height.div_ceil(2));
+        let mut average = Average::new(source, target, ColorType::Rgb);
+        for (y, row) in self.pixels.chunks_exact(self.width as usize).enumerate() {
+            average.add(y as u32, row.as_flattened());
+        }
+        average.finish()
+    }
 }
 
 /// Why an image could not be turned into a [`Thumbnail`].
@@ -61,15 +78,13 @@ impl From<DecodingError> for DecodeError {
     }
 }
 
-/// Largest size that fits the cell box, keeping aspect ratio.
+/// Largest size that fits the pixel bounds, keeping aspect ratio.
 ///
-/// `cells` is (columns, rows) and `cell_pixels` is (width, height) of one
-/// cell. The image is never enlarged, and each side stays at least one pixel.
-/// Returns `None` when any input is zero.
-pub fn fit(source: (u32, u32), cells: (u16, u16), cell_pixels: (u16, u16)) -> Option<(u32, u32)> {
+/// The image is never enlarged, and each side stays at least one pixel.
+/// Returns `None` when any source or bound dimension is zero.
+pub fn fit(source: (u32, u32), bounds: (u32, u32)) -> Option<(u32, u32)> {
     let (sw, sh) = (u64::from(source.0), u64::from(source.1));
-    let box_w = u64::from(cells.0) * u64::from(cell_pixels.0);
-    let box_h = u64::from(cells.1) * u64::from(cell_pixels.1);
+    let (box_w, box_h) = (u64::from(bounds.0), u64::from(bounds.1));
     if sw == 0 || sh == 0 || box_w == 0 || box_h == 0 {
         return None;
     }
@@ -214,8 +229,15 @@ pub fn decode(
     reader: impl Read,
     target: impl FnOnce(u32, u32) -> Option<(u32, u32)>,
 ) -> Result<Thumbnail, DecodeError> {
-    let limits = Limits { bytes: LIMIT_BYTES };
-    let mut decoder = Decoder::new_with_limits(Forward(BufReader::new(reader)), limits);
+    let mut options = DecodeOptions::default();
+    // Preview pixels do not use text or ICC profiles. Check the stream's
+    // integrity even for ancillary chunks; avoid retaining their metadata.
+    options.set_ignore_text_chunk(true);
+    options.set_ignore_iccp_chunk(true);
+    options.set_skip_ancillary_crc_failures(false);
+    options.set_ignore_adler32(false);
+    let mut decoder = Decoder::new_with_options(Forward(BufReader::new(reader)), options);
+    decoder.set_limits(Limits { bytes: LIMIT_BYTES });
     // Expanding to 8-bit grey/RGB(A) leaves four layouts to handle.
     decoder.set_transformations(Transformations::EXPAND | Transformations::STRIP_16);
     let info = decoder.read_header_info()?;
@@ -227,6 +249,15 @@ pub fn decode(
         .filter(|&(w, h)| w > 0 && h > 0)
         .ok_or_else(|| DecodeError::Invalid("empty target size".into()))?;
     let (tw, th) = (tw.min(width), th.min(height));
+    let (tw, th) = if tw * th > MAX_THUMBNAIL_PIXELS {
+        let scale = (f64::from(MAX_THUMBNAIL_PIXELS) / f64::from(tw * th)).sqrt();
+        (
+            ((f64::from(tw) * scale) as u32).max(1),
+            ((f64::from(th) * scale) as u32).max(1),
+        )
+    } else {
+        (tw, th)
+    };
 
     let mut reader = decoder.read_info()?;
     let (color, depth) = reader.output_color_type();
@@ -252,6 +283,9 @@ pub fn decode(
             y += 1;
         }
     }
+    // Reading the final row only flushes the image data. A complete IEND
+    // (and its checksum) must also be present before a preview is emitted.
+    reader.finish()?;
     Ok(average.finish())
 }
 
@@ -385,18 +419,18 @@ mod tests {
 
     #[test]
     fn fit_preserves_aspect_and_never_upscales() {
-        assert_eq!(fit((400, 200), (80, 12), (10, 20)), Some((400, 200)));
-        assert_eq!(fit((4000, 2000), (80, 12), (10, 20)), Some((480, 240)));
+        assert_eq!(fit((400, 200), (800, 240)), Some((400, 200)));
+        assert_eq!(fit((4000, 2000), (800, 240)), Some((480, 240)));
     }
 
     #[test]
     fn fit_handles_degenerate_boxes() {
-        let (width, _) = fit((1, 10000), (80, 12), (10, 20)).unwrap();
+        let (width, _) = fit((1, 10000), (800, 240)).unwrap();
         assert!(width >= 1);
-        assert_eq!(fit((10, 10), (0, 12), (10, 20)), None);
-        assert_eq!(fit((0, 5), (80, 12), (10, 20)), None);
-        assert_eq!(fit((10, 10), (80, 12), (0, 20)), None);
-        let (width, _) = fit((100, 100), (1, 3), (10, 20)).unwrap();
+        assert_eq!(fit((10, 10), (0, 240)), None);
+        assert_eq!(fit((0, 5), (800, 240)), None);
+        assert_eq!(fit((10, 10), (800, 0)), None);
+        let (width, _) = fit((100, 100), (10, 60)).unwrap();
         assert!(width <= 10);
     }
 
@@ -568,6 +602,39 @@ mod tests {
 
         assert!(decode_full(b"not a png").is_err());
         assert!(decode_full(b"").is_err());
+    }
+
+    #[test]
+    fn truncated_iend_is_invalid() {
+        let mut png = rgb8(1, 1, &[1, 2, 3]);
+        png.pop();
+        assert!(decode_full(&png).is_err());
+    }
+
+    #[test]
+    fn corrupt_iend_crc_is_invalid() {
+        let mut png = rgb8(1, 1, &[1, 2, 3]);
+        *png.last_mut().unwrap() ^= 1;
+        assert!(decode_full(&png).is_err());
+    }
+
+    #[test]
+    fn corrupt_ancillary_crc_is_invalid() {
+        let mut png = rgb8(1, 1, &[1, 2, 3]);
+        let mut text = Vec::new();
+        chunk(&mut text, b"tEXt", b"Title\0Icon");
+        *text.last_mut().unwrap() ^= 1;
+        // Ancillary metadata is allowed between IDAT and IEND.
+        png.splice(png.len() - 12..png.len() - 12, text);
+        assert!(decode_full(&png).is_err());
+    }
+
+    #[test]
+    fn huge_target_is_bounded_before_accumulation() {
+        let png = rgb8(1600, 800, &vec![17; 1600 * 800 * 3]);
+        let thumbnail = decode_full(&png).unwrap();
+        assert!(thumbnail.pixels.len() <= 512 * 1024);
+        assert!(thumbnail.width.abs_diff(thumbnail.height * 2) <= 1);
     }
 
     #[test]

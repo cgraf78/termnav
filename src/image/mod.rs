@@ -10,4 +10,5 @@ mod sixel;
 
 pub use blocks::blocks;
 pub use decode::{BACKGROUND, DecodeError, Thumbnail, decode, fit};
+pub(crate) use sixel::BAND_ROWS;
 pub use sixel::{quantize, sixel};
