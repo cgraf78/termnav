@@ -4,6 +4,8 @@
 //! the header before any pixel buffer exists and memory stays proportional
 //! to the thumbnail rather than the source image.
 
+mod blocks;
 mod decode;
 
+pub use blocks::blocks;
 pub use decode::{BACKGROUND, DecodeError, Thumbnail, decode, fit};
