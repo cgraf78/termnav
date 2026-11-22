@@ -32,6 +32,10 @@ Suite ownership follows the integration boundary:
   through the documented binding, acknowledgements, rejected transfers, an
   unsafe image directory, cancellation, a nested tmux layer, and a 16 MiB
   timing (`TERMNAV_PASTE_IMAGE_LARGE_BYTES=0` skips it).
+- The Ubuntu image-paste job tests the packaged Termnav with the shared
+  `tmux-pinned` and `wezterm-pinned` profiles. It runs the PTY preview fixture
+  and `test/paste-image-gui.py`, which verifies both previews over real SSH
+  with a private Xvfb display and tmux's default paste timing.
 - `process-contract-test` ensures retired executable and Python implementation
   paths stay absent from production artifacts.
 - `relay-test` covers nested SSH transport, directive storage, and in-band

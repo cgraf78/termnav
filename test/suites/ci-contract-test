@@ -179,13 +179,18 @@ image_paste_job=$(awk '
 # shellcheck disable=SC2016 # Commands are inspected as literal workflow text.
 for contract in \
   "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
-  'profiles: tmux-pinned' \
+  'profiles: tmux-pinned,wezterm-pinned' \
+  'test -n "$CI_WEZTERM_PINNED_RELEASE"' \
+  'test "$("$CI_WEZTERM_PINNED_BIN" --version)" = "wezterm $CI_WEZTERM_PINNED_VERSION"' \
   'python3 test/paste-image.py "$package/bin/termnav" --preview "$package"' \
   'python3 test/paste-image-gui.py "$package/bin/termnav" "$package"'; do
   [[ "$image_paste_job" == *"$contract"* ]] || fail "image paste CI is missing: $contract"
 done
 [[ "$image_paste_job" != *'tmux-builds/releases/'* ]] ||
   fail "image paste CI downloads tmux outside the shared installer"
+[[ "$image_paste_job" != *'wezterm/releases/'* &&
+  "$image_paste_job" != *'wezterm-builds/releases/'* ]] ||
+  fail "image paste CI downloads WezTerm outside the shared installer"
 
 tmux_floor_job=$(awk '
   /^  tmux-floor:$/ { in_floor = 1 }
