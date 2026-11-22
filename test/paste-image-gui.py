@@ -1,4 +1,4 @@
-"""Exercise the documented paste integration in real WezTerm on a private X server."""
+"""Exercise the documented paste integration in a real, isolated WezTerm GUI."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
@@ -68,6 +68,11 @@ def process(
                 child.wait(timeout=5)
             except ProcessLookupError:
                 child.wait(timeout=5)
+            except PermissionError:
+                # Darwin can report EPERM for the group after the GUI process
+                # exits. Preserve the original test error in that case.
+                if child.poll() is None:
+                    raise
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=5)
@@ -107,17 +112,28 @@ def write_config(root: Path, mode: str) -> tuple[Path, Path]:
 local assets = assert(os.getenv('TERMNAV_TEST_ASSETS')) .. '/lib/termnav/wezterm/'
 local routes = dofile(assets .. 'link-routes.lua').new(wezterm)
 local paste = dofile(assets .. 'paste-image.lua').new(wezterm, { routes = routes })
+local paste_action = paste:paste_action()
+local trigger = os.getenv('TERMNAV_TEST_PASTE_TRIGGER')
+if trigger then
+  -- macOS CI can run the actual action inside WezTerm without Accessibility
+  -- permissions for posting a keyboard event from a different process.
+  wezterm.on('update-status', function(window, pane)
+    if os.remove(trigger) then window:perform_action(paste_action, pane) end
+  end)
+end
 wezterm.on('user-var-changed', function(window, pane, name, value)
   paste:user_var_changed(window, pane, name, value)
 end)
 return {
   enable_wayland = false,
-  front_end = 'Software',
-  font = wezterm.font('DejaVu Sans Mono'),
+  -- On macOS both OpenGL and Software request an accelerated CGL pixel
+  -- format. Use the native WebGPU backend on the hosted virtual display.
+  front_end = trigger and 'WebGpu' or 'Software',
+  font = wezterm.font(trigger and 'Menlo' or 'DejaVu Sans Mono'),
   enable_tab_bar = false,
   initial_cols = 110,
   initial_rows = 30,
-  keys = { { key = 'v', mods = 'CTRL', action = paste:paste_action() } },
+  keys = { { key = 'v', mods = 'CTRL', action = paste_action } },
 }
 """,
         encoding="utf-8",
@@ -171,8 +187,10 @@ def window_draws_preview(window_id: str, env: dict[str, str]) -> bool:
     return False
 
 
-def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, mode: str) -> None:
-    """Send Ctrl-V through WezTerm and real SSH, then inspect the preview and path."""
+def exercise(
+    root: Path, binary: Path, assets: Path, display: str | None, image: Path, mode: str
+) -> None:
+    """Invoke WezTerm's paste action over real SSH, then inspect the preview and path."""
     root.mkdir(mode=0o700)
     client = root / "client"
     server = root / "server"
@@ -180,8 +198,7 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
     gui_env = environment(client, binary)
     lua, config = write_config(root, mode)
     write_zshrc(server / "home", assets)
-    # Only the local GUI receives DISPLAY. Remote Zsh cannot read the clipboard.
-    gui_env.update(DISPLAY=display, LIBGL_ALWAYS_SOFTWARE="1", TERMNAV_TEST_ASSETS=str(assets))
+    gui_env["TERMNAV_TEST_ASSETS"] = str(assets)
     socket = str(root / "tmux.sock")
     tmux = ["tmux", "-S", socket]
     raw = root / "client.raw"
@@ -189,13 +206,37 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
     remote = [*tmux, "-f", str(config), "new-session", "-s", "preview", env["SHELL"], "-di"]
     # Record the remote client PTY without putting another local terminal
     # emulator between WezTerm and OpenSSH.
-    ssh = ssh_command(
-        root,
-        ["script", "-qefc", shlex.join(remote), "--log-in", str(input_log), "--log-out", str(raw)],
-        env,
-    )
+    if display is None:
+        # Only CI uses the native pasteboard. Apple sshd expects an audit
+        # address that the private stdio proxy transport cannot supply.
+        helper = str(root.parent / "paste-preview-macos")
+        trigger = root / "paste-trigger"
+        gui_env["TERMNAV_TEST_PASTE_TRIGGER"] = str(trigger)
+        recording = ["/usr/bin/script", "-qF", str(raw), *remote]
+        sshd = Path(os.environ["TERMNAV_TEST_SSHD"]).resolve(strict=True)
+        clipboard = nullcontext()
+    else:
+        # Only the local GUI receives DISPLAY. Remote Zsh cannot read the clipboard.
+        gui_env.update(DISPLAY=display, LIBGL_ALWAYS_SOFTWARE="1")
+        recording = [
+            "script",
+            "-qefc",
+            shlex.join(remote),
+            "--log-in",
+            str(input_log),
+            "--log-out",
+            str(raw),
+        ]
+        sshd = Path("/usr/sbin/sshd")
+        selection = ["xclip", "-selection", "clipboard", "-t", "image/png"]
+        clipboard = process(
+            [*selection, "-i", "-quiet", str(image)], gui_env, root / "clipboard.log"
+        )
+    ssh = ssh_command(root, recording, env, sshd=sshd)
     pinned_cli = os.environ.get("CI_WEZTERM_PINNED_BIN")
-    wezterm_gui = str(Path(pinned_cli).with_name("wezterm-gui")) if pinned_cli else "wezterm-gui"
+    wezterm_gui = os.environ.get("CI_WEZTERM_PINNED_GUI") or (
+        str(Path(pinned_cli).with_name("wezterm-gui")) if pinned_cli else "wezterm-gui"
+    )
     gui = [
         wezterm_gui,
         "--config-file",
@@ -213,14 +254,24 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
     def stream() -> bytes:
         return raw.read_bytes() if raw.is_file() else b""
 
-    clipboard = ["xclip", "-selection", "clipboard", "-t", "image/png"]
+    def draws_preview(window_id: str) -> bool:
+        if display is not None:
+            return window_draws_preview(window_id, gui_env)
+        capture = root / "window.png"
+        run(["/usr/sbin/screencapture", "-x", "-o", f"-l{window_id}", str(capture)], gui_env)
+        return run([helper, "preview", str(capture)], gui_env).strip() == b"yes"
+
     try:
-        with (
-            process([*clipboard, "-i", "-quiet", str(image)], gui_env, root / "clipboard.log"),
-            process(gui, gui_env, root / "wezterm.log") as window,
-        ):
-            until("the X11 PNG selection", lambda: run([*clipboard, "-o"], gui_env, check=False))
-            until("the remote Zsh prompt", lambda: PROMPT.encode() in stream())
+        with clipboard, process(gui, gui_env, root / "wezterm.log") as window:
+            if display is None:
+                run([helper, "clipboard", str(image)], os.environ.copy())
+                find_window = [helper, "window", str(window.pid)]
+            else:
+                until(
+                    "the X11 PNG selection", lambda: run([*selection, "-o"], gui_env, check=False)
+                )
+                find_window = ["xdotool", "search", "--onlyvisible", "--pid", str(window.pid)]
+            until("the remote Zsh prompt", lambda: PROMPT.encode() in stream(), seconds=30)
             pane = (
                 run([*tmux, "display-message", "-p", "-t", "preview:", "#{pane_id}"], env)
                 .decode()
@@ -239,26 +290,25 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
                 )
             window_ids = until(
                 "the WezTerm window",
-                lambda: run(
-                    ["xdotool", "search", "--onlyvisible", "--pid", str(window.pid)],
-                    gui_env,
-                    check=False,
-                ),
+                lambda: run(find_window, gui_env, check=display is None),
             )
             (window_id,) = window_ids.decode().split()
-            assert not window_draws_preview(window_id, gui_env), "fixture colors before Ctrl-V"
-            run(
-                [
-                    "xdotool",
-                    "windowfocus",
-                    "--sync",
-                    window_id,
-                    "key",
-                    "--clearmodifiers",
-                    "ctrl+v",
-                ],
-                gui_env,
-            )
+            assert not draws_preview(window_id), "fixture colors before paste"
+            if display is None:
+                trigger.touch(exist_ok=False)
+            else:
+                run(
+                    [
+                        "xdotool",
+                        "windowfocus",
+                        "--sync",
+                        window_id,
+                        "key",
+                        "--clearmodifiers",
+                        "ctrl+v",
+                    ],
+                    gui_env,
+                )
             clips = server / "cache/termnav/paste-images"
             saved = until("a saved clipboard image", lambda: list(clips.glob("clip-*.png")))
             (clip,) = saved
@@ -283,7 +333,7 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
                 assert not SIXEL_FRAME.search(stream()), "blocks mode sent sixel"
             until(
                 "the preview's colors in the WezTerm window",
-                lambda: window_draws_preview(window_id, gui_env),
+                lambda: draws_preview(window_id),
             )
             # Capture the editable value without submitting the command.
             run([*tmux, "send-keys", "-t", pane, "C-x", "C-d"], env)
@@ -298,7 +348,7 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
                 lambda: staged.is_dir() and not list(staged.glob("stage-*.b64")),
             )
             print(
-                f"PASS: real WezTerm Ctrl-V over SSH renders {mode} and pastes one path", flush=True
+                f"PASS: real WezTerm paste over SSH renders {mode} and pastes one path", flush=True
             )
     except Exception:
         print(f"{mode} client output: {stream()[-4000:]!r}", file=sys.stderr)
@@ -331,11 +381,35 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
 
 
 def main(binary: Path, assets: Path) -> None:
-    """Use a new X server, never the user's desktop or clipboard."""
+    """Use a private X server or the GitHub-hosted macOS desktop."""
+    macos = sys.platform == "darwin"
+    if macos and (
+        os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        raise SystemExit("The native clipboard test requires a GitHub-hosted macOS runner")
     with tempfile.TemporaryDirectory(prefix="tn-gui-", dir="/tmp") as directory:
         root = Path(directory)
         image = root / "fixture.png"
         image.write_bytes(sample_png())
+        if macos:
+            assert Path(os.environ["CI_WEZTERM_PINNED_GUI"]).is_file(), "missing pinned macOS GUI"
+            swift_source = Path(__file__).with_name("support") / "paste-preview-macos.swift"
+            subprocess.run(
+                [
+                    "xcrun",
+                    "swiftc",
+                    "-O",
+                    str(swift_source),
+                    "-o",
+                    str(root / "paste-preview-macos"),
+                ],
+                check=True,
+                timeout=120,
+            )
+            for mode in ("blocks", "sixel"):
+                exercise(root / mode, binary, assets, None, image, mode)
+            return
         display_file = root / "display"
         with display_file.open("wb", buffering=0) as output:
             args = [
@@ -357,8 +431,7 @@ def main(binary: Path, assets: Path) -> None:
 
 
 if __name__ == "__main__":
-    # Let the context managers reap the private display and SSH connection
-    # when the CI runner cancels this process.
+    # Reap the GUI and SSH connection when the CI runner cancels this process.
     def terminate(signum: int, _frame: object) -> None:
         raise SystemExit(128 + signum)
 

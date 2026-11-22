@@ -11,7 +11,9 @@ import tempfile
 from pathlib import Path
 
 
-def ssh_command(root: Path, command: list[str], environment: dict[str, str]) -> list[str]:
+def ssh_command(
+    root: Path, command: list[str], environment: dict[str, str], *, sshd: Path
+) -> list[str]:
     """Prepare a private, single-connection sshd and return its PTY client command.
 
     The caller owns the temporary root and runs the client inside the terminal
@@ -71,7 +73,7 @@ def ssh_command(root: Path, command: list[str], environment: dict[str, str]) -> 
         f"SetEnv {settings}\n"
     )
     # ProxyCommand also expands percent tokens after shell quoting.
-    proxy = shlex.join(["/usr/sbin/sshd", "-i", "-e", "-f", str(config)])
+    proxy = shlex.join([str(sshd), "-i", "-e", "-f", str(config)])
     proxy += " 2>" + shlex.quote(str(fixture / "sshd.log"))
     return [
         "/usr/bin/ssh",
