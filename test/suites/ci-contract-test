@@ -179,9 +179,15 @@ image_paste_job=$(awk '
 # shellcheck disable=SC2016 # Commands are inspected as literal workflow text.
 for contract in \
   "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
+  'runs-on: ${{ matrix.runner }}' \
+  'runner: ubuntu-24.04' \
+  'runner: macos-26' \
+  'platform: macos-arm64' \
+  'target: aarch64-apple-darwin' \
   'profiles: tmux-pinned,wezterm-pinned' \
   'test -n "$CI_WEZTERM_PINNED_RELEASE"' \
   'test "$("$CI_WEZTERM_PINNED_BIN" --version)" = "wezterm $CI_WEZTERM_PINNED_VERSION"' \
+  'test -x "$CI_WEZTERM_PINNED_GUI"' \
   'python3 test/paste-image.py "$package/bin/termnav" --preview "$package"' \
   'python3 test/paste-image-gui.py "$package/bin/termnav" "$package"'; do
   [[ "$image_paste_job" == *"$contract"* ]] || fail "image paste CI is missing: $contract"

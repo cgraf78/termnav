@@ -32,10 +32,15 @@ Suite ownership follows the integration boundary:
   through the documented binding, acknowledgements, rejected transfers, an
   unsafe image directory, cancellation, a nested tmux layer, and a 16 MiB
   timing (`TERMNAV_PASTE_IMAGE_LARGE_BYTES=0` skips it).
-- The Ubuntu image-paste job tests the packaged Termnav with the shared
-  `tmux-pinned` and `wezterm-pinned` profiles. It runs the PTY preview fixture
-  and `test/paste-image-gui.py`, which verifies both previews over real SSH
-  with a private Xvfb display and tmux's default paste timing.
+- The Ubuntu 24.04 and Apple Silicon macOS image-paste jobs test packaged
+  Termnav with the shared `tmux-pinned` and `wezterm-pinned` profiles. Both
+  run the PTY and GUI fixtures over private tmux servers and check both
+  previews. The GUI fixture uses an authenticated SSH hop and default tmux
+  paste timing. Ubuntu sends Ctrl-V on a private Xvfb display. On the hosted
+  macOS runner, the fixture writes a PNG to the native pasteboard and invokes
+  the same bound WezTerm action from inside the GUI, so it needs no synthetic
+  keyboard permissions. The macOS fixture is limited to hosted CI because its
+  pasteboard is shared across apps in the running desktop session.
 - `process-contract-test` ensures retired executable and Python implementation
   paths stay absent from production artifacts.
 - `relay-test` covers nested SSH transport, directive storage, and in-band

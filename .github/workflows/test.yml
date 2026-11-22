@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@dc0a352d134e3f1b86a8083740dd3e09f81fb743
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@eae91e5478afef7d0c261c2119e3e2017219e47d
     with:
       matrix-set: full
       msrv-toolchain: "1.88"
@@ -55,7 +55,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install the exact tmux floor
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@eae91e5478afef7d0c261c2119e3e2017219e47d
         with:
           matrix-name: Ubuntu
           profiles: python,tmux-floor-exact
@@ -84,7 +84,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@dc0a352d134e3f1b86a8083740dd3e09f81fb743
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@eae91e5478afef7d0c261c2119e3e2017219e47d
 
   vscode-adapter:
     name: VS Code adapter / Ubuntu
@@ -136,7 +136,7 @@ jobs:
           toolchain: stable
 
       - name: Install pinned tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@eae91e5478afef7d0c261c2119e3e2017219e47d
         with:
           matrix-name: Ubuntu
           profiles: tmux-pinned
@@ -175,7 +175,7 @@ jobs:
           toolchain: stable
 
       - name: Install pinned tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@eae91e5478afef7d0c261c2119e3e2017219e47d
         with:
           matrix-name: macOS
           profiles: tmux-pinned
@@ -231,9 +231,21 @@ jobs:
           test/suites/wezterm-integration-test
 
   image-paste:
-    name: Image paste end to end / Ubuntu
-    runs-on: ubuntu-24.04
+    name: Image paste end to end / ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            platform: linux-x86_64-musl
+          - name: macOS
+            runner: macos-26
+            target: aarch64-apple-darwin
+            platform: macos-arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -242,25 +254,37 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - name: Install pinned tmux and WezTerm
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@eae91e5478afef7d0c261c2119e3e2017219e47d
         with:
-          matrix-name: Ubuntu
+          matrix-name: ${{ matrix.name }}
           profiles: tmux-pinned,wezterm-pinned
-      - name: Install image paste test prerequisites
+      - name: Install Linux image paste prerequisites
+        if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
           # WezTerm loads EGL dynamically, even with software rendering.
           sudo apt-get install -y --no-install-recommends \
             fonts-dejavu-core libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
             musl-tools openssh-server x11-apps xclip xdotool xvfb zsh
+      - name: Install macOS image paste prerequisites
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          # Apple's sshd rejects audit sessions for stdio proxy connections.
+          brew install openssh
+          printf 'TERMNAV_TEST_SSHD=%s/sbin/sshd\n' "$(brew --prefix openssh)" >> "$GITHUB_ENV"
       - name: Exercise both previews with the packaged Termnav
         shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+          ASSET_PLATFORM: ${{ matrix.platform }}
         run: |
           test -n "$CI_WEZTERM_PINNED_RELEASE"
           test "$("$CI_WEZTERM_PINNED_BIN" --version)" = "wezterm $CI_WEZTERM_PINNED_VERSION"
-          archive=$(scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl)
+          test -x "$CI_WEZTERM_PINNED_GUI"
+          archive=$(scripts/package-release.sh "$RUST_TARGET" "$ASSET_PLATFORM")
           package="$RUNNER_TEMP/termnav-package"
           mkdir "$package"
           tar -xzf "$archive" -C "$package"
