@@ -45,13 +45,19 @@ only from release archives. User-facing contracts live in
   RustSec job runs `cargo audit --file Cargo.lock`.
 - `cargo test --locked && test/termnav-test` is CI's `test-command`. It
   builds the release binary unless `TERMNAV_TEST_BINARY` is set and runs
-  ShellCheck unless `TERMNAV_SKIP_SHELLCHECK=1`.
+  ShellCheck unless `TERMNAV_SKIP_SHELLCHECK=1`. Desktop tmux integration
+  uses the shared `tmux-pinned` profile. The Ubuntu compatibility job uses
+  `tmux-floor-exact` and runs `test/termnav-test --tmux-floor-smoke` for
+  real navigation and focus at the supported floor.
+- The image-paste and relay jobs use the same pin. Follow the
+  [managed tmux update procedure](https://github.com/cgraf78/actions/blob/main/docs/workflow-api.md#updating-the-managed-tmux-build).
 - Required extra jobs: `test/suites/vscode-adapter-test` (needs `node`;
   skips locally without it) and, against current `eza` on
   `archlinux:latest`, `test/suites/wezterm-integration-test` after
   `cargo build --release --locked`. PR-only on Ubuntu and macOS:
   `TERMNAV_PERFORMANCE_BASELINE=<base-sha> test/suites/relay-performance-test`.
-- Termux: `TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test`.
+- Termux uses its native tmux package and runs
+  `TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test`.
 
 ## Test isolation
 

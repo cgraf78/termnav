@@ -35,12 +35,12 @@ release_content=$(<"$release_workflow")
   fail "daily matrix does not retain its portfolio offset"
 [[ "$content" == *"cgraf78/actions/.github/workflows/rust-ci.yml@$actions_sha"* ]] ||
   fail "Rust CI does not use the locked actions revision"
-[[ "$content" == *'profiles: base,shellcheck,zsh,lua,neovim,tmux-floor,python,openssh-netcat-lsof'* ]] ||
+[[ "$content" == *'profiles: base,shellcheck,zsh,lua,neovim,tmux-pinned,python,openssh-netcat-lsof'* ]] ||
   fail "Rust CI does not install the integration-test profiles"
 [[ "$content" == *'matrix-set: full'* ]] ||
   fail "Rust CI does not run the full pull-request platform matrix"
-[[ "$content" == *'termux-profiles: base,zsh,neovim,tmux-floor,python,openssh-netcat-lsof'* ]] ||
-  fail "Termux CI does not install the full integration-test profiles"
+[[ "$content" == *'termux-profiles: base,zsh,neovim,tmux,python,openssh-netcat-lsof'* ]] ||
+  fail "Termux CI does not install native tmux with the integration-test profiles"
 [[ "$content" == *'termux-command: TERMNAV_REQUIRE_TMUX=1 TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test'* ]] ||
   fail "Termux CI does not run the packaged binary through the full suite"
 [[ "$content" == *'test-command: export TERMNAV_REQUIRE_TMUX=1 && cargo test --locked && test/termnav-test'* ]] ||
@@ -105,6 +105,8 @@ for contract in \
   'fetch-depth: 0' \
   'name: Install Rust' \
   'toolchain: stable' \
+  "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
+  'profiles: tmux-pinned' \
   'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
   'TERMNAV_PERFORMANCE_BASELINE: HEAD' \
   'TERMNAV_PERFORMANCE_SAMPLES: "2"' \
@@ -134,7 +136,8 @@ for contract in \
   'fetch-depth: 0' \
   'name: Install Rust' \
   'toolchain: stable' \
-  'name: Install tmux' \
+  "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
+  'profiles: tmux-pinned' \
   'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
   'TERMNAV_PERFORMANCE_SAMPLES: "20"' \
   'run: test/suites/relay-performance-test'; do
@@ -147,14 +150,16 @@ done
 for contract in \
   'name: Required' \
   'if: ${{ always() }}' \
-  'needs: [rust, vscode-adapter, eza-current, image-paste, relay-performance, relay-performance-macos]' \
+  'needs: [rust, tmux-floor, vscode-adapter, eza-current, image-paste, relay-performance, relay-performance-macos]' \
   'RUST_RESULT: ${{ needs.rust.result }}' \
+  'TMUX_FLOOR_RESULT: ${{ needs.tmux-floor.result }}' \
   'VSCODE_ADAPTER_RESULT: ${{ needs.vscode-adapter.result }}' \
   'EZA_CURRENT_RESULT: ${{ needs.eza-current.result }}' \
   'IMAGE_PASTE_RESULT: ${{ needs.image-paste.result }}' \
   'RELAY_PERFORMANCE_RESULT: ${{ needs.relay-performance.result }}' \
   'RELAY_PERFORMANCE_MACOS_RESULT: ${{ needs.relay-performance-macos.result }}' \
   'test "$RUST_RESULT" = success' \
+  'test "$TMUX_FLOOR_RESULT" = success' \
   'test "$VSCODE_ADAPTER_RESULT" = success' \
   'test "$EZA_CURRENT_RESULT" = success' \
   'test "$IMAGE_PASTE_RESULT" = success' \
@@ -173,10 +178,35 @@ image_paste_job=$(awk '
 ' "$workflow")
 # shellcheck disable=SC2016 # Commands are inspected as literal workflow text.
 for contract in \
+  "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
+  'profiles: tmux-pinned' \
   'python3 test/paste-image.py "$package/bin/termnav" --preview "$package"' \
   'python3 test/paste-image-gui.py "$package/bin/termnav" "$package"'; do
   [[ "$image_paste_job" == *"$contract"* ]] || fail "image paste CI is missing: $contract"
 done
+[[ "$image_paste_job" != *'tmux-builds/releases/'* ]] ||
+  fail "image paste CI downloads tmux outside the shared installer"
+
+tmux_floor_job=$(awk '
+  /^  tmux-floor:$/ { in_floor = 1 }
+  in_floor && /^  [^ ]/ && $0 != "  tmux-floor:" { exit }
+  in_floor { print }
+' "$workflow")
+for contract in \
+  'runs-on: ubuntu-24.04' \
+  "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
+  'profiles: python,tmux-floor-exact' \
+  'TERMNAV_REQUIRE_TMUX: "1"' \
+  'run: test/termnav-test --tmux-floor-smoke'; do
+  [[ "$tmux_floor_job" == *"$contract"* ]] || fail "tmux floor CI is missing: $contract"
+done
+# Use a mismatched floor so even a runner that lost the smoke mode exits
+# before entering the full suite and invoking this contract again.
+floor_status=0
+floor_output=$(CI_TMUX_FLOOR=0.0 CI_TMUX_FLOOR_EXACT='' \
+  "$root/test/termnav-test" --tmux-floor-smoke 2>&1) || floor_status=$?
+[[ $floor_status == 1 && $floor_output == *'needs an exact CI_TMUX_FLOOR'* ]] ||
+  fail 'tmux floor smoke does not reject a missing exact floor binding'
 
 # Process-heavy integration fixtures intentionally own subprocess trees. Keep
 # their outer deadline in the portable process-group wrapper so a child that

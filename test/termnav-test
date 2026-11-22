@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Run all repo-owned termnav test suites.
+# Run all repo-owned termnav test suites, or the real-tmux floor smoke.
 
 set -euo pipefail
+
+if [[ ${1:-} == --tmux-floor-smoke &&
+  (${CI_TMUX_FLOOR_EXACT:-} != 1 || -z ${CI_TMUX_FLOOR:-}) ]]; then
+  printf 'termnav-test: FAIL: the tmux floor smoke needs an exact CI_TMUX_FLOOR\n' >&2
+  exit 1
+fi
 
 test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 root="${test_dir%/test}"
@@ -100,8 +106,8 @@ for file in "${runtime_shell_files[@]}"; do
     *) shellcheck_runtime_files+=("$file") ;;
   esac
 done
-# CI's matrix legs lint here. Only the Termux leg sets TERMNAV_SKIP_SHELLCHECK=1,
-# because its dependency profile has no ShellCheck.
+# CI's main platform matrix lint runs here. The separate compatibility jobs
+# reuse this runner without repeating the main matrix's ShellCheck work.
 if [[ "${TERMNAV_SKIP_SHELLCHECK:-0}" != 1 ]]; then
   shellcheck -x -P SCRIPTDIR \
     "${shellcheck_runtime_files[@]}" \
@@ -133,8 +139,8 @@ if [[ $TERMNAV_TEST_TMUX != ok ]]; then
   fi
   printf 'termnav-test: SKIP: tmux cases: %s\n' "$reason"
 fi
-# The CI floor profile names the floor it provides, and, on the leg that built
-# it, that this run must use exactly that release.
+# Check the provisioned release against Termnav's own support floor before
+# any real-tmux suite can silently use a newer binary earlier on PATH.
 if [[ -n ${CI_TMUX_FLOOR:-} ]]; then
   read -r floor_major floor_minor <<<"$(_tmux_floor)"
   if [[ $(_tmux_release "$CI_TMUX_FLOOR") != "$floor_major $floor_minor" ]]; then
@@ -149,7 +155,12 @@ if [[ -n ${CI_TMUX_FLOOR:-} ]]; then
   fi
 fi
 
-for suite in "$test_dir"/suites/*-test; do
+if [[ ${1:-} == --tmux-floor-smoke ]]; then
+  suites=("$test_dir/suites/navigation-cli-test" "$test_dir/suites/tmux-focus-test")
+else
+  suites=("$test_dir"/suites/*-test)
+fi
+for suite in "${suites[@]}"; do
   "$suite"
 done
 
