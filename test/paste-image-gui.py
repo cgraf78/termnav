@@ -68,6 +68,11 @@ def process(
                 child.wait(timeout=5)
             except ProcessLookupError:
                 child.wait(timeout=5)
+            except PermissionError:
+                # Darwin can report EPERM for the group after the GUI process
+                # exits. Preserve the original test error in that case.
+                if child.poll() is None:
+                    raise
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait(timeout=5)
@@ -121,7 +126,9 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
 end)
 return {
   enable_wayland = false,
-  front_end = trigger and 'OpenGL' or 'Software',
+  -- On macOS both OpenGL and Software request an accelerated CGL pixel
+  -- format. Use the native WebGPU backend on the hosted virtual display.
+  front_end = trigger and 'WebGpu' or 'Software',
   font = wezterm.font(trigger and 'Menlo' or 'DejaVu Sans Mono'),
   enable_tab_bar = false,
   initial_cols = 110,
