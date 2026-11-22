@@ -123,11 +123,15 @@ return {
         encoding="utf-8",
     )
     tmux = root / "tmux.conf"
+    # tmux 3.8 skips its fast-input heuristic for bracketed-paste clients.
+    # Exercise its default here while the PTY fixture retains the older wiring.
     tmux.write_text(
         "set -g status off\n"
         "set -g allow-passthrough on\n"
         "set -as terminal-features 'xterm-256color:RGB:sixel'\n"
-        f"set-environment -g TERMNAV_PASTE_IMAGE_PREVIEW {mode}\n" + documented_binding(),
+        f"set-environment -g TERMNAV_PASTE_IMAGE_PREVIEW {mode}\n"
+        + documented_binding()
+        + "set -gu assume-paste-time\n",
         encoding="utf-8",
     )
     return lua, tmux
@@ -190,8 +194,10 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
         ["script", "-qefc", shlex.join(remote), "--log-in", str(input_log), "--log-out", str(raw)],
         env,
     )
+    pinned_cli = os.environ.get("CI_WEZTERM_PINNED_BIN")
+    wezterm_gui = str(Path(pinned_cli).with_name("wezterm-gui")) if pinned_cli else "wezterm-gui"
     gui = [
-        "wezterm-gui",
+        wezterm_gui,
         "--config-file",
         str(lua),
         "start",
@@ -221,9 +227,13 @@ def exercise(root: Path, binary: Path, assets: Path, display: str, image: Path, 
                 .strip()
             )
             assert pane.startswith("%") and pane[1:].isdigit(), pane
+            paste_time = run([*tmux, "show-options", "-gv", "assume-paste-time"], env)
+            assert int(paste_time) > 0, paste_time
+            features = run([*tmux, "list-clients", "-F", "#{client_termfeatures}"], env)
+            (client_features,) = features.splitlines()
+            assert b"bpaste" in client_features.split(b","), features
             if mode == "sixel":
-                features = run([*tmux, "list-clients", "-F", "#{client_termfeatures}"], env)
-                assert b"sixel" in features.splitlines()[0].split(b","), features
+                assert b"sixel" in client_features.split(b","), features
                 assert (
                     run([*tmux, "display-message", "-p", "#{sixel_support}"], env).strip() == b"1"
                 )

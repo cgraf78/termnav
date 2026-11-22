@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@dc0a352d134e3f1b86a8083740dd3e09f81fb743
     with:
       matrix-set: full
       msrv-toolchain: "1.88"
@@ -55,7 +55,7 @@ jobs:
         with:
           toolchain: stable
       - name: Install the exact tmux floor
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
         with:
           matrix-name: Ubuntu
           profiles: python,tmux-floor-exact
@@ -84,7 +84,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@dc0a352d134e3f1b86a8083740dd3e09f81fb743
 
   vscode-adapter:
     name: VS Code adapter / Ubuntu
@@ -136,7 +136,7 @@ jobs:
           toolchain: stable
 
       - name: Install pinned tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
         with:
           matrix-name: Ubuntu
           profiles: tmux-pinned
@@ -175,7 +175,7 @@ jobs:
           toolchain: stable
 
       - name: Install pinned tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
         with:
           matrix-name: macOS
           profiles: tmux-pinned
@@ -243,29 +243,23 @@ jobs:
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - name: Install pinned WezTerm
-        shell: bash
-        run: |
-          wezterm_release=20240203-110809-5046fc22
-          wezterm_package="$RUNNER_TEMP/wezterm.deb"
-          curl --fail --location --silent --show-error --retry 3 \
-            "https://github.com/wezterm/wezterm/releases/download/$wezterm_release/wezterm-$wezterm_release.Ubuntu22.04.deb" \
-            --output "$wezterm_package"
-          printf '%s  %s\n' '86358dab5794a4fb63f7c91dd68d4fdc3da58faad648a58fc77d2bd51c7b0686' "$wezterm_package" | sha256sum --check --strict
-          sudo apt-get update
-          # WezTerm loads EGL dynamically, even with software rendering.
-          sudo apt-get install -y --no-install-recommends \
-            "$wezterm_package" fonts-dejavu-core libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
-            musl-tools openssh-server x11-apps xclip xdotool xvfb zsh
-
-      - name: Install pinned sixel tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@36d1bb6a8070d9dc7dfc85e1d21b2fe9b3721450
+      - name: Install pinned tmux and WezTerm
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@dc0a352d134e3f1b86a8083740dd3e09f81fb743
         with:
           matrix-name: Ubuntu
-          profiles: tmux-pinned
+          profiles: tmux-pinned,wezterm-pinned
+      - name: Install image paste test prerequisites
+        shell: bash
+        run: |
+          # WezTerm loads EGL dynamically, even with software rendering.
+          sudo apt-get install -y --no-install-recommends \
+            fonts-dejavu-core libegl1 libegl-mesa0 libgl1 libgl1-mesa-dri \
+            musl-tools openssh-server x11-apps xclip xdotool xvfb zsh
       - name: Exercise both previews with the packaged Termnav
         shell: bash
         run: |
+          test -n "$CI_WEZTERM_PINNED_RELEASE"
+          test "$("$CI_WEZTERM_PINNED_BIN" --version)" = "wezterm $CI_WEZTERM_PINNED_VERSION"
           archive=$(scripts/package-release.sh x86_64-unknown-linux-musl linux-x86_64-musl)
           package="$RUNNER_TEMP/termnav-package"
           mkdir "$package"

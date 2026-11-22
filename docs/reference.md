@@ -478,10 +478,12 @@ sends only `!`.
 ### Wiring
 
 In the innermost tmux layer, use `run-shell` to expand tmux formats in the
-`display-popup` command. Disable the fast-input paste heuristic in that tmux
-server. On X11, WezTerm can send an empty bracketed text paste directly
-before the image trigger. If both arrive together, the heuristic can send the
-trigger to the pane as literal input. Bracketed text pastes still work.
+`display-popup` command. On X11, WezTerm can send an empty bracketed text
+paste directly before the image trigger. If both arrive together, the
+fast-input heuristic can send the trigger to the pane as literal input.
+The example disables that heuristic for compatibility with older tmux
+versions. tmux 3.8 skips it automatically for clients with the `bpaste`
+terminal feature, so those clients can keep the default.
 
 ```tmux
 set -g assume-paste-time 0
