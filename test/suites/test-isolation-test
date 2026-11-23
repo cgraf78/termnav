@@ -166,7 +166,7 @@ set +e
   # ignores TERM. Waiting only for the leader therefore leaks the exact process
   # class that an outer suite deadline is supposed to contain.
   # shellcheck disable=SC2016
-  _with_timeout 0.1s "$test_shell" -c '
+  _with_timeout 1s "$test_shell" -c '
     trap "exit 0" TERM
     "$3" -c '\''trap "" TERM; exec "$1" 60'\'' sh "$4" &
     child=$!
@@ -176,7 +176,7 @@ set +e
   ' sh "$timeout_leader_pid" "$timeout_child_pid" "$test_shell" "$test_sleep"
 ) &
 timeout_runner=$!
-deadline=$((SECONDS + 3))
+deadline=$((SECONDS + 5))
 while kill -0 "$timeout_runner" 2>/dev/null && ((SECONDS < deadline)); do
   sleep 0.02
 done
@@ -193,7 +193,9 @@ else
 fi
 set -e
 _assert_exit "test isolation: timeout returns its stable deadline status" 124 "$timeout_status"
-if [[ -s $timeout_child_pid ]] && _process_running "$(cat "$timeout_child_pid")"; then
+if [[ ! -s $timeout_leader_pid || ! -s $timeout_child_pid ]]; then
+  _fail "test isolation: timeout did not start both owned fixture processes"
+elif _process_running "$(cat "$timeout_child_pid")"; then
   _fail "test isolation: timeout left a stubborn descendant running"
   if [[ -s $timeout_leader_pid ]]; then
     kill -KILL -- "-$(cat "$timeout_leader_pid")" 2>/dev/null || true
@@ -201,6 +203,46 @@ if [[ -s $timeout_child_pid ]] && _process_running "$(cat "$timeout_child_pid")"
 else
   _pass "test isolation: timeout cleans up the complete fixture process group"
 fi
+
+run_timeout_model() (
+  local real_python
+  real_python=$(command -v python3) || exit
+  # shellcheck disable=SC2329 # Indirectly invoked by _with_timeout.
+  python3() {
+    # The supervisor sends its Python body on stdin after a leading '-'.
+    shift
+    "$real_python" "$TERMNAV_TEST_DIR/support/timeout-model.py" "$@"
+  }
+  _with_timeout 1s "$1"
+)
+
+model_status=0
+model_output=$(run_timeout_model completed-wait 2>&1) || model_status=$?
+_assert_exit "test isolation: completion wins a signal during leader reaping" 7 "$model_status"
+_assert_not_contains "test isolation: cancellation never signals a reaped group" \
+  "signalled a group after its leader was reaped" "$model_output"
+
+model_status=0
+model_output=$(run_timeout_model owned-group 2>&1) || model_status=$?
+_assert_exit "test isolation: timeout retains its group ID up to escalation" 124 "$model_status"
+_assert_contains "test isolation: timeout signals its owned group before reaping" \
+  "attempted final signal to owned group" "$model_output"
+
+model_status=0
+model_output=$(run_timeout_model zombie-only 2>&1) || model_status=$?
+_assert_exit "test isolation: Darwin zombie-only group reaches normal timeout status" \
+  124 "$model_status"
+_assert_not_contains "test isolation: Darwin zombie-only cleanup has no traceback" \
+  "Traceback" "$model_output"
+
+model_status=0
+model_output=$(run_timeout_model live-denial 2>&1) || model_status=$?
+_assert_exit "test isolation: denied Darwin signal to a live group fails cleanup" \
+  1 "$model_status"
+_assert_contains "test isolation: checks the denial after final escalation" \
+  "attempted final signal to owned group" "$model_output"
+_assert_contains "test isolation: preserves a genuine Darwin permission error" \
+  "PermissionError: group has no authority for requested signal" "$model_output"
 
 # Blocking terminal signals around fork closes the supervisor's ownership race,
 # but that mask must be restored in the command before exec. Otherwise every
@@ -261,7 +303,9 @@ else
 fi
 set -e
 _assert_exit "test isolation: TERM returns the conventional signal status" 143 "$signal_status"
-if [[ -s $signal_child_pid ]] && _process_running "$(cat "$signal_child_pid")"; then
+if [[ ! -s $signal_leader_pid || ! -s $signal_child_pid ]]; then
+  _fail "test isolation: cancellation did not start both owned fixture processes"
+elif _process_running "$(cat "$signal_child_pid")"; then
   _fail "test isolation: interrupted timeout supervisor left a descendant running"
   if [[ -s $signal_leader_pid ]]; then
     kill -KILL -- "-$(cat "$signal_leader_pid")" 2>/dev/null || true

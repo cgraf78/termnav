@@ -389,13 +389,14 @@ def seconds(value: str) -> float:
     return float(value)
 
 
-class SupervisorSignal(Exception):
-    def __init__(self, signum: int):
-        self.signum = signum
+received_signal = None
 
 
 def interrupted(signum: int, _frame: object) -> None:
-    raise SupervisorSignal(signum)
+    """Record cancellation without interrupting publication of a reaped PID."""
+    global received_signal
+    if received_signal is None:
+        received_signal = signum
 
 
 def group_alive(group: int) -> bool:
@@ -409,65 +410,95 @@ def group_alive(group: int) -> bool:
 
 
 def signal_group(group: int, signum: int) -> None:
+    """Deliver a signal while the fixture still reserves the group ID."""
     try:
         os.killpg(group, signum)
     except ProcessLookupError:
         pass
 
 
+def darwin_group_has_live_members(group: int) -> bool:
+    """Distinguish a zombie-only group from another signal permission failure."""
+    snapshot = subprocess.run(
+        ["/bin/ps", "-axo", "pgid=,stat="],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=1,
+    )
+    return any(
+        int(pgid) == group and not state.startswith("Z")
+        for pgid, state in (line.split() for line in snapshot.stdout.splitlines())
+    )
+
+
 def stop_group(process: subprocess.Popen[bytes], first_signal: int) -> None:
+    """Drain the group before reaping the leader that reserves its ID."""
     # Once cleanup starts, a second terminal signal must not interrupt the only
-    # code responsible for the child group. The group identifier remains valid
-    # while any descendant survives, even after the direct leader exits.
+    # code responsible for the child group.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal_group(process.pid, first_signal)
+    if process.returncode is not None:
+        return
+    try:
+        signal_group(process.pid, first_signal)
+    except PermissionError:
+        if sys.platform != "darwin":
+            raise
+        # Darwin can temporarily refuse a group whose leader is exiting.
+        # Resolve that ambiguity at final cleanup while the PID remains owned.
     deadline = time.monotonic() + 1.0
     while group_alive(process.pid) and time.monotonic() < deadline:
-        process.poll()
         time.sleep(0.01)
-    if group_alive(process.pid):
-        signal_group(process.pid, signal.SIGKILL)
-    process.wait()
+    try:
+        if group_alive(process.pid):
+            signal_group(process.pid, signal.SIGKILL)
+    except PermissionError:
+        if sys.platform != "darwin" or darwin_group_has_live_members(process.pid):
+            raise
+    process.wait(timeout=1)
 
 
 signal.signal(signal.SIGINT, interrupted)
 signal.signal(signal.SIGTERM, interrupted)
-process = None
+blocked = {signal.SIGINT, signal.SIGTERM}
+previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+
+
+def restore_child_mask() -> None:
+    """Keep the supervisor's temporary signal mask out of the command."""
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 try:
-    blocked = {signal.SIGINT, signal.SIGTERM}
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked)
+    if received_signal is not None:
+        raise SystemExit(128 + received_signal)
+    process = subprocess.Popen(
+        sys.argv[2:],
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        preexec_fn=restore_child_mask,
+    )
+finally:
+    # Deliver pending terminal signals only after registering the group.
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
-    def restore_child_mask() -> None:
-        # Popen inherits the caller's signal mask across exec. This supervisor
-        # is deliberately single-threaded, so a small pre-exec hook is safe and
-        # keeps the ownership race closed without changing the wrapped suite's
-        # signal semantics.
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-
+deadline = time.monotonic() + seconds(sys.argv[1])
+while received_signal is None:
+    remaining = max(0.0, deadline - time.monotonic())
     try:
-        process = subprocess.Popen(
-            sys.argv[2:],
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            preexec_fn=restore_child_mask,
-        )
-    finally:
-        # A pending signal is delivered only after `process` owns the new group,
-        # closing the otherwise unavoidable spawn-before-assignment leak window.
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-    try:
-        raise SystemExit(process.wait(timeout=seconds(sys.argv[1])))
+        status = process.wait(timeout=min(remaining, 0.05))
     except subprocess.TimeoutExpired:
-        stop_group(process, signal.SIGTERM)
-        raise SystemExit(124)
-    except SupervisorSignal as caught:
-        stop_group(process, caught.signum)
-        raise SystemExit(128 + caught.signum)
-except SupervisorSignal as caught:
-    if process is not None:
-        stop_group(process, caught.signum)
-    raise SystemExit(128 + caught.signum)
+        if remaining == 0:
+            break
+    else:
+        # The completed wait released the group ID, so it wins a cancellation
+        # delivered while Popen published the result.
+        raise SystemExit(status)
+
+signum = received_signal
+stop_group(process, signal.SIGTERM if signum is None else signum)
+raise SystemExit(124 if signum is None else 128 + signum)
 PY
     then
       return 0
