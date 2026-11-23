@@ -143,26 +143,35 @@ if trigger then
 end
 local paste = dofile(assets .. 'paste-image.lua').new(paste_wezterm, { routes = routes })
 local paste_action = paste:paste_action()
-if trigger then
+if trigger and wezterm.gui then
   -- macOS CI can run the actual action inside WezTerm without Accessibility
-  -- permissions for posting keyboard events. The remote PTY can show its
-  -- prompt before WezTerm has processed the tmux user variables.
+  -- permissions for posting keyboard events. Poll independently of status
+  -- updates, since an idle window can miss the request after the prompt.
   local last_owner
-  wezterm.on('update-status', function(window, pane)
+  local function try_paste()
     local pending = io.open(trigger, 'r')
-    if not pending then return end
+    if not pending then return false end
     pending:close()
+    -- This fixture starts one window in its own WezTerm process.
+    local window = wezterm.gui.gui_windows()[1]
+    local pane = window and window:active_pane()
+    if not pane then return false end
+    -- The remote prompt can arrive before WezTerm sees the tmux user vars.
     local owner = routes.terminal_owner(pane)
     if owner ~= 'tmux' then
       if owner ~= last_owner then report('waiting for tmux ownership: ' .. owner) end
       last_owner = owner
-      return
+      return false
     end
-    if os.remove(trigger) then
-      report('consumed trigger: ' .. owner)
-      window:perform_action(paste_action, pane)
-    end
-  end)
+    if not os.remove(trigger) then return false end
+    report('consumed trigger: ' .. owner)
+    window:perform_action(paste_action, pane)
+    return true
+  end
+  local function poll()
+    if not try_paste() then wezterm.time.call_after(0.1, poll) end
+  end
+  wezterm.time.call_after(0.1, poll)
 end
 wezterm.on('user-var-changed', function(window, pane, name, value)
   paste:user_var_changed(window, pane, name, value)
