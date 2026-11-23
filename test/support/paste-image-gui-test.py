@@ -76,6 +76,32 @@ class NativePreviewTest(unittest.TestCase):
 class ProcessCleanupTest(unittest.TestCase):
     """The spawned GUI group still owns descendants after its leader exits."""
 
+    def test_retries_denied_probe_during_leader_exit(self) -> None:
+        """Darwin can deny a group probe before the leader becomes waitable."""
+        child = Mock(pid=42)
+        child.poll.side_effect = (None, None, 0)
+        with (
+            patch("os.killpg", side_effect=(None, PermissionError, ProcessLookupError)) as group,
+            patch("time.monotonic", side_effect=(0, 1)),
+            patch("time.sleep"),
+        ):
+            HARNESS["stop_process"](child)
+        self.assertEqual(
+            [call.args for call in group.call_args_list],
+            [(child.pid, signal.SIGTERM), (child.pid, 0), (child.pid, 0)],
+        )
+        child.wait.assert_called_once_with(timeout=5)
+
+    def test_preserves_denied_signal_for_live_leader(self) -> None:
+        """A real signal denial for a live fixture still fails cleanup."""
+        child = Mock(pid=42)
+        child.poll.return_value = None
+        with (
+            patch("os.killpg", side_effect=PermissionError),
+            self.assertRaises(PermissionError),
+        ):
+            HARNESS["stop_process"](child)
+
     def test_escalates_for_descendant_after_leader_exits(self) -> None:
         """Waiting for the leader alone must not end cleanup."""
         child = Mock(pid=42)
