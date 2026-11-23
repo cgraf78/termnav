@@ -49,8 +49,10 @@ Suite ownership follows the integration boundary:
   dispatch on the lightweight path. Set `TERMNAV_PERFORMANCE_BASELINE` to a Git
   revision to compare alternating subprocess samples and enforce calibrated
   median non-regression budgets plus absolute median and p95 responsiveness
-  ceilings; pull-request CI compares against the explicit PR base revision
-  automatically.
+  ceilings. Pull-request CI compares against the explicit PR base revision
+  automatically. Set `TERMNAV_TEST_BINARY` to measure a prebuilt executable.
+  The report records that executable's version and the benchmark checkout's
+  commit separately.
 - `relay-terminal-test` covers the terminal barrier, mixed-version relay paths,
   `open-url` delivery from a real tmux pane to its attached client,
   arbitrary nesting depth, burst preservation, and VS Code terminal handoff. Its

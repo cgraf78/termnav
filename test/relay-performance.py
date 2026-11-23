@@ -459,20 +459,31 @@ def tmux_boundary_samples(
 
 def main() -> int:
     """Benchmark calibrated hot paths and enforce noise-tolerant budgets."""
+    root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-ref", required=True)
+    parser.add_argument("--candidate", type=Path, default=root / "target/release/termnav")
     parser.add_argument("--samples", type=int, default=50)
     args = parser.parse_args()
+    candidate = args.candidate.absolute()
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        parser.error(f"candidate is missing or not executable: {candidate}")
     # Synthetic clients must not discover the developer's enclosing tmux by
     # walking back through this benchmark process. Real terminal clients have
     # no such inherited parent scope.
     os.environ.pop("TMUX", None)
     os.environ.pop("TMUX_PANE", None)
-    root = Path(__file__).resolve().parent.parent
-    candidate = root / "target/release/termnav"
     report: dict[str, object] = {
         "baseline_ref": args.baseline_ref,
-        "candidate_commit": subprocess.run(
+        # A caller-supplied binary may have been built from a different checkout.
+        "candidate_version": subprocess.run(
+            [str(candidate), "version"],
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip(),
+        "checkout_commit": subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             text=True,
             capture_output=True,

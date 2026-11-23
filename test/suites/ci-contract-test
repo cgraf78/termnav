@@ -110,6 +110,7 @@ for contract in \
   'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
   'TERMNAV_PERFORMANCE_BASELINE: HEAD' \
   'TERMNAV_PERFORMANCE_SAMPLES: "2"' \
+  'TERMNAV_TEST_BINARY: ./target/relay performance candidate' \
   'run: test/suites/relay-performance-test'; do
   [[ "$performance_job" == *"$contract"* ]] ||
     fail "Relay performance job is missing: $contract"

@@ -28,6 +28,12 @@ fi
 # shellcheck source=../helpers.sh
 . "$test_dir/helpers.sh"
 
+# Resolve a bare name with the suite's isolated PATH so every phase invokes
+# the same executable, including calibrated subprocess measurements.
+if [[ $candidate != */* ]]; then
+  candidate=$(type -P -- "$candidate")
+fi
+
 tmp=$(_tmpdir)
 set +e
 env -u TERMNAV_PARENT_RELAY XDG_RUNTIME_DIR="$tmp/runtime" \
@@ -61,6 +67,7 @@ if [[ -n "${TERMNAV_PERFORMANCE_BASELINE:-}" ]]; then
   # unknown historical baseline can still hang before those boundaries. Own the
   # whole subprocess group so local and CI runs fail with a useful deadline.
   _with_timeout 15m python3 "$test_dir/relay-performance.py" \
+    --candidate "$candidate" \
     --baseline-ref "$TERMNAV_PERFORMANCE_BASELINE" \
     --samples "${TERMNAV_PERFORMANCE_SAMPLES:-50}"
   _pass "relay performance: calibrated subprocess budgets"
