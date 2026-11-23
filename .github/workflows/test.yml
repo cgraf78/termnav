@@ -150,7 +150,12 @@ jobs:
         env:
           TERMNAV_PERFORMANCE_BASELINE: HEAD
           TERMNAV_PERFORMANCE_SAMPLES: "2"
-        run: test/suites/relay-performance-test
+          TERMNAV_TEST_BINARY: ./target/relay performance candidate
+        # Leave no binary at the default path so the smoke run also verifies
+        # that the Python measurements use the shell suite's selected candidate.
+        run: |
+          mv target/release/termnav "$TERMNAV_TEST_BINARY"
+          test/suites/relay-performance-test
 
   relay-performance-macos:
     name: Relay hot path / macOS
