@@ -46,22 +46,37 @@ tooling_shell_files=(
   "$root/scripts/smoke-release.sh"
 )
 
+runtime_inventory_scratch() {
+  # BSD mktemp can prefer its own per-user directory without a template.
+  if [[ -n ${TMPDIR:-} ]]; then
+    mktemp "$@" -- "${TMPDIR%/}/runtime-inventory.XXXXXX"
+  else
+    mktemp "$@"
+  fi
+}
+
 check_runtime_shell_inventory() {
-  local file first_line listed discovered
+  local file first_line listed discovered inventory
   listed=$(
-    for file in "${runtime_shell_files[@]}"; do
-      printf '%s\n' "${file#"$root"/}"
+    for file in "$@"; do
+      printf '%q\n' "${file#"$root"/}"
     done | LC_ALL=C sort
   )
   discovered=$(
-    while IFS= read -r file; do
+    # Stage exact paths and only classify them after the index read succeeds.
+    inventory=$(runtime_inventory_scratch) || return
+    trap 'rm -f -- "$inventory"' EXIT
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+    git -C "$root" ls-files -z --cached --others --exclude-standard -- \
+      bin lib share >"$inventory" || return
+    while IFS= read -r -d '' file; do
       # `git ls-files` still reports deletions until they are staged. Ignore
       # absent paths so local pre-commit verification sees the same inventory
       # that CI will see from the resulting commit.
       [[ -f "$root/$file" ]] || continue
       case "$file" in
         *.sh | *.sh.template | *.zsh)
-          printf '%s\n' "$file"
+          printf '%q\n' "$file"
           continue
           ;;
       esac
@@ -78,10 +93,13 @@ check_runtime_shell_inventory() {
         "$first_line" == '# shellcheck shell=dash' ||
         "$first_line" == '# shellcheck shell=ksh' ||
         "$first_line" == '# shellcheck shell=sh' ]]; then
-        printf '%s\n' "$file"
+        printf '%q\n' "$file"
       fi
-    done < <(git -C "$root" ls-files --cached --others --exclude-standard -- bin lib share)
-  )
+    done <"$inventory"
+  ) || {
+    printf '%s\n' 'termnav-test: cannot enumerate runtime shell files' >&2
+    return 1
+  }
   discovered=$(printf '%s\n' "$discovered" | sed '/^$/d' | LC_ALL=C sort)
 
   if [[ "$listed" != "$discovered" ]]; then
@@ -93,7 +111,40 @@ check_runtime_shell_inventory() {
   fi
 }
 
-check_runtime_shell_inventory
+inventory_status=0
+inventory_error=$(
+  # shellcheck disable=SC2329 # Used by check_runtime_shell_inventory below.
+  git() {
+    command git "$@" || return
+    return 17
+  }
+  check_runtime_shell_inventory "${runtime_shell_files[@]}" 2>&1
+) || inventory_status=$?
+if [[ "$inventory_status" != 1 ||
+  "$inventory_error" != 'termnav-test: cannot enumerate runtime shell files' ]]; then
+  printf '%s\n' 'termnav-test: runtime shell inventory did not reject a Git error' >&2
+  exit 1
+fi
+
+# One unusual pathname must not stand in for two intended entries.
+inventory_status=0
+inventory_error=$(
+  root=$(runtime_inventory_scratch -d) || exit 2
+  trap 'rm -rf -- "$root"' EXIT
+  joined=$'lib/first.sh\nlib/second.sh'
+  mkdir -p -- "$root/${joined%/*}" || exit 2
+  : >"$root/$joined" || exit 2
+  # shellcheck disable=SC2329 # Used by check_runtime_shell_inventory below.
+  git() {
+    printf '%s\0' "$joined"
+  }
+  check_runtime_shell_inventory "$root/lib/first.sh" "$root/lib/second.sh" 2>&1
+) || inventory_status=$?
+if [[ "$inventory_status" != 1 || "$inventory_error" != *'runtime shell inventory is stale'* ]]; then
+  printf '%s\n' 'termnav-test: runtime shell inventory did not preserve pathname boundaries' >&2
+  exit 1
+fi
+check_runtime_shell_inventory "${runtime_shell_files[@]}"
 # ShellCheck does not support Zsh. Syntax-check that adapter with Zsh itself.
 shellcheck_runtime_files=()
 for file in "${runtime_shell_files[@]}"; do
