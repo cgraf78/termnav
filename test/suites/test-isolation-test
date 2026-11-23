@@ -69,17 +69,36 @@ _assert_eq "test isolation: URL fallbacks reach a failing opener, not a browser"
 
 tool_fixture=$(_tmpdir)
 mkdir "$tool_fixture/candidate:dir" "$tool_fixture/ambient" "$tool_fixture/tmp:dir"
+mkdir "$tool_fixture/mktemp-bin" "$tool_fixture/-nested-tmp" "$tool_fixture/platform-tmp"
 printf '#!/bin/sh\nprintf "selected fixture\\n"\n' >"$tool_fixture/candidate:dir/selected"
 printf '#!/bin/sh\nprintf "ambient fixture\\n"\n' >"$tool_fixture/ambient/termnav"
 chmod +x "$tool_fixture/candidate:dir/selected" "$tool_fixture/ambient/termnav"
+# Darwin chooses its per-user temp root for a template-less mktemp. Model
+# that default here so the nested-directory contract is exercised on Linux.
+cat >"$tool_fixture/mktemp-bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+if [[ $# -eq 1 && $1 == -d ]]; then
+  exec "$FIXTURE_MKTEMP" -d "$FIXTURE_PLATFORM_TMP/tmp.XXXXXXXXXX"
+fi
+exec "$FIXTURE_MKTEMP" "$@"
+EOF
+chmod +x "$tool_fixture/mktemp-bin/mktemp"
+fixture_mktemp=$(type -P mktemp) || exit 1
 # The child shell expands its own positional parameters.
 # shellcheck disable=SC2016
-tool_output=$(env -u BASH_ENV -u ENV PATH="$tool_fixture/ambient:$PATH" \
+tool_output=$(env -u BASH_ENV -u ENV PATH="$tool_fixture/mktemp-bin:$tool_fixture/ambient:$PATH" \
+  FIXTURE_MKTEMP="$fixture_mktemp" FIXTURE_PLATFORM_TMP="$tool_fixture/platform-tmp" \
+  TMPDIR=-nested-tmp \
   TERMNAV_TEST_BINARY="./candidate:dir/selected" "$BASH" -c '
     cd -- "$1" && . "$2" || exit 1
     binary=$(type -P termnav) || exit 1
-    case "$binary" in "$3"/*) "$binary" ;; *) exit 2 ;; esac
-  ' bash "$tool_fixture" "$TERMNAV_TEST_DIR/helpers.sh" "$_TEST_TMP_ROOT")
+    binary_dir=$(CDPATH="" cd -P -- "${binary%/*}" && pwd -P) || exit 1
+    caller_tmp=$(CDPATH="" cd -P -- "$3" && pwd -P) || exit 1
+    case "$binary_dir" in
+      "$caller_tmp"/*) "$binary" ;;
+      *) printf "adapter directory escaped nested TMPDIR: %s\n" "$binary_dir" >&2; exit 2 ;;
+    esac
+  ' bash "$tool_fixture" "$TERMNAV_TEST_DIR/helpers.sh" "$tool_fixture/-nested-tmp")
 _assert_exit "test isolation: a renamed relative binary is available as termnav" 0 "$?"
 _assert_eq "test isolation: name lookup uses the selected binary, even with a colon in its path" \
   "selected fixture" "$tool_output"

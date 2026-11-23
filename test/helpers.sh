@@ -208,10 +208,21 @@ if [[ -n ${TERMNAV_TEST_BINARY:-} ]]; then
   export TERMNAV_TEST_BINARY
 fi
 
-_TEST_TMP_ROOT=$(mktemp -d) || {
+# A bare mktemp may prefer the platform's default directory over TMPDIR.
+# An explicit template keeps nested fixtures in the caller's scratch root.
+_test_tmp_args=(-d)
+if [[ -n ${TMPDIR:-} ]]; then
+  _test_tmp_parent=$TMPDIR
+  if [[ $_test_tmp_parent != /* ]]; then
+    _test_tmp_parent="$PWD/$_test_tmp_parent"
+  fi
+  _test_tmp_args+=(-- "${_test_tmp_parent%/}/tmp.XXXXXX")
+fi
+_TEST_TMP_ROOT=$(mktemp "${_test_tmp_args[@]}") || {
   echo "failed to create test temp root" >&2
   exit 1
 }
+unset _test_tmp_args _test_tmp_parent
 if [[ -z "$_TEST_TMP_ROOT" || ! -d "$_TEST_TMP_ROOT" ]]; then
   echo "mktemp returned invalid test temp root: $_TEST_TMP_ROOT" >&2
   exit 1
