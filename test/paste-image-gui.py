@@ -111,14 +111,57 @@ def write_config(root: Path, mode: str) -> tuple[Path, Path]:
         """local wezterm = require 'wezterm'
 local assets = assert(os.getenv('TERMNAV_TEST_ASSETS')) .. '/lib/termnav/wezterm/'
 local routes = dofile(assets .. 'link-routes.lua').new(wezterm)
-local paste = dofile(assets .. 'paste-image.lua').new(wezterm, { routes = routes })
-local paste_action = paste:paste_action()
 local trigger = os.getenv('TERMNAV_TEST_PASTE_TRIGGER')
+local paste_wezterm = wezterm
+local report
+if trigger then
+  local status_path = assert(os.getenv('TERMNAV_TEST_PASTE_STATUS'))
+  report = function(message)
+    local status = assert(io.open(status_path, 'a'))
+    status:write(message, '\\n')
+    status:close()
+  end
+  -- The real paste action declines staging silently. Capture the fixture's
+  -- child outcome without launching another clipboard read on a timeout.
+  paste_wezterm = setmetatable({
+    run_child_process = function(args)
+      report('stage started')
+      local ok, succeeded, stdout, stderr = pcall(wezterm.run_child_process, args)
+      if not ok then
+        report('stage raised: ' .. tostring(succeeded))
+        error(succeeded)
+      end
+      if succeeded then
+        report('stage succeeded')
+      else
+        local detail = stderr == '' and 'no child diagnostic' or tostring(stderr)
+        report('stage failed: ' .. detail:sub(1, 2000))
+      end
+      return succeeded, stdout, stderr
+    end,
+  }, { __index = wezterm })
+end
+local paste = dofile(assets .. 'paste-image.lua').new(paste_wezterm, { routes = routes })
+local paste_action = paste:paste_action()
 if trigger then
   -- macOS CI can run the actual action inside WezTerm without Accessibility
-  -- permissions for posting a keyboard event from a different process.
+  -- permissions for posting keyboard events. The remote PTY can show its
+  -- prompt before WezTerm has processed the tmux user variables.
+  local last_owner
   wezterm.on('update-status', function(window, pane)
-    if os.remove(trigger) then window:perform_action(paste_action, pane) end
+    local pending = io.open(trigger, 'r')
+    if not pending then return end
+    pending:close()
+    local owner = routes.terminal_owner(pane)
+    if owner ~= 'tmux' then
+      if owner ~= last_owner then report('waiting for tmux ownership: ' .. owner) end
+      last_owner = owner
+      return
+    end
+    if os.remove(trigger) then
+      report('consumed trigger: ' .. owner)
+      window:perform_action(paste_action, pane)
+    end
   end)
 end
 wezterm.on('user-var-changed', function(window, pane, name, value)
@@ -211,7 +254,9 @@ def exercise(
         # address that the private stdio proxy transport cannot supply.
         helper = str(root.parent / "paste-preview-macos")
         trigger = root / "paste-trigger"
+        paste_status = root / "paste-status"
         gui_env["TERMNAV_TEST_PASTE_TRIGGER"] = str(trigger)
+        gui_env["TERMNAV_TEST_PASTE_STATUS"] = str(paste_status)
         recording = ["/usr/bin/script", "-qF", str(raw), *remote]
         sshd = Path(os.environ["TERMNAV_TEST_SSHD"]).resolve(strict=True)
         clipboard = nullcontext()
@@ -351,6 +396,13 @@ def exercise(
                 f"PASS: real WezTerm paste over SSH renders {mode} and pastes one path", flush=True
             )
     except Exception:
+        if display is None:
+            status = paste_status.read_text(errors="replace") if paste_status.is_file() else ""
+            print(
+                f"{mode} paste trigger pending: {trigger.is_file()}\n"
+                f"{mode} WezTerm paste status: {status or 'no status recorded'}",
+                file=sys.stderr,
+            )
         print(f"{mode} client output: {stream()[-4000:]!r}", file=sys.stderr)
         if input_log.is_file():
             print(f"{mode} client input: {input_log.read_bytes()[-2000:]!r}", file=sys.stderr)
