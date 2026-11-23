@@ -16,21 +16,35 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import BinaryIO, TypeVar
 
-from paste_preview import PROMPT, SIXEL_FRAME, documented_binding, sample_png, write_zshrc
+from paste_preview import (
+    PROMPT,
+    SIXEL_FRAME,
+    documented_binding,
+    sample_png,
+    write_zshrc,
+)
 from paste_preview_ssh import ssh_command
 
 T = TypeVar("T")
 HOME_DIRS = ("home", "config", "data", "cache", "state", "run", "tmp")
 
 
-def until(description: str, probe: Callable[[], T], seconds: float = 10) -> T:
+def until(
+    description: str,
+    probe: Callable[[], T],
+    seconds: float = 10,
+    *,
+    detail: Callable[[], str] | None = None,
+) -> T:
     """Poll a test-owned resource while it catches up with the client."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if result := probe():
             return result
         time.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {description}")
+    diagnostic = detail() if detail else ""
+    message = f"timed out waiting for {description}"
+    raise AssertionError(f"{message}\n{diagnostic}" if diagnostic else message)
 
 
 def run(args: list[str], env: dict[str, str], *, check: bool = True) -> bytes:
@@ -39,6 +53,35 @@ def run(args: list[str], env: dict[str, str], *, check: bool = True) -> bytes:
     if check:
         assert result.returncode == 0, (args, result.stderr.decode(errors="replace"))
     return result.stdout
+
+
+def signal_group(child: subprocess.Popen[bytes], sig: int) -> bool:
+    """Signal the group still owned by this session, if present."""
+    try:
+        os.killpg(child.pid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Darwin can report EPERM for a GUI group after its leader exits.
+        if child.poll() is None:
+            raise
+        return False
+    return True
+
+
+def stop_process(child: subprocess.Popen[bytes]) -> None:
+    """Reap the leader and give its entire process group a shutdown deadline."""
+    if signal_group(child, signal.SIGTERM):
+        deadline = time.monotonic() + 5
+        while True:
+            child.poll()
+            if not signal_group(child, 0):
+                break
+            if time.monotonic() >= deadline:
+                signal_group(child, signal.SIGKILL)
+                break
+            time.sleep(0.05)
+    child.wait(timeout=5)
 
 
 @contextmanager
@@ -63,19 +106,7 @@ def process(
             print(f"{log.name}: {log.read_text(errors='replace')[-4000:]}", file=sys.stderr)
             raise
         finally:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-                child.wait(timeout=5)
-            except ProcessLookupError:
-                child.wait(timeout=5)
-            except PermissionError:
-                # Darwin can report EPERM for the group after the GUI process
-                # exits. Preserve the original test error in that case.
-                if child.poll() is None:
-                    raise
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait(timeout=5)
+            stop_process(child)
 
 
 def environment(root: Path, binary: Path) -> dict[str, str]:
@@ -239,6 +270,53 @@ def window_draws_preview(window_id: str, env: dict[str, str]) -> bool:
     return False
 
 
+class WindowUnavailable(Exception):
+    """The native window server could not capture a current window."""
+
+
+def mac_window_preview(helper: str, pid: int, capture: Path, env: dict[str, str]) -> bool:
+    """Return the pixel probe for a fresh capture of the current WezTerm window."""
+    window_ids = run([helper, "window", str(pid)], env).decode().split()
+    if not window_ids:
+        raise WindowUnavailable("WezTerm has no visible window")
+    (window_id,) = window_ids
+    capture.unlink(missing_ok=True)
+    args = ["/usr/sbin/screencapture", "-x", "-o", f"-l{window_id}", str(capture)]
+    try:
+        result = subprocess.run(args, env=env, capture_output=True, timeout=5, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise WindowUnavailable(f"screencapture timed out for window {window_id}") from exc
+    if result.returncode or not capture.is_file():
+        error = result.stderr.decode(errors="replace").strip()
+        raise WindowUnavailable(
+            f"screencapture for window {window_id} exited {result.returncode}: "
+            f"{error or 'no screenshot produced'}"
+        )
+    return run([helper, "preview", str(capture)], env).strip() == b"yes"
+
+
+def wait_for_preview(
+    description: str, probe: Callable[[], bool], *, before_paste: bool = False
+) -> None:
+    """Wait for a usable frame before paste or a colored frame after paste."""
+    unavailable = ""
+
+    def ready() -> bool:
+        nonlocal unavailable
+        try:
+            colored = probe()
+        except WindowUnavailable as exc:
+            unavailable = str(exc)
+            return False
+        unavailable = ""
+        if before_paste:
+            assert not colored, "fixture colors before paste"
+            return True
+        return colored
+
+    until(description, ready, detail=lambda: unavailable)
+
+
 def exercise(
     root: Path, binary: Path, assets: Path, display: str | None, image: Path, mode: str
 ) -> None:
@@ -301,6 +379,7 @@ def exercise(
         *ssh,
     ]
     pane = ""
+    window_id = ""
 
     def screen() -> str:
         return run([*tmux, "capture-pane", "-pJ", "-t", pane], env).decode()
@@ -308,18 +387,15 @@ def exercise(
     def stream() -> bytes:
         return raw.read_bytes() if raw.is_file() else b""
 
-    def draws_preview(window_id: str) -> bool:
+    def draws_preview() -> bool:
         if display is not None:
             return window_draws_preview(window_id, gui_env)
-        capture = root / "window.png"
-        run(["/usr/sbin/screencapture", "-x", "-o", f"-l{window_id}", str(capture)], gui_env)
-        return run([helper, "preview", str(capture)], gui_env).strip() == b"yes"
+        return mac_window_preview(helper, window.pid, root / "window.png", gui_env)
 
     try:
         with clipboard, process(gui, gui_env, root / "wezterm.log") as window:
             if display is None:
                 run([helper, "clipboard", str(image)], os.environ.copy())
-                find_window = [helper, "window", str(window.pid)]
             else:
                 until(
                     "the X11 PNG selection", lambda: run([*selection, "-o"], gui_env, check=False)
@@ -342,15 +418,16 @@ def exercise(
                 assert (
                     run([*tmux, "display-message", "-p", "#{sixel_support}"], env).strip() == b"1"
                 )
-            window_ids = until(
-                "the WezTerm window",
-                lambda: run(find_window, gui_env, check=display is None),
-            )
-            (window_id,) = window_ids.decode().split()
-            assert not draws_preview(window_id), "fixture colors before paste"
             if display is None:
+                wait_for_preview("a pre-paste screenshot", draws_preview, before_paste=True)
                 trigger.touch(exist_ok=False)
             else:
+                window_ids = until(
+                    "the WezTerm window",
+                    lambda: run(find_window, gui_env, check=False),
+                )
+                (window_id,) = window_ids.decode().split()
+                assert not draws_preview(), "fixture colors before paste"
                 run(
                     [
                         "xdotool",
@@ -385,10 +462,7 @@ def exercise(
                     "preview was not above the prompt"
                 )
                 assert not SIXEL_FRAME.search(stream()), "blocks mode sent sixel"
-            until(
-                "the preview's colors in the WezTerm window",
-                lambda: draws_preview(window_id),
-            )
+            wait_for_preview("the preview's colors in the WezTerm window", draws_preview)
             # Capture the editable value without submitting the command.
             run([*tmux, "send-keys", "-t", pane, "C-x", "C-d"], env)
             buffer = server / "home" / "buffer"
