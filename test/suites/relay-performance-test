@@ -28,11 +28,9 @@ fi
 # shellcheck source=../helpers.sh
 . "$test_dir/helpers.sh"
 
-# Resolve a bare name with the suite's isolated PATH so every phase invokes
-# the same executable, including calibrated subprocess measurements.
-if [[ $candidate != */* ]]; then
-  candidate=$(type -P -- "$candidate")
-fi
+# Use the resolved executable directly so measurements do not include the
+# shell adapter used for command-name lookup in other suites.
+candidate=${TERMNAV_TEST_BINARY:-$candidate}
 
 tmp=$(_tmpdir)
 set +e

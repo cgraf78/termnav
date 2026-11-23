@@ -403,16 +403,17 @@ printf 'dir=%s\n' "${TERMNAV_SSH_SHIM_DIR-}" >>"$TERMNAV_TEST_COMMAND_LOG"
 printf 'path=%s\n' "$PATH" >>"$TERMNAV_TEST_COMMAND_LOG"
 SH
 chmod +x "$ssh_invoking_shim/ssh" "$ssh_real_bin/ssh"
+ssh_fixture_path="$_TEST_TERMNAV_PATH_BIN:$ssh_invoking_shim:$ssh_installed_shim:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin"
 TERMNAV_TEST_INTEGRATION_COUNT="$ssh_integration_count" \
   TERMNAV_TEST_COMMAND_LOG="$ssh_real_log" \
-  PATH="${TERMNAV_TEST_BINARY%/termnav}:$ssh_invoking_shim:$ssh_installed_shim:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin" \
+  PATH="$ssh_fixture_path" \
   _with_timeout 5s "$ssh_invoking_shim/ssh" -V \
   >/dev/null 2>&1
 ssh_invoking_status=$?
 _assert_exit "ssh resolver: invoking shim directory is never selected" 0 \
   "$ssh_invoking_status"
 _assert_eq "ssh resolver: invoking shim delegates to the next real SSH" \
-  $'<-V>\nactive=\ndir=\npath='"${TERMNAV_TEST_BINARY%/termnav}:$ssh_invoking_shim:$ssh_installed_shim:$ssh_real_bin:${BASH%/*}:/usr/bin:/bin" \
+  $'<-V>\nactive=\ndir=\npath='"$ssh_fixture_path" \
   "$(cat "$ssh_real_log" 2>/dev/null)"
 _assert_eq "ssh resolver: two-shim integration invokes one shim" 1 \
   "$(cat "$ssh_integration_count" 2>/dev/null)"

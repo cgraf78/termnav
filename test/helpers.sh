@@ -184,6 +184,30 @@ _assert_file_content() {
 # Temp directory management
 # ---------------------------------------------------------------------------
 
+# Mock programs must occupy one directory entry in PATH.
+if [[ ${TMPDIR:-} == *:* ]]; then
+  printf '%s\n' 'test fixtures: TMPDIR must not contain a colon' >&2
+  exit 1
+fi
+
+# Resolve a bare override before adding any fixture or editor paths.
+if [[ -n ${TERMNAV_TEST_BINARY:-} ]]; then
+  if [[ $TERMNAV_TEST_BINARY != */* && (! -f $TERMNAV_TEST_BINARY || ! -x $TERMNAV_TEST_BINARY) ]]; then
+    TERMNAV_TEST_BINARY=$(type -P -- "$TERMNAV_TEST_BINARY") || {
+      printf '%s\n' 'test fixtures: TERMNAV_TEST_BINARY was not found on PATH' >&2
+      exit 1
+    }
+  fi
+  if [[ $TERMNAV_TEST_BINARY != /* ]]; then
+    TERMNAV_TEST_BINARY="$PWD/$TERMNAV_TEST_BINARY"
+  fi
+  if [[ ! -f $TERMNAV_TEST_BINARY || ! -x $TERMNAV_TEST_BINARY ]]; then
+    printf 'test fixtures: TERMNAV_TEST_BINARY is not executable: %s\n' "$TERMNAV_TEST_BINARY" >&2
+    exit 1
+  fi
+  export TERMNAV_TEST_BINARY
+fi
+
 _TEST_TMP_ROOT=$(mktemp -d) || {
   echo "failed to create test temp root" >&2
   exit 1
@@ -210,11 +234,6 @@ if [[ -n $TERMNAV_TEST_NVIM_BINARY ]]; then
   PATH="$(dirname -- "$TERMNAV_TEST_NVIM_BINARY"):$PATH"
   export PATH
 fi
-if [[ -n ${TERMNAV_TEST_BINARY:-} ]]; then
-  PATH="$(cd -- "$(dirname -- "$TERMNAV_TEST_BINARY")" && pwd -P):$PATH"
-  export PATH
-fi
-
 # Native Termnav commands can reach tmux clients, Neovim sockets, and SSH
 # transports directly. A forgotten mock must therefore fail inside disposable
 # state instead of falling through to the developer's live terminal topology.
@@ -321,6 +340,16 @@ _termnav_command_adapter() {
   } >"$target"
   chmod 0700 "$target"
 }
+
+# The selected build may be renamed or installed beside unrelated executables.
+# Make only that binary available by its normal command name inside fixtures.
+# Direct invocations keep its original path, including asset-root discovery.
+_TEST_TERMNAV_PATH_BIN="$_TEST_TMP_ROOT/termnav-bin"
+if [[ -n ${TERMNAV_TEST_BINARY:-} ]]; then
+  mkdir "$_TEST_TERMNAV_PATH_BIN" || exit 1
+  _termnav_command_adapter "$_TEST_TERMNAV_PATH_BIN/termnav" "$TERMNAV_TEST_BINARY" || exit 1
+  export PATH="$_TEST_TERMNAV_PATH_BIN:$PATH"
+fi
 
 # ---------------------------------------------------------------------------
 # Portable timeout wrapper. Python owns a new process group and escalates TERM

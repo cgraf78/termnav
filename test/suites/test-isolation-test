@@ -67,6 +67,42 @@ done
 _assert_eq "test isolation: URL fallbacks reach a failing opener, not a browser" \
   false "${BROWSER-unset}"
 
+tool_fixture=$(_tmpdir)
+mkdir "$tool_fixture/candidate:dir" "$tool_fixture/ambient" "$tool_fixture/tmp:dir"
+printf '#!/bin/sh\nprintf "selected fixture\\n"\n' >"$tool_fixture/candidate:dir/selected"
+printf '#!/bin/sh\nprintf "ambient fixture\\n"\n' >"$tool_fixture/ambient/termnav"
+chmod +x "$tool_fixture/candidate:dir/selected" "$tool_fixture/ambient/termnav"
+# The child shell expands its own positional parameters.
+# shellcheck disable=SC2016
+tool_output=$(env -u BASH_ENV -u ENV PATH="$tool_fixture/ambient:$PATH" \
+  TERMNAV_TEST_BINARY="./candidate:dir/selected" "$BASH" -c '
+    cd -- "$1" && . "$2" || exit 1
+    binary=$(type -P termnav) || exit 1
+    case "$binary" in "$3"/*) "$binary" ;; *) exit 2 ;; esac
+  ' bash "$tool_fixture" "$TERMNAV_TEST_DIR/helpers.sh" "$_TEST_TMP_ROOT")
+_assert_exit "test isolation: a renamed relative binary is available as termnav" 0 "$?"
+_assert_eq "test isolation: name lookup uses the selected binary, even with a colon in its path" \
+  "selected fixture" "$tool_output"
+
+mkdir "$tool_fixture/editor"
+cp "$tool_fixture/candidate:dir/selected" "$tool_fixture/ambient/selected"
+cp "$tool_fixture/ambient/termnav" "$tool_fixture/editor/selected"
+# Resolve the bare test override from caller PATH, before adding editor tools.
+# shellcheck disable=SC2016
+tool_output=$(env -u BASH_ENV -u ENV PATH="$tool_fixture/ambient:$PATH" \
+  TERMNAV_TEST_NVIM_BINARY="$tool_fixture/editor/nvim" TERMNAV_TEST_BINARY=selected \
+  "$BASH" -c '. "$1" && "$TERMNAV_TEST_BINARY"' bash "$TERMNAV_TEST_DIR/helpers.sh")
+_assert_exit "test isolation: a bare binary override resolves successfully" 0 "$?"
+_assert_eq "test isolation: editor tools cannot replace a bare override" "selected fixture" "$tool_output"
+
+tool_status=0
+# shellcheck disable=SC2016 # The child shell sets its own positional parameters.
+tool_output=$(TMPDIR="$tool_fixture/tmp:dir" "$BASH" -c '. "$1"; echo setup-continued' \
+  bash "$TERMNAV_TEST_DIR/helpers.sh" 2>&1) || tool_status=$?
+_assert_exit "test isolation: fixture setup rejects an unrepresentable TMPDIR" 1 "$tool_status"
+_assert_contains "test isolation: TMPDIR diagnostic explains the restriction" \
+  'TMPDIR must not contain a colon' "$tool_output"
+
 if command -v nvim >/dev/null 2>&1 && nvim --version >/dev/null 2>&1; then
   nvim_fixture_dir=$(_tmpdir)
   nvim_fixture=$nvim_fixture_dir/runner.lua
