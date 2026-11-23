@@ -401,7 +401,7 @@ PY
       TERMNAV_TEST_PASTE_TRIGGER="$gui_scratch/trigger" \
       TERMNAV_TEST_PASTE_STATUS="$gui_scratch/status" \
       _run_lua "$test_dir/support/paste-preview-trigger-test.lua" "$gui_config" 2>&1)
-    _assert_eq "macOS paste fixture: waits for WezTerm to see tmux" "ok" "$trigger_output"
+    _assert_eq "macOS paste fixture: polls for the request and tmux ownership" "ok" "$trigger_output"
   else
     _fail "macOS paste fixture: could not generate the test configuration"
   fi

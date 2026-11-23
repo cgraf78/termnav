@@ -1,14 +1,18 @@
 -- Drive the generated macOS config without a window server or pasteboard.
-local handlers, timers = {}, {}
+local timers = {}
 local stages, pastes = 0, 0
+local windows = {}
 package.preload.wezterm = function()
   return {
-    on = function(name, handler)
-      handlers[name] = handler
-    end,
+    on = function() end,
     font = function(name)
       return name
     end,
+    gui = {
+      gui_windows = function()
+        return windows
+      end,
+    },
     action = {
       PasteFrom = function()
         return "paste"
@@ -43,6 +47,9 @@ local pane = {
   end,
 }
 local window = {
+  active_pane = function()
+    return pane
+  end,
   perform_action = function(self, action, target)
     assert(target == pane, "paste targeted a different pane")
     if action == "paste" then
@@ -53,23 +60,30 @@ local window = {
   end,
 }
 dofile(arg[1])
-local status = handlers["update-status"]
+-- No status event runs. The fixture must find the late request on its own.
+local function tick()
+  assert(#timers == 1, "expected one timer without a status event")
+  table.remove(timers, 1)()
+end
+
 local trigger = assert(os.getenv("TERMNAV_TEST_PASTE_TRIGGER"))
+tick()
 assert(io.open(trigger, "w")):close()
 
-status(window, pane)
+tick()
+windows[1] = window
+tick()
 local pending = io.open(trigger, "r")
 assert(pending, "the GUI consumed the paste request before it saw tmux ownership")
 pending:close()
-assert(pastes == 0 and stages == 0 and #timers == 0, "the GUI pasted before tmux was ready")
+assert(pastes == 0 and stages == 0, "the GUI pasted before tmux was ready")
 
 vars.TERMNAV_TMUX = "true"
-status(window, pane)
-status(window, pane)
+tick()
 assert(not io.open(trigger, "r"), "the ready GUI did not consume the request")
-assert(pastes == 1 and #timers == 1, "the ready GUI did not invoke exactly one real paste action")
-timers[1]()
-assert(stages == 1, "the ready GUI did not run the clipboard stage once")
+assert(pastes == 1, "the ready GUI did not invoke exactly one real paste action")
+tick()
+assert(stages == 1 and #timers == 0, "the ready GUI did not stop after staging the clipboard")
 
 local diagnostics = assert(io.open(assert(os.getenv("TERMNAV_TEST_PASTE_STATUS")), "r"))
 local log = diagnostics:read("*a")
