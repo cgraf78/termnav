@@ -62,10 +62,13 @@ def signal_group(child: subprocess.Popen[bytes], sig: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Darwin can report EPERM for a GUI group after its leader exits.
-        if child.poll() is None:
+        # Darwin can stop finding signalable group members before the leader
+        # becomes waitable. Keep probing within the shutdown deadline while
+        # the leader is still present, but report a denied real signal.
+        if child.poll() is not None:
+            return False
+        if sig != 0:
             raise
-        return False
     return True
 
 
