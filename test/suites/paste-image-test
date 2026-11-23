@@ -382,6 +382,33 @@ else
   _assert_eq "paste-image module: gesture, handshake, flow control, cleanup" "ok" "$module_output"
 fi
 
+if [[ $module_rc != 127 ]] && command -v python3 >/dev/null 2>&1; then
+  gui_scratch=$(_tmpdir)
+  if gui_config=$(
+    PYTHONDONTWRITEBYTECODE=1 python3 - "$test_dir" "$gui_scratch" <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+test_dir, root = map(Path, sys.argv[1:])
+sys.path.insert(0, str(test_dir))
+(root / "client/config").mkdir(parents=True)
+harness = runpy.run_path(str(test_dir / "paste-image-gui.py"))
+print(harness["write_config"](root, "blocks")[0])
+PY
+  ); then
+    trigger_output=$(TERMNAV_TEST_ASSETS="$root" \
+      TERMNAV_TEST_PASTE_TRIGGER="$gui_scratch/trigger" \
+      TERMNAV_TEST_PASTE_STATUS="$gui_scratch/status" \
+      _run_lua "$test_dir/support/paste-preview-trigger-test.lua" "$gui_config" 2>&1)
+    _assert_eq "macOS paste fixture: waits for WezTerm to see tmux" "ok" "$trigger_output"
+  else
+    _fail "macOS paste fixture: could not generate the test configuration"
+  fi
+else
+  echo "  SKIP: macOS paste fixture test requires python3 and lua or nvim"
+fi
+
 # The Lua and Rust endpoints cannot share code; pin the shared vocabulary.
 protocol_source=$(cat "$root/src/paste_image/mod.rs")
 _assert_contains "paste-image protocol: Rust user variable matches the module" \
