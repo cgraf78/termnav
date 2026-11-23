@@ -4,7 +4,7 @@
 set -euo pipefail
 export NO_COLOR=1
 
-test_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+test_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 root="${test_dir%/test}"
 # shellcheck source=test/helpers.sh
 . "$test_dir/helpers.sh"

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Integration tests for per-SSH relay process ownership."""
 
 from __future__ import annotations
@@ -15,9 +14,19 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RELAY = pathlib.Path(os.environ.get("TERMNAV_TEST_BINARY", ROOT / "target" / "release" / "termnav"))
+
+
+def fixture_env() -> dict[str, str]:
+    """Keep the caller's startup files out of test-owned subprocesses."""
+
+    environment = os.environ.copy()
+    environment.pop("BASH_ENV", None)
+    environment.pop("ENV", None)
+    return environment
 
 
 def wait_for(predicate, description: str, timeout: float = 3.0) -> None:
@@ -233,7 +242,7 @@ exec sleep 300
 
         owner_read, owner_write = os.pipe()
         self.descriptors.update((owner_read, owner_write))
-        environment = os.environ.copy()
+        environment = fixture_env()
         # Owned-server lifecycle tests model a relay hop outside tmux unless a
         # case opts in explicitly. Never let the developer's live session turn
         # a protocol fixture into real pane discovery or routing.
@@ -395,7 +404,7 @@ PY
             encoding="utf-8",
         )
         direct_ssh.chmod(0o700)
-        environment = os.environ.copy()
+        environment = fixture_env()
         environment.update(
             {
                 "TERMNAV_TEST_DIRECT_REPLY": str(reply_path),
@@ -482,13 +491,47 @@ PY
         wait_for(lambda: second.poll() is not None, "second owned relay to exit")
         wait_for(lambda: not second_socket.exists(), "second owned relay socket cleanup")
 
+    def test_ssh_fixture_ignores_caller_shell_startup(self) -> None:
+        """The real SSH fixture must reach its mock client with private settings."""
+
+        startup = self.root / "startup.sh"
+        marker = self.root / "startup-ran"
+        startup.write_text(
+            """case "$0" in
+  */tnrl-*/ssh)
+    : >"$TERMNAV_TEST_STARTUP_MARKER"
+    exit 47
+    ;;
+esac
+""",
+            encoding="utf-8",
+        )
+        startup_vars = {
+            "BASH_ENV": str(startup),
+            "ENV": str(startup),
+            "TERMNAV_TEST_STARTUP_MARKER": str(marker),
+        }
+        control = subprocess.run(
+            ["bash", "-c", ":", str(self.fake_ssh)],
+            env={**os.environ, **startup_vars},
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(control.returncode, 47, "the caller startup probe was inactive")
+        self.assertTrue(marker.is_file())
+        marker.unlink()
+
+        with patch.dict(os.environ, startup_vars):
+            self.test_ssh_wrapper_signals_stop_child_and_relay()
+        self.assertFalse(marker.exists(), "the SSH child ran the caller's startup file")
+
     @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires POSIX process signals")
     def test_ssh_wrapper_signals_stop_child_and_relay(self) -> None:
         """Catchable termination must leave neither child nor listener behind."""
 
         for signum in (signal.SIGINT, signal.SIGTERM):
             with self.subTest(signal=signum):
-                environment = os.environ.copy()
+                environment = fixture_env()
                 environment.update(
                     {
                         "PATH": f"{self.root}:{environment.get('PATH', '')}",
@@ -548,7 +591,7 @@ exec sleep 300
 """,
             encoding="utf-8",
         )
-        environment = os.environ.copy()
+        environment = fixture_env()
         environment.update(
             {
                 "PATH": f"{self.root}:{environment.get('PATH', '')}",
@@ -618,7 +661,7 @@ while [[ ! -e "$TERMNAV_TEST_RELEASE_DIR/$$" ]]; do sleep 0.01; done
             encoding="utf-8",
         )
         self.fake_ssh.chmod(0o700)
-        environment = os.environ.copy()
+        environment = fixture_env()
         environment.update(
             {
                 "PATH": f"{self.root}:{environment.get('PATH', '')}",
@@ -688,7 +731,7 @@ while [[ ! -e "$TERMNAV_TEST_RELEASE_DIR/$$" ]]; do sleep 0.01; done
     def test_ssh_wrapper_sigkill_does_not_orphan_its_relay(self) -> None:
         """A killed wrapper must not leave its connection relay or socket."""
 
-        environment = os.environ.copy()
+        environment = fixture_env()
         environment.update(
             {
                 "REPO_TEST": "1",
