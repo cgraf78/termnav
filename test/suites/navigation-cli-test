@@ -10,7 +10,7 @@ export NO_COLOR=1
 # where the test runner happened to be launched.
 unset TMUX TMUX_PANE
 
-TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TERMNAV_ROOT="$(cd -- "$TERMNAV_TEST_DIR/.." && pwd -P)"
 
 # shellcheck source=../helpers.sh

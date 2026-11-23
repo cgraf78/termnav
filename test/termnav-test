@@ -9,7 +9,7 @@ if [[ ${1:-} == --tmux-floor-smoke &&
   exit 1
 fi
 
-test_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+test_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 root="${test_dir%/test}"
 
 # Shell/Lua integration suites exercise the optimized artifact that users

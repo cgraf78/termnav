@@ -67,7 +67,8 @@ fn head_ref() -> Option<String> {
 
 fn build_version(commit: &str) -> String {
     let output = Command::new("bash")
-        .arg("scripts/release-version.sh")
+        // Anchor the helper to the crate so its directory lookup bypasses CDPATH.
+        .arg("./scripts/release-version.sh")
         .env("TERMNAV_BUILD_COMMIT", commit)
         .output()
         .unwrap_or_else(|error| panic!("failed to run release-version.sh: {error}"));

@@ -4,7 +4,7 @@
 set -o pipefail
 export NO_COLOR=1
 
-TERMNAV_TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+TERMNAV_TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 # Deliberately seed values that would route native Termnav calls into the
 # developer's real tmux and Neovim sessions if the shared harness leaked them.

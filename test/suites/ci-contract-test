@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 workflow="$root/.github/workflows/test.yml"
 retry_workflow="$root/.github/workflows/retry-infrastructure.yml"
 release_workflow="$root/.github/workflows/release.yml"
@@ -43,7 +43,7 @@ release_content=$(<"$release_workflow")
   fail "Termux CI does not install native tmux with the integration-test profiles"
 [[ "$content" == *'termux-command: TERMNAV_REQUIRE_TMUX=1 TERMNAV_TEST_BINARY=./termnav TERMNAV_SKIP_SHELLCHECK=1 test/termnav-test'* ]] ||
   fail "Termux CI does not run the packaged binary through the full suite"
-[[ "$content" == *'test-command: export TERMNAV_REQUIRE_TMUX=1 && cargo test --locked && test/termnav-test'* ]] ||
+[[ "$content" == *'test-command: export TERMNAV_REQUIRE_TMUX=1 && cargo test --locked && CDPATH=. test/termnav-test'* ]] ||
   fail "Rust CI does not run the native and integration suites together"
 [[ "$retry_content" == *"cgraf78/actions/.github/actions/infra-retry@$actions_sha"* ]] ||
   fail "infrastructure retry does not use the locked actions revision"
