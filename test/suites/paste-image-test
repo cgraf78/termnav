@@ -382,6 +382,16 @@ else
   _assert_eq "paste-image module: gesture, handshake, flow control, cleanup" "ok" "$module_output"
 fi
 
+if command -v python3 >/dev/null 2>&1; then
+  if PYTHONDONTWRITEBYTECODE=1 python3 "$test_dir/support/paste-image-gui-test.py"; then
+    _pass "GUI paste fixture: captures a fresh window before reading its pixels"
+  else
+    _fail "GUI paste fixture: screenshot probe checks failed"
+  fi
+else
+  echo "  SKIP: GUI screenshot fixture test requires python3"
+fi
+
 if [[ $module_rc != 127 ]] && command -v python3 >/dev/null 2>&1; then
   gui_scratch=$(_tmpdir)
   if gui_config=$(
