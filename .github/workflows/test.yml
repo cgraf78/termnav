@@ -189,10 +189,11 @@ jobs:
       # macOS has no procfs. This repeats the real nested-boundary benchmark on
       # the fallback process-inspection path so a change cannot be fast on
       # Linux while spawning enough `ps` processes to feel sluggish on Macs.
+      # Use the shared sample count so two occasional scheduling stalls
+      # cannot trip the absolute p95 ceiling on their own.
       - name: Compare relay hot paths with the PR base
         env:
           TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}
-          TERMNAV_PERFORMANCE_SAMPLES: "20"
         run: test/suites/relay-performance-test
 
   eza-current:
