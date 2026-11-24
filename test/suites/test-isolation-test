@@ -12,6 +12,10 @@ export HOME=/termnav-live-home-sentinel
 export XDG_STATE_HOME=/termnav-live-state-sentinel
 export TMUX=/tmp/termnav-live-tmux-sentinel,1,0
 export TMUX_PANE=%999
+export TMUX_TMPDIR=/tmp/termnav-live-tmux-directory-sentinel
+export ZDOTDIR=/termnav-live-zsh-config-sentinel
+export ENV=/termnav-live-sh-config-sentinel
+export BASH_ENV=/termnav-live-bash-config-sentinel
 export NVIM=/tmp/termnav-live-nvim-sentinel
 export SSH_CONNECTION='192.0.2.1 1 192.0.2.2 22'
 export BROWSER=/termnav-live-browser-sentinel
@@ -56,7 +60,7 @@ case "$XDG_STATE_HOME" in
   *) _fail "test isolation: XDG state escaped the invocation root ($XDG_STATE_HOME)" ;;
 esac
 
-for variable in TMUX TMUX_PANE NVIM SSH_CONNECTION DISPLAY WAYLAND_DISPLAY; do
+for variable in TMUX TMUX_PANE TMUX_TMPDIR ZDOTDIR ENV BASH_ENV NVIM SSH_CONNECTION DISPLAY WAYLAND_DISPLAY; do
   if [[ -v $variable ]]; then
     _fail "test isolation: $variable leaked into a suite"
   else
