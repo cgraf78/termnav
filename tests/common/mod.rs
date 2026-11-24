@@ -3,6 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// Use a shell that exists even when native Android children have a clean environment.
+#[allow(dead_code)]
+pub(crate) const fn fixture_shell() -> &'static str {
+    if cfg!(target_os = "android") {
+        "/system/bin/sh"
+    } else {
+        "/bin/sh"
+    }
+}
+
 /// Write an executable fixture (mode 755) holding `contents`.
 ///
 /// Tests run on parallel threads. A thread that spawns a process while this
@@ -17,7 +27,7 @@ static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
     use std::io::Write;
 
-    let mut writer = std::process::Command::new("/bin/sh")
+    let mut writer = std::process::Command::new(fixture_shell())
         .args(["-c", "cat >\"$1\" && chmod 755 \"$1\"", "sh"])
         .arg(path)
         .stdin(std::process::Stdio::piped())
@@ -88,12 +98,16 @@ pub(crate) fn socket_root() -> PathBuf {
     let temporary = std::env::temp_dir();
     // macOS's /var/folders TMPDIR plus a test label can exceed sockaddr_un.
     // Executables stay in Cargo's approved target tree; only sockets use /tmp.
-    let parent = if temporary.as_os_str().as_encoded_bytes().len() > 60
-        && std::path::Path::new("/tmp").is_dir()
-    {
-        std::path::Path::new("/tmp")
+    let parent = if temporary.as_os_str().as_encoded_bytes().len() > 60 {
+        // Termux's short writable temporary directory lives under its prefix.
+        let fallback = if cfg!(target_os = "android") {
+            std::env::var_os("PREFIX").map(|prefix| PathBuf::from(prefix).join("tmp"))
+        } else {
+            Some(PathBuf::from("/tmp"))
+        };
+        fallback.filter(|path| path.is_dir()).unwrap_or(temporary)
     } else {
-        temporary.as_path()
+        temporary
     };
     for _ in 0..100 {
         let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
