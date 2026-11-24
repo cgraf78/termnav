@@ -140,11 +140,15 @@ for contract in \
   "cgraf78/actions/.github/actions/shell-ci-prereqs@$actions_sha" \
   'profiles: tmux-pinned' \
   'TERMNAV_PERFORMANCE_BASELINE: ${{ github.event.pull_request.base.sha }}' \
-  'TERMNAV_PERFORMANCE_SAMPLES: "20"' \
   'run: test/suites/relay-performance-test'; do
   [[ "$performance_macos_job" == *"$contract"* ]] ||
     fail "macOS relay performance job is missing: $contract"
 done
+[[ "$performance_macos_job" != *'TERMNAV_PERFORMANCE_SAMPLES:'* ]] ||
+  fail 'macOS relay performance must use the shared sample count'
+# shellcheck disable=SC2016 # Inspect the literal shell default.
+grep -Fq -- '--samples "${TERMNAV_PERFORMANCE_SAMPLES:-50}"' "$performance_suite" ||
+  fail 'relay performance must default to 50 paired observations'
 
 # These are literal GitHub and shell expressions in the workflow contract.
 # shellcheck disable=SC2016
@@ -233,6 +237,30 @@ grep -Fq "_with_timeout 10m python3 \"\$test_dir/support/tmux-focus.py\"" "$focu
   fail "tmux focus suite has no bounded outer deadline"
 
 performance_content=$(<"$performance_harness")
+for contract in \
+  'if candidate_median > baseline_median * 1.10 + 3:' \
+  'if candidate_median > 35:' \
+  'if candidate_p95 > 60:'; do
+  [[ "$performance_content" == *"$contract"* ]] ||
+    fail "relay hot path budget is missing: $contract"
+done
+
+python3 - "$performance_harness" <<'PY'
+import runpy
+import sys
+
+percentile = runpy.run_path(sys.argv[1])["percentile"]
+# Two slow observations dominate a 20-sample nearest-rank p95, but they
+# should not trip the 50-sample ceiling. A third slow sample still must fail.
+isolated_tail = [23] * 18 + [68, 72]
+if percentile(isolated_tail, 0.95) <= 60:
+    raise SystemExit("ci-contract-test: the short sample should reproduce a false failure")
+if percentile(isolated_tail + [23] * 30, 0.95) > 60:
+    raise SystemExit("ci-contract-test: a short delay tripped the shared sample budget")
+if percentile([23] * 47 + [68] * 3, 0.95) <= 60:
+    raise SystemExit("ci-contract-test: the shared sample budget missed a sustained slow tail")
+PY
+
 for contract in \
   '"baseline_median_ms": tmux_before_median' \
   '"candidate_median_ms": tmux_after_median' \
