@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   rust:
-    uses: cgraf78/actions/.github/workflows/rust-ci.yml@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+    uses: cgraf78/actions/.github/workflows/rust-ci.yml@e9922d129ba6d9dc43793247409197b0b07b81c8
     with:
       matrix-set: full
       msrv-toolchain: "1.88"
@@ -52,11 +52,11 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           toolchain: stable
       - name: Install the exact tmux floor
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           matrix-name: Ubuntu
           profiles: python,tmux-floor-exact
@@ -85,7 +85,7 @@ jobs:
       # files, so `.github/cgraf78-actions.lock` cannot be interpolated. This gate
       # verifies every unavoidable cgraf78/actions literal still matches that
       # single reviewed dependency decision.
-      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+      - uses: cgraf78/actions/.github/actions/verify-consumer-sync@e9922d129ba6d9dc43793247409197b0b07b81c8
 
   vscode-adapter:
     name: VS Code adapter / Ubuntu
@@ -132,12 +132,12 @@ jobs:
       # matrix above, so it must establish its own toolchain before the harness
       # builds both the base revision and the pull-request candidate.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           toolchain: stable
 
       - name: Install pinned tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           matrix-name: Ubuntu
           profiles: tmux-pinned
@@ -176,12 +176,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           toolchain: stable
 
       - name: Install pinned tmux
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           matrix-name: macOS
           profiles: tmux-pinned
@@ -257,12 +257,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: cgraf78/actions/.github/actions/rust-toolchain@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
       - name: Install pinned tmux and WezTerm
-        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@2001f9830b4d5fa6fbc67d3445e2328022c97cac
+        uses: cgraf78/actions/.github/actions/shell-ci-prereqs@e9922d129ba6d9dc43793247409197b0b07b81c8
         with:
           matrix-name: ${{ matrix.name }}
           profiles: tmux-pinned,wezterm-pinned
